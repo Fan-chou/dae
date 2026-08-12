@@ -4,6 +4,9 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
 func TestParseDomainProviderPreservesDomainKindsAndOrder(t *testing.T) {
@@ -99,8 +102,37 @@ func TestGenerateDaeRoutesEscapesValuesAndPreservesRouteOrder(t *testing.T) {
 	if report.Generated != 2 || report.Skipped != 0 {
 		t.Fatalf("report = %#v", report)
 	}
-	want := "domain(full: 'a\\'b.example') -> proxy\ndip('192.0.2.0/24') -> direct\n"
+	want := "domain(full: \"a'b.example\") -> proxy\ndip('192.0.2.0/24') -> direct\n"
 	if output != want {
 		t.Fatalf("output = %q, want %q", output, want)
+	}
+}
+
+func TestGenerateDaeRoutesRoundTripsBackslashesThroughKdaeParser(t *testing.T) {
+	manifest := Manifest{Routes: []RouteSpec{{Provider: "p", Outbound: "proxy", Kind: "domain"}}}
+	sets := map[string]ParsedRuleSet{"p": {Domains: []DomainRule{{Kind: DomainRegex, Value: `^cdn\\.`}}}}
+	output, _, err := GenerateDaeRoutes(manifest, sets, true)
+	if err != nil {
+		t.Fatalf("GenerateDaeRoutes() error = %v", err)
+	}
+	sections, err := config_parser.Parse("global {}\nrouting {\n" + output + "  fallback: direct\n}\n")
+	if err != nil {
+		t.Fatalf("generated routes do not parse: %v; output=%q", err, output)
+	}
+	conf, err := config.New(sections)
+	if err != nil {
+		t.Fatalf("config.New() error = %v; output=%q", err, output)
+	}
+	got := conf.Routing.Rules[0].AndFunctions[0].Params[0].Val
+	if got != `^cdn\\.` {
+		t.Fatalf("round-tripped regex = %q, want %q", got, `^cdn\\.`)
+	}
+}
+
+func TestGenerateDaeRoutesRejectsControlAndOutboundInjection(t *testing.T) {
+	manifest := Manifest{Routes: []RouteSpec{{Provider: "p", Outbound: "proxy\nfallback: direct", Kind: "domain"}}}
+	sets := map[string]ParsedRuleSet{"p": {Domains: []DomainRule{{Kind: DomainSuffix, Value: "example.com\nother"}}}}
+	if _, _, err := GenerateDaeRoutes(manifest, sets, true); err == nil {
+		t.Fatal("GenerateDaeRoutes() error = nil for injected values")
 	}
 }

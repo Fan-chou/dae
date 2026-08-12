@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type SyncOptions struct {
@@ -69,8 +71,13 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		options.CacheDir = filepath.Join(baseDir, "persist.d", "rule-providers")
 	}
 	fetcher := NewProviderFetcher(options.Client, options.CacheDir)
+	fetcher.ValidateBody = func(spec ProviderSpec, body []byte) error {
+		_, err := ParseProvider(body, spec)
+		return err
+	}
 	if options.AllowPrivate {
 		fetcher.ValidateURL = validateTestURL
+		fetcher.AllowPrivate = true
 	}
 
 	sets := make(map[string]ParsedRuleSet, len(manifest.Providers))
@@ -104,6 +111,9 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		return SyncReport{}, err
 	}
 	report.Routes = routeReport
+	if options.RoutesOutput != "" && routeReport.Generated == 0 {
+		return SyncReport{}, fmt.Errorf("refusing to replace routes output with zero generated rules")
+	}
 	if options.RoutesOutput != "" {
 		if err := writeAtomic(options.RoutesOutput, []byte(routes)); err != nil {
 			return SyncReport{}, fmt.Errorf("write routes: %w", err)
@@ -151,10 +161,7 @@ func loadProvider(ctx context.Context, fetcher *ProviderFetcher, spec ProviderSp
 		result, err := fetcher.Fetch(ctx, spec)
 		return result.Snapshot, result, err
 	case "file":
-		if err := validateRelativePath(baseDir, spec.Path); err != nil {
-			return ProviderSnapshot{}, FetchResult{}, err
-		}
-		body, err := readLimited(filepath.Join(baseDir, filepath.Clean(spec.Path)), spec.EffectiveMaxSize())
+		body, err := readProviderFile(baseDir, spec.Path, spec.EffectiveMaxSize())
 		if err != nil {
 			return ProviderSnapshot{}, FetchResult{}, err
 		}
@@ -168,18 +175,68 @@ func loadProvider(ctx context.Context, fetcher *ProviderFetcher, spec ProviderSp
 	}
 }
 
+func readProviderFile(baseDir, providerPath string, maxSize int64) ([]byte, error) {
+	if err := validateRelativePath(baseDir, providerPath); err != nil {
+		return nil, err
+	}
+	baseResolved, err := filepath.EvalSymlinks(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider base directory: %w", err)
+	}
+	candidate, err := filepath.Abs(filepath.Join(baseDir, filepath.Clean(providerPath)))
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider path: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider file: %w", err)
+	}
+	rel, err := filepath.Rel(baseResolved, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("provider path %q resolves outside base directory", providerPath)
+	}
+	fd, err := unix.Open(resolved, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open provider file safely: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), resolved)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open provider file safely: invalid file handle")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat provider file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("provider path %q is not a regular file", providerPath)
+	}
+	return readLimitedReader(file, maxSize)
+}
+
 func readLimited(path string, maxSize int64) ([]byte, error) {
+	if maxSize <= 0 || maxSize > maxProviderMaxSize {
+		return nil, fmt.Errorf("invalid max_size %d", maxSize)
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	body, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	return readLimitedReader(file, maxSize)
+}
+
+func readLimitedReader(reader io.Reader, maxSize int64) ([]byte, error) {
+	if maxSize <= 0 || maxSize > maxProviderMaxSize {
+		return nil, fmt.Errorf("invalid max_size %d", maxSize)
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, maxSize+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(body)) > maxSize {
-		return nil, fmt.Errorf("file exceeds max_size %d", maxSize)
+		return nil, fmt.Errorf("provider content exceeds max_size %d", maxSize)
 	}
 	return body, nil
 }

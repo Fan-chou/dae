@@ -16,6 +16,8 @@ import (
 const (
 	defaultProviderMaxSize  = 8 << 20
 	defaultProviderInterval = time.Hour
+	maxProviderMaxSize      = 64 << 20
+	maxProviderInterval     = 30 * 24 * time.Hour
 )
 
 var providerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -159,8 +161,14 @@ func validateManifestWithURL(manifest Manifest, baseDir string, validateURL func
 		if provider.Interval < 0 {
 			return fmt.Errorf("provider %q has negative interval", provider.Name)
 		}
+		if provider.Interval > maxProviderInterval {
+			return fmt.Errorf("provider %q interval exceeds %s", provider.Name, maxProviderInterval)
+		}
 		if provider.MaxSize < 0 {
 			return fmt.Errorf("provider %q has negative max_size", provider.Name)
+		}
+		if provider.MaxSize > maxProviderMaxSize {
+			return fmt.Errorf("provider %q max_size exceeds %d bytes", provider.Name, maxProviderMaxSize)
 		}
 		if provider.Path != "" {
 			if err := validateRelativePath(baseDir, provider.Path); err != nil {
@@ -175,14 +183,21 @@ func validateManifestWithURL(manifest Manifest, baseDir string, validateURL func
 		if route.Outbound == "" {
 			return fmt.Errorf("route %d has empty outbound", i)
 		}
+		if err := validateRouteOutbound(route.Outbound); err != nil {
+			return fmt.Errorf("route %d: %w", i, err)
+		}
 		kind := strings.ToLower(route.Kind)
+		providerBehavior := providers[route.Provider].Behavior
 		if kind == "" {
-			kind = providers[route.Provider].Behavior
+			if providerBehavior == "classical" {
+				return fmt.Errorf("route %d for classical provider %q requires explicit kind", i, route.Provider)
+			}
+			kind = providerBehavior
 		}
 		if kind != "domain" && kind != "ipcidr" {
 			return fmt.Errorf("route %d has unsupported route kind %q", i, route.Kind)
 		}
-		if providerBehavior := providers[route.Provider].Behavior; providerBehavior != kind {
+		if providerBehavior != "classical" && providerBehavior != kind {
 			return fmt.Errorf("route %d kind %q does not match provider %q behavior %q", i, kind, route.Provider, providerBehavior)
 		}
 	}
@@ -205,14 +220,38 @@ func validateProviderURL(raw string) error {
 	default:
 		return fmt.Errorf("unsupported url scheme %q", u.Scheme)
 	}
-	host := strings.ToLower(u.Hostname())
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || host == "metadata.google.internal" {
+		return fmt.Errorf("url host %q is not allowed", host)
+	}
+	if numericAddressLike(host) {
 		return fmt.Errorf("url host %q is not allowed", host)
 	}
 	if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified()) {
 		return fmt.Errorf("url host %q is not allowed", host)
 	}
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("url host %q is not allowed", host)
+	}
 	return nil
+}
+
+func numericAddressLike(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validateRelativePath(baseDir, path string) error {
@@ -260,6 +299,9 @@ func parseByteSize(node yaml.Node) (int64, error) {
 		parsed, err := strconv.ParseInt(number, 10, 64)
 		if err != nil || parsed < 0 {
 			break
+		}
+		if parsed > (1<<63-1)/unit.factor {
+			return 0, fmt.Errorf("size %q overflows int64", value)
 		}
 		return parsed * unit.factor, nil
 	}

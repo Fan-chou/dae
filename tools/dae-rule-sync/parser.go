@@ -87,6 +87,9 @@ func providerItems(data []byte, format string) ([]string, error) {
 		return strings.Split(string(data), "\n"), nil
 	}
 	if format == "" || strings.ToLower(format) == "yaml" {
+		if err := validateProviderYAML(data); err != nil {
+			return nil, err
+		}
 		var envelope struct {
 			Payload []string `yaml:"payload"`
 		}
@@ -100,6 +103,41 @@ func providerItems(data []byte, format string) ([]string, error) {
 		return list, nil
 	}
 	return nil, fmt.Errorf("unsupported provider format %q", format)
+}
+
+func validateProviderYAML(data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse yaml provider: %w", err)
+	}
+	const maxNodes = 100000
+	nodes := 0
+	var walk func(*yaml.Node, int) error
+	walk = func(node *yaml.Node, depth int) error {
+		if node == nil {
+			return nil
+		}
+		if depth > 64 {
+			return fmt.Errorf("provider yaml nesting exceeds 64 levels")
+		}
+		nodes++
+		if nodes > maxNodes {
+			return fmt.Errorf("provider yaml contains too many nodes")
+		}
+		if node.Kind == yaml.AliasNode {
+			return fmt.Errorf("provider yaml aliases are not allowed")
+		}
+		for _, child := range node.Content {
+			if err := walk(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(&root, 0); err != nil {
+		return err
+	}
+	return nil
 }
 
 func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, *UnsupportedRule, error) {
@@ -157,13 +195,24 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 		return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: fmt.Sprintf("unsupported classical rule %s", kind)}, nil
 	}
 
-	if !strings.ContainsAny(raw, " ,\t\r") {
-		if behavior == "ipcidr" {
-			prefix, err := netip.ParsePrefix(raw)
-			if err == nil {
+	if !strings.ContainsAny(raw, " ,	\r") {
+		if behavior == "ipcidr" || behavior == "classical" {
+			if addr, err := netip.ParseAddr(raw); err == nil {
+				bits := 128
+				if addr.Is4() {
+					bits = 32
+				}
+				return "", "", netip.PrefixFrom(addr, bits), nil, nil
+			}
+			if prefix, err := netip.ParsePrefix(raw); err == nil {
 				return "", "", prefix, nil, nil
 			}
-			return "", "", netip.Prefix{}, nil, fmt.Errorf("invalid CIDR %q: %w", raw, err)
+			if behavior == "ipcidr" {
+				return "", "", netip.Prefix{}, nil, fmt.Errorf("invalid CIDR %q", raw)
+			}
+		}
+		if behavior == "ipcidr" {
+			return "", "", netip.Prefix{}, nil, fmt.Errorf("invalid CIDR %q", raw)
 		}
 		return DomainSuffix, raw, netip.Prefix{}, nil, nil
 	}
@@ -171,12 +220,19 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 }
 
 func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict bool) (string, ConversionReport, error) {
+	providerBehaviors := make(map[string]string, len(manifest.Providers))
+	for _, provider := range manifest.Providers {
+		providerBehaviors[provider.Name] = strings.ToLower(provider.Behavior)
+	}
 	var output strings.Builder
 	var report ConversionReport
 	for _, route := range manifest.Routes {
 		set, ok := sets[route.Provider]
 		if !ok {
 			return "", report, fmt.Errorf("route references missing provider %q", route.Provider)
+		}
+		if err := validateRouteOutbound(route.Outbound); err != nil {
+			return "", report, fmt.Errorf("route for provider %q: %w", route.Provider, err)
 		}
 		if len(set.Unsupported) > 0 {
 			if strict {
@@ -187,11 +243,24 @@ func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict 
 		}
 		kind := strings.ToLower(route.Kind)
 		if kind == "" {
-			kind = "domain"
+			kind = providerBehaviors[route.Provider]
+			if kind == "classical" {
+				return "", report, fmt.Errorf("route for classical provider %q requires explicit kind", route.Provider)
+			}
+		}
+		if kind != "domain" && kind != "ipcidr" {
+			return "", report, fmt.Errorf("unsupported route kind %q", route.Kind)
+		}
+		behavior := providerBehaviors[route.Provider]
+		if behavior != "classical" && behavior != "" && behavior != kind {
+			return "", report, fmt.Errorf("route kind %q does not match provider %q behavior %q", kind, route.Provider, behavior)
 		}
 		switch kind {
 		case "domain":
 			for _, domain := range set.Domains {
+				if err := validateDaeLiteral(domain.Value); err != nil {
+					return "", report, fmt.Errorf("provider %q rule: %w", route.Provider, err)
+				}
 				fmt.Fprintf(&output, "domain(%s: %s) -> %s\n", domain.Kind, daeQuote(domain.Value), route.Outbound)
 				report.Generated++
 			}
@@ -200,15 +269,34 @@ func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict 
 				fmt.Fprintf(&output, "dip(%s) -> %s\n", daeQuote(prefix.String()), route.Outbound)
 				report.Generated++
 			}
-		default:
-			return "", report, fmt.Errorf("unsupported route kind %q", route.Kind)
 		}
 	}
 	return output.String(), report, nil
 }
 
 func daeQuote(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, "'", `\'`)
+	if strings.Contains(value, "'") && !strings.Contains(value, `"`) {
+		return `"` + value + `"`
+	}
 	return "'" + value + "'"
+}
+
+func validateDaeLiteral(value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("rule value contains a control character")
+	}
+	if strings.Contains(value, "'") && strings.Contains(value, `"`) {
+		return fmt.Errorf("rule value contains both quote characters")
+	}
+	return nil
+}
+
+func validateRouteOutbound(outbound string) error {
+	if outbound == "" {
+		return fmt.Errorf("outbound is empty")
+	}
+	if !providerNamePattern.MatchString(outbound) {
+		return fmt.Errorf("outbound %q is not a safe identifier", outbound)
+	}
+	return nil
 }

@@ -88,6 +88,109 @@ proxy-groups:
 	}
 }
 
+func TestRunSyncKeepsLastGoodCacheWhenNewProviderBodyCannotBeParsed(t *testing.T) {
+	valid := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if valid {
+			_, _ = fmt.Fprint(w, "payload:\n  - good.example\n")
+			return
+		}
+		_, _ = fmt.Fprint(w, "payload: [this is not valid yaml")
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	manifest := fmt.Sprintf("providers:\n  - name: p\n    type: http\n    url: %s\n    behavior: domain\n    format: yaml\nroutes:\n  - provider: p\n    outbound: proxy\n    kind: domain\n", server.URL)
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	outputPath := filepath.Join(dir, "routes.dae")
+	options := SyncOptions{ManifestPath: manifestPath, CacheDir: filepath.Join(dir, "cache"), RoutesOutput: outputPath, Client: http.DefaultClient, AllowPrivate: true}
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("initial RunSync() error = %v", err)
+	}
+	valid = false
+	report, err := RunSync(context.Background(), options)
+	if err != nil {
+		t.Fatalf("stale-cache RunSync() error = %v", err)
+	}
+	if report.Providers[0].Warning == "" || !report.Providers[0].UsedCache {
+		t.Fatalf("report = %#v, want stale-cache warning", report)
+	}
+	body, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "domain(suffix: 'good.example') -> proxy\n" {
+		t.Fatalf("routes after bad update = %q", body)
+	}
+}
+
+func TestRunSyncRejectsFileProviderSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.yaml")
+	if err := os.WriteFile(outside, []byte("payload:\n  - outside.example\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	link := filepath.Join(dir, "rules.yaml")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	manifest := `providers:
+  - name: p
+    type: file
+    path: rules.yaml
+    behavior: domain
+    format: yaml
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := RunSync(context.Background(), SyncOptions{ManifestPath: manifestPath, RoutesOutput: filepath.Join(dir, "routes.dae")}); err == nil {
+		t.Fatal("RunSync() error = nil for symlink escape")
+	}
+}
+
+func TestRunSyncDoesNotOverwriteRoutesWithEmptyProviderResult(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	manifest := `providers:
+  - name: empty
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: []"
+routes:
+  - provider: empty
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	outputPath := filepath.Join(dir, "routes.dae")
+	if err := os.WriteFile(outputPath, []byte("domain(suffix: 'old.example') -> proxy\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err := RunSync(context.Background(), SyncOptions{ManifestPath: manifestPath, RoutesOutput: outputPath})
+	if err == nil {
+		t.Fatal("RunSync() error = nil for empty route result")
+	}
+	body, readErr := os.ReadFile(outputPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile() error = %v", readErr)
+	}
+	if string(body) != "domain(suffix: 'old.example') -> proxy\n" {
+		t.Fatalf("routes after empty result = %q", body)
+	}
+}
+
 func TestAtomicWriteReplacesFileWithoutTemporarySibling(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "output.dae")

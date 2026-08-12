@@ -127,5 +127,59 @@ func TestProviderFetcherLeavesNoTemporaryCacheAfterCommit(t *testing.T) {
 func newTestProviderFetcher(client *http.Client, cacheDir string) *ProviderFetcher {
 	fetcher := NewProviderFetcher(client, cacheDir)
 	fetcher.ValidateURL = func(string) error { return nil }
+	fetcher.AllowPrivate = true
 	return fetcher
+}
+
+func TestProviderFetcherSingleFlightsConcurrentRefreshes(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = fmt.Fprint(w, "payload")
+	}))
+	defer server.Close()
+
+	fetcher := newTestProviderFetcher(http.DefaultClient, t.TempDir())
+	spec := ProviderSpec{Name: "p", Type: "http", URL: server.URL, MaxSize: 1024}
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := fetcher.Fetch(context.Background(), spec)
+			results <- err
+		}()
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent Fetch() error = %v", err)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestProviderFetcherDoesNotReuseCacheWhenURLChanges(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "first")
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			t.Fatal("sent conditional header for a different source URL")
+		}
+		_, _ = fmt.Fprint(w, "second")
+	}))
+	defer second.Close()
+
+	fetcher := newTestProviderFetcher(http.DefaultClient, t.TempDir())
+	if _, err := fetcher.Fetch(context.Background(), ProviderSpec{Name: "p", Type: "http", URL: first.URL, MaxSize: 1024}); err != nil {
+		t.Fatalf("first Fetch() error = %v", err)
+	}
+	result, err := fetcher.Fetch(context.Background(), ProviderSpec{Name: "p", Type: "http", URL: second.URL, MaxSize: 1024})
+	if err != nil {
+		t.Fatalf("second Fetch() error = %v", err)
+	}
+	if string(result.Snapshot.Body) != "second" {
+		t.Fatalf("body = %q, want second", result.Snapshot.Body)
+	}
 }

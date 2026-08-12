@@ -96,3 +96,22 @@ func TestValidateManifestRejectsUnsupportedRouteKind(t *testing.T) {
 		t.Fatalf("ValidateManifest() error = %v, want route diagnostic", err)
 	}
 }
+
+func TestValidateManifestRejectsOversizedProviderLimit(t *testing.T) {
+	manifest := Manifest{
+		Providers: []ProviderSpec{{Name: "p", Type: "file", Path: "p.yaml", Behavior: "domain", Format: "yaml", MaxSize: maxProviderMaxSize + 1}},
+	}
+	if err := ValidateManifest(manifest, t.TempDir()); err == nil {
+		t.Fatal("ValidateManifest() error = nil for oversized max_size")
+	}
+}
+
+func TestValidateManifestAllowsExplicitKindForClassicalProvider(t *testing.T) {
+	manifest := Manifest{
+		Providers: []ProviderSpec{{Name: "p", Type: "file", Path: "p.yaml", Behavior: "classical", Format: "text"}},
+		Routes:    []RouteSpec{{Provider: "p", Outbound: "proxy", Kind: "domain"}},
+	}
+	if err := ValidateManifest(manifest, t.TempDir()); err != nil {
+		t.Fatalf("ValidateManifest() error = %v", err)
+	}
+}
