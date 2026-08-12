@@ -87,8 +87,10 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 					continue
 				}
 				if _, node := proxies[member]; !node {
-					reasons = append(reasons, "unknown member "+member)
-					continue
+					return "", GroupConversionReport{}, fmt.Errorf("group %q has unknown member %q", group.Name, member)
+				}
+				if err := validateDaeLiteral(member); err != nil {
+					return "", GroupConversionReport{}, fmt.Errorf("group %q member %q: %w", group.Name, member, err)
 				}
 				members = append(members, member)
 			}

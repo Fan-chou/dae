@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/component/ruleprovider"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
@@ -151,6 +152,9 @@ func readConfig(cfgFile string) (conf *config.Config, includes []string, err err
 	}
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err
+	}
+	if err := ruleprovider.LoadAndExpand(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient); err != nil {
+		return nil, nil, fmt.Errorf("load native rule providers: %w", err)
 	}
 	return conf, includes, nil
 }

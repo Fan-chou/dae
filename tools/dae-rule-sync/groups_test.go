@@ -84,3 +84,20 @@ func TestGenerateFlatDaeGroupsUsesDeterministicSafeNames(t *testing.T) {
 		t.Fatalf("conversion is not deterministic:\nfirst=%q\nsecond=%q", first, second)
 	}
 }
+
+func TestGenerateFlatDaeGroupsRejectsUnknownMember(t *testing.T) {
+	config := MihomoConfig{Groups: []MihomoGroup{{Name: "Proxy", Type: "select", Proxies: []string{"missing"}}}}
+	if _, _, err := GenerateFlatDaeGroups(config); err == nil {
+		t.Fatal("GenerateFlatDaeGroups() error = nil for unknown member")
+	}
+}
+
+func TestGenerateFlatDaeGroupsRejectsUnsafeMemberLiteral(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "a'\"b"}},
+		Groups:  []MihomoGroup{{Name: "Proxy", Type: "select", Proxies: []string{"a'\"b"}}},
+	}
+	if _, _, err := GenerateFlatDaeGroups(config); err == nil {
+		t.Fatal("GenerateFlatDaeGroups() error = nil for unsafe member")
+	}
+}

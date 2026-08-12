@@ -114,11 +114,6 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 	if options.RoutesOutput != "" && routeReport.Generated == 0 {
 		return SyncReport{}, fmt.Errorf("refusing to replace routes output with zero generated rules")
 	}
-	if options.RoutesOutput != "" {
-		if err := writeAtomic(options.RoutesOutput, []byte(routes)); err != nil {
-			return SyncReport{}, fmt.Errorf("write routes: %w", err)
-		}
-	}
 
 	if options.GroupsInputPath != "" {
 		groupsBody, err := os.ReadFile(options.GroupsInputPath)
@@ -137,8 +132,16 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		if options.GroupsOutput == "" {
 			return SyncReport{}, fmt.Errorf("groups output is required when groups input is set")
 		}
+		if groupReport.Converted == 0 {
+			return SyncReport{}, fmt.Errorf("refusing to replace groups output with zero converted groups")
+		}
 		if err := writeAtomic(options.GroupsOutput, []byte(groups)); err != nil {
 			return SyncReport{}, fmt.Errorf("write groups: %w", err)
+		}
+	}
+	if options.RoutesOutput != "" {
+		if err := writeAtomic(options.RoutesOutput, []byte(routes)); err != nil {
+			return SyncReport{}, fmt.Errorf("write routes: %w", err)
 		}
 	}
 	return report, nil

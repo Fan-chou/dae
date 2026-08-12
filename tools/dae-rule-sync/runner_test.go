@@ -191,6 +191,57 @@ routes:
 	}
 }
 
+func TestRunSyncDoesNotOverwriteGroupsWithEmptyConversion(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	manifest := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [example.com]"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	groupsInput := filepath.Join(dir, "mihomo.yaml")
+	if err := os.WriteFile(groupsInput, []byte("proxies: []\nproxy-groups:\n  - name: nested\n    type: select\n    proxies: [DIRECT]\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	groupsOutput := filepath.Join(dir, "groups.dae")
+	old := "group {\n    old {\n    }\n}\n"
+	if err := os.WriteFile(groupsOutput, []byte(old), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	routesOutput := filepath.Join(dir, "routes.dae")
+	oldRoutes := "domain(suffix: 'old.example') -> old\n"
+	if err := os.WriteFile(routesOutput, []byte(oldRoutes), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err := RunSync(context.Background(), SyncOptions{ManifestPath: manifestPath, RoutesOutput: routesOutput, GroupsInputPath: groupsInput, GroupsOutput: groupsOutput})
+	if err == nil {
+		t.Fatal("RunSync() error = nil for empty group conversion")
+	}
+	body, readErr := os.ReadFile(groupsOutput)
+	if readErr != nil {
+		t.Fatalf("ReadFile() error = %v", readErr)
+	}
+	if string(body) != old {
+		t.Fatalf("groups after empty conversion = %q", body)
+	}
+	routeBody, readErr := os.ReadFile(routesOutput)
+	if readErr != nil {
+		t.Fatalf("ReadFile(routes) error = %v", readErr)
+	}
+	if string(routeBody) != oldRoutes {
+		t.Fatalf("routes after failed group conversion = %q", routeBody)
+	}
+}
+
 func TestAtomicWriteReplacesFileWithoutTemporarySibling(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "output.dae")

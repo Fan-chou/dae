@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -22,6 +24,7 @@ type ProviderSnapshot struct {
 	ETag         string
 	LastModified string
 	SourceURL    string
+	SourceKey    string
 	SHA256       string
 	UpdatedAt    time.Time
 }
@@ -55,6 +58,7 @@ type providerCacheMetadata struct {
 	LastModified string    `json:"last_modified,omitempty"`
 	SHA256       string    `json:"sha256"`
 	SourceURL    string    `json:"source_url,omitempty"`
+	SourceKey    string    `json:"source_key"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
@@ -118,7 +122,7 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 		validateURL = validateProviderURL
 	}
 	if err := validateURL(spec.URL); err != nil {
-		return FetchResult{}, fmt.Errorf("provider %q: %w", spec.Name, err)
+		return FetchResult{}, fmt.Errorf("provider %q: %w", spec.Name, redactProviderError(err))
 	}
 	if f.CacheDir == "" {
 		return FetchResult{}, errors.New("cache directory is empty")
@@ -148,7 +152,7 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
 	if err != nil {
-		return FetchResult{}, fmt.Errorf("create request: %w", err)
+		return FetchResult{}, fmt.Errorf("create request: %w", redactProviderError(err))
 	}
 	if cacheErr == nil {
 		req.Header.Set("If-None-Match", cached.ETag)
@@ -194,7 +198,8 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 		Body:         append([]byte(nil), body...),
 		ETag:         resp.Header.Get("ETag"),
 		LastModified: resp.Header.Get("Last-Modified"),
-		SourceURL:    spec.URL,
+		SourceURL:    redactProviderURL(spec.URL),
+		SourceKey:    digest([]byte(spec.URL)),
 		SHA256:       digest(body),
 		UpdatedAt:    now().UTC(),
 	}
@@ -208,6 +213,7 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 }
 
 func (f *ProviderFetcher) staleResult(cached ProviderSnapshot, cacheErr error, warning error) (FetchResult, error) {
+	warning = redactProviderError(warning)
 	if cacheErr == nil {
 		return FetchResult{Snapshot: cloneSnapshot(cached), UsedCache: true, Warning: warning}, nil
 	}
@@ -231,7 +237,7 @@ func (f *ProviderFetcher) readCache(name string, maxSize int64, sourceURL string
 	if err := json.Unmarshal(metaBody, &metadata); err != nil {
 		return ProviderSnapshot{}, fmt.Errorf("decode metadata: %w", err)
 	}
-	if metadata.SourceURL != sourceURL {
+	if metadata.SourceKey != digest([]byte(sourceURL)) {
 		return ProviderSnapshot{}, errors.New("provider cache source URL mismatch")
 	}
 	body, err := readLimited(filepath.Join(root, "current", "body"), maxSize)
@@ -247,6 +253,7 @@ func (f *ProviderFetcher) readCache(name string, maxSize int64, sourceURL string
 		ETag:         metadata.ETag,
 		LastModified: metadata.LastModified,
 		SourceURL:    metadata.SourceURL,
+		SourceKey:    metadata.SourceKey,
 		SHA256:       metadata.SHA256,
 		UpdatedAt:    metadata.UpdatedAt,
 	}, nil
@@ -267,7 +274,7 @@ func (f *ProviderFetcher) writeCache(snapshot ProviderSnapshot) error {
 			_ = os.RemoveAll(tmpDir)
 		}
 	}()
-	if err := os.WriteFile(filepath.Join(tmpDir, "body"), snapshot.Body, 0o600); err != nil {
+	if err := writeFileSync(filepath.Join(tmpDir, "body"), snapshot.Body, 0o600); err != nil {
 		return err
 	}
 	metadata := providerCacheMetadata{
@@ -275,22 +282,39 @@ func (f *ProviderFetcher) writeCache(snapshot ProviderSnapshot) error {
 		LastModified: snapshot.LastModified,
 		SHA256:       snapshot.SHA256,
 		SourceURL:    snapshot.SourceURL,
+		SourceKey:    snapshot.SourceKey,
 		UpdatedAt:    snapshot.UpdatedAt,
 	}
 	metadataBody, err := json.Marshal(metadata)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "metadata.json"), metadataBody, 0o600); err != nil {
+	if err := writeFileSync(filepath.Join(tmpDir, "metadata.json"), metadataBody, 0o600); err != nil {
 		return err
 	}
-	currentTemp := filepath.Join(root, ".current.tmp")
-	_ = os.Remove(currentTemp)
+	if err := syncDirectory(tmpDir); err != nil {
+		return err
+	}
+	currentTempFile, err := os.CreateTemp(root, ".current.tmp-*")
+	if err != nil {
+		return err
+	}
+	currentTemp := currentTempFile.Name()
+	if err := currentTempFile.Close(); err != nil {
+		_ = os.Remove(currentTemp)
+		return err
+	}
+	if err := os.Remove(currentTemp); err != nil {
+		return err
+	}
 	if err := os.Symlink(filepath.Join("versions", filepath.Base(tmpDir)), currentTemp); err != nil {
 		return err
 	}
 	if err := os.Rename(currentTemp, filepath.Join(root, "current")); err != nil {
 		_ = os.Remove(currentTemp)
+		return err
+	}
+	if err := syncDirectory(root); err != nil {
 		return err
 	}
 	keep = true
@@ -312,6 +336,55 @@ func digest(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func redactProviderURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "[redacted-url]"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+var providerURLPattern = regexp.MustCompile(`https?://[^\s"]+`)
+
+func redactProviderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(providerURLPattern.ReplaceAllStringFunc(err.Error(), redactProviderURL))
+}
+
+func writeFileSync(path string, body []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
 func safeTransport(roundTripper http.RoundTripper) (http.RoundTripper, error) {
 	if roundTripper == nil {
 		roundTripper = http.DefaultTransport
@@ -321,6 +394,7 @@ func safeTransport(roundTripper http.RoundTripper) (http.RoundTripper, error) {
 		return nil, fmt.Errorf("provider client transport must be *http.Transport for IP safety checks")
 	}
 	clone := transport.Clone()
+	clone.Proxy = nil
 	originalDial := clone.DialContext
 	if originalDial == nil {
 		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -362,6 +436,33 @@ func safeDialContext(original func(context.Context, string, string) (net.Conn, e
 	}
 }
 
+var blockedProviderNetworks = mustProviderNetworks([]string{
+	"100.64.0.0/10",
+	"198.18.0.0/15",
+	"100.100.100.200/32",
+	"168.63.129.16/32",
+})
+
+func mustProviderNetworks(values []string) []*net.IPNet {
+	networks := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			panic(err)
+		}
+		networks = append(networks, network)
+	}
+	return networks
+}
+
 func blockedProviderIP(ip net.IP) bool {
-	return ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified()
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, network := range blockedProviderNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
