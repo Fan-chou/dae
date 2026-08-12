@@ -30,6 +30,7 @@ type ProviderSpec struct {
 	Type     string        `yaml:"type"`
 	URL      string        `yaml:"url"`
 	Path     string        `yaml:"path"`
+	Data     string        `yaml:"data"`
 	Behavior string        `yaml:"behavior"`
 	Format   string        `yaml:"format"`
 	Interval time.Duration `yaml:"-"`
@@ -48,6 +49,7 @@ func (p *ProviderSpec) UnmarshalYAML(node *yaml.Node) error {
 		Type     string    `yaml:"type"`
 		URL      string    `yaml:"url"`
 		Path     string    `yaml:"path"`
+		Data     string    `yaml:"data"`
 		Behavior string    `yaml:"behavior"`
 		Format   string    `yaml:"format"`
 		Interval string    `yaml:"interval"`
@@ -61,6 +63,7 @@ func (p *ProviderSpec) UnmarshalYAML(node *yaml.Node) error {
 	p.Type = strings.ToLower(strings.TrimSpace(raw.Type))
 	p.URL = strings.TrimSpace(raw.URL)
 	p.Path = strings.TrimSpace(raw.Path)
+	p.Data = raw.Data
 	p.Behavior = strings.ToLower(strings.TrimSpace(raw.Behavior))
 	p.Format = strings.ToLower(strings.TrimSpace(raw.Format))
 	if raw.Interval != "" {
@@ -89,6 +92,10 @@ func ParseManifest(data []byte) (Manifest, error) {
 }
 
 func ValidateManifest(manifest Manifest, baseDir string) error {
+	return validateManifestWithURL(manifest, baseDir, validateProviderURL)
+}
+
+func validateManifestWithURL(manifest Manifest, baseDir string, validateURL func(string) error) error {
 	if baseDir == "" {
 		return fmt.Errorf("base directory is empty")
 	}
@@ -121,7 +128,7 @@ func ValidateManifest(manifest Manifest, baseDir string) error {
 			return fmt.Errorf("provider %q has unsupported type %q", provider.Name, provider.Type)
 		}
 		if provider.Type == "http" {
-			if err := validateProviderURL(provider.URL); err != nil {
+			if err := validateURL(provider.URL); err != nil {
 				return fmt.Errorf("provider %q: %w", provider.Name, err)
 			}
 		} else if provider.Type == "file" && provider.Path == "" {
@@ -129,6 +136,9 @@ func ValidateManifest(manifest Manifest, baseDir string) error {
 		}
 		if provider.Type == "inline" && provider.URL != "" {
 			return fmt.Errorf("provider %q: inline provider cannot set url", provider.Name)
+		}
+		if provider.Type == "inline" && provider.Data == "" {
+			return fmt.Errorf("provider %q: inline provider requires data", provider.Name)
 		}
 		if provider.Behavior == "" {
 			return fmt.Errorf("provider %q: behavior is required", provider.Name)
