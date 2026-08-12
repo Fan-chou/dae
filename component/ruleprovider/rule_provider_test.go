@@ -2,6 +2,7 @@ package ruleprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,49 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
+
+type countingRoundTripper struct {
+	calls int
+}
+
+func (t *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls++
+	return nil, fmt.Errorf("unexpected provider request")
+}
+
+func TestLoadAndExpandRejectsUnhardenedProductionRuntimeBeforeIO(t *testing.T) {
+	transport := &countingRoundTripper{}
+	conf := &config.Config{
+		RuleProvider: []config.RuleProvider{{
+			Name:     "remote",
+			Type:     "http",
+			URL:      "https://example.invalid/rules.yaml",
+			Behavior: "domain",
+		}},
+	}
+
+	err := LoadAndExpand(context.Background(), conf, t.TempDir(), &http.Client{Transport: transport})
+	if !errors.Is(err, ErrProductionRuntimeDisabled) {
+		t.Fatalf("LoadAndExpand() error = %v, want %v", err, ErrProductionRuntimeDisabled)
+	}
+	if transport.calls != 0 {
+		t.Fatalf("provider requests = %d, want 0", transport.calls)
+	}
+}
+
+func TestLoadAndExpandAllowsEmptyProviderConfiguration(t *testing.T) {
+	for name, conf := range map[string]*config.Config{
+		"nil":   nil,
+		"empty": {},
+		"slice": {RuleProvider: []config.RuleProvider{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := LoadAndExpand(context.Background(), conf, "", nil); err != nil {
+				t.Fatalf("LoadAndExpand() error = %v, want nil", err)
+			}
+		})
+	}
+}
 
 func TestExpandRulesetPreservesAndFunctionsAndOutbound(t *testing.T) {
 	sections, err := config_parser.Parse(`

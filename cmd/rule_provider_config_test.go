@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/daeuniverse/dae/component/ruleprovider"
 )
 
-func TestReadConfigExpandsNativeRuleProvider(t *testing.T) {
+func TestReadConfigRejectsNativeRuleProviderBeforeSecurityHardening(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "rules.yaml"), []byte("payload:\n  - example.com\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -29,14 +32,7 @@ routing {
 	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	conf, _, err := readConfig(configPath)
-	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
-	}
-	if len(conf.Routing.Rules) != 1 || conf.Routing.Rules[0].AndFunctions[0].Name != "domain" {
-		t.Fatalf("routing rules = %#v", conf.Routing.Rules)
-	}
-	if got := conf.Routing.Rules[0].AndFunctions[0].Params[0].Val; got != "example.com" {
-		t.Fatalf("domain = %q", got)
+	if _, _, err := readConfig(configPath); !errors.Is(err, ruleprovider.ErrProductionRuntimeDisabled) {
+		t.Fatalf("readConfig() error = %v, want %v", err, ruleprovider.ErrProductionRuntimeDisabled)
 	}
 }

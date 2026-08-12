@@ -2,6 +2,7 @@ package ruleprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,12 @@ const (
 	defaultMaxSize = 8 << 20
 	maxSize        = 64 << 20
 )
+
+// ErrProductionRuntimeDisabled keeps the unfinished native provider runtime
+// out of the production configuration path until its snapshot and security
+// guarantees are complete. Low-level Load calls remain available for isolated
+// tests and for the later hardened implementation.
+var ErrProductionRuntimeDisabled = errors.New("native rule provider runtime is disabled until security hardening is complete")
 
 type ProviderRules struct {
 	Functions []*config_parser.Function
@@ -66,16 +73,7 @@ func LoadAndExpand(ctx context.Context, conf *config.Config, baseDir string, cli
 	if conf == nil || len(conf.RuleProvider) == 0 {
 		return nil
 	}
-	registry, err := Load(ctx, conf.RuleProvider, baseDir, client)
-	if err != nil {
-		return err
-	}
-	rules, err := ExpandRoutingRules(conf.Routing.Rules, registry)
-	if err != nil {
-		return err
-	}
-	conf.Routing.Rules = rules
-	return nil
+	return ErrProductionRuntimeDisabled
 }
 
 func loadBody(ctx context.Context, provider config.RuleProvider, baseDir string, client *http.Client, options LoadOptions) ([]byte, error) {

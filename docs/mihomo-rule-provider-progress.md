@@ -1,6 +1,6 @@
 # Mihomo 规则集 / 代理组改造进展与后续方案
 
-> 本文件随一次性整理提交保存，用于记录当前工作区中所有未提交代码的范围、验证结果、后续步骤和已知问题。它不是“阶段一已完成”的声明；阶段一仍需完成 DAT/ext 输出并通过独立审查门禁。
+> 本文件以 `bf855b9` 的历史 WIP checkpoint 为基线，记录后续阶段的验证结果、审查结论和已知问题。当前阶段 0 改动仍须通过出口审查后单独提交；本文不是“阶段一已完成”的声明，阶段一仍需完成 DAT/ext 输出并通过独立审查门禁。
 
 ## 1. 目标与架构约束
 
@@ -14,7 +14,7 @@
 - provider 下载失败或解析失败时保留最后一个有效版本，不能用空规则覆盖有效配置；
 - 新行为采用 RED → GREEN → REFACTOR，并在阶段出口进行独立规格审查和安全审查。
 
-## 2. 本次整理提交包含的代码
+## 2. 历史 WIP checkpoint 与当前阶段 0 变更
 
 ### 2.1 阶段一：外部同步器加固
 
@@ -67,9 +67,11 @@
 - HTTP 失败时使用 cache；
 - `ruleset(name)` 替换为现有 routing function，同时保留 `&&` 条件和 outbound；
 - unknown provider 和 negated `ruleset()` 拒绝；
-- `readConfig()` 加载配置后调用 `LoadAndExpand()`。
+- 低层 `Load` / `LoadWithOptions` 仍可用于隔离测试和后续安全实现；
+- `LoadAndExpand()` 目前在非空 `rule_provider` 上显式返回
+  `ErrProductionRuntimeDisabled`，因此未完成安全收口的 native runtime 不会进入生产配置路径。
 
-配置 schema 已在此前提交 `5153920` 中完成；本次提交补上 runtime 初版和 config→runtime 接入测试文件。
+配置 schema 已在此前提交 `5153920` 中完成；历史 WIP checkpoint `bf855b9` 补上 runtime 初版和 config→runtime 接入测试文件。当前阶段 0 仅新增生产入口门禁及其测试。
 
 ### 2.3 文档
 
@@ -82,6 +84,7 @@
 - group 资源注入和空 groups 覆盖问题已按第二轮审查意见补充拒绝逻辑；
 - 原生 provider 配置 schema 已提交；
 - 原生 provider runtime 的 file/http 加载、基础解析、ruleset 展开已完成初版；
+- 阶段 0 已将 native provider 生产集成入口收口为 fail closed，避免在安全收口前处理不可信远程输入；
 - 阶段一工具包测试通过；
 - 阶段二 `component/ruleprovider` 与 `config` 包测试通过；
 - 未修改 eBPF 数据面。
@@ -98,7 +101,7 @@ TMPDIR=/root/go-tmp go test ./component/ruleprovider ./config -count=1
 ok
 ```
 
-阶段一此前也已通过 race/vet；本次最终提交前会再次运行相关 race/vet 和 `git diff --check`。
+阶段一工具包的 race/vet 是历史验证结果；当前阶段 0 已重新运行受影响包的 race/vet 和 `git diff --check`，结果见下方阶段记录。
 
 cmd 集成测试当前不能执行，原因是仓库当前分支缺少 eBPF 生成 Go 文件，属于现有环境/分支基线阻塞：
 
@@ -110,6 +113,76 @@ undefined: bpfRedirectTuple
 ```
 
 因此不能把 `go test ./cmd/...` 或 `go test ./...` 报告为通过。
+
+## 5.4 阶段 0：native provider 生产入口收口
+
+本阶段按 RED → GREEN 完成，范围仅限生产集成门禁，不宣称 native provider 安全实现已经完成。
+
+变更文件：
+
+- `component/ruleprovider/rule_provider.go`：新增稳定的
+  `ErrProductionRuntimeDisabled`，并在 `LoadAndExpand()` 进行任何 provider I/O
+  之前拒绝非空 provider 配置；
+- `component/ruleprovider/rule_provider_test.go`：验证非空 provider 返回该 sentinel；
+- `cmd/rule_provider_config_test.go`：将生产配置入口验收改为 fail-closed；
+- 本进展文档：记录阶段出口和验证边界。
+
+TDD 证据：
+
+```text
+RED:
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  go test ./component/ruleprovider -run TestLoadAndExpandRejectsUnhardenedProductionRuntimeBeforeIO -count=1
+-> build failed: undefined: ErrProductionRuntimeDisabled (expected before implementation)
+
+GREEN:
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  go test ./component/ruleprovider -run '^TestLoadAndExpandRejectsUnhardenedProductionRuntimeBeforeIO$' -count=1
+-> ok
+```
+
+阶段 0 验证记录：
+
+```text
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  go test ./component/ruleprovider ./config -count=1
+-> ok
+
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  go test -race ./component/ruleprovider ./config -count=1
+-> ok
+
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  go vet ./component/ruleprovider ./config
+-> ok (no output)
+
+TMPDIR=/private/tmp/dae-go-tmp GOCACHE=/private/tmp/dae-go-cache GOPATH=/private/tmp/dae-gopath \
+  GOOS=linux GOARCH=amd64 go test -c -tags dae_stub_ebpf -o /private/tmp/dae-cmd.test ./cmd
+-> ok (stub compile; binary not executed on the Darwin host)
+
+GOOS=linux GOARCH=amd64 go test -c -o /private/tmp/dae-cmd-plain.test ./cmd
+-> blocked by existing missing bpfObjects/bpfTuplesKey/bpfDomainRouting/bpfRedirectTuple
+
+git diff --check
+-> ok
+```
+
+按计划要求的 `GOOS=linux GOARCH=amd64 go test -run '^$' -tags dae_stub_ebpf ./cmd/...`
+在当前 Darwin 主机上编译成功但执行阶段返回 `exec format error`；因此以不执行二进制的
+`go test -c` 结果记录 stub 编译门禁，不能把 cmd/全仓测试宣称为通过。审查修复后又补充了
+“空配置保持 no-op”和“非空配置在 HTTP RoundTripper 被调用前拒绝”的回归测试；阶段 0
+的独立出口审查记录如下：
+
+```text
+最终规格/验收复审：ship；无 findings。
+最终安全/代码质量复审：ship；无 findings。
+两次审查均确认：LoadAndExpand 在任何 provider load、I/O、解析、cache 或展开前拒绝非空配置，
+nil/empty provider 保持 no-op，且阶段 diff 仅包含四个预期文件。
+最终复审运行时观测：agent_role=sol_advisor_sol_reviewer，model=gpt-5.6-sol，effort=high，
+sandbox_policy_type=workspace-write，permission_profile_type=managed；主会话在审查前后
+git status 和四个阶段文件的 diff 均未变化，未发现审查器修改工作区。因此这里不宣称
+OS 级只读隔离。
+```
 
 ## 5. 当前仍未完成的事项
 
@@ -151,12 +224,12 @@ undefined: bpfRedirectTuple
 
 按以下顺序继续，避免在阶段一出口未关闭前扩大阶段三范围：
 
-### Step 1：收口本次提交
+### Step 1：提交阶段 0 门禁并记录出口
 
 - 格式化所有改动；
 - 运行阶段一、阶段二包测试、race、vet 和 diff 检查；
 - 记录 cmd/eBPF 基线失败，不伪造全量通过；
-- 将当前全部未提交代码和本文件放入一个整理提交。
+- 阶段 0 门禁单独提交；不把 DAT、native lifecycle 或 group runtime 混入该提交。
 
 ### Step 2：完成阶段一 DAT writer
 
@@ -198,10 +271,11 @@ undefined: bpfRedirectTuple
 
 ## 7. 当前提交边界
 
-本次提交的性质是**未提交代码整理提交 / WIP checkpoint**，不是阶段一或阶段二完成提交。它的目的：
+`bf855b9` 的性质是**历史未提交代码整理 / WIP checkpoint**，不是阶段一或阶段二完成提交。当前工作区的阶段 0 变更待审查通过后单独提交。其目的：
 
 - 固化当前已经完成的代码和测试；
 - 让后续 DAT、native lifecycle、group runtime 工作有清晰基线；
-- 通过本文件避免遗漏已发现的审查问题和环境阻塞。
+- 通过本文件避免遗漏已发现的审查问题和环境阻塞；
+- 将每个后续垂直功能保持在独立 commit 中。
 
-后续每个垂直功能仍应单独提交，不能继续把所有阶段性改动堆到本提交中。
+不能把阶段 0、DAT、native lifecycle 或 group runtime 堆进同一个提交。
