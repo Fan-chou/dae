@@ -23,6 +23,7 @@ type configSectionSpec struct {
 var configSectionSpecs = []configSectionSpec{
 	{name: "global", required: true, decode: decodeGlobalSection},
 	{name: "subscription", decode: decodeSubscriptionSection},
+	{name: "rule_provider", decode: decodeRuleProviderSection},
 	{name: "node", decode: decodeNodeSection},
 	{name: "group", decode: decodeGroupSection},
 	{name: "routing", required: true, decode: decodeRoutingSection},
@@ -62,6 +63,10 @@ func decodeGlobalSection(conf *Config, section *config_parser.Section) error {
 
 func decodeSubscriptionSection(conf *Config, section *config_parser.Section) error {
 	return SectionParser(reflect.ValueOf(&conf.Subscription), section)
+}
+
+func decodeRuleProviderSection(conf *Config, section *config_parser.Section) error {
+	return SectionParser(reflect.ValueOf(&conf.RuleProvider), section)
 }
 
 func decodeNodeSection(conf *Config, section *config_parser.Section) error {

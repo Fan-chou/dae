@@ -174,6 +174,7 @@ type Routing struct {
 type Config struct {
 	Global       Global          `mapstructure:"global" required:"" desc:"GlobalDesc"`
 	Subscription []KeyableString `mapstructure:"subscription"`
+	RuleProvider []RuleProvider  `mapstructure:"rule_provider"`
 	Node         []KeyableString `mapstructure:"node"`
 	Group        []Group         `mapstructure:"group" desc:"GroupDesc"`
 	Routing      Routing         `mapstructure:"routing" required:""`
