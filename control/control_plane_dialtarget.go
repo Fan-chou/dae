@@ -31,10 +31,13 @@ func (c *ControlPlane) ActivateCheck() {
 			c.log.Debugf("Skip health check for unreferenced outbound: %v", g.Name)
 			continue
 		}
-		for _, d := range g.Dialers {
-			// We only activate check of nodes that have a group.
-			d.ActivateCheck()
+		if g.IsLazyCheck() {
+			c.log.Debugf("Defer health check for lazy outbound: %v", g.Name)
+			continue
 		}
+		// We only activate checks for nodes that have a group. Nested groups
+		// recurse through their children so child lazy settings are preserved.
+		g.ActivateCheck()
 	}
 }
 

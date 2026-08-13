@@ -99,4 +99,5 @@ min_moving_avg: Select node by the moving average of latencies of checks, which 
 	"udp_check_dns":         "Override global config.",
 	"check_interval":        "Override global config.",
 	"check_tolerance":       "Override global config.",
+	"lazy":                  "Delay group health checks until the group is selected.",
 }

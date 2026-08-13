@@ -51,7 +51,11 @@ func TestGenerateFlatDaeGroupsPreservesNestedAndSpecialMembers(t *testing.T) {
 	config := MihomoConfig{
 		Proxies: []MihomoProxy{{Name: "hk-1"}},
 		Groups: []MihomoGroup{
-			{Name: "Inner", Type: "select", Proxies: []string{"hk-1"}},
+			{
+				Name: "Inner", Type: "select", Proxies: []string{"hk-1"},
+				URL: mihomoStringPtr("https://example.com/check"), Interval: mihomoInt64Ptr(30),
+				Lazy: boolPtr(true), Tolerance: mihomoInt64Ptr(5),
+			},
 			{Name: "Outer", Type: "select", Proxies: []string{"Inner", "DIRECT", "REJECT"}},
 		},
 	}
@@ -64,6 +68,14 @@ func TestGenerateFlatDaeGroupsPreservesNestedAndSpecialMembers(t *testing.T) {
 	}
 	if !strings.Contains(output, "filter: group('Inner')\n        filter: group('direct')\n        filter: group('block')") {
 		t.Fatalf("output = %q", output)
+	}
+	if !strings.Contains(output, "tcp_check_url: 'https://example.com/check'") {
+		t.Fatalf("output = %q, child health option was not preserved", output)
+	}
+	for _, field := range []string{"check_interval: 30s", "check_tolerance: 5ms", "lazy: true"} {
+		if !strings.Contains(output, field) {
+			t.Fatalf("output = %q, child option %q was not preserved", output, field)
+		}
 	}
 }
 
@@ -158,3 +170,119 @@ func TestGenerateFlatDaeGroupsRejectsUnsafeMemberLiteral(t *testing.T) {
 		t.Fatal("GenerateFlatDaeGroups() error = nil for unsafe member")
 	}
 }
+
+func TestParseMihomoGroupHealthOptionsPreservesExplicitValues(t *testing.T) {
+	config, err := ParseMihomoConfig([]byte(`
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [node]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    lazy: false
+    tolerance: 0
+`))
+	if err != nil {
+		t.Fatalf("ParseMihomoConfig() error = %v", err)
+	}
+	group := config.Groups[0]
+	if group.URL == nil || *group.URL != "https://www.gstatic.com/generate_204" {
+		t.Fatalf("URL = %#v", group.URL)
+	}
+	if group.Interval == nil || *group.Interval != 300 {
+		t.Fatalf("Interval = %#v", group.Interval)
+	}
+	if group.Lazy == nil || *group.Lazy {
+		t.Fatalf("Lazy = %#v, want explicit false", group.Lazy)
+	}
+	if group.Tolerance == nil || *group.Tolerance != 0 {
+		t.Fatalf("Tolerance = %#v, want explicit zero", group.Tolerance)
+	}
+}
+
+func TestGenerateFlatDaeGroupsConvertsGroupHealthOptions(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "node"}},
+		Groups: []MihomoGroup{{
+			Name:      "Proxy",
+			Type:      "select",
+			Proxies:   []string{"node"},
+			URL:       mihomoStringPtr("https://www.gstatic.com/generate_204"),
+			Interval:  mihomoInt64Ptr(300),
+			Lazy:      boolPtr(true),
+			Tolerance: mihomoInt64Ptr(50),
+		}},
+	}
+	output, _, err := GenerateFlatDaeGroups(config)
+	if err != nil {
+		t.Fatalf("GenerateFlatDaeGroups() error = %v", err)
+	}
+	for _, want := range []string{
+		"tcp_check_url: 'https://www.gstatic.com/generate_204'",
+		"check_interval: 300s",
+		"check_tolerance: 50ms",
+		"lazy: true",
+		"policy: fixed(0)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, missing %q", output, want)
+		}
+	}
+}
+
+func TestGenerateFlatDaeGroupsRejectsInvalidHealthOptions(t *testing.T) {
+	tests := map[string]MihomoGroup{
+		"unsupported scheme": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			URL: mihomoStringPtr("ftp://example.com/check"),
+		},
+		"missing host": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			URL: mihomoStringPtr("https:///check"),
+		},
+		"negative interval": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			Interval: mihomoInt64Ptr(-1),
+		},
+		"interval overflow": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			Interval: mihomoInt64Ptr(int64(1<<63 - 1)),
+		},
+		"negative tolerance": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			Tolerance: mihomoInt64Ptr(-1),
+		},
+		"tolerance overflow": {
+			Name: "Proxy", Type: "select", Proxies: []string{"node"},
+			Tolerance: mihomoInt64Ptr(int64(1<<63 - 1)),
+		},
+	}
+	for name, group := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := MihomoConfig{
+				Proxies: []MihomoProxy{{Name: "node"}},
+				Groups:  []MihomoGroup{group},
+			}
+			if _, _, err := GenerateFlatDaeGroups(config); err == nil {
+				t.Fatal("GenerateFlatDaeGroups() error = nil")
+			}
+		})
+	}
+}
+
+func TestGenerateFlatDaeGroupsRejectsNestedParentHealthOptions(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "node"}},
+		Groups: []MihomoGroup{
+			{Name: "Inner", Type: "select", Proxies: []string{"node"}, URL: mihomoStringPtr("https://example.com/check")},
+			{Name: "Outer", Type: "fallback", Proxies: []string{"Inner"}, Interval: mihomoInt64Ptr(30)},
+		},
+	}
+	if _, _, err := GenerateFlatDaeGroups(config); err == nil || !strings.Contains(err.Error(), "nested members") {
+		t.Fatalf("GenerateFlatDaeGroups() error = %v, want nested health rejection", err)
+	}
+}
+
+func mihomoStringPtr(value string) *string { return &value }
+
+func mihomoInt64Ptr(value int64) *int64 { return &value }

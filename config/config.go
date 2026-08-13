@@ -136,6 +136,42 @@ type Group struct {
 	UdpCheckDns        []string      `mapstructure:"udp_check_dns"`
 	CheckInterval      time.Duration `mapstructure:"check_interval"`
 	CheckTolerance     time.Duration `mapstructure:"check_tolerance"`
+	Lazy               bool          `mapstructure:"lazy"`
+
+	// The duration and lazy presence bits preserve the distinction between an
+	// omitted Mihomo field and an explicit zero/false value after conversion to
+	// dae's config model. They are parser metadata and are never marshalled.
+	CheckIntervalSet  bool `mapstructure:"_"`
+	CheckToleranceSet bool `mapstructure:"_"`
+	LazySet           bool `mapstructure:"_"`
+}
+
+// HasHealthCheckOverride reports whether this group explicitly carries one of
+// the health-check knobs. Lazy=false is still an explicit option for nested
+// graph validation even though it does not enable health checks by itself.
+func (g Group) HasHealthCheckOverride() bool {
+	return g.TcpCheckUrl != nil ||
+		g.TcpCheckHttpMethod != "" ||
+		g.UdpCheckDns != nil ||
+		g.CheckInterval != 0 ||
+		g.CheckIntervalSet ||
+		g.CheckTolerance != 0 ||
+		g.CheckToleranceSet ||
+		g.Lazy || g.LazySet
+}
+
+// EnablesHealthCheck reports whether this group needs alive-state sets and
+// health-check activation even when its selection policy is fixed. A fixed
+// Mihomo select choice must not silently discard explicit health settings.
+func (g Group) EnablesHealthCheck() bool {
+	return g.TcpCheckUrl != nil ||
+		g.TcpCheckHttpMethod != "" ||
+		g.UdpCheckDns != nil ||
+		g.CheckInterval != 0 ||
+		g.CheckIntervalSet ||
+		g.CheckTolerance != 0 ||
+		g.CheckToleranceSet ||
+		g.Lazy || g.LazySet
 }
 
 type DnsRequestRouting struct {

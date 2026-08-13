@@ -74,7 +74,24 @@ func decodeNodeSection(conf *Config, section *config_parser.Section) error {
 }
 
 func decodeGroupSection(conf *Config, section *config_parser.Section) error {
-	return SectionParser(reflect.ValueOf(&conf.Group), section)
+	if err := SectionParser(reflect.ValueOf(&conf.Group), section); err != nil {
+		return err
+	}
+	groupIndex := 0
+	for _, item := range section.Items {
+		groupSection, ok := item.Value.(*config_parser.Section)
+		if !ok {
+			continue
+		}
+		if groupIndex >= len(conf.Group) {
+			return fmt.Errorf("group section count changed while decoding")
+		}
+		conf.Group[groupIndex].CheckIntervalSet = sectionHasParam(groupSection, "check_interval")
+		conf.Group[groupIndex].CheckToleranceSet = sectionHasParam(groupSection, "check_tolerance")
+		conf.Group[groupIndex].LazySet = sectionHasParam(groupSection, "lazy")
+		groupIndex++
+	}
+	return nil
 }
 
 func decodeRoutingSection(conf *Config, section *config_parser.Section) error {

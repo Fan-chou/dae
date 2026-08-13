@@ -723,11 +723,7 @@ func newControlPlaneWithContextOptions(
 		callback := core.outboundAliveChangeCallback(uint8(baseOutboundCount+plan.index), disableKernelAliveCallback)
 
 		if plan.hasNestedReferences() {
-			groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create nested group %q: %w", group.Name, err)
-			}
-			if groupOption != nil {
+			if group.HasHealthCheckOverride() {
 				return nil, fmt.Errorf("nested group %q cannot override health-check options", group.Name)
 			}
 
@@ -798,8 +794,11 @@ func newControlPlaneWithContextOptions(
 			}
 		}
 		groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create group %q health-check override: %w", group.Name, err)
+		}
 		finalOption := option
-		if err == nil && groupOption != nil {
+		if groupOption != nil {
 			newDialers := make([]*dialer.Dialer, 0)
 			for _, d := range dialers {
 				newDialer := d.CloneWithGlobalOptionContext(context.Background(), groupOption)
@@ -817,7 +816,18 @@ func newControlPlaneWithContextOptions(
 			}
 		}
 		applyPersistedGroupSelection(groupSelectionStore, group, policy, memberIdentities, log)
-		builtGroups[group.Name] = outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy, callback)
+		builtGroups[group.Name] = outbound.NewDialerGroupWithRuntimeOptions(
+			finalOption,
+			group.Name,
+			dialers,
+			annos,
+			*policy,
+			callback,
+			outbound.DialerGroupRuntimeOptions{
+				HealthCheckEnabled: group.EnablesHealthCheck(),
+				Lazy:               group.Lazy,
+			},
+		)
 		if len(group.SelectionMembers) > 0 {
 			groupSelectionMembers[group.Name] = append([]string(nil), memberIdentities...)
 		}

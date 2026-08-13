@@ -43,11 +43,11 @@ func ParseGroupOverrideOption(group config.Group, global config.Global, log *log
 		result.UdpCheckDns = group.UdpCheckDns
 		changed = true
 	}
-	if group.CheckInterval != 0 {
+	if group.CheckInterval != 0 || group.CheckIntervalSet {
 		result.CheckInterval = group.CheckInterval
 		changed = true
 	}
-	if group.CheckTolerance != 0 {
+	if group.CheckTolerance != 0 || group.CheckToleranceSet {
 		result.CheckTolerance = group.CheckTolerance
 		changed = true
 	}

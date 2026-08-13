@@ -202,6 +202,18 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
 		case *config_parser.Function:
 			m.writeLine(depth, key+":"+val.String(true, true, false))
+		case []*config_parser.Function:
+			if len(val) == 0 {
+				return nil
+			}
+			functions := make([]string, 0, len(val))
+			for _, function := range val {
+				if function == nil {
+					return fmt.Errorf("nil function in %v", key)
+				}
+				functions = append(functions, function.String(true, true, false))
+			}
+			m.writeLine(depth, key+":"+strings.Join(functions, "&&"))
 		default:
 			return fmt.Errorf("unknown leaf type: %T", val)
 		}
@@ -229,6 +241,7 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 			case "Name":
 			case "FilterAnnotation":
 			case "SoMarkFromDaeSet":
+			case "CheckIntervalSet", "CheckToleranceSet", "LazySet":
 				continue
 			case "Rules":
 				// Expand.
@@ -254,6 +267,10 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 			continue
 		}
 
+		if shouldOmitUnsetGroupHealthField(from, structField.Name, field) {
+			continue
+		}
+
 		// Normal field.
 		if err = m.marshalLeaf(key, field, depth); err != nil {
 			return err
@@ -261,4 +278,23 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 	}
 
 	return nil
+}
+
+func shouldOmitUnsetGroupHealthField(group reflect.Value, fieldName string, field reflect.Value) bool {
+	if !field.IsZero() {
+		return false
+	}
+	var presenceFieldName string
+	switch fieldName {
+	case "CheckInterval":
+		presenceFieldName = "CheckIntervalSet"
+	case "CheckTolerance":
+		presenceFieldName = "CheckToleranceSet"
+	case "Lazy":
+		presenceFieldName = "LazySet"
+	default:
+		return false
+	}
+	presenceField := group.FieldByName(presenceFieldName)
+	return presenceField.IsValid() && presenceField.Kind() == reflect.Bool && !presenceField.Bool()
 }

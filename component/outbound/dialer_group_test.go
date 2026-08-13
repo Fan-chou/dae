@@ -159,6 +159,121 @@ func TestDialerGroup_Select_Fixed(t *testing.T) {
 	}
 }
 
+func TestDialerGroup_FixedHealthOverrideKeepsHealthState(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	dialers := []*dialer.Dialer{newDirectDialer(option, false), newDirectDialer(option, false)}
+	g := NewDialerGroupWithRuntimeOptions(
+		option,
+		"fixed-health",
+		dialers,
+		newEmptyAnnotations(len(dialers)),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 1},
+		func(bool, *dialer.NetworkType, bool) {},
+		DialerGroupRuntimeOptions{HealthCheckEnabled: true},
+	)
+	defer g.Close()
+	for _, d := range dialers {
+		defer d.Close()
+	}
+	if g.MustGetAliveDialerSet(TestNetworkType) == nil {
+		t.Fatal("fixed group with explicit health options must retain alive-state sets")
+	}
+	selected, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected != dialers[1] {
+		t.Fatalf("selected dialer = %p, want fixed dialer %p", selected, dialers[1])
+	}
+}
+
+func TestDialerGroup_LazyCheckActivatesOnFirstSelection(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	d := newDirectDialer(option, false)
+	g := NewDialerGroupWithRuntimeOptions(
+		option,
+		"lazy-health",
+		[]*dialer.Dialer{d},
+		newEmptyAnnotations(1),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		func(bool, *dialer.NetworkType, bool) {},
+		DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true},
+	)
+	defer g.Close()
+	defer d.Close()
+	checkActivated := func() bool {
+		return reflect.ValueOf(d).Elem().FieldByName("checkActivated").Bool()
+	}
+	if checkActivated() {
+		t.Fatal("lazy group activated health check during construction")
+	}
+	if !g.IsLazyCheck() {
+		t.Fatal("group did not retain lazy runtime option")
+	}
+	if _, _, err := g.Select(TestNetworkType, true); err != nil {
+		t.Fatalf("first Select() error = %v", err)
+	}
+	if !checkActivated() {
+		t.Fatal("first selection did not activate health check")
+	}
+	if _, _, err := g.Select(TestNetworkType, true); err != nil {
+		t.Fatalf("second Select() error = %v", err)
+	}
+}
+
+func TestDialerGroup_NestedActivationRespectsChildLazyCheck(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	d := newDirectDialer(option, false)
+	child := NewDialerGroupWithRuntimeOptions(
+		option,
+		"lazy-child",
+		[]*dialer.Dialer{d},
+		newEmptyAnnotations(1),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		func(bool, *dialer.NetworkType, bool) {},
+		DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true},
+	)
+	parent, err := NewNestedDialerGroup(option, "parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer d.Close()
+
+	checkActivated := func() bool {
+		return reflect.ValueOf(d).Elem().FieldByName("checkActivated").Bool()
+	}
+	parent.ActivateCheck()
+	if checkActivated() {
+		t.Fatal("parent activation bypassed child's lazy health check")
+	}
+	if _, _, err := parent.Select(TestNetworkType, true); err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if !checkActivated() {
+		t.Fatal("child selection did not activate lazy health check")
+	}
+}
+
 func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 
 	option := &dialer.GlobalOption{

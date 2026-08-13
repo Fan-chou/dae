@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -38,6 +40,14 @@ type MihomoGroup struct {
 	Type    string   `yaml:"type"`
 	Proxies []string `yaml:"proxies"`
 	Use     []string `yaml:"use"`
+
+	// Pointers are intentional: Mihomo distinguishes an omitted option from an
+	// explicit false/zero value, and conversion must not silently replace either
+	// with dae's global defaults.
+	URL       *string `yaml:"url"`
+	Interval  *int64  `yaml:"interval"`
+	Lazy      *bool   `yaml:"lazy"`
+	Tolerance *int64  `yaml:"tolerance"`
 }
 
 type GroupUnsupported struct {
@@ -105,6 +115,17 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 			return "", GroupConversionReport{}, fmt.Errorf("duplicate group %q", group.Name)
 		}
 		groups[group.Name] = struct{}{}
+	}
+	for _, group := range config.Groups {
+		if err := validateMihomoGroupHealth(group); err != nil {
+			return "", GroupConversionReport{}, fmt.Errorf("group %q: %w", group.Name, err)
+		}
+		if hasMihomoNestedMember(group, groups) && hasMihomoGroupHealthOptions(group) {
+			return "", GroupConversionReport{}, fmt.Errorf(
+				"group %q has explicit health-check options but nested members have no unambiguous group-level health semantics",
+				group.Name,
+			)
+		}
 	}
 
 	report := GroupConversionReport{NameMap: make(map[string]string, len(config.Groups))}
@@ -194,6 +215,18 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 		if strings.EqualFold(group.Type, "select") && allSafeSelectionIdentities(selectionMembers) {
 			fmt.Fprintf(&output, "        selection_members: %s\n", daeQuote(strings.Join(selectionMembers, ",")))
 		}
+		if group.URL != nil {
+			fmt.Fprintf(&output, "        tcp_check_url: %s\n", daeQuote(*group.URL))
+		}
+		if group.Interval != nil {
+			fmt.Fprintf(&output, "        check_interval: %ds\n", *group.Interval)
+		}
+		if group.Tolerance != nil {
+			fmt.Fprintf(&output, "        check_tolerance: %dms\n", *group.Tolerance)
+		}
+		if group.Lazy != nil {
+			fmt.Fprintf(&output, "        lazy: %t\n", *group.Lazy)
+		}
 		if !hasNestedMembers[groupIndex] {
 			fmt.Fprintf(&output, "        filter: name(")
 			for i, member := range members {
@@ -221,6 +254,70 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	}
 	output.WriteString("}\n")
 	return output.String(), report, nil
+}
+
+func hasMihomoGroupHealthOptions(group MihomoGroup) bool {
+	return group.URL != nil || group.Interval != nil || group.Lazy != nil || group.Tolerance != nil
+}
+
+func hasMihomoNestedMember(group MihomoGroup, groups map[string]struct{}) bool {
+	for _, member := range group.Proxies {
+		if _, nested := groups[member]; nested {
+			return true
+		}
+		if _, special := specialMihomoGroupReference(member); special {
+			return true
+		}
+	}
+	return false
+}
+
+func validateMihomoGroupHealth(group MihomoGroup) error {
+	if group.URL != nil {
+		raw := *group.URL
+		if raw == "" || strings.TrimSpace(raw) != raw {
+			return errors.New("url must be a non-empty absolute URL")
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("url is invalid: %w", err)
+		}
+		scheme := strings.ToLower(parsed.Scheme)
+		if scheme != "http" && scheme != "https" {
+			return fmt.Errorf("url scheme %q is unsupported; only http and https are allowed", parsed.Scheme)
+		}
+		if parsed.Hostname() == "" {
+			return errors.New("url must include a host")
+		}
+		if err := validateDaeLiteral(raw); err != nil {
+			return fmt.Errorf("url cannot be represented in dae config: %w", err)
+		}
+	}
+	if group.Interval != nil {
+		if _, err := mihomoDuration(*group.Interval, time.Second, "interval", false); err != nil {
+			return err
+		}
+	}
+	if group.Tolerance != nil {
+		if _, err := mihomoDuration(*group.Tolerance, time.Millisecond, "tolerance", true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mihomoDuration(value int64, unit time.Duration, field string, allowZero bool) (time.Duration, error) {
+	if value < 0 || (!allowZero && value == 0) {
+		if allowZero {
+			return 0, fmt.Errorf("%s must be non-negative", field)
+		}
+		return 0, fmt.Errorf("%s must be greater than zero", field)
+	}
+	maxDuration := time.Duration(1<<63 - 1)
+	if value > int64(maxDuration/unit) {
+		return 0, fmt.Errorf("%s duration overflows time.Duration", field)
+	}
+	return time.Duration(value) * unit, nil
 }
 
 // allSafeSelectionIdentities keeps the sideband metadata parseable without

@@ -38,10 +38,13 @@ type DialerGroup struct {
 
 	selectionState   atomic.Pointer[dialerGroupSelectionState]
 	selectionStateMu sync.Mutex
+	lazyCheckOnce    sync.Once
 
 	dialersAnnotations  []*dialer.Annotation
 	checkTolerance      time.Duration
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool)
+	healthCheckEnabled  bool
+	lazyCheck           bool
 
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
@@ -72,6 +75,16 @@ type dialerGroupMember struct {
 	annotation *dialer.Annotation
 }
 
+// DialerGroupRuntimeOptions carries group-level health behavior that is not a
+// dialer option. HealthCheckEnabled is needed for fixed Mihomo select groups:
+// fixed selection remains fixed, but explicit health settings must still be
+// observed by the existing connectivity-check machinery. Lazy defers those
+// checks until the group participates in a real selection.
+type DialerGroupRuntimeOptions struct {
+	HealthCheckEnabled bool
+	Lazy               bool
+}
+
 func NewDialerGroup(
 	option *dialer.GlobalOption,
 	name string,
@@ -79,6 +92,26 @@ func NewDialerGroup(
 	dialersAnnotations []*dialer.Annotation,
 	p DialerSelectionPolicy,
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool),
+) *DialerGroup {
+	return NewDialerGroupWithRuntimeOptions(
+		option,
+		name,
+		dialers,
+		dialersAnnotations,
+		p,
+		aliveChangeCallback,
+		DialerGroupRuntimeOptions{},
+	)
+}
+
+func NewDialerGroupWithRuntimeOptions(
+	option *dialer.GlobalOption,
+	name string,
+	dialers []*dialer.Dialer,
+	dialersAnnotations []*dialer.Annotation,
+	p DialerSelectionPolicy,
+	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool),
+	runtimeOptions DialerGroupRuntimeOptions,
 ) *DialerGroup {
 	log := option.Log
 
@@ -89,6 +122,8 @@ func NewDialerGroup(
 		dialersAnnotations:  dialersAnnotations,
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
+		healthCheckEnabled:  runtimeOptions.HealthCheckEnabled || runtimeOptions.Lazy,
+		lazyCheck:           runtimeOptions.Lazy,
 	}
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
@@ -153,9 +188,55 @@ func NewNestedDialerGroup(
 			leafAnnotations = append(leafAnnotations, &dialer.Annotation{})
 		}
 	}
-	group := NewDialerGroup(option, name, leafDialers, leafAnnotations, p, aliveChangeCallback)
+	group := NewDialerGroupWithRuntimeOptions(option, name, leafDialers, leafAnnotations, p, aliveChangeCallback, DialerGroupRuntimeOptions{})
 	group.nestedMembers = internalMembers
 	return group, nil
+}
+
+// IsLazyCheck reports whether ControlPlane should defer this group's health
+// checks until the group is selected.
+func (g *DialerGroup) IsLazyCheck() bool {
+	return g != nil && g.lazyCheck
+}
+
+func (g *DialerGroup) activateChecks() {
+	if g == nil {
+		return
+	}
+	if len(g.nestedMembers) != 0 {
+		for _, member := range g.nestedMembers {
+			if member.group != nil {
+				member.group.ActivateCheck()
+				continue
+			}
+			if member.dialer != nil {
+				member.dialer.ActivateCheck()
+			}
+		}
+		return
+	}
+	for _, d := range g.Dialers {
+		if d != nil {
+			d.ActivateCheck()
+		}
+	}
+}
+
+// ActivateCheck starts this group's eager checks. Nested groups delegate to
+// their child groups so a child's lazy setting is not bypassed by the parent's
+// flattened leaf-dialer snapshot.
+func (g *DialerGroup) ActivateCheck() {
+	if g == nil || g.lazyCheck {
+		return
+	}
+	g.activateChecks()
+}
+
+func (g *DialerGroup) activateLazyCheck() {
+	if g == nil || !g.lazyCheck {
+		return
+	}
+	g.lazyCheckOnce.Do(g.activateChecks)
 }
 
 func (g *DialerGroup) Close() error {
@@ -191,8 +272,8 @@ func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	defer g.selectionStateMu.Unlock()
 
 	current := g.currentSelectionState()
-	currentNeedsAliveState := policyNeedsAliveState(current.policy.Policy)
-	newNeedsAliveState := policyNeedsAliveState(policy.Policy)
+	currentNeedsAliveState := g.needsAliveState(current.policy.Policy)
+	newNeedsAliveState := g.needsAliveState(policy.Policy)
 
 	switch {
 	case currentNeedsAliveState && newNeedsAliveState:
@@ -213,8 +294,8 @@ func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	case !currentNeedsAliveState && newNeedsAliveState:
 		next := g.buildSelectionState(policy, true)
 		g.registerAliveDialerSets(next.aliveDialerSets)
-		for _, d := range g.Dialers {
-			d.ActivateCheck()
+		if !g.lazyCheck {
+			g.activateChecks()
 		}
 		g.selectionState.Store(next)
 
@@ -257,7 +338,7 @@ func (g *DialerGroup) CaptureReloadSelectionFallback() ReloadSelectionFallback {
 		return fallback
 	}
 	for _, nt := range standardSelectionNetworkTypes() {
-		d, _, _, err := g.SelectWithExclusionResult(nt, false, nil)
+		d, _, _, err := g.selectWithExclusionResult(nt, false, nil, false)
 		if err == nil && d != nil {
 			fallback[nt.Index()] = d
 		}
@@ -408,8 +489,15 @@ func (g *DialerGroup) SelectWithExclusion(networkType *dialer.NetworkType, stric
 // domain actually used to admit that dialer. For ordinary selections this is
 // the requested network type; for data-UDP recovery it may be DNS-UDP or TCP.
 func (g *DialerGroup) SelectWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
+	return g.selectWithExclusionResult(networkType, strictIpVersion, excluded, true)
+}
+
+func (g *DialerGroup) selectWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, activateLazy bool) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
+	if activateLazy {
+		g.activateLazyCheck()
+	}
 	if len(g.nestedMembers) != 0 {
-		return g.selectNestedWithExclusionResult(networkType, strictIpVersion, excluded)
+		return g.selectNestedWithExclusionResult(networkType, strictIpVersion, excluded, activateLazy)
 	}
 	state := g.currentSelectionState()
 	policy := state.policy
@@ -436,24 +524,24 @@ func (g *DialerGroup) SelectWithExclusionResult(networkType *dialer.NetworkType,
 	return nil, latency, selectedNetworkType, err
 }
 
-func (g *DialerGroup) selectNestedWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
+func (g *DialerGroup) selectNestedWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, activateLazy bool) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
 	policy := g.currentSelectionState().policy
-	d, latency, selectedNetworkType, err = g.selectNested(networkType, policy, excluded)
+	d, latency, selectedNetworkType, err = g.selectNested(networkType, policy, excluded, activateLazy)
 	if !strictIpVersion && errors.Is(err, ErrNoAliveDialer) {
 		nt := *networkType
 		nt.IpVersion = (consts.IpVersion_X - networkType.IpVersion.ToIpVersionType()).ToIpVersionStr()
-		return g.selectNested(&nt, policy, excluded)
+		return g.selectNested(&nt, policy, excluded, activateLazy)
 	}
 	return d, latency, selectedNetworkType, err
 }
 
-func (g *DialerGroup) selectNested(networkType *dialer.NetworkType, policy DialerSelectionPolicy, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
+func (g *DialerGroup) selectNested(networkType *dialer.NetworkType, policy DialerSelectionPolicy, excluded *dialer.Dialer, activateLazy bool) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
 	if len(g.nestedMembers) == 0 {
 		return nil, 0, nil, fmt.Errorf("nested group %q has no members", g.Name)
 	}
 	networkTypes, count := g.selectionNetworkTypes(networkType, policy)
 	for i := range count {
-		d, latency, selectedNetworkType, err = g.selectNestedForNetworkType(&networkTypes[i], policy, excluded)
+		d, latency, selectedNetworkType, err = g.selectNestedForNetworkType(&networkTypes[i], policy, excluded, activateLazy)
 		if err == nil {
 			return d, latency, selectedNetworkType, nil
 		}
@@ -464,19 +552,19 @@ func (g *DialerGroup) selectNested(networkType *dialer.NetworkType, policy Diale
 	return nil, time.Hour, nil, ErrNoAliveDialer
 }
 
-func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType, policy DialerSelectionPolicy, excluded *dialer.Dialer) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
+func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType, policy DialerSelectionPolicy, excluded *dialer.Dialer, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
 	switch policy.Policy {
 	case consts.DialerSelectionPolicy_Fixed:
 		if policy.FixedIndex < 0 || policy.FixedIndex >= len(g.nestedMembers) {
 			return nil, 0, nil, fmt.Errorf("selected nested group member index is out of range")
 		}
-		return g.nestedMembers[policy.FixedIndex].selectForNestedGroup(networkType, policy.Policy, excluded, true)
+		return g.nestedMembers[policy.FixedIndex].selectForNestedGroup(networkType, policy.Policy, excluded, true, activateLazy)
 
 	case consts.DialerSelectionPolicy_Random:
 		start := fastrand.Intn(len(g.nestedMembers))
 		for offset := range len(g.nestedMembers) {
 			member := g.nestedMembers[(start+offset)%len(g.nestedMembers)]
-			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false)
+			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
 			if err == nil {
 				return d, latency, selectedNetworkType, nil
 			}
@@ -488,7 +576,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 
 	case consts.DialerSelectionPolicy_FirstAlive:
 		for _, member := range g.nestedMembers {
-			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false)
+			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
 			if err == nil {
 				return d, latency, selectedNetworkType, nil
 			}
@@ -505,7 +593,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		var bestNetworkType *dialer.NetworkType
 		bestLatency := time.Hour
 		for _, member := range g.nestedMembers {
-			d, latency, memberNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false)
+			d, latency, memberNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
 			if err == nil {
 				if bestDialer == nil || latency < bestLatency {
 					bestDialer, bestLatency, bestNetworkType = d, latency, memberNetworkType
@@ -525,9 +613,9 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 	}
 }
 
-func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, excluded *dialer.Dialer, fixed bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
+func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, excluded *dialer.Dialer, fixed bool, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
 	if m.group != nil {
-		return m.group.SelectWithExclusionResult(networkType, true, excluded)
+		return m.group.selectWithExclusionResult(networkType, true, excluded, activateLazy)
 	}
 	if m.dialer == nil {
 		return nil, 0, nil, fmt.Errorf("nested group member has no selectable dialer")
@@ -662,7 +750,7 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 	state := &dialerGroupSelectionState{
 		policy: policy,
 	}
-	if !policyNeedsAliveState(policy.Policy) {
+	if !g.needsAliveState(policy.Policy) {
 		return state
 	}
 
@@ -694,6 +782,10 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 		}
 	}
 	return state
+}
+
+func (g *DialerGroup) needsAliveState(policy consts.DialerSelectionPolicy) bool {
+	return g.healthCheckEnabled || policyNeedsAliveState(policy)
 }
 
 func (g *DialerGroup) registerAliveDialerSets(aliveDialerSets [8]*dialer.AliveDialerSet) {

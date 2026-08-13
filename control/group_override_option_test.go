@@ -39,3 +39,23 @@ func TestParseGroupOverrideOptionWithRuntimePreservesDaeDNS(t *testing.T) {
 		t.Fatalf("TransportCacheNamespace = %q, want %q", dst.TransportCacheNamespace, src.TransportCacheNamespace)
 	}
 }
+
+func TestParseGroupOverrideOptionPreservesExplicitZeroDurations(t *testing.T) {
+	global := config.Global{
+		CheckInterval:  30 * time.Second,
+		CheckTolerance: 250 * time.Millisecond,
+	}
+	option, err := ParseGroupOverrideOption(config.Group{
+		CheckIntervalSet:  true,
+		CheckToleranceSet: true,
+	}, global, logrus.New())
+	if err != nil {
+		t.Fatalf("ParseGroupOverrideOption() error = %v", err)
+	}
+	if option == nil {
+		t.Fatal("expected explicit zero duration override")
+	}
+	if option.CheckInterval != 0 || option.CheckTolerance != 0 {
+		t.Fatalf("override durations = %v/%v, want zero/zero", option.CheckInterval, option.CheckTolerance)
+	}
+}
