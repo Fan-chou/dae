@@ -8,6 +8,7 @@ package outbound
 import (
 	"testing"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	"github.com/stretchr/testify/require"
 )
@@ -18,4 +19,13 @@ func TestNewDialerSelectionPolicyFromGroupParamRejectsInvalidPolicyType(t *testi
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unsupported function-list-or-string value type")
+}
+
+func TestNewDialerSelectionPolicyFromGroupParamParsesFirstAlive(t *testing.T) {
+	policy, err := NewDialerSelectionPolicyFromGroupParam(&config.Group{
+		Policy: "first_alive",
+	})
+	require.NoError(t, err)
+	require.Equal(t, consts.DialerSelectionPolicy_FirstAlive, policy.Policy)
+	require.Zero(t, policy.FixedIndex)
 }

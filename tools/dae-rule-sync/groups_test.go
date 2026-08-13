@@ -42,8 +42,8 @@ func TestGenerateFlatDaeGroupsMapsSimplePolicies(t *testing.T) {
 	if report.Converted != 1 || report.Approximated != 1 || len(report.Unsupported) != 0 {
 		t.Fatalf("report = %#v", report)
 	}
-	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1', 'us-1')") || !strings.Contains(output, "policy: min_moving_avg") {
-		t.Fatalf("output = %q", output)
+	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1', 'us-1')") || !strings.Contains(output, "policy: first_alive") {
+		t.Fatalf("output = %q, want fallback mapped to first_alive", output)
 	}
 }
 

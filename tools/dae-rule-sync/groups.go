@@ -341,7 +341,7 @@ func flatGroupPolicy(groupType string) (policy string, approximate bool, err err
 	case "select":
 		return "fixed(0)", true, nil
 	case "fallback":
-		return "min_moving_avg", true, nil
+		return "first_alive", true, nil
 	case "url-test":
 		return "min_avg10", true, nil
 	default:

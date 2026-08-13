@@ -423,7 +423,7 @@ func (g *DialerGroup) SelectWithExclusionResult(networkType *dialer.NetworkType,
 	if err == nil {
 		return d, latency, selectedNetworkType, nil
 	}
-	if errors.Is(err, ErrNoAliveDialer) && len(g.Dialers) == 1 {
+	if errors.Is(err, ErrNoAliveDialer) && len(g.Dialers) == 1 && policy.Policy != consts.DialerSelectionPolicy_FirstAlive {
 		// There is only one dialer in this group. Just choose it instead of return error.
 		if d, _, selectedNetworkType, err = g._select(networkType, state, DialerSelectionPolicy{
 			Policy:     consts.DialerSelectionPolicy_Fixed,
@@ -486,6 +486,18 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		}
 		return nil, time.Hour, nil, ErrNoAliveDialer
 
+	case consts.DialerSelectionPolicy_FirstAlive:
+		for _, member := range g.nestedMembers {
+			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false)
+			if err == nil {
+				return d, latency, selectedNetworkType, nil
+			}
+			if !errors.Is(err, ErrNoAliveDialer) {
+				return nil, latency, selectedNetworkType, err
+			}
+		}
+		return nil, time.Hour, nil, ErrNoAliveDialer
+
 	case consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
@@ -530,6 +542,9 @@ func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType,
 	if policy == consts.DialerSelectionPolicy_Random {
 		return m.dialer, 0, selectedNetworkType, nil
 	}
+	if policy == consts.DialerSelectionPolicy_FirstAlive {
+		return m.dialer, 0, selectedNetworkType, nil
+	}
 	latency, ok := m.dialer.SelectionLatency(networkType, policy)
 	if !ok {
 		latency = time.Hour
@@ -542,6 +557,9 @@ func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType,
 
 func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGroupSelectionState, policy DialerSelectionPolicy, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
 	if len(g.Dialers) == 0 {
+		if policy.Policy == consts.DialerSelectionPolicy_FirstAlive {
+			return nil, 0, nil, ErrNoAliveDialer
+		}
 		return nil, 0, nil, fmt.Errorf("no dialer in this group")
 	}
 	switch policy.Policy {
@@ -551,6 +569,23 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 			a := state.aliveDialerSets[networkTypes[i].Index()]
 			d := a.GetRandExcluded(excluded)
 			if d != nil {
+				selected := preferAlternateSelectionNetworkType(d, &networkTypes[i])
+				return d, 0, selected, nil
+			}
+		}
+		return nil, time.Hour, nil, ErrNoAliveDialer
+
+	case consts.DialerSelectionPolicy_FirstAlive:
+		networkTypes, count := g.selectionNetworkTypes(networkType, policy)
+		for i := range count {
+			a := state.aliveDialerSets[networkTypes[i].Index()]
+			if a == nil {
+				continue
+			}
+			for _, d := range g.Dialers {
+				if d == nil || d == excluded || !a.IsAlive(d) {
+					continue
+				}
 				selected := preferAlternateSelectionNetworkType(d, &networkTypes[i])
 				return d, 0, selected, nil
 			}
@@ -680,6 +715,7 @@ func (g *DialerGroup) unregisterAliveDialerSets(aliveDialerSets [8]*dialer.Alive
 func policyNeedsAliveState(policy consts.DialerSelectionPolicy) bool {
 	switch policy {
 	case consts.DialerSelectionPolicy_Random,
+		consts.DialerSelectionPolicy_FirstAlive,
 		consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:

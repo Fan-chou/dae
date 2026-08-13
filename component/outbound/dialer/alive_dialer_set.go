@@ -141,6 +141,16 @@ func (a *AliveDialerSet) Len() int {
 	return len(a.aliveEntries)
 }
 
+// IsAlive reports whether dialer is currently admitted by this group's health
+// set. The caller may impose a separate order over the group's dialers.
+func (a *AliveDialerSet) IsAlive(dialer *Dialer) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	index, ok := a.dialerToIndex[dialer]
+	return ok && index >= 0 && index < len(a.aliveEntries) && a.aliveEntries[index].dialer == dialer
+}
+
 func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

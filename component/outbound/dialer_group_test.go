@@ -529,3 +529,147 @@ func TestDialerGroup_Select_DataUdpFixedPolicyDoesNotFallback(t *testing.T) {
 		t.Fatalf("expected fixed policy to keep selecting dialers[1], got another dialer")
 	}
 }
+
+func TestDialerGroup_Select_FirstAlivePreservesDeclarationOrder(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	})
+	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(2 * time.Second)
+	dialers[1].MustGetLatencies10(TestNetworkType).AppendLatency(time.Millisecond)
+
+	for range 20 {
+		d, latency, err := g.Select(TestNetworkType, true)
+		if err != nil {
+			t.Fatalf("Select() error = %v", err)
+		}
+		if d != dialers[0] {
+			t.Fatalf("selected dialer = %p, want first declared dialer %p", d, dialers[0])
+		}
+		if latency != 0 {
+			t.Fatalf("selection latency = %v, want 0 for first_alive", latency)
+		}
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveSkipsDeadAndReturnsNoAlive(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	})
+	set := g.MustGetAliveDialerSet(TestNetworkType)
+	set.NotifyLatencyChange(dialers[0], false)
+
+	d, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() after first dialer failure = %v", err)
+	}
+	if d != dialers[1] {
+		t.Fatalf("selected dialer = %p, want second declared alive dialer %p", d, dialers[1])
+	}
+
+	set.NotifyLatencyChange(dialers[1], false)
+	if _, _, err := g.Select(TestNetworkType, true); !errors.Is(err, ErrNoAliveDialer) {
+		t.Fatalf("Select() with no alive dialers error = %v, want ErrNoAliveDialer", err)
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveSingleDeadDoesNotForceSelection(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	d := newDirectDialer(option, false)
+	g := NewDialerGroup(option, "single-first-alive", []*dialer.Dialer{d}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(d, false)
+
+	if _, _, err := g.Select(TestNetworkType, true); !errors.Is(err, ErrNoAliveDialer) {
+		t.Fatalf("Select() with one dead dialer error = %v, want ErrNoAliveDialer", err)
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveEmptyReturnsNoAlive(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	g := NewDialerGroup(option, "empty-first-alive", nil, nil, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+
+	if _, _, err := g.Select(TestNetworkType, true); !errors.Is(err, ErrNoAliveDialer) {
+		t.Fatalf("Select() with empty group error = %v, want ErrNoAliveDialer", err)
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveFallsBackToOtherIPFamily(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	})
+	for _, d := range dialers {
+		d.ReportUnavailableForced(TestNetworkType, errors.New("forced IPv4 failure"))
+	}
+
+	d, _, selectedNetworkType, err := g.SelectWithExclusionResult(TestNetworkType, false, nil)
+	if err != nil {
+		t.Fatalf("SelectWithExclusionResult() error = %v", err)
+	}
+	if d != dialers[0] {
+		t.Fatalf("selected dialer = %p, want first declared IPv6-alive dialer %p", d, dialers[0])
+	}
+	if selectedNetworkType == nil || selectedNetworkType.IpVersion != consts.IpVersionStr_6 {
+		t.Fatalf("selected network type = %#v, want IPv6 fallback", selectedNetworkType)
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveNestedSkipsFailedChildAndUsesBuiltinSibling(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	for _, builtinName := range []string{"direct", "block"} {
+		t.Run(builtinName, func(t *testing.T) {
+			childDialers := []*dialer.Dialer{
+				newDirectDialer(option, false),
+				newDirectDialer(option, false),
+			}
+			child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+				Policy: consts.DialerSelectionPolicy_FirstAlive,
+			}, func(bool, *dialer.NetworkType, bool) {})
+			childSet := child.MustGetAliveDialerSet(TestNetworkType)
+			for _, d := range childDialers {
+				childSet.NotifyLatencyChange(d, false)
+			}
+
+			builtinDialer := newDirectDialer(option, false)
+			builtin := NewDialerGroup(option, builtinName, []*dialer.Dialer{builtinDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+				Policy:     consts.DialerSelectionPolicy_Fixed,
+				FixedIndex: 0,
+			}, func(bool, *dialer.NetworkType, bool) {})
+			parent, err := NewNestedDialerGroup(option, "parent", []NestedDialerGroupMember{
+				{Group: child},
+				{Group: builtin},
+			}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *dialer.NetworkType, bool) {})
+			if err != nil {
+				t.Fatalf("NewNestedDialerGroup() error = %v", err)
+			}
+
+			selected, _, err := parent.Select(TestNetworkType, true)
+			if err != nil {
+				t.Fatalf("Select() error = %v", err)
+			}
+			if selected != builtinDialer {
+				t.Fatalf("selected dialer = %p, want %s builtin sibling %p", selected, builtinName, builtinDialer)
+			}
+		})
+	}
+}

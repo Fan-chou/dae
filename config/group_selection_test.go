@@ -34,3 +34,33 @@ routing {}
 		t.Fatalf("group selection metadata = %#v", conf.Group)
 	}
 }
+
+func TestGroupFirstAlivePolicyParses(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+group {
+    fallback_group {
+        filter: name('node-one')
+        policy: first_alive
+    }
+}
+routing {}
+`)
+	if err != nil {
+		t.Fatalf("config_parser.Parse() error = %v", err)
+	}
+	conf, err := New(sections)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if len(conf.Group) != 1 {
+		t.Fatalf("groups = %#v, want one group", conf.Group)
+	}
+	policy, err := ParseFunctionListOrString(conf.Group[0].Policy)
+	if err != nil {
+		t.Fatalf("ParseFunctionListOrString() error = %v", err)
+	}
+	if len(policy) != 1 || policy[0].Name != "first_alive" {
+		t.Fatalf("parsed policy = %#v, want first_alive", policy)
+	}
+}

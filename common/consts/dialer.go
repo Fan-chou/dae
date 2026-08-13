@@ -32,6 +32,8 @@ const (
 	DialerSelectionPolicy_MinMovingAverageLatencies DialerSelectionPolicy = "min_moving_avg"
 	// DialerSelectionPolicy_MinLastLatency selects the dialer with minimum last latency.
 	DialerSelectionPolicy_MinLastLatency DialerSelectionPolicy = "min"
+	// DialerSelectionPolicy_FirstAlive selects the first alive dialer in declaration order.
+	DialerSelectionPolicy_FirstAlive DialerSelectionPolicy = "first_alive"
 )
 
 const (
