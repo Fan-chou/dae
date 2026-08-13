@@ -10,6 +10,7 @@ import (
 	_ "github.com/daeuniverse/outbound/protocol/anytls"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	_ "github.com/daeuniverse/outbound/protocol/shadowsocks"
+	_ "github.com/daeuniverse/outbound/protocol/shadowsocks_2022"
 	_ "github.com/daeuniverse/outbound/protocol/socks5"
 	_ "github.com/daeuniverse/outbound/transport/shadowtls"
 	_ "github.com/daeuniverse/outbound/transport/simpleobfs"
