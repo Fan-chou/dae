@@ -1873,6 +1873,242 @@ func TestLoadRejects304GenerationDriftAgainstCachedSnapshot(t *testing.T) {
 	}
 }
 
+func TestMultiProviderLoadRejectsUnversionedStableMixedBodies(t *testing.T) {
+	const (
+		oldABody = "payload:\n  - a-old.example\n"
+		oldBBody = "payload:\n  - b-old.example\n"
+		newBBody = "payload:\n  - b-new.example\n"
+	)
+	var requestMu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMu.Lock()
+		requests[r.URL.Path]++
+		requestNumber := requests[r.URL.Path]
+		requestMu.Unlock()
+
+		switch r.URL.Path {
+		case "/a":
+			_, _ = fmt.Fprint(w, oldABody)
+		case "/b":
+			if requestNumber <= 2 {
+				_, _ = fmt.Fprint(w, oldBBody)
+				return
+			}
+			_, _ = fmt.Fprint(w, newBBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	providers := []config.RuleProvider{
+		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+	}
+	dir := t.TempDir()
+	options := loadOptions{allowPrivate: true}
+
+	initialRegistry, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
+	if err != nil {
+		t.Fatalf("initial unversioned A/B load error = %v", err)
+	}
+	if initialRegistry["a"].Functions[0].Params[0].Val != "a-old.example" || initialRegistry["b"].Functions[0].Params[0].Val != "b-old.example" {
+		t.Fatalf("initial registry = %#v, want A-old/B-old", initialRegistry)
+	}
+
+	descriptorA := testCacheDescriptor(t, providers[0], dir)
+	descriptorB := testCacheDescriptor(t, providers[1], dir)
+	initialA, err := readCacheSnapshot(descriptorA)
+	if err != nil {
+		t.Fatalf("read initial A snapshot error = %v", err)
+	}
+	initialB, err := readCacheSnapshot(descriptorB)
+	if err != nil {
+		t.Fatalf("read initial B snapshot error = %v", err)
+	}
+	initialAState, err := readCurrentState(descriptorA.root)
+	if err != nil {
+		t.Fatalf("read initial A current state error = %v", err)
+	}
+	initialBState, err := readCurrentState(descriptorB.root)
+	if err != nil {
+		t.Fatalf("read initial B current state error = %v", err)
+	}
+	if initialA.metadata.Generation != "" || initialB.metadata.Generation != "" {
+		t.Fatalf("initial snapshots unexpectedly have generation tokens: A=%#v B=%#v", initialA.metadata, initialB.metadata)
+	}
+
+	registry, loadErr := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
+	if loadErr == nil {
+		aValue, bValue := "<missing>", "<missing>"
+		if rules, ok := registry["a"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
+			aValue = rules.Functions[0].Params[0].Val
+		}
+		if rules, ok := registry["b"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
+			bValue = rules.Functions[0].Params[0].Val
+		}
+		t.Fatalf("unversioned stable mixed batch was accepted: a=%q b=%q registry=%#v", aValue, bValue, registry)
+	}
+	if registry != nil {
+		t.Fatalf("unversioned stable mixed batch returned registry with error: err=%v registry=%#v", loadErr, registry)
+	}
+	message := strings.ToLower(loadErr.Error())
+	if !strings.Contains(message, "batch") ||
+		(!strings.Contains(message, "consisten") && !strings.Contains(message, "fence") && !strings.Contains(message, "freshness") && !strings.Contains(message, "generation")) {
+		t.Fatalf("unversioned stable mixed batch error = %v, want explicit batch consistency/fence error", loadErr)
+	}
+
+	afterA, err := readCacheSnapshot(descriptorA)
+	if err != nil {
+		t.Fatalf("read final A snapshot error = %v", err)
+	}
+	afterB, err := readCacheSnapshot(descriptorB)
+	if err != nil {
+		t.Fatalf("read final B snapshot error = %v", err)
+	}
+	afterAState, err := readCurrentState(descriptorA.root)
+	if err != nil {
+		t.Fatalf("read final A current state error = %v", err)
+	}
+	afterBState, err := readCurrentState(descriptorB.root)
+	if err != nil {
+		t.Fatalf("read final B current state error = %v", err)
+	}
+	if !reflect.DeepEqual(afterA, initialA) || !reflect.DeepEqual(afterAState, initialAState) {
+		t.Fatalf("rejected unversioned mixed batch changed A current/cache: initial=%#v/%#v after=%#v/%#v", initialAState, initialA, afterAState, afterA)
+	}
+	if !reflect.DeepEqual(afterB, initialB) || !reflect.DeepEqual(afterBState, initialBState) {
+		t.Fatalf("rejected unversioned mixed batch changed B current/cache: initial=%#v/%#v after=%#v/%#v", initialBState, initialB, afterBState, afterB)
+	}
+}
+
+func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) {
+	const (
+		aOldBody = "payload:\n  - a-old.example\n"
+		aNewBody = "payload:\n  - a-new.example\n"
+		bOldBody = "payload:\n  - b-old.example\n"
+	)
+	var requestMu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMu.Lock()
+		requests[r.URL.Path]++
+		requestNumber := requests[r.URL.Path]
+		requestMu.Unlock()
+
+		switch r.URL.Path {
+		case "/a":
+			switch requestNumber {
+			case 1:
+				_, _ = fmt.Fprint(w, aOldBody)
+			case 2:
+				_, _ = fmt.Fprint(w, aNewBody)
+			default:
+				http.Error(w, "A unavailable", http.StatusServiceUnavailable)
+			}
+		case "/b":
+			if requestNumber == 1 {
+				_, _ = fmt.Fprint(w, bOldBody)
+				return
+			}
+			http.Error(w, "B unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	providerA := config.RuleProvider{
+		Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024,
+	}
+	providerB := config.RuleProvider{
+		Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024,
+	}
+	dir := t.TempDir()
+	options := loadOptions{allowPrivate: true}
+
+	if _, err := loadWithOptions(context.Background(), []config.RuleProvider{providerA}, dir, http.DefaultClient, options); err != nil {
+		t.Fatalf("initial A-old load error = %v", err)
+	}
+	if _, err := loadWithOptions(context.Background(), []config.RuleProvider{providerB}, dir, http.DefaultClient, options); err != nil {
+		t.Fatalf("initial B-old load error = %v", err)
+	}
+	newRegistry, err := loadWithOptions(context.Background(), []config.RuleProvider{providerA}, dir, http.DefaultClient, options)
+	if err != nil {
+		t.Fatalf("independent A-new load error = %v", err)
+	}
+	if newRegistry[providerA.Name].Functions[0].Params[0].Val != "a-new.example" {
+		t.Fatalf("independent A-new registry = %#v, want A-new", newRegistry)
+	}
+
+	providers := []config.RuleProvider{providerA, providerB}
+	descriptorA := testCacheDescriptor(t, providerA, dir)
+	descriptorB := testCacheDescriptor(t, providerB, dir)
+	initialA, err := readCacheSnapshot(descriptorA)
+	if err != nil {
+		t.Fatalf("read A-new snapshot error = %v", err)
+	}
+	initialB, err := readCacheSnapshot(descriptorB)
+	if err != nil {
+		t.Fatalf("read B-old snapshot error = %v", err)
+	}
+	initialAState, err := readCurrentState(descriptorA.root)
+	if err != nil {
+		t.Fatalf("read A-new current state error = %v", err)
+	}
+	initialBState, err := readCurrentState(descriptorB.root)
+	if err != nil {
+		t.Fatalf("read B-old current state error = %v", err)
+	}
+	if string(initialA.body) != aNewBody || string(initialB.body) != bOldBody || initialA.metadata.Generation != "" || initialB.metadata.Generation != "" {
+		t.Fatalf("last-good setup snapshots = A:%#v B:%#v, want unversioned A-new/B-old", initialA, initialB)
+	}
+
+	registry, loadErr := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
+	if loadErr == nil {
+		aValue, bValue := "<missing>", "<missing>"
+		if rules, ok := registry["a"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
+			aValue = rules.Functions[0].Params[0].Val
+		}
+		if rules, ok := registry["b"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
+			bValue = rules.Functions[0].Params[0].Val
+		}
+		t.Fatalf("unversioned mixed last-good batch was accepted: a=%q b=%q registry=%#v", aValue, bValue, registry)
+	}
+	if registry != nil {
+		t.Fatalf("unversioned mixed last-good batch returned registry with error: err=%v registry=%#v", loadErr, registry)
+	}
+	message := strings.ToLower(loadErr.Error())
+	if !strings.Contains(message, "batch") ||
+		(!strings.Contains(message, "consisten") && !strings.Contains(message, "fence") && !strings.Contains(message, "freshness") && !strings.Contains(message, "generation")) {
+		t.Fatalf("unversioned mixed last-good batch error = %v, want explicit batch consistency/fence error", loadErr)
+	}
+
+	afterA, err := readCacheSnapshot(descriptorA)
+	if err != nil {
+		t.Fatalf("read final A snapshot error = %v", err)
+	}
+	afterB, err := readCacheSnapshot(descriptorB)
+	if err != nil {
+		t.Fatalf("read final B snapshot error = %v", err)
+	}
+	afterAState, err := readCurrentState(descriptorA.root)
+	if err != nil {
+		t.Fatalf("read final A current state error = %v", err)
+	}
+	afterBState, err := readCurrentState(descriptorB.root)
+	if err != nil {
+		t.Fatalf("read final B current state error = %v", err)
+	}
+	if !reflect.DeepEqual(afterA, initialA) || !reflect.DeepEqual(afterAState, initialAState) {
+		t.Fatalf("rejected unversioned mixed last-good batch changed A current/cache: initial=%#v/%#v after=%#v/%#v", initialAState, initialA, afterAState, afterA)
+	}
+	if !reflect.DeepEqual(afterB, initialB) || !reflect.DeepEqual(afterBState, initialBState) {
+		t.Fatalf("rejected unversioned mixed last-good batch changed B current/cache: initial=%#v/%#v after=%#v/%#v", initialBState, initialB, afterBState, afterB)
+	}
+}
+
 func TestLoadRejects304GenerationWhenCachedSnapshotHasNoToken(t *testing.T) {
 	const (
 		body = "payload:\n  - cached-without-token.example\n"

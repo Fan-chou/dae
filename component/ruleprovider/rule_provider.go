@@ -3,6 +3,7 @@ package ruleprovider
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -50,6 +51,8 @@ const (
 	maxProviderGenerationLength         = 256
 	maxProviderGenerationHistoryEntries = 16
 	maxProviderGenerationHistoryBytes   = maxProviderGenerationHistoryEntries * maxProviderGenerationLength
+	batchIdentityBytes                  = 16
+	batchIdentityLength                 = batchIdentityBytes * 2
 )
 
 var providerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -75,6 +78,7 @@ type preparedProvider struct {
 	name                 string
 	rules                ProviderRules
 	generation           string
+	batchIdentity        string
 	descriptor           cacheDescriptor
 	candidate            *cacheCandidate
 	expectedCurrent      currentState
@@ -89,6 +93,7 @@ type cacheCandidate struct {
 	generation           string
 	preparedAt           time.Time
 	updatedAt            time.Time
+	batchIdentity        string
 	expectedCurrent      currentState
 	expectedCurrentKnown bool
 }
@@ -266,6 +271,7 @@ type cacheMetadata struct {
 	LastModified      string            `json:"last_modified,omitempty"`
 	Generation        string            `json:"generation,omitempty"`
 	GenerationHistory generationHistory `json:"generation_history,omitempty"`
+	BatchIdentity     string            `json:"batch_identity,omitempty"`
 }
 
 type cacheSnapshot struct {
@@ -284,6 +290,7 @@ type cacheTransaction struct {
 	SchemaVersion int                              `json:"schema_version"`
 	State         string                           `json:"state"`
 	Generation    string                           `json:"generation"`
+	BatchIdentity string                           `json:"batch_identity,omitempty"`
 	Providers     map[string]cacheTransactionEntry `json:"providers"`
 }
 
@@ -412,33 +419,110 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 		seen[provider.Name] = struct{}{}
 	}
 
-	prepared := make([]preparedProvider, len(normalized))
-	preparationErrors := make([]error, len(normalized))
-	if len(normalized) == 1 {
-		prepared[0], preparationErrors[0] = prepareProvider(ctx, normalized[0], baseDir, client, options)
-	} else if len(normalized) > 1 {
-		// A batch must retain every accepted result until the complete batch is
-		// ready. Keep the established deterministic reverse-input preparation
-		// order for compatibility with providers that do not expose a generation
-		// token; the generation fence below is the only cross-provider consistency
-		// decision when tokens are available.
-		for index := len(normalized) - 1; index >= 0; index-- {
-			prepared[index], preparationErrors[index] = prepareProvider(ctx, normalized[index], baseDir, client, options)
-		}
-	}
-
-	for index, provider := range normalized {
-		if err := preparationErrors[index]; err != nil {
-			return nil, nil, fmt.Errorf("rule provider %q: %w", provider.Name, err)
-		}
-	}
-	if err := validateBatchGeneration(prepared); err != nil {
+	prepared, err := prepareStableProviderBatch(ctx, normalized, baseDir, client, options)
+	if err != nil {
 		return nil, nil, err
 	}
 	for index, provider := range normalized {
 		registry[provider.Name] = prepared[index].rules
 	}
 	return registry, prepared, nil
+}
+
+func prepareStableProviderBatch(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) ([]preparedProvider, error) {
+	prepared, err := prepareProviderBatch(ctx, providers, baseDir, client, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateBatchGeneration(prepared); err != nil {
+		return nil, err
+	}
+	if requiresUnversionedBatchIdentity(prepared) {
+		// Retain the existing second fetch as an update probe. It does not prove
+		// that independent providers share a remote generation; acceptance below
+		// still requires either fresh candidates for every provider or a durable
+		// common cache batch identity.
+		prepared, err = prepareProviderBatch(ctx, providers, baseDir, client, options)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateBatchGeneration(prepared); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateUnversionedBatchConsistency(prepared); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+func prepareProviderBatch(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) ([]preparedProvider, error) {
+	prepared := make([]preparedProvider, len(providers))
+	preparationErrors := make([]error, len(providers))
+	// Keep the established request order for compatibility. Cross-provider
+	// acceptance is decided only by generation tokens or cache batch identity.
+	for index := len(providers) - 1; index >= 0; index-- {
+		prepared[index], preparationErrors[index] = prepareProvider(ctx, providers[index], baseDir, client, options)
+	}
+	for index, provider := range providers {
+		if err := preparationErrors[index]; err != nil {
+			return nil, fmt.Errorf("rule provider %q: %w", provider.Name, err)
+		}
+	}
+	return prepared, nil
+}
+
+// requiresUnversionedBatchIdentity identifies batches for which per-provider
+// HTTP observations provide no common generation. A cache batch identity is
+// the only durable proof that unchanged, revalidated, or last-good results
+// were published together.
+func requiresUnversionedBatchIdentity(prepared []preparedProvider) bool {
+	if len(prepared) < 2 {
+		return false
+	}
+	hasHTTP := false
+	for _, provider := range prepared {
+		if provider.generation != "" {
+			return false
+		}
+		if provider.descriptor.sourceType == "http" {
+			hasHTTP = true
+		}
+	}
+	return hasHTTP
+}
+
+func validateUnversionedBatchConsistency(prepared []preparedProvider) error {
+	if !requiresUnversionedBatchIdentity(prepared) {
+		return nil
+	}
+
+	candidates := 0
+	for _, provider := range prepared {
+		if provider.candidate != nil {
+			candidates++
+		}
+	}
+	if candidates == len(prepared) {
+		// Every provider has a fresh candidate. publishPrepared binds all of
+		// them to one transaction-generated identity before any current pointer
+		// is replaced, so this is a safe initial or complete batch update.
+		return nil
+	}
+	if candidates != 0 {
+		return errors.New("rule provider batch consistency fence rejects mixed fresh and cached results without a generation token")
+	}
+
+	batchIdentity := prepared[0].batchIdentity
+	if batchIdentity == "" {
+		return errors.New("rule provider batch consistency fence rejects cached results without a shared batch identity")
+	}
+	for _, provider := range prepared[1:] {
+		if provider.batchIdentity != batchIdentity {
+			return errors.New("rule provider batch consistency fence rejects cached results from different batches")
+		}
+	}
+	return nil
 }
 
 func normalizeProvider(provider config.RuleProvider) config.RuleProvider {
@@ -516,7 +600,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	if expectedCurrentErr != nil {
 		return preparedProvider{}, fmt.Errorf("inspect provider cache %q: %w", provider.Name, expectedCurrentErr)
 	}
-	makePrepared := func(rules ProviderRules, generation string, candidate *cacheCandidate) preparedProvider {
+	makePrepared := func(rules ProviderRules, generation, batchIdentity string, candidate *cacheCandidate) preparedProvider {
 		if candidate != nil {
 			candidate.expectedCurrent = expectedCurrent
 			candidate.expectedCurrentKnown = true
@@ -525,6 +609,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			name:                 provider.Name,
 			rules:                rules,
 			generation:           generation,
+			batchIdentity:        batchIdentity,
 			descriptor:           descriptor,
 			candidate:            candidate,
 			expectedCurrent:      expectedCurrent,
@@ -538,14 +623,14 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 		body, readErr := readProviderFile(baseDir, provider.Path, provider.MaxSize)
 		if readErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
 			}
 			return preparedProvider{}, fmt.Errorf("read provider file: %v; cache failed: %w", readErr, cachedRulesErr)
 		}
 		rules, parseErr := parseProviderBody(body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
 			}
 			return preparedProvider{}, fmt.Errorf("validate file provider body: %w", parseErr)
 		}
@@ -557,21 +642,23 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			expectedCurrent:      expectedCurrent,
 			expectedCurrentKnown: true,
 		}
+		batchIdentity := ""
 		if cacheErr == nil &&
 			cachedRulesErr == nil &&
 			cached.metadata.SHA256 == digest(body) &&
 			cacheMetadataMatches(cached.metadata, descriptor) &&
 			cached.metadata.Generation == "" {
 			candidate = nil
+			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, "", candidate), nil
+		return makePrepared(rules, "", batchIdentity, candidate), nil
 	case "http":
 		cached, cacheErr := readCacheSnapshot(descriptor)
 		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider)
 		fetched, fetchErr := fetchHTTP(ctx, provider.URL, provider.MaxSize, client, options.allowPrivate, cached)
 		if fetchErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
 			}
 			if isSecurityError(fetchErr) {
 				return preparedProvider{}, fmt.Errorf("fetch rejected by provider security policy: %w", fetchErr)
@@ -595,12 +682,12 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 					return preparedProvider{}, fmt.Errorf("provider returned 304 generation %q inconsistent with cached generation %q", fetched.generation, generation)
 				}
 			}
-			return makePrepared(cachedRules, generation, nil), nil
+			return makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil), nil
 		}
 		rules, parseErr := parseProviderBody(fetched.body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
 			}
 			return preparedProvider{}, fmt.Errorf("validate fresh provider body: %w", parseErr)
 		}
@@ -615,6 +702,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			expectedCurrent:      expectedCurrent,
 			expectedCurrentKnown: true,
 		}
+		batchIdentity := ""
 		if cacheErr == nil &&
 			cachedRulesErr == nil &&
 			cached.metadata.SHA256 == digest(fetched.body) &&
@@ -623,8 +711,9 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			cached.metadata.LastModified == fetched.lastModified &&
 			cached.metadata.Generation == fetched.generation {
 			candidate = nil
+			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, fetched.generation, candidate), nil
+		return makePrepared(rules, fetched.generation, batchIdentity, candidate), nil
 	default:
 		return preparedProvider{}, fmt.Errorf("unsupported provider type %q", provider.Type)
 	}
@@ -646,6 +735,32 @@ func cacheSnapshotGeneration(snapshot cacheSnapshot) string {
 		return snapshot.generation
 	}
 	return snapshot.metadata.Generation
+}
+
+func cacheSnapshotBatchIdentity(snapshot cacheSnapshot) string {
+	return snapshot.metadata.BatchIdentity
+}
+
+func newCacheTransactionID() (string, error) {
+	var random [batchIdentityBytes]byte
+	if _, err := io.ReadFull(rand.Reader, random[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(random[:]), nil
+}
+
+func validateStoredBatchIdentity(batchIdentity string) error {
+	if batchIdentity == "" {
+		return nil
+	}
+	if len(batchIdentity) != batchIdentityLength {
+		return fmt.Errorf("batch identity has invalid length %d", len(batchIdentity))
+	}
+	decoded, err := hex.DecodeString(batchIdentity)
+	if err != nil || len(decoded) != batchIdentityBytes {
+		return errors.New("batch identity is not canonical hexadecimal")
+	}
+	return nil
 }
 
 func validateBatchGeneration(prepared []preparedProvider) error {
@@ -815,7 +930,12 @@ func fetchHTTP(ctx context.Context, rawURL string, max int64, baseClient *http.C
 		if err != nil {
 			return fetchedBody{}, err
 		}
-		return fetchedBody{generation: generation, notModified: true}, nil
+		return fetchedBody{
+			etag:         boundedHeaderValue(response.Header.Get("ETag")),
+			lastModified: boundedHeaderValue(response.Header.Get("Last-Modified")),
+			generation:   generation,
+			notModified:  true,
+		}, nil
 	}
 	if response.StatusCode != http.StatusOK {
 		return fetchedBody{}, fmt.Errorf("provider returned HTTP %s", response.Status)
@@ -1172,6 +1292,9 @@ func readCacheSnapshotWithSourceBinding(descriptor cacheDescriptor, requireSourc
 	if err := validateStoredProviderGeneration(metadata.Generation); err != nil {
 		return cacheSnapshot{}, fmt.Errorf("validate cache generation: %w", err)
 	}
+	if err := validateStoredBatchIdentity(metadata.BatchIdentity); err != nil {
+		return cacheSnapshot{}, fmt.Errorf("validate cache batch identity: %w", err)
+	}
 	if !cacheMetadataMatchesForSourceChange(metadata, descriptor) || (requireSourceBinding && !cacheMetadataMatches(metadata, descriptor)) {
 		return cacheSnapshot{}, errors.New("cache metadata source mismatch")
 	}
@@ -1252,6 +1375,31 @@ func publishPrepared(prepared []preparedProvider) error {
 	if err := validatePreparedCandidates(prepared); err != nil {
 		return err
 	}
+	if err := validateUnversionedBatchConsistency(prepared); err != nil {
+		return err
+	}
+
+	hasCandidate := false
+	for _, provider := range prepared {
+		if provider.candidate != nil {
+			hasCandidate = true
+			break
+		}
+	}
+	if !hasCandidate {
+		return nil
+	}
+	transactionID, err := newCacheTransactionID()
+	if err != nil {
+		return fmt.Errorf("generate provider cache transaction identity: %w", err)
+	}
+	batchIdentity := ""
+	if requiresUnversionedBatchIdentity(prepared) {
+		batchIdentity = transactionID
+		for index := range prepared {
+			prepared[index].candidate.batchIdentity = batchIdentity
+		}
+	}
 
 	caches := make([]preparedCache, 0, len(prepared))
 	for index := range prepared {
@@ -1306,6 +1454,7 @@ func publishPrepared(prepared []preparedProvider) error {
 			LastModified:      candidate.modified,
 			Generation:        candidate.generation,
 			GenerationHistory: history,
+			BatchIdentity:     candidate.batchIdentity,
 		}
 		metadataBody, err := json.Marshal(metadata)
 		if err == nil && len(metadataBody) > maxCacheMetadataSize {
@@ -1338,7 +1487,8 @@ func publishPrepared(prepared []preparedProvider) error {
 	transactionRecord := cacheTransaction{
 		SchemaVersion: cacheTransactionVersion,
 		State:         "publishing",
-		Generation:    strconv.FormatInt(time.Now().UTC().UnixNano(), 10),
+		Generation:    transactionID,
+		BatchIdentity: batchIdentity,
 		Providers:     make(map[string]cacheTransactionEntry, len(prepared)),
 	}
 	newCurrent := make(map[string]string, len(caches))
@@ -1660,6 +1810,12 @@ func recoverPendingPublishLocked(transactionRoot, transactionPath string) error 
 	if transaction.State != "publishing" && transaction.State != "committed" {
 		return fmt.Errorf("unsupported cache transaction state %q", transaction.State)
 	}
+	if err := validateStoredBatchIdentity(transaction.BatchIdentity); err != nil {
+		return fmt.Errorf("validate cache transaction batch identity: %w", err)
+	}
+	if transaction.BatchIdentity != "" && transaction.BatchIdentity != transaction.Generation {
+		return errors.New("cache transaction batch identity does not match transaction generation")
+	}
 	if len(transaction.Providers) == 0 {
 		return errors.New("cache transaction journal has no providers")
 	}
@@ -1691,7 +1847,7 @@ func recoverPendingPublishLocked(transactionRoot, transactionPath string) error 
 	}
 	defer locks.Close()
 
-	if transaction.State == "committed" && transactionCurrentsMatch(transactionRoot, transaction.Providers) {
+	if transaction.State == "committed" && transactionCurrentsMatch(transactionRoot, transaction.Providers, transaction.BatchIdentity) {
 		if err := removeCacheTransaction(transactionPath); err != nil {
 			return fmt.Errorf("remove committed cache transaction journal: %w", err)
 		}
@@ -1763,7 +1919,7 @@ func validateCacheCurrentTarget(root, target string, allowEmpty bool) error {
 	return nil
 }
 
-func transactionCurrentsMatch(transactionRoot string, entries map[string]cacheTransactionEntry) bool {
+func transactionCurrentsMatch(transactionRoot string, entries map[string]cacheTransactionEntry, batchIdentity string) bool {
 	for name, entry := range entries {
 		state, err := readCurrentState(filepath.Join(transactionRoot, name))
 		if err != nil {
@@ -1778,8 +1934,26 @@ func transactionCurrentsMatch(transactionRoot string, entries map[string]cacheTr
 		if !state.exists || state.target != entry.NewCurrent {
 			return false
 		}
+		if batchIdentity != "" && !currentCacheHasBatchIdentity(state, batchIdentity) {
+			return false
+		}
 	}
 	return true
+}
+
+func currentCacheHasBatchIdentity(state currentState, batchIdentity string) bool {
+	metadataBody, err := readCacheRegularFile(filepath.Join(state.resolved, "metadata.json"), maxCacheMetadataSize)
+	if err != nil {
+		return false
+	}
+	var metadata cacheMetadata
+	if err := json.Unmarshal(metadataBody, &metadata); err != nil {
+		return false
+	}
+	if err := validateStoredBatchIdentity(metadata.BatchIdentity); err != nil {
+		return false
+	}
+	return metadata.BatchIdentity == batchIdentity
 }
 
 func writeCacheTransaction(path string, transaction cacheTransaction) error {
