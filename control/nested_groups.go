@@ -8,6 +8,7 @@ package control
 import (
 	"fmt"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 )
@@ -24,6 +25,17 @@ type nestedGroupBuildPlan struct {
 	referenceOrder []string
 }
 
+func builtinOutboundGroup(name string) (consts.OutboundIndex, bool) {
+	switch name {
+	case consts.OutboundDirect.String():
+		return consts.OutboundDirect, true
+	case consts.OutboundBlock.String():
+		return consts.OutboundBlock, true
+	default:
+		return 0, false
+	}
+}
+
 func (p nestedGroupBuildPlan) hasNestedReferences() bool {
 	return len(p.references) != 0
 }
@@ -34,6 +46,9 @@ func planNestedGroupBuild(groups []config.Group) ([]nestedGroupBuildPlan, []int,
 	for i, group := range groups {
 		if group.Name == "" {
 			return nil, nil, fmt.Errorf("group has empty name")
+		}
+		if _, reserved := builtinOutboundGroup(group.Name); reserved {
+			return nil, nil, fmt.Errorf("group name %q is reserved for a built-in outbound", group.Name)
 		}
 		if _, exists := byName[group.Name]; exists {
 			return nil, nil, fmt.Errorf("duplicated group name %q", group.Name)
@@ -57,6 +72,9 @@ func planNestedGroupBuild(groups []config.Group) ([]nestedGroupBuildPlan, []int,
 
 	for _, plan := range plans {
 		for _, childName := range plan.referenceOrder {
+			if _, builtin := builtinOutboundGroup(childName); builtin {
+				continue
+			}
 			if _, exists := byName[childName]; !exists {
 				return nil, nil, fmt.Errorf("group %q references unknown nested group %q", plan.group.Name, childName)
 			}
@@ -83,6 +101,9 @@ func planNestedGroupBuild(groups []config.Group) ([]nestedGroupBuildPlan, []int,
 		}
 		state[index] = visiting
 		for _, childName := range plans[index].referenceOrder {
+			if _, builtin := builtinOutboundGroup(childName); builtin {
+				continue
+			}
 			if err := visit(byName[childName], depth+1); err != nil {
 				return err
 			}

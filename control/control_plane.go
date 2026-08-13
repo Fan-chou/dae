@@ -733,6 +733,10 @@ func newControlPlaneWithContextOptions(
 			seenDirectDialers := make(map[*dialer.Dialer]struct{})
 			for filterIndex := range group.Filter {
 				if childName, nested := plan.references[filterIndex]; nested {
+					if builtinIndex, builtin := builtinOutboundGroup(childName); builtin {
+						members = append(members, outbound.NestedDialerGroupMember{Group: outbounds[int(builtinIndex)]})
+						continue
+					}
 					child := builtGroups[childName]
 					if child == nil {
 						return nil, fmt.Errorf("nested group %q was not built before parent %q", childName, group.Name)

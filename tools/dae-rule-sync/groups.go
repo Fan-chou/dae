@@ -46,6 +46,17 @@ var daeIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // the runtime even when it is acyclic.
 const maxNestedGroupDepth = 32
 
+func specialMihomoGroupReference(member string) (string, bool) {
+	switch member {
+	case "DIRECT":
+		return "direct", true
+	case "REJECT":
+		return "block", true
+	default:
+		return "", false
+	}
+}
+
 func ParseMihomoConfig(data []byte) (MihomoConfig, error) {
 	var config MihomoConfig
 	if err := yaml.Unmarshal(data, &config); err != nil {
@@ -100,7 +111,8 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 		for _, member := range group.Proxies {
 			switch member {
 			case "DIRECT", "REJECT":
-				reasons = append(reasons, member+" member")
+				members = append(members, member)
+				hasNestedMembers[groupIndex] = true
 			default:
 				if _, nested := groups[member]; nested {
 					if !convertibleGroups[member] {
@@ -121,6 +133,9 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 		}
 		if len(group.Use) > 0 {
 			reasons = append(reasons, "proxy provider members are unsupported")
+		}
+		if len(group.Proxies) == 0 && len(group.Use) == 0 {
+			return "", GroupConversionReport{}, fmt.Errorf("group %q has no members", group.Name)
 		}
 		if len(members) == 0 {
 			if len(reasons) > 0 {
@@ -153,6 +168,10 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 			output.WriteString(")\n")
 		} else {
 			for _, member := range members {
+				if reference, special := specialMihomoGroupReference(member); special {
+					fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(reference))
+					continue
+				}
 				if _, nested := groups[member]; nested {
 					fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(report.NameMap[member]))
 					continue
@@ -188,6 +207,10 @@ func convertibleMihomoGroups(groupsIn []MihomoGroup, proxies, groups map[string]
 			return false
 		}
 		for _, member := range group.Proxies {
+			if _, special := specialMihomoGroupReference(member); special {
+				convertible[name] = true
+				return true
+			}
 			if _, nested := groups[member]; nested {
 				if visit(member) {
 					convertible[name] = true
@@ -211,9 +234,9 @@ func convertibleMihomoGroups(groupsIn []MihomoGroup, proxies, groups map[string]
 }
 
 // validateMihomoGroupGraph validates the graph before it is rendered. The
-// returned bool slice records which declarations need explicit group(...) edges;
-// declarations are intentionally rendered in source order so existing outbound
-// ordering remains stable.
+// returned bool slice records which declarations need explicit group(...) edges
+// for nested or built-in groups; declarations are intentionally rendered in
+// source order so existing outbound ordering remains stable.
 func validateMihomoGroupGraph(groupsIn []MihomoGroup, groups map[string]struct{}) (map[string][]string, []bool, error) {
 	dependencies := make(map[string][]string, len(groupsIn))
 	hasNested := make([]bool, len(groupsIn))

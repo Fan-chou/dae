@@ -1576,7 +1576,7 @@ func TestRunSyncFetchesProviderAndWritesRoutes(t *testing.T) {
 	}
 }
 
-func TestRunSyncWritesFlatGroupsAndReportsUnsupportedMembers(t *testing.T) {
+func TestRunSyncWritesFlatGroupsAndPreservesDirectMembers(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "providers.yaml")
 	if err := os.WriteFile(manifestPath, []byte("providers: []\nroutes: []\n"), 0o600); err != nil {
@@ -1609,10 +1609,10 @@ proxy-groups:
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
-	if !strings.Contains(string(body), "filter: name('hk-1')") {
+	if !strings.Contains(string(body), "filter: name('hk-1')") || !strings.Contains(string(body), "filter: group('direct')") {
 		t.Fatalf("groups = %q", body)
 	}
-	if len(report.Groups.Unsupported) != 1 {
+	if report.Groups.Converted != 1 || len(report.Groups.Unsupported) != 0 {
 		t.Fatalf("groups report = %#v", report.Groups)
 	}
 }
@@ -2261,7 +2261,7 @@ routes:
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	groupsInput := filepath.Join(dir, "mihomo.yaml")
-	if err := os.WriteFile(groupsInput, []byte("proxies: []\nproxy-groups:\n  - name: nested\n    type: select\n    proxies: [DIRECT]\n"), 0o600); err != nil {
+	if err := os.WriteFile(groupsInput, []byte("proxies: []\nproxy-groups:\n  - name: empty\n    type: select\n    proxies: []\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	groupsOutput := filepath.Join(dir, "groups.dae")
