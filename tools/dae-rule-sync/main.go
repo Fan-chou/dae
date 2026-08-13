@@ -18,6 +18,7 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	flags.SetOutput(output)
 	var options SyncOptions
 	flags.StringVar(&options.ManifestPath, "manifest", "", "provider manifest path")
+	flags.StringVar(&options.MihomoRoutingPath, "mihomo-routing-config", "", "complete Mihomo routing config path; requires generation-dir")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "provider cache directory")
 	flags.StringVar(&options.RoutesOutput, "routes-output", "", "direct routes output path (compatibility-only; non-atomic complete-state publication)")
 	flags.StringVar(&options.GroupsInputPath, "mihomo-config", "", "optional Mihomo config for flat group conversion")
@@ -28,8 +29,11 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	if err := flags.Parse(args); err != nil {
 		return SyncOptions{}, err
 	}
-	if options.ManifestPath == "" {
-		return SyncOptions{}, fmt.Errorf("-manifest is required")
+	if options.ManifestPath == "" && options.MihomoRoutingPath == "" {
+		return SyncOptions{}, fmt.Errorf("-manifest or -mihomo-routing-config is required")
+	}
+	if options.ManifestPath != "" && options.MihomoRoutingPath != "" {
+		return SyncOptions{}, fmt.Errorf("-manifest and -mihomo-routing-config cannot be combined")
 	}
 	return options, nil
 }

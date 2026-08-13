@@ -28,16 +28,17 @@ import (
 var runSyncMu sync.Mutex
 
 type SyncOptions struct {
-	ManifestPath    string
-	CacheDir        string
-	RoutesOutput    string
-	GroupsInputPath string
-	GroupsOutput    string
-	NodesOutput     string
-	GenerationDir   string
-	Client          *http.Client
-	Strict          bool
-	AllowPrivate    bool
+	ManifestPath      string
+	MihomoRoutingPath string
+	CacheDir          string
+	RoutesOutput      string
+	GroupsInputPath   string
+	GroupsOutput      string
+	NodesOutput       string
+	GenerationDir     string
+	Client            *http.Client
+	Strict            bool
+	AllowPrivate      bool
 }
 
 type ProviderSyncReport struct {
@@ -61,6 +62,12 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 	runSyncMu.Lock()
 	defer runSyncMu.Unlock()
 
+	if options.ManifestPath != "" && options.MihomoRoutingPath != "" {
+		return SyncReport{}, errors.New("manifest path and Mihomo routing config cannot be combined")
+	}
+	if options.MihomoRoutingPath != "" {
+		return runMihomoRoutingSync(ctx, options)
+	}
 	if options.ManifestPath == "" {
 		return SyncReport{}, fmt.Errorf("manifest path is required")
 	}
