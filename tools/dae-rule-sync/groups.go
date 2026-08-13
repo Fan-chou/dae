@@ -16,8 +16,21 @@ type MihomoConfig struct {
 }
 
 type MihomoProxy struct {
-	Name string `yaml:"name"`
-	Type string `yaml:"type"`
+	Name              string         `yaml:"name"`
+	Type              string         `yaml:"type"`
+	Server            string         `yaml:"server"`
+	Port              int            `yaml:"port"`
+	Username          string         `yaml:"username"`
+	Password          string         `yaml:"password"`
+	Cipher            string         `yaml:"cipher"`
+	SNI               string         `yaml:"sni"`
+	ServerName        string         `yaml:"servername"`
+	ClientFingerprint string         `yaml:"client-fingerprint"`
+	TLS               *bool          `yaml:"tls"`
+	SkipCertVerify    *bool          `yaml:"skip-cert-verify"`
+	UDP               *bool          `yaml:"udp"`
+	Plugin            string         `yaml:"plugin"`
+	PluginOpts        map[string]any `yaml:"plugin-opts"`
 }
 
 type MihomoGroup struct {
@@ -66,6 +79,13 @@ func ParseMihomoConfig(data []byte) (MihomoConfig, error) {
 }
 
 func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, error) {
+	return generateFlatDaeGroups(config, nil)
+}
+
+// generateFlatDaeGroups renders the group-only compatibility output. When
+// nodeNames is non-nil, ordinary Mihomo proxy references are replaced by the
+// generated dae node names before rendering.
+func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (string, GroupConversionReport, error) {
 	proxies := make(map[string]struct{}, len(config.Proxies))
 	for _, proxy := range config.Proxies {
 		if proxy.Name == "" {
@@ -125,10 +145,18 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 				if _, node := proxies[member]; !node {
 					return "", GroupConversionReport{}, fmt.Errorf("group %q has unknown member %q", group.Name, member)
 				}
-				if err := validateDaeLiteral(member); err != nil {
-					return "", GroupConversionReport{}, fmt.Errorf("group %q member %q: %w", group.Name, member, err)
+				mappedMember := member
+				if nodeNames != nil {
+					var ok bool
+					mappedMember, ok = nodeNames[member]
+					if !ok || mappedMember == "" {
+						return "", GroupConversionReport{}, fmt.Errorf("group %q member %q has no generated dae node name", group.Name, member)
+					}
 				}
-				members = append(members, member)
+				if err := validateDaeLiteral(mappedMember); err != nil {
+					return "", GroupConversionReport{}, fmt.Errorf("group %q member %q: %w", group.Name, mappedMember, err)
+				}
+				members = append(members, mappedMember)
 			}
 		}
 		if len(group.Use) > 0 {

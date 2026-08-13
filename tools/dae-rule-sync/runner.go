@@ -33,6 +33,7 @@ type SyncOptions struct {
 	RoutesOutput    string
 	GroupsInputPath string
 	GroupsOutput    string
+	NodesOutput     string
 	GenerationDir   string
 	Client          *http.Client
 	Strict          bool
@@ -53,6 +54,7 @@ type SyncReport struct {
 	Providers []ProviderSyncReport  `json:"providers"`
 	Routes    ConversionReport      `json:"routes"`
 	Groups    GroupConversionReport `json:"groups"`
+	Nodes     NodeConversionReport  `json:"nodes"`
 }
 
 func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
@@ -62,8 +64,11 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 	if options.ManifestPath == "" {
 		return SyncReport{}, fmt.Errorf("manifest path is required")
 	}
-	if options.GenerationDir != "" && (options.RoutesOutput != "" || options.GroupsOutput != "") {
+	if options.GenerationDir != "" && (options.RoutesOutput != "" || options.GroupsOutput != "" || options.NodesOutput != "") {
 		return SyncReport{}, errors.New("generation output cannot be combined with direct routes or groups output")
+	}
+	if options.NodesOutput != "" && options.GroupsInputPath == "" {
+		return SyncReport{}, errors.New("nodes output requires Mihomo config input")
 	}
 	generationMode := options.GenerationDir != ""
 	var generationRoot generationRootState
@@ -198,7 +203,9 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		return SyncReport{}, fmt.Errorf("refusing to replace routes output with zero generated rules")
 	}
 
+	var nodes []byte
 	var groups []byte
+	var mihomoMetadata *generationMihomoMetadata
 	if options.GroupsInputPath != "" {
 		groupsBody, err := os.ReadFile(options.GroupsInputPath)
 		if err != nil {
@@ -208,9 +215,35 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		if err != nil {
 			return SyncReport{}, err
 		}
-		groupsText, groupReport, err := GenerateFlatDaeGroups(mihomoConfig)
-		if err != nil {
-			return SyncReport{}, err
+		fullMihomoOutput := generationMode || options.NodesOutput != ""
+		var groupsText string
+		var groupReport GroupConversionReport
+		if fullMihomoOutput {
+			nodesText, nodeReport, err := GenerateMihomoNodes(mihomoConfig)
+			if err != nil {
+				return SyncReport{}, err
+			}
+			groupsText, groupReport, err = generateFlatDaeGroups(mihomoConfig, nodeReport.NameMap)
+			if err != nil {
+				return SyncReport{}, err
+			}
+			nodes = []byte(nodesText)
+			report.Nodes = nodeReport
+			metadata := generationMihomoMetadata{
+				InputSHA256:  digest(groupsBody),
+				NodeNameMap:  cloneStringMap(nodeReport.NameMap),
+				GroupNameMap: cloneStringMap(groupReport.NameMap),
+				NodeTypes:    cloneStringMap(nodeReport.Types),
+			}
+			mihomoMetadata = &metadata
+		} else {
+			// Preserve the historical direct groups-only helper when no node
+			// output was requested. Complete Mihomo conversion uses generation
+			// mode or an explicit NodesOutput and is fail-closed.
+			groupsText, groupReport, err = GenerateFlatDaeGroups(mihomoConfig)
+			if err != nil {
+				return SyncReport{}, err
+			}
 		}
 		report.Groups = groupReport
 		if options.GenerationDir == "" && options.GroupsOutput == "" {
@@ -230,7 +263,7 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 			selectedSnapshots = append(selectedSnapshots, snapshots[spec.Name])
 		}
 		if generationReused {
-			unchanged, err := generationMatchesCurrent(generationRoot, []byte(routes), groups, selectedSnapshots)
+			unchanged, err := generationMatchesCurrentWithNodes(generationRoot, []byte(routes), nodes, groups, selectedSnapshots, mihomoMetadata)
 			if err != nil {
 				return SyncReport{}, fmt.Errorf("compare current generation: %w", err)
 			}
@@ -238,7 +271,7 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 				return report, nil
 			}
 		}
-		generationPublication, err := beginGenerationPublicationAt(generationRoot, []byte(routes), groups, selectedSnapshots, datSpecs...)
+		generationPublication, err := beginGenerationPublicationAtWithNodes(generationRoot, []byte(routes), nodes, groups, selectedSnapshots, mihomoMetadata, datSpecs...)
 		if err != nil {
 			return SyncReport{}, fmt.Errorf("prepare generation: %w", err)
 		}
@@ -263,6 +296,14 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		candidate, err := prepareOutputCandidate(options.GroupsOutput, groups)
 		if err != nil {
 			return SyncReport{}, fmt.Errorf("write groups: %w", err)
+		}
+		outputCandidates = append(outputCandidates, candidate)
+	}
+	if options.NodesOutput != "" {
+		candidate, err := prepareOutputCandidate(options.NodesOutput, nodes)
+		if err != nil {
+			cleanupOutputCandidates(outputCandidates)
+			return SyncReport{}, fmt.Errorf("write nodes: %w", err)
 		}
 		outputCandidates = append(outputCandidates, candidate)
 	}
@@ -292,6 +333,10 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 // that generation. Fresh responses and any output or binding difference keep
 // the normal publication path.
 func generationMatchesCurrent(state generationRootState, routes, groups []byte, snapshots []ProviderSnapshot) (bool, error) {
+	return generationMatchesCurrentWithNodes(state, routes, nil, groups, snapshots, nil)
+}
+
+func generationMatchesCurrentWithNodes(state generationRootState, routes, nodes, groups []byte, snapshots []ProviderSnapshot, mihomo *generationMihomoMetadata) (bool, error) {
 	if state.previousID == "" {
 		return false, nil
 	}
@@ -306,6 +351,13 @@ func generationMatchesCurrent(state generationRootState, routes, groups []byte, 
 		return false, err
 	}
 	if metadata.RoutesSHA256 != digest(routes) || metadata.GroupsSHA256 != digest(groups) || len(metadata.Providers) != len(snapshots) {
+		return false, nil
+	}
+	if nodes != nil {
+		if metadata.NodesSHA256 != digest(nodes) || mihomo == nil || metadata.Mihomo == nil || metadata.Mihomo.InputSHA256 != mihomo.InputSHA256 {
+			return false, nil
+		}
+	} else if metadata.NodesSHA256 != "" {
 		return false, nil
 	}
 	for _, snapshot := range snapshots {
@@ -769,8 +821,17 @@ type generationMetadata struct {
 	PreviousGeneration string                               `json:"previous_generation,omitempty"`
 	RoutesSHA256       string                               `json:"routes_sha256"`
 	GroupsSHA256       string                               `json:"groups_sha256"`
+	NodesSHA256        string                               `json:"nodes_sha256,omitempty"`
 	Providers          map[string]generationProviderBinding `json:"providers"`
 	DATs               map[string]generationDATBinding      `json:"dats,omitempty"`
+	Mihomo             *generationMihomoMetadata            `json:"mihomo,omitempty"`
+}
+
+type generationMihomoMetadata struct {
+	InputSHA256  string            `json:"input_sha256"`
+	NodeNameMap  map[string]string `json:"node_name_map"`
+	GroupNameMap map[string]string `json:"group_name_map"`
+	NodeTypes    map[string]string `json:"node_types"`
 }
 
 type generationProviderBinding struct {
@@ -902,6 +963,10 @@ func beginGenerationPublication(root string, routes, groups []byte) (*generation
 }
 
 func beginGenerationPublicationAt(state generationRootState, routes, groups []byte, snapshots []ProviderSnapshot, datSpecs ...generationDATSpec) (*generationPublication, error) {
+	return beginGenerationPublicationAtWithNodes(state, routes, nil, groups, snapshots, nil, datSpecs...)
+}
+
+func beginGenerationPublicationAtWithNodes(state generationRootState, routes, nodes, groups []byte, snapshots []ProviderSnapshot, mihomo *generationMihomoMetadata, datSpecs ...generationDATSpec) (*generationPublication, error) {
 	candidateDir, err := os.MkdirTemp(state.generations, "generation-")
 	if err != nil {
 		return nil, fmt.Errorf("create generation candidate: %w", err)
@@ -914,7 +979,10 @@ func beginGenerationPublicationAt(state generationRootState, routes, groups []by
 	}()
 
 	generationID := filepath.Base(candidateDir)
-	metadata := generationMetadata{SchemaVersion: 2, Generation: generationID, PreviousGeneration: state.previousID, RoutesSHA256: digest(routes), GroupsSHA256: digest(groups), Providers: make(map[string]generationProviderBinding, len(snapshots))}
+	metadata := generationMetadata{SchemaVersion: 2, Generation: generationID, PreviousGeneration: state.previousID, RoutesSHA256: digest(routes), GroupsSHA256: digest(groups), Providers: make(map[string]generationProviderBinding, len(snapshots)), Mihomo: mihomo}
+	if nodes != nil {
+		metadata.NodesSHA256 = digest(nodes)
+	}
 	if err := writeGenerationProviderSnapshots(candidateDir, snapshots, metadata.Providers); err != nil {
 		return nil, err
 	}
@@ -933,15 +1001,29 @@ func beginGenerationPublicationAt(state generationRootState, routes, groups []by
 		body []byte
 	}{
 		{name: "routes.dae", body: routes},
-		{name: "groups.dae", body: groups},
-		{name: "metadata.json", body: metadataBody},
 	}
+	if nodes != nil {
+		files = append(files, struct {
+			name string
+			body []byte
+		}{name: "nodes.dae", body: nodes})
+	}
+	files = append(files,
+		struct {
+			name string
+			body []byte
+		}{name: "groups.dae", body: groups},
+		struct {
+			name string
+			body []byte
+		}{name: "metadata.json", body: metadataBody},
+	)
 	for _, file := range files {
 		if err := writeFileSync(filepath.Join(candidateDir, file.name), file.body, 0o600); err != nil {
 			return nil, fmt.Errorf("write generation %s: %w", file.name, err)
 		}
 	}
-	if err := validateGenerationCandidate(candidateDir, generationID, routes, groups); err != nil {
+	if err := validateGenerationCandidateWithNodes(candidateDir, generationID, routes, nodes, groups); err != nil {
 		return nil, err
 	}
 	if err := syncDirectory(candidateDir); err != nil {
@@ -1375,12 +1457,30 @@ func validateStoredGeneration(candidateDir, generationID string) error {
 	if err != nil {
 		return err
 	}
+	var nodes []byte
+	if metadata.NodesSHA256 != "" {
+		nodes, err = readRegular("nodes.dae")
+		if err != nil {
+			return err
+		}
+		if metadata.NodesSHA256 != digest(nodes) || metadata.Mihomo == nil {
+			return errors.New("generation node metadata does not match contents")
+		}
+		if err := validateGenerationMihomoMetadata(metadata.Mihomo); err != nil {
+			return err
+		}
+	}
 	if metadata.RoutesSHA256 != digest(routes) || metadata.GroupsSHA256 != digest(groups) {
 		return errors.New("generation metadata does not match contents")
 	}
 	providers, err := readGenerationProviders(candidateDir, metadata)
 	if err != nil {
 		return err
+	}
+	if nodes != nil {
+		if err := validateGeneratedMihomoConfig(nodes, groups, routes); err != nil {
+			return err
+		}
 	}
 	rules, err := generationRoutingRules(routes, groups)
 	if err != nil {
@@ -1414,6 +1514,59 @@ func generationRoutingRules(routes, groups []byte) ([]*config_parser.RoutingRule
 		return rules, nil
 	}
 	return nil, errors.New("generation routing section is missing")
+}
+
+func validateGeneratedMihomoConfig(nodes, groups, routes []byte) error {
+	sections, err := config_parser.Parse("global {}\n" + string(nodes) + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	if err != nil {
+		return err
+	}
+	conf, err := config.New(sections)
+	if err != nil {
+		return err
+	}
+	nodeNames := make(map[string]struct{}, len(conf.Node))
+	for _, rawNode := range conf.Node {
+		name, _, keyed := strings.Cut(string(rawNode), ":")
+		if !keyed || name == "" {
+			return errors.New("generated Mihomo nodes contain an unkeyed node")
+		}
+		nodeNames[name] = struct{}{}
+	}
+	groupNames := make(map[string]struct{}, len(conf.Group))
+	for _, group := range conf.Group {
+		groupNames[group.Name] = struct{}{}
+	}
+	for _, group := range conf.Group {
+		for _, filter := range group.Filter {
+			for _, function := range filter {
+				if function == nil {
+					continue
+				}
+				switch function.Name {
+				case "name":
+					for _, param := range function.Params {
+						if param.Key != "" {
+							continue
+						}
+						if _, ok := nodeNames[param.Val]; !ok {
+							return fmt.Errorf("group %q references missing generated dae node", group.Name)
+						}
+					}
+				case "group":
+					for _, param := range function.Params {
+						if param.Key != "" || param.Val == "direct" || param.Val == "block" {
+							continue
+						}
+						if _, ok := groupNames[param.Val]; !ok {
+							return fmt.Errorf("group %q references missing generated dae group", group.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func readGenerationMetadata(candidateDir, generationID string) (generationMetadata, error) {
@@ -1812,6 +1965,10 @@ func generationIPParamsMatch(params []*config_parser.Param, expected map[string]
 }
 
 func validateGenerationCandidate(candidateDir, generationID string, routes, groups []byte) error {
+	return validateGenerationCandidateWithNodes(candidateDir, generationID, routes, nil, groups)
+}
+
+func validateGenerationCandidateWithNodes(candidateDir, generationID string, routes, nodes, groups []byte) error {
 	readRegular := func(name string) ([]byte, error) {
 		path := filepath.Join(candidateDir, name)
 		info, err := os.Lstat(path)
@@ -1842,6 +1999,15 @@ func validateGenerationCandidate(candidateDir, generationID string, routes, grou
 	if digest(groupsBody) != digest(groups) {
 		return fmt.Errorf("generation groups checksum mismatch")
 	}
+	if nodes != nil {
+		nodesBody, err := readRegular("nodes.dae")
+		if err != nil {
+			return err
+		}
+		if digest(nodesBody) != digest(nodes) {
+			return fmt.Errorf("generation nodes checksum mismatch")
+		}
+	}
 	metadataBody, err := readRegular("metadata.json")
 	if err != nil {
 		return err
@@ -1859,6 +2025,14 @@ func validateGenerationCandidate(candidateDir, generationID string, routes, grou
 	if metadata.GroupsSHA256 != digest(groupsBody) {
 		return fmt.Errorf("generation metadata groups checksum mismatch")
 	}
+	if nodes != nil {
+		if metadata.NodesSHA256 != digest(nodes) || metadata.Mihomo == nil {
+			return fmt.Errorf("generation metadata nodes checksum mismatch")
+		}
+		if err := validateGenerationMihomoMetadata(metadata.Mihomo); err != nil {
+			return err
+		}
+	}
 	if metadata.SchemaVersion != 2 || metadata.Providers == nil {
 		return fmt.Errorf("generation metadata is incomplete")
 	}
@@ -1866,7 +2040,13 @@ func validateGenerationCandidate(candidateDir, generationID string, routes, grou
 	if err != nil {
 		return fmt.Errorf("validate generation provider snapshots: %w", err)
 	}
-	rules, err := generationRoutingRules(routesBody, groupsBody)
+	var rules []*config_parser.RoutingRule
+	if nodes != nil {
+		if err := validateGeneratedMihomoConfig(nodes, groupsBody, routesBody); err != nil {
+			return fmt.Errorf("parse generation node config: %w", err)
+		}
+	}
+	rules, err = generationRoutingRules(routesBody, groupsBody)
 	if err != nil {
 		return fmt.Errorf("parse generation DAE config: %w", err)
 	}

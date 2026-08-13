@@ -139,6 +139,9 @@ func runnerWriteGenerationGroupsInput(t *testing.T, path, member string) {
 	groups := fmt.Sprintf(`proxies:
   - name: %s
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1071,6 +1074,9 @@ routes:
 		mihomo := fmt.Sprintf(`proxies:
   - name: %s
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1360,6 +1366,9 @@ routes:
 	groups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1399,6 +1408,9 @@ func TestRunSyncRetainsLatestTwoGenerations(t *testing.T) {
 	groups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1468,6 +1480,9 @@ routes:
 	validGroups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1586,6 +1601,9 @@ func TestRunSyncWritesFlatGroupsAndPreservesDirectMembers(t *testing.T) {
 	mihomo := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -1689,6 +1707,9 @@ routes:
 	groups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -2129,6 +2150,9 @@ routes:
 	groups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -2315,6 +2339,9 @@ routes:
 	mihomo := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -2386,6 +2413,9 @@ routes:
 	validGroups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select
@@ -3564,6 +3594,9 @@ func writeGenerationGroupsInput(t *testing.T, path string) {
 	groups := `proxies:
   - name: hk-1
     type: anytls
+    server: 127.0.0.1
+    port: 443
+    password: test-password
 proxy-groups:
   - name: Proxy
     type: select

@@ -23,12 +23,13 @@ func TestParseCLIArgsReadsOutputsAndStrictMode(t *testing.T) {
 		"-routes-output", "routes.dae",
 		"-mihomo-config", "mihomo.yaml",
 		"-groups-output", "groups.dae",
+		"-nodes-output", "nodes.dae",
 		"-strict",
 	})
 	if err != nil {
 		t.Fatalf("ParseCLIArgs() error = %v", err)
 	}
-	if options.ManifestPath != "manifest.yaml" || options.CacheDir != "cache" || options.RoutesOutput != "routes.dae" || options.GroupsInputPath != "mihomo.yaml" || options.GroupsOutput != "groups.dae" || !options.Strict {
+	if options.ManifestPath != "manifest.yaml" || options.CacheDir != "cache" || options.RoutesOutput != "routes.dae" || options.GroupsInputPath != "mihomo.yaml" || options.GroupsOutput != "groups.dae" || options.NodesOutput != "nodes.dae" || !options.Strict {
 		t.Fatalf("options = %#v", options)
 	}
 }
