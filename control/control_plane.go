@@ -710,6 +710,8 @@ func newControlPlaneWithContextOptions(
 	}
 	baseOutboundCount := len(outbounds)
 	builtGroups := make(map[string]*outbound.DialerGroup, len(groupPlans))
+	groupSelectionStore := groupSelectionStoreFromContext(ctx)
+	groupSelectionMembers := make(map[string][]string)
 	for _, planIndex := range groupBuildOrder {
 		plan := groupPlans[planIndex]
 		group := plan.group
@@ -730,11 +732,13 @@ func newControlPlaneWithContextOptions(
 			}
 
 			members := make([]outbound.NestedDialerGroupMember, 0)
+			memberIdentities := make([]string, 0)
 			seenDirectDialers := make(map[*dialer.Dialer]struct{})
 			for filterIndex := range group.Filter {
 				if childName, nested := plan.references[filterIndex]; nested {
 					if builtinIndex, builtin := builtinOutboundGroup(childName); builtin {
 						members = append(members, outbound.NestedDialerGroupMember{Group: outbounds[int(builtinIndex)]})
+						memberIdentities = append(memberIdentities, childName)
 						continue
 					}
 					child := builtGroups[childName]
@@ -742,6 +746,7 @@ func newControlPlaneWithContextOptions(
 						return nil, fmt.Errorf("nested group %q was not built before parent %q", childName, group.Name)
 					}
 					members = append(members, outbound.NestedDialerGroupMember{Group: child})
+					memberIdentities = append(memberIdentities, childName)
 					continue
 				}
 				dialers, annos, err := dialerSet.FilterAndAnnotate(
@@ -757,16 +762,23 @@ func newControlPlaneWithContextOptions(
 					}
 					seenDirectDialers[d] = struct{}{}
 					members = append(members, outbound.NestedDialerGroupMember{Dialer: d, Annotation: annos[i]})
+					if d.Property() != nil {
+						memberIdentities = append(memberIdentities, d.Property().Name)
+					}
 				}
 			}
 			if log.IsLevelEnabled(logrus.DebugLevel) {
 				log.Debugf(`Nested group "%v" has %d ordered members.`, group.Name, len(members))
 			}
+			applyPersistedGroupSelection(groupSelectionStore, group, policy, memberIdentities, log)
 			dialerGroup, err := outbound.NewNestedDialerGroup(option, group.Name, members, *policy, callback)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create nested group %q: %w", group.Name, err)
 			}
 			builtGroups[group.Name] = dialerGroup
+			if len(group.SelectionMembers) > 0 {
+				groupSelectionMembers[group.Name] = append([]string(nil), memberIdentities...)
+			}
 			continue
 		}
 
@@ -798,7 +810,17 @@ func newControlPlaneWithContextOptions(
 			dialers = newDialers
 			finalOption = groupOption
 		}
+		memberIdentities := make([]string, 0, len(dialers))
+		for _, d := range dialers {
+			if d != nil && d.Property() != nil {
+				memberIdentities = append(memberIdentities, d.Property().Name)
+			}
+		}
+		applyPersistedGroupSelection(groupSelectionStore, group, policy, memberIdentities, log)
 		builtGroups[group.Name] = outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy, callback)
+		if len(group.SelectionMembers) > 0 {
+			groupSelectionMembers[group.Name] = append([]string(nil), memberIdentities...)
+		}
 	}
 	for _, plan := range groupPlans {
 		outbounds = append(outbounds, builtGroups[plan.group.Name])
@@ -944,12 +966,14 @@ func newControlPlaneWithContextOptions(
 		listenIp:      "0.0.0.0",
 		egressRuntime: egressRuntime,
 		controlPlaneGenerationState: controlPlaneGenerationState{
-			outbounds:           outbounds,
-			referencedOutbounds: referencedOutbounds,
-			dialMode:            dialMode,
-			policyIdentity:      policyIdentity,
-			routingMatcher:      routingMatcher,
-			bootstrapResolvers:  bootstrapResolvers,
+			outbounds:             outbounds,
+			referencedOutbounds:   referencedOutbounds,
+			groupSelectionStore:   groupSelectionStore,
+			groupSelectionMembers: groupSelectionMembers,
+			dialMode:              dialMode,
+			policyIdentity:        policyIdentity,
+			routingMatcher:        routingMatcher,
+			bootstrapResolvers:    bootstrapResolvers,
 		},
 		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
 		controlPlaneDatapathJanitor:   newControlPlaneDatapathJanitor(),

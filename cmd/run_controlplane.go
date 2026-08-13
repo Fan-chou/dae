@@ -28,6 +28,7 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/common/subscription"
 	"github.com/daeuniverse/dae/component/daedns"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
@@ -199,6 +200,15 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
+	if cfgFile != "" {
+		selectionStore := outbound.NewDefaultGroupSelectionStore(filepath.Dir(cfgFile))
+		if loadErr := selectionStore.Load(); loadErr != nil {
+			// Selection persistence is optional state. Damaged or inaccessible
+			// state must not prevent a safe first-member configuration startup.
+			log.WithError(loadErr).Warn("Ignoring invalid Mihomo group selection state")
+		}
+		ctx = control.WithGroupSelectionStore(ctx, selectionStore)
+	}
 	if conf.Global.SoMarkFromDae == 0 {
 		var autoSelected bool
 		conf.Global.SoMarkFromDae, autoSelected = common.ResolveSoMarkFromDae(conf.Global.SoMarkFromDae, conf.Global.SoMarkFromDaeSet)
@@ -355,6 +365,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		return nil, err
 	}
 	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
 		tag := strings.TrimSuffix(file.Name(), ".sub")
 		if _, ok := tagToNodeList[tag]; !ok {
 			err := os.Remove(filepath.Join(filepath.Dir(cfgFile), "persist.d", file.Name()))

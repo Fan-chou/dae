@@ -127,11 +127,15 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	output.WriteString("group {\n")
 	for groupIndex, group := range config.Groups {
 		members := make([]string, 0, len(group.Proxies))
+		selectionMembers := make([]string, 0, len(group.Proxies))
 		var reasons []string
 		for _, member := range group.Proxies {
 			switch member {
 			case "DIRECT", "REJECT":
 				members = append(members, member)
+				if reference, special := specialMihomoGroupReference(member); special {
+					selectionMembers = append(selectionMembers, reference)
+				}
 				hasNestedMembers[groupIndex] = true
 			default:
 				if _, nested := groups[member]; nested {
@@ -140,6 +144,7 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 						continue
 					}
 					members = append(members, member)
+					selectionMembers = append(selectionMembers, report.NameMap[member])
 					continue
 				}
 				if _, node := proxies[member]; !node {
@@ -157,6 +162,7 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 					return "", GroupConversionReport{}, fmt.Errorf("group %q member %q: %w", group.Name, mappedMember, err)
 				}
 				members = append(members, mappedMember)
+				selectionMembers = append(selectionMembers, mappedMember)
 			}
 		}
 		if len(group.Use) > 0 {
@@ -185,6 +191,9 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 			report.Approximated++
 		}
 		fmt.Fprintf(&output, "    %s {\n", report.NameMap[group.Name])
+		if strings.EqualFold(group.Type, "select") && allSafeSelectionIdentities(selectionMembers) {
+			fmt.Fprintf(&output, "        selection_members: %s\n", daeQuote(strings.Join(selectionMembers, ",")))
+		}
 		if !hasNestedMembers[groupIndex] {
 			fmt.Fprintf(&output, "        filter: name(")
 			for i, member := range members {
@@ -212,6 +221,22 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	}
 	output.WriteString("}\n")
 	return output.String(), report, nil
+}
+
+// allSafeSelectionIdentities keeps the sideband metadata parseable without
+// allowing arbitrary Mihomo names to become a second config-language parser.
+// Full node conversion always maps names into this form; the legacy
+// groups-only output omits metadata when an original name is not safe.
+func allSafeSelectionIdentities(members []string) bool {
+	if len(members) == 0 {
+		return false
+	}
+	for _, member := range members {
+		if !mihomoNodeIdentifierPattern.MatchString(member) && !daeIdentifierPattern.MatchString(member) {
+			return false
+		}
+	}
+	return true
 }
 
 // convertibleMihomoGroups is a deterministic post-order availability pass for

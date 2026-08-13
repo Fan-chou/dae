@@ -121,6 +121,20 @@ func TestGenerateFlatDaeGroupsUsesDeterministicSafeNames(t *testing.T) {
 	}
 }
 
+func TestGenerateFlatDaeGroupsPreservesSelectMemberIdentities(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "hk-1"}, {Name: "us-1"}},
+		Groups:  []MihomoGroup{{Name: "Proxy", Type: "select", Proxies: []string{"hk-1", "us-1", "DIRECT"}}},
+	}
+	output, _, err := GenerateFlatDaeGroups(config)
+	if err != nil {
+		t.Fatalf("GenerateFlatDaeGroups() error = %v", err)
+	}
+	if !strings.Contains(output, `selection_members: 'hk-1,us-1,direct'`) {
+		t.Fatalf("output = %q, want stable select member identities", output)
+	}
+}
+
 func TestGenerateFlatDaeGroupsRejectsUnknownMember(t *testing.T) {
 	config := MihomoConfig{Groups: []MihomoGroup{{Name: "Proxy", Type: "select", Proxies: []string{"missing"}}}}
 	if _, _, err := GenerateFlatDaeGroups(config); err == nil {

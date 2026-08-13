@@ -306,7 +306,7 @@ proxy-groups:
 	if !strings.Contains(string(nodes), report.Nodes.NameMap["普通/节点"]+":") || !strings.Contains(string(nodes), "ss-node:") || !strings.Contains(string(nodes), "socks-node:") {
 		t.Fatalf("nodes.dae = %q, want all generated node names", nodes)
 	}
-	if !strings.Contains(string(groupsOutput), "filter: name('"+report.Nodes.NameMap["普通/节点"]+"')") || strings.Contains(string(groupsOutput), "普通/节点") {
+	if !strings.Contains(string(groupsOutput), "filter: name('"+report.Nodes.NameMap["普通/节点"]+"')") || !strings.Contains(string(groupsOutput), "selection_members:") || strings.Contains(string(groupsOutput), "普通/节点") {
 		t.Fatalf("groups.dae = %q, want mapped node member without raw Unicode name", groupsOutput)
 	}
 	if strings.Contains(string(metadata), "metadata-secret") || strings.Contains(string(metadata), "ss-secret") || strings.Contains(string(metadata), "socks-secret") {

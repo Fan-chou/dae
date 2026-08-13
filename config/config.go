@@ -126,6 +126,10 @@ type Group struct {
 	Filter           [][]*config_parser.Function `mapstructure:"filter" repeatable:""`
 	FilterAnnotation [][]*config_parser.Param    `mapstructure:"_"`
 	Policy           FunctionListOrString        `mapstructure:"policy" required:""`
+	// SelectionMembers is emitted by the Mihomo converter for select groups.
+	// It is metadata, not a replacement for the ordinary fixed(index) policy;
+	// native dae groups leave it empty and retain their historical semantics.
+	SelectionMembers []string `mapstructure:"selection_members"`
 
 	TcpCheckUrl        []string      `mapstructure:"tcp_check_url"`
 	TcpCheckHttpMethod string        `mapstructure:"tcp_check_http_method"`

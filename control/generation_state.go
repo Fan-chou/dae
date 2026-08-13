@@ -14,10 +14,12 @@ import (
 )
 
 type controlPlaneGenerationState struct {
-	outbounds           []*outbound.DialerGroup
-	referencedOutbounds map[string]struct{}
-	dialMode            consts.DialMode
-	policyIdentity      routing.PolicyIdentity
-	routingMatcher      *RoutingMatcher
-	bootstrapResolvers  []netip.AddrPort
+	outbounds             []*outbound.DialerGroup
+	referencedOutbounds   map[string]struct{}
+	groupSelectionStore   *outbound.GroupSelectionStore
+	groupSelectionMembers map[string][]string
+	dialMode              consts.DialMode
+	policyIdentity        routing.PolicyIdentity
+	routingMatcher        *RoutingMatcher
+	bootstrapResolvers    []netip.AddrPort
 }
