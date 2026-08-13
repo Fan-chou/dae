@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
@@ -210,6 +211,13 @@ func (l *MihomoRuleLowerer) lowerExpression(expr MihomoExpr, negated bool, sourc
 			Params: []*config_parser.Param{{Val: safeName}},
 		}}}, nil
 
+	case MihomoExprProviderData:
+		function, err := lowerMihomoProviderData(expr.ProviderDataRef, negated, source)
+		if err != nil {
+			return nil, err
+		}
+		return []mihomoLoweredTerm{{function}}, nil
+
 	case MihomoExprSubRule:
 		return nil, mihomoLoweringError(source, "SUB-RULE expression is unsupported; graph compiler must lower it")
 
@@ -376,6 +384,124 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 	return &config_parser.Function{Name: functionName, Not: negated, Params: params}, nil
 }
 
+func lowerMihomoProviderData(ref *MihomoProviderDataRef, negated bool, source MihomoRuleSource) (*config_parser.Function, error) {
+	if err := validateMihomoProviderDataRef(ref, source); err != nil {
+		return nil, err
+	}
+
+	providerCode := strings.TrimSpace(ref.ProviderCode)
+	if ref.UseDAT {
+		return &config_parser.Function{
+			Name: map[MihomoProviderDataKind]string{
+				MihomoProviderDataDomain: "domain",
+				MihomoProviderDataIPCIDR: "ip",
+			}[ref.Kind],
+			Not:    negated,
+			Params: []*config_parser.Param{{Key: "ext", Val: strings.TrimSpace(ref.DATRelativePath) + ":" + providerCode}},
+		}, nil
+	}
+
+	if ref.Kind == MihomoProviderDataDomain {
+		params := make([]*config_parser.Param, 0, len(ref.Domains))
+		for _, rule := range ref.Domains {
+			key := string(rule.Kind)
+			params = append(params, &config_parser.Param{Key: key, Val: rule.Value})
+		}
+		return &config_parser.Function{Name: "domain", Not: negated, Params: params}, nil
+	}
+
+	params := make([]*config_parser.Param, 0, len(ref.Prefixes))
+	for _, prefix := range ref.Prefixes {
+		params = append(params, &config_parser.Param{Val: prefix.String()})
+	}
+	return &config_parser.Function{Name: "ip", Not: negated, Params: params}, nil
+}
+
+func validateMihomoProviderDataRef(ref *MihomoProviderDataRef, source MihomoRuleSource) error {
+	if ref == nil {
+		return mihomoLoweringError(source, "provider-data expression has no provider data")
+	}
+	if !providerNamePattern.MatchString(ref.ProviderCode) {
+		return mihomoLoweringError(source, fmt.Sprintf("provider-data provider code %q is not a safe identifier", ref.ProviderCode))
+	}
+
+	validateDATPath := func(directory string) error {
+		path := ref.DATRelativePath
+		if strings.IndexFunc(path, unicode.IsControl) >= 0 {
+			return mihomoLoweringError(source, "provider-data DAT binding path contains a control character")
+		}
+		if strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
+			return mihomoLoweringError(source, "provider-data DAT binding path must be relative")
+		}
+		for _, component := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+			if component == ".." {
+				return mihomoLoweringError(source, "provider-data DAT binding path must not contain a parent component")
+			}
+		}
+		expected := directory + ref.ProviderCode + ".dat"
+		if path != expected {
+			return mihomoLoweringError(source, fmt.Sprintf("provider-data DAT binding path %q does not match %q", path, expected))
+		}
+		return nil
+	}
+
+	if ref.UseDAT {
+		if strings.TrimSpace(ref.DATRelativePath) == "" {
+			return mihomoLoweringError(source, "provider-data DAT binding has an empty relative path")
+		}
+		if len(ref.Domains) != 0 || len(ref.Prefixes) != 0 {
+			return mihomoLoweringError(source, "provider-data DAT binding must not include inline data")
+		}
+	} else if strings.TrimSpace(ref.DATRelativePath) != "" {
+		return mihomoLoweringError(source, "inline provider-data must not include a DAT path")
+	}
+
+	switch ref.Kind {
+	case MihomoProviderDataDomain:
+		if ref.UseDAT {
+			if err := validateDATPath("generated/geosite/"); err != nil {
+				return err
+			}
+		}
+		if len(ref.Prefixes) != 0 {
+			return mihomoLoweringError(source, "domain provider-data contains ipcidr data")
+		}
+		if !ref.UseDAT && len(ref.Domains) == 0 {
+			return mihomoLoweringError(source, "domain provider-data has no inline rules")
+		}
+		for _, rule := range ref.Domains {
+			if strings.TrimSpace(rule.Value) == "" {
+				return mihomoLoweringError(source, "domain provider-data contains an empty inline value")
+			}
+			switch rule.Kind {
+			case DomainFull, DomainSuffix, DomainKeyword, DomainRegex:
+			default:
+				return mihomoLoweringError(source, fmt.Sprintf("domain provider-data has unsupported rule kind %q", rule.Kind))
+			}
+		}
+	case MihomoProviderDataIPCIDR:
+		if ref.UseDAT {
+			if err := validateDATPath("generated/geoip/"); err != nil {
+				return err
+			}
+		}
+		if len(ref.Domains) != 0 {
+			return mihomoLoweringError(source, "ipcidr provider-data contains domain data")
+		}
+		if !ref.UseDAT && len(ref.Prefixes) == 0 {
+			return mihomoLoweringError(source, "ipcidr provider-data has no inline rules")
+		}
+		for _, prefix := range ref.Prefixes {
+			if !prefix.IsValid() {
+				return mihomoLoweringError(source, "ipcidr provider-data contains an invalid inline prefix")
+			}
+		}
+	default:
+		return mihomoLoweringError(source, fmt.Sprintf("provider-data has unsupported kind %q", ref.Kind))
+	}
+	return nil
+}
+
 func (l *MihomoRuleLowerer) lowerAction(action MihomoAction, source MihomoRuleSource) (*config_parser.Function, error) {
 	target := strings.TrimSpace(action.Target)
 	if target == "" || strings.EqualFold(target, "MATCH") {
@@ -443,6 +569,14 @@ func (l *MihomoRuleLowerer) validateNoResolve(expr MihomoExpr, source MihomoRule
 		}
 		if !ok || !strings.EqualFold(strings.TrimSpace(behavior), "ipcidr") {
 			return mihomoLoweringError(source, fmt.Sprintf("no-resolve RULE-SET provider %q is not known to have ipcidr behavior", provider))
+		}
+		return nil
+	case MihomoExprProviderData:
+		if err := validateMihomoProviderDataRef(expr.ProviderDataRef, source); err != nil {
+			return err
+		}
+		if expr.ProviderDataRef.Kind != MihomoProviderDataIPCIDR {
+			return mihomoLoweringError(source, fmt.Sprintf("no-resolve is only equivalent for ipcidr provider-data, not %q", expr.ProviderDataRef.Kind))
 		}
 		return nil
 	case MihomoExprSubRule:
