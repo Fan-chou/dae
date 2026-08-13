@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -26,5 +30,29 @@ func TestParseCLIArgsReadsOutputsAndStrictMode(t *testing.T) {
 	}
 	if options.ManifestPath != "manifest.yaml" || options.CacheDir != "cache" || options.RoutesOutput != "routes.dae" || options.GroupsInputPath != "mihomo.yaml" || options.GroupsOutput != "groups.dae" || !options.Strict {
 		t.Fatalf("options = %#v", options)
+	}
+}
+
+func TestCLIHelpDocumentsPublicationSemantics(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller() failed")
+	}
+	cmd := exec.Command("go", "run", ".", "-h")
+	cmd.Dir = filepath.Dir(filename)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go run . -h error = %v; output = %q", err, output.String())
+	}
+
+	help := strings.ToLower(output.String())
+	hasAtomicGeneration := strings.Contains(help, "generation") && strings.Contains(help, "atomic")
+	hasDirectCompatibility := strings.Contains(help, "routes") &&
+		strings.Contains(help, "groups") &&
+		(strings.Contains(help, "compatib") || strings.Contains(help, "non-atomic"))
+	if !hasAtomicGeneration || !hasDirectCompatibility {
+		t.Fatalf("CLI help = %q, want atomic generation semantics and compatibility/non-atomic routes/groups direct-output wording", output.String())
 	}
 }

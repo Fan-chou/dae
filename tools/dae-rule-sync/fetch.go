@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,6 +29,8 @@ type ProviderSnapshot struct {
 	SourceKey    string
 	SHA256       string
 	UpdatedAt    time.Time
+	Behavior     string
+	Format       string
 }
 
 type FetchResult struct {
@@ -43,8 +47,12 @@ type ProviderFetcher struct {
 	ValidateURL  func(string) error
 	ValidateBody func(ProviderSpec, []byte) error
 	AllowPrivate bool
-	flightMu     sync.Mutex
-	flights      map[string]*providerFlight
+	// DeferCacheCommit lets a caller validate and publish a complete output
+	// generation before making a fetched snapshot the provider's last-good.
+	DeferCacheCommit bool
+	flightMu         sync.Mutex
+	flights          map[string]*providerFlight
+	cacheMu          sync.Mutex
 }
 
 type providerFlight struct {
@@ -73,62 +81,211 @@ func (f *ProviderFetcher) Fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 	if f == nil {
 		return FetchResult{}, errors.New("nil provider fetcher")
 	}
-	key := spec.Name + "\x00" + spec.URL
+	return f.fetchFlight(ctx, "cache\x00"+spec.Name+"\x00"+spec.URL, func() (FetchResult, error) {
+		return f.fetch(ctx, spec)
+	})
+}
+
+func (f *ProviderFetcher) fetchFlight(ctx context.Context, key string, fetch func() (FetchResult, error)) (FetchResult, error) {
 	f.flightMu.Lock()
 	if f.flights == nil {
 		f.flights = make(map[string]*providerFlight)
 	}
 	if existing, ok := f.flights[key]; ok {
 		f.flightMu.Unlock()
-		select {
-		case <-existing.done:
-			return cloneFetchResult(existing.result), existing.err
-		case <-ctx.Done():
-			return FetchResult{}, ctx.Err()
-		}
+		return waitProviderFlight(ctx, existing)
 	}
 	flight := &providerFlight{done: make(chan struct{})}
 	f.flights[key] = flight
 	f.flightMu.Unlock()
 
-	result, err := f.fetch(ctx, spec)
-	f.flightMu.Lock()
-	flight.result = cloneFetchResult(result)
-	flight.err = err
-	close(flight.done)
-	delete(f.flights, key)
-	f.flightMu.Unlock()
-	return result, err
+	go func() {
+		result, err := fetch()
+		f.flightMu.Lock()
+		flight.result = cloneFetchResult(result)
+		flight.err = err
+		close(flight.done)
+		delete(f.flights, key)
+		f.flightMu.Unlock()
+	}()
+	return waitProviderFlight(ctx, flight)
+}
+
+func waitProviderFlight(ctx context.Context, flight *providerFlight) (FetchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, err
+	}
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		return FetchResult{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, err
+	}
+	return cloneFetchResult(flight.result), flight.err
 }
 
 func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchResult, error) {
+	if err := f.validateHTTPSpec(spec); err != nil {
+		return FetchResult{}, err
+	}
+	if f.CacheDir == "" {
+		return FetchResult{}, errors.New("cache directory is empty")
+	}
+	cached, cacheErr := f.readCache(spec.Name, spec.EffectiveMaxSize(), spec.URL)
+	return f.fetchRemote(ctx, spec, cached, cacheErr, true, f.ValidateBody, func(warning error) (FetchResult, error) {
+		return f.staleResult(cached, cacheErr, warning)
+	})
+}
+
+// FetchWithFallback fetches a provider without consulting or publishing the
+// standalone provider cache. The supplied snapshot is the caller's pinned
+// last-good value (the generation-local snapshot in generation mode).
+func (f *ProviderFetcher) FetchWithFallback(ctx context.Context, spec ProviderSpec, fallback ProviderSnapshot) (FetchResult, error) {
+	return f.fetchWithFallback(ctx, spec, fallback, f.ValidateBody)
+}
+
+// FetchWithFallbackValidated is FetchWithFallback with a caller-supplied
+// acceptance check for both a fresh response and its generation-local
+// fallback. Concurrent callers share only the HTTP response; each caller
+// applies its own acceptance check and fallback afterwards.
+func (f *ProviderFetcher) FetchWithFallbackValidated(ctx context.Context, spec ProviderSpec, fallback ProviderSnapshot, validateBody func(ProviderSpec, []byte) error) (FetchResult, error) {
 	if f == nil {
 		return FetchResult{}, errors.New("nil provider fetcher")
 	}
+	if f.ValidateBody != nil && validateBody != nil {
+		baseValidate := f.ValidateBody
+		semanticValidate := validateBody
+		validateBody = func(spec ProviderSpec, body []byte) error {
+			if err := baseValidate(spec, body); err != nil {
+				return err
+			}
+			return semanticValidate(spec, body)
+		}
+	} else if validateBody == nil {
+		validateBody = f.ValidateBody
+	}
+	return f.fetchWithFallback(ctx, spec, fallback, validateBody)
+}
+
+func (f *ProviderFetcher) fetchWithFallback(ctx context.Context, spec ProviderSpec, fallback ProviderSnapshot, validateBody func(ProviderSpec, []byte) error) (FetchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, err
+	}
+	if err := f.validateHTTPSpec(spec); err != nil {
+		return FetchResult{}, err
+	}
+	maxSize := spec.EffectiveMaxSize()
+	fallbackErr := error(os.ErrNotExist)
+	if fallback.Name != "" {
+		if fallback.Name != spec.Name || fallback.SourceKey != digest([]byte(spec.URL)) {
+			fallbackErr = errors.New("generation provider snapshot source mismatch")
+		} else if int64(len(fallback.Body)) > maxSize {
+			fallbackErr = fmt.Errorf("generation provider snapshot exceeds max_size %d", maxSize)
+		} else if fallback.SHA256 != digest(fallback.Body) {
+			fallbackErr = errors.New("generation provider snapshot checksum mismatch")
+		} else if fallback.Behavior != normalizedProviderBehavior(spec) || normalizedSnapshotFormat(fallback.Format) != normalizedProviderFormat(spec) {
+			fallbackErr = errors.New("generation provider snapshot behavior or format mismatch")
+		} else if validateBody != nil {
+			fallbackErr = validateBody(spec, fallback.Body)
+		} else {
+			fallbackErr = nil
+		}
+		if fallbackErr == nil && strings.TrimSpace(fallback.Format) == "" {
+			// Pre-default-format snapshots are semantically YAML. Persist the
+			// canonical value if this snapshot is selected again.
+			fallback.Format = normalizedProviderFormat(spec)
+		}
+	}
+	key := "generation\x00" + spec.Name + "\x00" + spec.URL
+	result, err := f.fetchFlight(ctx, key, func() (FetchResult, error) {
+		// The generation flight carries raw bytes that may be consumed by
+		// callers other than its leader. HTTP client timeouts still bound the
+		// shared request, while each caller keeps its own cancellation below.
+		flightCtx := context.WithoutCancel(ctx)
+		// A generation flight shares raw bytes, not a caller's max_size
+		// decision. Manifest validation caps every individual max_size at this
+		// global limit; each caller applies its own lower limit below.
+		sharedSpec := spec
+		sharedSpec.MaxSize = maxProviderMaxSize
+		return f.fetchRemote(flightCtx, sharedSpec, ProviderSnapshot{}, os.ErrNotExist, false, nil, func(warning error) (FetchResult, error) {
+			return FetchResult{}, redactProviderError(warning)
+		})
+	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return FetchResult{}, ctxErr
+	}
+	if err == nil && int64(len(result.Snapshot.Body)) > maxSize {
+		err = fmt.Errorf("provider response exceeds max_size %d", maxSize)
+	}
+	if err == nil && validateBody != nil {
+		if validationErr := validateBody(spec, result.Snapshot.Body); validationErr != nil {
+			err = fmt.Errorf("validate provider body: %w", validationErr)
+		}
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return FetchResult{}, ctxErr
+		}
+		return f.staleResult(fallback, fallbackErr, err)
+	}
+	result.Snapshot.Behavior = normalizedProviderBehavior(spec)
+	result.Snapshot.Format = normalizedProviderFormat(spec)
+	if fallbackErr == nil && fallback.SHA256 == result.Snapshot.SHA256 {
+		result.UsedCache = true
+		result.Updated = false
+	}
+	return result, nil
+}
+
+func normalizedProviderBehavior(spec ProviderSpec) string {
+	return strings.ToLower(strings.TrimSpace(spec.Behavior))
+}
+
+func normalizedProviderFormat(spec ProviderSpec) string {
+	return normalizedSnapshotFormat(spec.Format)
+}
+
+func normalizedSnapshotFormat(format string) string {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		return "yaml"
+	}
+	return format
+}
+
+func (f *ProviderFetcher) validateHTTPSpec(spec ProviderSpec) error {
+	if f == nil {
+		return errors.New("nil provider fetcher")
+	}
 	if spec.Name == "" {
-		return FetchResult{}, errors.New("provider name is empty")
+		return errors.New("provider name is empty")
 	}
 	if !providerNamePattern.MatchString(spec.Name) {
-		return FetchResult{}, fmt.Errorf("provider name %q is not a safe identifier", spec.Name)
+		return fmt.Errorf("provider name %q is not a safe identifier", spec.Name)
 	}
 	if spec.Type == "" {
 		spec.Type = "http"
 	}
 	if spec.Type != "http" {
-		return FetchResult{}, fmt.Errorf("provider %q: fetcher only supports http, got %q", spec.Name, spec.Type)
+		return fmt.Errorf("provider %q: fetcher only supports http, got %q", spec.Name, spec.Type)
 	}
 	validateURL := f.ValidateURL
 	if validateURL == nil {
 		validateURL = validateProviderURL
 	}
 	if err := validateURL(spec.URL); err != nil {
-		return FetchResult{}, fmt.Errorf("provider %q: %w", spec.Name, redactProviderError(err))
+		return fmt.Errorf("provider %q: %w", spec.Name, redactProviderError(err))
 	}
-	if f.CacheDir == "" {
-		return FetchResult{}, errors.New("cache directory is empty")
-	}
-	cached, cacheErr := f.readCache(spec.Name, spec.EffectiveMaxSize(), spec.URL)
+	return nil
+}
 
+func (f *ProviderFetcher) fetchRemote(ctx context.Context, spec ProviderSpec, cached ProviderSnapshot, cacheErr error, allowCacheCommit bool, validateBody func(ProviderSpec, []byte) error, stale func(error) (FetchResult, error)) (FetchResult, error) {
+	validateURL := f.ValidateURL
+	if validateURL == nil {
+		validateURL = validateProviderURL
+	}
 	baseClient := f.Client
 	if baseClient == nil {
 		baseClient = http.DefaultClient
@@ -160,33 +317,33 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return f.staleResult(cached, cacheErr, fmt.Errorf("fetch provider: %w", err))
+		return stale(fmt.Errorf("fetch provider: %w", err))
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusNotModified:
 		if cacheErr != nil {
-			return FetchResult{}, fmt.Errorf("provider returned 304 without usable cache: %w", cacheErr)
+			return stale(fmt.Errorf("provider returned 304 without usable cache: %w", cacheErr))
 		}
 		return FetchResult{Snapshot: cloneSnapshot(cached), UsedCache: true}, nil
 	case http.StatusOK:
 		// Continue below.
 	default:
-		return f.staleResult(cached, cacheErr, fmt.Errorf("provider returned HTTP %s", resp.Status))
+		return stale(fmt.Errorf("provider returned HTTP %s", resp.Status))
 	}
 
 	maxSize := spec.EffectiveMaxSize()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
 	if err != nil {
-		return f.staleResult(cached, cacheErr, fmt.Errorf("read provider: %w", err))
+		return stale(fmt.Errorf("read provider: %w", err))
 	}
 	if int64(len(body)) > maxSize {
-		return f.staleResult(cached, cacheErr, fmt.Errorf("provider response exceeds max_size %d", maxSize))
+		return stale(fmt.Errorf("provider response exceeds max_size %d", maxSize))
 	}
-	if f.ValidateBody != nil {
-		if err := f.ValidateBody(spec, body); err != nil {
-			return f.staleResult(cached, cacheErr, fmt.Errorf("validate provider body: %w", err))
+	if validateBody != nil {
+		if err := validateBody(spec, body); err != nil {
+			return stale(fmt.Errorf("validate provider body: %w", err))
 		}
 	}
 	now := f.Now
@@ -206,10 +363,29 @@ func (f *ProviderFetcher) fetch(ctx context.Context, spec ProviderSpec) (FetchRe
 	if cacheErr == nil && cached.SHA256 == snapshot.SHA256 {
 		return FetchResult{Snapshot: cloneSnapshot(snapshot), UsedCache: true}, nil
 	}
-	if err := f.writeCache(snapshot); err != nil {
-		return f.staleResult(cached, cacheErr, fmt.Errorf("write provider cache: %w", err))
+	if f.DeferCacheCommit || !allowCacheCommit {
+		return FetchResult{Snapshot: cloneSnapshot(snapshot), Updated: true}, nil
+	}
+	if err := f.CommitSnapshot(snapshot); err != nil {
+		return stale(fmt.Errorf("write provider cache: %w", err))
 	}
 	return FetchResult{Snapshot: cloneSnapshot(snapshot), Updated: true}, nil
+}
+
+func (f *ProviderFetcher) CommitSnapshot(snapshot ProviderSnapshot) error {
+	if f == nil {
+		return errors.New("nil provider fetcher")
+	}
+	batch, err := f.prepareSnapshotBatch([]ProviderSnapshot{snapshot})
+	if err != nil {
+		return err
+	}
+	defer batch.close()
+	if err := batch.publish(); err != nil {
+		return err
+	}
+	batch.finalize()
+	return nil
 }
 
 func (f *ProviderFetcher) staleResult(cached ProviderSnapshot, cacheErr error, warning error) (FetchResult, error) {
@@ -229,7 +405,11 @@ func (f *ProviderFetcher) readCache(name string, maxSize int64, sourceURL string
 		return ProviderSnapshot{}, errors.New("invalid provider cache name")
 	}
 	root := f.cacheRoot(name)
-	metaBody, err := os.ReadFile(filepath.Join(root, "current", "metadata.json"))
+	currentVersion, err := currentCacheVersion(root)
+	if err != nil {
+		return ProviderSnapshot{}, err
+	}
+	metaBody, err := os.ReadFile(filepath.Join(currentVersion, "metadata.json"))
 	if err != nil {
 		return ProviderSnapshot{}, err
 	}
@@ -240,7 +420,7 @@ func (f *ProviderFetcher) readCache(name string, maxSize int64, sourceURL string
 	if metadata.SourceKey != digest([]byte(sourceURL)) {
 		return ProviderSnapshot{}, errors.New("provider cache source URL mismatch")
 	}
-	body, err := readLimited(filepath.Join(root, "current", "body"), maxSize)
+	body, err := readLimited(filepath.Join(currentVersion, "body"), maxSize)
 	if err != nil {
 		return ProviderSnapshot{}, err
 	}
@@ -259,23 +439,162 @@ func (f *ProviderFetcher) readCache(name string, maxSize int64, sourceURL string
 	}, nil
 }
 
-func (f *ProviderFetcher) writeCache(snapshot ProviderSnapshot) error {
-	root := f.cacheRoot(snapshot.Name)
-	if err := os.MkdirAll(filepath.Join(root, "versions"), 0o700); err != nil {
-		return err
+type cacheCandidate struct {
+	snapshot   ProviderSnapshot
+	root       string
+	versions   string
+	versionDir string
+	oldTarget  string
+	hadCurrent bool
+}
+
+type cachePublication struct {
+	candidate  *cacheCandidate
+	newTarget  string
+	currentSet bool
+}
+
+type cacheBatch struct {
+	fetcher      *ProviderFetcher
+	candidates   []*cacheCandidate
+	publications []cachePublication
+	published    bool
+	finalized    bool
+}
+
+func (f *ProviderFetcher) prepareSnapshotBatch(snapshots []ProviderSnapshot) (*cacheBatch, error) {
+	if len(snapshots) == 0 {
+		return &cacheBatch{fetcher: f, finalized: true}, nil
 	}
-	tmpDir, err := os.MkdirTemp(filepath.Join(root, "versions"), ".tmp-")
+	f.cacheMu.Lock()
+	batch := &cacheBatch{fetcher: f}
+	if err := f.preflightCacheRoots(snapshots); err != nil {
+		f.cacheMu.Unlock()
+		return nil, err
+	}
+	for _, snapshot := range snapshots {
+		candidate, err := f.prepareCacheCandidate(snapshot)
+		if err != nil {
+			batch.cleanupCandidates()
+			f.cacheMu.Unlock()
+			return nil, err
+		}
+		batch.candidates = append(batch.candidates, candidate)
+	}
+	return batch, nil
+}
+
+func (f *ProviderFetcher) preflightCacheRoots(snapshots []ProviderSnapshot) error {
+	if f.CacheDir == "" {
+		return errors.New("cache directory is empty")
+	}
+	if info, err := os.Lstat(f.CacheDir); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return errors.New("cache directory is not a controlled directory")
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect cache directory: %w", err)
+	}
+	for _, snapshot := range snapshots {
+		if !providerNamePattern.MatchString(snapshot.Name) {
+			return errors.New("invalid provider cache name")
+		}
+		root := f.cacheRoot(snapshot.Name)
+		if info, err := os.Lstat(root); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("provider %q cache root is not a controlled directory", snapshot.Name)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect provider %q cache root: %w", snapshot.Name, err)
+		}
+		versions := filepath.Join(root, "versions")
+		if info, err := os.Lstat(versions); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("provider %q cache versions is not a controlled directory", snapshot.Name)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect provider %q cache versions: %w", snapshot.Name, err)
+		}
+		if _, ok, err := inspectCacheCurrent(root, versions); err != nil {
+			return fmt.Errorf("provider %q cache current: %w", snapshot.Name, err)
+		} else if ok {
+			// inspectCacheCurrent performs the path and symlink containment checks.
+		}
+	}
+	return nil
+}
+
+func inspectCacheCurrent(root, versions string) (string, bool, error) {
+	current := filepath.Join(root, "current")
+	info, err := os.Lstat(current)
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
 	if err != nil {
-		return err
+		return "", false, err
 	}
-	keep := false
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "", true, errors.New("current is not a symlink")
+	}
+	target, err := os.Readlink(current)
+	if err != nil {
+		return "", true, err
+	}
+	if filepath.IsAbs(target) || filepath.Clean(target) != target || filepath.Dir(target) != "versions" || filepath.Base(target) == "." || filepath.Base(target) == ".." {
+		return "", true, fmt.Errorf("target %q is outside versions", target)
+	}
+	resolvedVersions, err := filepath.EvalSymlinks(versions)
+	if err != nil {
+		return "", true, err
+	}
+	resolvedCurrent, err := filepath.EvalSymlinks(current)
+	if err != nil {
+		return "", true, err
+	}
+	relative, err := filepath.Rel(resolvedVersions, resolvedCurrent)
+	if err != nil || relative == "." || filepath.Dir(relative) != "." || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return "", true, errors.New("current resolves outside versions")
+	}
+	return target, true, nil
+}
+
+func currentCacheVersion(root string) (string, error) {
+	target, ok, err := inspectCacheCurrent(root, filepath.Join(root, "versions"))
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	version := filepath.Join(root, "versions", filepath.Base(target))
+	if err := validateCacheVersion(version); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+func (f *ProviderFetcher) prepareCacheCandidate(snapshot ProviderSnapshot) (*cacheCandidate, error) {
+	root := f.cacheRoot(snapshot.Name)
+	versions := filepath.Join(root, "versions")
+	if err := os.MkdirAll(versions, 0o700); err != nil {
+		return nil, err
+	}
+	oldTarget, hadCurrent, err := inspectCacheCurrent(root, versions)
+	if err != nil {
+		return nil, err
+	}
+	versionDir, err := os.MkdirTemp(versions, "version-")
+	if err != nil {
+		return nil, err
+	}
+	cleanup := true
 	defer func() {
-		if !keep {
-			_ = os.RemoveAll(tmpDir)
+		if cleanup {
+			_ = os.RemoveAll(versionDir)
 		}
 	}()
-	if err := writeFileSync(filepath.Join(tmpDir, "body"), snapshot.Body, 0o600); err != nil {
-		return err
+	if err := writeFileSync(filepath.Join(versionDir, "body"), snapshot.Body, 0o600); err != nil {
+		return nil, err
 	}
 	metadata := providerCacheMetadata{
 		ETag:         snapshot.ETag,
@@ -287,37 +606,233 @@ func (f *ProviderFetcher) writeCache(snapshot ProviderSnapshot) error {
 	}
 	metadataBody, err := json.Marshal(metadata)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := writeFileSync(filepath.Join(tmpDir, "metadata.json"), metadataBody, 0o600); err != nil {
-		return err
+	if err := writeFileSync(filepath.Join(versionDir, "metadata.json"), metadataBody, 0o600); err != nil {
+		return nil, err
 	}
-	if err := syncDirectory(tmpDir); err != nil {
-		return err
+	if err := validateCacheVersion(versionDir); err != nil {
+		return nil, err
 	}
-	currentTempFile, err := os.CreateTemp(root, ".current.tmp-*")
+	if err := syncDirectory(versionDir); err != nil {
+		return nil, err
+	}
+	cleanup = false
+	return &cacheCandidate{snapshot: snapshot, root: root, versions: versions, versionDir: versionDir, oldTarget: oldTarget, hadCurrent: hadCurrent}, nil
+}
+
+func (b *cacheBatch) publish() error {
+	if b == nil || b.finalized {
+		return nil
+	}
+	for _, candidate := range b.candidates {
+		publication := cachePublication{candidate: candidate, newTarget: filepath.Join("versions", filepath.Base(candidate.versionDir))}
+		if err := replaceCacheCurrent(candidate.root, publication.newTarget); err != nil {
+			b.rollback()
+			return err
+		}
+		publication.currentSet = true
+		b.publications = append(b.publications, publication)
+	}
+	for _, candidate := range b.candidates {
+		if err := retainCacheVersions(candidate.versions, filepath.Base(candidate.versionDir)); err != nil {
+			b.rollback()
+			return err
+		}
+	}
+	for _, candidate := range b.candidates {
+		if err := syncDirectory(candidate.root); err != nil {
+			b.rollback()
+			return err
+		}
+	}
+	b.published = true
+	return nil
+}
+
+func (b *cacheBatch) rollback() error {
+	if b == nil {
+		return nil
+	}
+	var firstErr error
+	for i := len(b.publications) - 1; i >= 0; i-- {
+		publication := b.publications[i]
+		if !publication.currentSet {
+			continue
+		}
+		candidate := publication.candidate
+		var err error
+		if candidate.hadCurrent {
+			err = replaceCacheCurrent(candidate.root, candidate.oldTarget)
+		} else {
+			err = removeCacheCurrent(candidate.root, publication.newTarget)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	b.cleanupCandidates()
+	b.publications = nil
+	b.published = false
+	return firstErr
+}
+
+func (b *cacheBatch) finalize() {
+	if b == nil {
+		return
+	}
+	b.published = true
+	b.finalized = true
+}
+
+func (b *cacheBatch) close() {
+	if b == nil {
+		return
+	}
+	if !b.finalized {
+		if !b.published {
+			b.cleanupCandidates()
+		}
+		b.finalized = true
+	}
+	if b.fetcher != nil && len(b.candidates) > 0 {
+		b.fetcher.cacheMu.Unlock()
+		b.fetcher = nil
+	}
+}
+
+func (b *cacheBatch) cleanupCandidates() {
+	for _, candidate := range b.candidates {
+		if candidate.versionDir != "" {
+			_ = os.RemoveAll(candidate.versionDir)
+		}
+	}
+}
+
+func replaceCacheCurrent(root, target string) error {
+	tmpFile, err := os.CreateTemp(root, ".current.tmp-")
 	if err != nil {
 		return err
 	}
-	currentTemp := currentTempFile.Name()
-	if err := currentTempFile.Close(); err != nil {
-		_ = os.Remove(currentTemp)
+	tmp := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Remove(currentTemp); err != nil {
+	if err := os.Remove(tmp); err != nil {
 		return err
 	}
-	if err := os.Symlink(filepath.Join("versions", filepath.Base(tmpDir)), currentTemp); err != nil {
+	if err := os.Symlink(target, tmp); err != nil {
 		return err
 	}
-	if err := os.Rename(currentTemp, filepath.Join(root, "current")); err != nil {
-		_ = os.Remove(currentTemp)
+	if err := os.Rename(tmp, filepath.Join(root, "current")); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	if err := syncDirectory(root); err != nil {
+	return nil
+}
+
+func removeCacheCurrent(root, expectedTarget string) error {
+	target, ok, err := inspectCacheCurrent(root, filepath.Join(root, "versions"))
+	if err != nil {
 		return err
 	}
-	keep = true
+	if !ok || target != expectedTarget {
+		return nil
+	}
+	return os.Remove(filepath.Join(root, "current"))
+}
+
+func validateCacheVersion(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("cache version is not a controlled directory")
+	}
+	for _, name := range []string{"body", "metadata.json"} {
+		fileInfo, err := os.Lstat(filepath.Join(path, name))
+		if err != nil {
+			return err
+		}
+		if !fileInfo.Mode().IsRegular() {
+			return fmt.Errorf("cache version %s is not a regular file", name)
+		}
+	}
+	metadataBody, err := os.ReadFile(filepath.Join(path, "metadata.json"))
+	if err != nil {
+		return err
+	}
+	var metadata providerCacheMetadata
+	if err := json.Unmarshal(metadataBody, &metadata); err != nil {
+		return err
+	}
+	if metadata.SHA256 == "" || metadata.SourceKey == "" {
+		return errors.New("cache metadata is incomplete")
+	}
+	body, err := os.ReadFile(filepath.Join(path, "body"))
+	if err != nil {
+		return err
+	}
+	if digest(body) != metadata.SHA256 {
+		return errors.New("cache version checksum mismatch")
+	}
+	return nil
+}
+
+func retainCacheVersions(versions, currentName string) error {
+	entries, err := os.ReadDir(versions)
+	if err != nil {
+		return err
+	}
+	type versionEntry struct {
+		name string
+		info os.FileInfo
+	}
+	validOld := make([]versionEntry, 0, len(entries))
+	changed := false
+	for _, entry := range entries {
+		path := filepath.Join(versions, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("cache version %q is not a controlled directory", entry.Name())
+		}
+		if entry.Name() == currentName {
+			if err := validateCacheVersion(path); err != nil {
+				return fmt.Errorf("current cache version %q: %w", entry.Name(), err)
+			}
+			continue
+		}
+		if err := validateCacheVersion(path); err != nil {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			changed = true
+			continue
+		}
+		validOld = append(validOld, versionEntry{name: entry.Name(), info: info})
+	}
+	sort.Slice(validOld, func(i, j int) bool {
+		if validOld[i].info.ModTime().Equal(validOld[j].info.ModTime()) {
+			return validOld[i].name > validOld[j].name
+		}
+		return validOld[i].info.ModTime().After(validOld[j].info.ModTime())
+	})
+	if len(validOld) > 1 {
+		for _, entry := range validOld[1:] {
+			if err := os.RemoveAll(filepath.Join(versions, entry.name)); err != nil {
+				return err
+			}
+			changed = true
+		}
+	}
+	if changed {
+		return syncDirectory(versions)
+	}
 	return nil
 }
 

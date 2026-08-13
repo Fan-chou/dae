@@ -234,13 +234,6 @@ func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict 
 		if err := validateRouteOutbound(route.Outbound); err != nil {
 			return "", report, fmt.Errorf("route for provider %q: %w", route.Provider, err)
 		}
-		if len(set.Unsupported) > 0 {
-			if strict {
-				return "", report, fmt.Errorf("provider %q contains %d unsupported rules", route.Provider, len(set.Unsupported))
-			}
-			report.Unsupported = append(report.Unsupported, set.Unsupported...)
-			report.Skipped += len(set.Unsupported)
-		}
 		kind := strings.ToLower(route.Kind)
 		if kind == "" {
 			kind = providerBehaviors[route.Provider]
@@ -254,6 +247,16 @@ func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict 
 		behavior := providerBehaviors[route.Provider]
 		if behavior != "classical" && behavior != "" && behavior != kind {
 			return "", report, fmt.Errorf("route kind %q does not match provider %q behavior %q", kind, route.Provider, behavior)
+		}
+		if (kind == "domain" && len(set.Domains) == 0) || (kind == "ipcidr" && len(set.Prefixes) == 0) {
+			return "", report, fmt.Errorf("provider %q has no convertible %s rules", route.Provider, kind)
+		}
+		if len(set.Unsupported) > 0 {
+			if strict {
+				return "", report, fmt.Errorf("provider %q contains %d unsupported rules", route.Provider, len(set.Unsupported))
+			}
+			report.Unsupported = append(report.Unsupported, set.Unsupported...)
+			report.Skipped += len(set.Unsupported)
 		}
 		switch kind {
 		case "domain":

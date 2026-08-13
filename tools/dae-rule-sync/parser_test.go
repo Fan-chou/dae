@@ -136,3 +136,26 @@ func TestGenerateDaeRoutesRejectsControlAndOutboundInjection(t *testing.T) {
 		t.Fatal("GenerateDaeRoutes() error = nil for injected values")
 	}
 }
+
+func TestGenerateDaeRoutesRejectsClassicalProviderRouteKindMismatchEvenWhenAnotherProviderGeneratesRules(t *testing.T) {
+	manifest := Manifest{
+		Providers: []ProviderSpec{
+			{Name: "classical-ip", Behavior: "classical"},
+			{Name: "domain", Behavior: "domain"},
+		},
+		Routes: []RouteSpec{
+			{Provider: "classical-ip", Outbound: "proxy", Kind: "domain"},
+			{Provider: "domain", Outbound: "direct", Kind: "domain"},
+		},
+	}
+	sets := map[string]ParsedRuleSet{
+		"classical-ip": {Prefixes: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}},
+		"domain":       {Domains: []DomainRule{{Kind: DomainSuffix, Value: "example.com"}}},
+	}
+
+	if _, _, err := GenerateDaeRoutes(manifest, sets, true); err == nil {
+		t.Fatal("GenerateDaeRoutes() error = nil for classical provider route-kind mismatch")
+	} else if !strings.Contains(err.Error(), `classical-ip`) {
+		t.Fatalf("GenerateDaeRoutes() error = %v, want classical provider diagnostic", err)
+	}
+}

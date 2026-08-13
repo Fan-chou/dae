@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,14 +10,19 @@ import (
 )
 
 func ParseCLIArgs(args []string) (SyncOptions, error) {
+	return parseCLIArgs(args, io.Discard)
+}
+
+func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	flags := flag.NewFlagSet("dae-rule-sync", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
+	flags.SetOutput(output)
 	var options SyncOptions
 	flags.StringVar(&options.ManifestPath, "manifest", "", "provider manifest path")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "provider cache directory")
-	flags.StringVar(&options.RoutesOutput, "routes-output", "", "generated dae routes path")
+	flags.StringVar(&options.RoutesOutput, "routes-output", "", "direct routes output path (compatibility mode; non-atomic publication)")
 	flags.StringVar(&options.GroupsInputPath, "mihomo-config", "", "optional Mihomo config for flat group conversion")
-	flags.StringVar(&options.GroupsOutput, "groups-output", "", "generated dae groups path")
+	flags.StringVar(&options.GroupsOutput, "groups-output", "", "direct groups output path (compatibility mode; non-atomic publication)")
+	flags.StringVar(&options.GenerationDir, "generation-dir", "", "generation output directory; atomically publishes routes, groups, and provider snapshots together")
 	flags.BoolVar(&options.Strict, "strict", false, "fail when a rule cannot be converted")
 	if err := flags.Parse(args); err != nil {
 		return SyncOptions{}, err
@@ -28,8 +34,11 @@ func ParseCLIArgs(args []string) (SyncOptions, error) {
 }
 
 func main() {
-	options, err := ParseCLIArgs(os.Args[1:])
+	options, err := parseCLIArgs(os.Args[1:], os.Stdout)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}

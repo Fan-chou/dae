@@ -131,7 +131,7 @@ func validateManifestWithURL(manifest Manifest, baseDir string, validateURL func
 		}
 		if provider.Type == "http" {
 			if err := validateURL(provider.URL); err != nil {
-				return fmt.Errorf("provider %q: %w", provider.Name, err)
+				return fmt.Errorf("provider %q: %w", provider.Name, redactProviderError(err))
 			}
 		} else if provider.Type == "file" && provider.Path == "" {
 			return fmt.Errorf("provider %q: file provider requires path", provider.Name)
