@@ -23,6 +23,10 @@ const (
 	FilterInput_Name            = "name"
 	FilterInput_SubscriptionTag = "subtag"
 	FilterInput_Link            = "link"
+	// FilterInput_Group is a control-plane-only exact reference to another
+	// outbound group. It is deliberately not a node filter: accepting it in
+	// filterHit would silently turn a miss into an empty node set.
+	FilterInput_Group = "group"
 )
 
 const (
@@ -36,6 +40,43 @@ type DialerSet struct {
 	log          *logrus.Logger
 	dialers      []*dialer.Dialer
 	nodeToTagMap map[*dialer.Dialer]string
+}
+
+// GroupMemberReference records one exact nested-group member. Group references
+// are intentionally restricted to a standalone group(name) filter with no
+// annotation. Anything more expressive would be ambiguous: it is unclear
+// whether an AND/NOT/regex should apply to the group identity, its direct
+// members, or the child group's final selection.
+type GroupMemberReference struct {
+	FilterIndex int
+	Name        string
+}
+
+// ExactGroupMemberReferences separates the small, unambiguous nested-group
+// syntax from ordinary node filters. Callers must remove those filter clauses
+// before using FilterAndAnnotate.
+func ExactGroupMemberReferences(filters [][]*config_parser.Function, annotations [][]*config_parser.Param) ([]GroupMemberReference, error) {
+	if len(filters) != len(annotations) {
+		return nil, fmt.Errorf("[CODE BUG]: unmatched annotations length: %v filters and %v annotations", len(filters), len(annotations))
+	}
+	var refs []GroupMemberReference
+	for i, clause := range filters {
+		containsGroup := false
+		for _, filter := range clause {
+			if filter != nil && filter.Name == FilterInput_Group {
+				containsGroup = true
+				break
+			}
+		}
+		if !containsGroup {
+			continue
+		}
+		if len(clause) != 1 || clause[0] == nil || clause[0].Name != FilterInput_Group || clause[0].Not || len(clause[0].Params) != 1 || clause[0].Params[0] == nil || clause[0].Params[0].Key != "" || clause[0].Params[0].Val == "" || len(annotations[i]) != 0 {
+			return nil, fmt.Errorf("nested group filter at index %d must be an unannotated exact group(name) reference", i)
+		}
+		refs = append(refs, GroupMemberReference{FilterIndex: i, Name: clause[0].Params[0].Val})
+	}
+	return refs, nil
 }
 
 // AllDialers returns a snapshot of every dialer owned by the set.

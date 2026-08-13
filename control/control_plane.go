@@ -35,6 +35,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/daeuniverse/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
@@ -700,18 +701,77 @@ func newControlPlaneWithContextOptions(
 		dialer.CleanupTransportCacheNamespace(option.TransportCacheNamespace)
 		return nil
 	})
-	for _, group := range groups {
+	groupPlans, groupBuildOrder, err := planNestedGroupBuild(groups)
+	if err != nil {
+		return nil, fmt.Errorf("validate group graph: %w", err)
+	}
+	if len(outbounds)+len(groupPlans) > int(consts.OutboundUserDefinedMax) {
+		return nil, fmt.Errorf("too many outbounds")
+	}
+	baseOutboundCount := len(outbounds)
+	builtGroups := make(map[string]*outbound.DialerGroup, len(groupPlans))
+	for _, planIndex := range groupBuildOrder {
+		plan := groupPlans[planIndex]
+		group := plan.group
 		// Parse policy.
 		policy, err := outbound.NewDialerSelectionPolicyFromGroupParam(&group)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create group %v: %w", group.Name, err)
 		}
-		// Filter nodes with user given filters.
+		callback := core.outboundAliveChangeCallback(uint8(baseOutboundCount+plan.index), disableKernelAliveCallback)
+
+		if plan.hasNestedReferences() {
+			groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create nested group %q: %w", group.Name, err)
+			}
+			if groupOption != nil {
+				return nil, fmt.Errorf("nested group %q cannot override health-check options", group.Name)
+			}
+
+			members := make([]outbound.NestedDialerGroupMember, 0)
+			seenDirectDialers := make(map[*dialer.Dialer]struct{})
+			for filterIndex := range group.Filter {
+				if childName, nested := plan.references[filterIndex]; nested {
+					child := builtGroups[childName]
+					if child == nil {
+						return nil, fmt.Errorf("nested group %q was not built before parent %q", childName, group.Name)
+					}
+					members = append(members, outbound.NestedDialerGroupMember{Group: child})
+					continue
+				}
+				dialers, annos, err := dialerSet.FilterAndAnnotate(
+					[][]*config_parser.Function{group.Filter[filterIndex]},
+					[][]*config_parser.Param{group.FilterAnnotation[filterIndex]},
+				)
+				if err != nil {
+					return nil, fmt.Errorf(`failed to create nested group "%v": %w`, group.Name, err)
+				}
+				for i, d := range dialers {
+					if _, exists := seenDirectDialers[d]; exists {
+						return nil, fmt.Errorf("nested group %q selects direct dialer %q more than once", group.Name, d.Property().Name)
+					}
+					seenDirectDialers[d] = struct{}{}
+					members = append(members, outbound.NestedDialerGroupMember{Dialer: d, Annotation: annos[i]})
+				}
+			}
+			if log.IsLevelEnabled(logrus.DebugLevel) {
+				log.Debugf(`Nested group "%v" has %d ordered members.`, group.Name, len(members))
+			}
+			dialerGroup, err := outbound.NewNestedDialerGroup(option, group.Name, members, *policy, callback)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create nested group %q: %w", group.Name, err)
+			}
+			builtGroups[group.Name] = dialerGroup
+			continue
+		}
+
+		// Established flat path: retain its filtering, override, and selection
+		// behavior unchanged for configurations without group(...) members.
 		dialers, annos, err := dialerSet.FilterAndAnnotate(group.Filter, group.FilterAnnotation)
 		if err != nil {
 			return nil, fmt.Errorf(`failed to create group "%v": %w`, group.Name, err)
 		}
-		// Convert node links to dialers.
 		if log.IsLevelEnabled(logrus.DebugLevel) {
 			log.Debugf(`Group "%v" node list:`, group.Name)
 			for _, d := range dialers {
@@ -734,10 +794,10 @@ func newControlPlaneWithContextOptions(
 			dialers = newDialers
 			finalOption = groupOption
 		}
-		// Create dialer group and append it to outbounds.
-		dialerGroup := outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy,
-			core.outboundAliveChangeCallback(uint8(len(outbounds)), disableKernelAliveCallback))
-		outbounds = append(outbounds, dialerGroup)
+		builtGroups[group.Name] = outbound.NewDialerGroup(finalOption, group.Name, dialers, annos, *policy, callback)
+	}
+	for _, plan := range groupPlans {
+		outbounds = append(outbounds, builtGroups[plan.group.Name])
 	}
 
 	registeredDialerCallbacks := make(map[*dialer.Dialer]struct{})

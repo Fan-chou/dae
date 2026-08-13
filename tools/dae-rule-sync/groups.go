@@ -41,6 +41,11 @@ type GroupConversionReport struct {
 
 var daeIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// maxNestedGroupDepth bounds recursive selection in the generated group graph.
+// Mihomo group files are provider input, so an unbounded graph must never reach
+// the runtime even when it is acyclic.
+const maxNestedGroupDepth = 32
+
 func ParseMihomoConfig(data []byte) (MihomoConfig, error) {
 	var config MihomoConfig
 	if err := yaml.Unmarshal(data, &config); err != nil {
@@ -54,6 +59,9 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 	for _, proxy := range config.Proxies {
 		if proxy.Name == "" {
 			return "", GroupConversionReport{}, errors.New("proxy has empty name")
+		}
+		if _, exists := proxies[proxy.Name]; exists {
+			return "", GroupConversionReport{}, fmt.Errorf("duplicate proxy %q", proxy.Name)
 		}
 		proxies[proxy.Name] = struct{}{}
 	}
@@ -69,12 +77,24 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 	}
 
 	report := GroupConversionReport{NameMap: make(map[string]string, len(config.Groups))}
+	safeNames := make(map[string]string, len(config.Groups))
 	for _, group := range config.Groups {
-		report.NameMap[group.Name] = safeDaeIdentifier(group.Name)
+		safeName := safeDaeIdentifier(group.Name)
+		if previous, exists := safeNames[safeName]; exists {
+			return "", GroupConversionReport{}, fmt.Errorf("groups %q and %q map to the same dae name %q", previous, group.Name, safeName)
+		}
+		safeNames[safeName] = group.Name
+		report.NameMap[group.Name] = safeName
 	}
+
+	_, hasNestedMembers, err := validateMihomoGroupGraph(config.Groups, groups)
+	if err != nil {
+		return "", GroupConversionReport{}, err
+	}
+	convertibleGroups := convertibleMihomoGroups(config.Groups, proxies, groups)
 	var output strings.Builder
 	output.WriteString("group {\n")
-	for _, group := range config.Groups {
+	for groupIndex, group := range config.Groups {
 		members := make([]string, 0, len(group.Proxies))
 		var reasons []string
 		for _, member := range group.Proxies {
@@ -83,7 +103,11 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 				reasons = append(reasons, member+" member")
 			default:
 				if _, nested := groups[member]; nested {
-					reasons = append(reasons, "nested group "+member)
+					if !convertibleGroups[member] {
+						reasons = append(reasons, "nested group "+member+" is not convertible")
+						continue
+					}
+					members = append(members, member)
 					continue
 				}
 				if _, node := proxies[member]; !node {
@@ -118,19 +142,122 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 			report.Approximated++
 		}
 		fmt.Fprintf(&output, "    %s {\n", report.NameMap[group.Name])
-		fmt.Fprintf(&output, "        filter: name(")
-		for i, member := range members {
-			if i > 0 {
-				output.WriteString(", ")
+		if !hasNestedMembers[groupIndex] {
+			fmt.Fprintf(&output, "        filter: name(")
+			for i, member := range members {
+				if i > 0 {
+					output.WriteString(", ")
+				}
+				output.WriteString(daeQuote(member))
 			}
-			output.WriteString(daeQuote(member))
+			output.WriteString(")\n")
+		} else {
+			for _, member := range members {
+				if _, nested := groups[member]; nested {
+					fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(report.NameMap[member]))
+					continue
+				}
+				fmt.Fprintf(&output, "        filter: name(%s)\n", daeQuote(member))
+			}
 		}
-		output.WriteString(")\n")
 		fmt.Fprintf(&output, "        policy: %s\n", policy)
 		output.WriteString("    }\n")
 	}
 	output.WriteString("}\n")
 	return output.String(), report, nil
+}
+
+// convertibleMihomoGroups is a deterministic post-order availability pass for
+// rendered declarations. A parent must never emit group(child) when the child
+// is omitted because it has no usable member or an unsupported policy.
+func convertibleMihomoGroups(groupsIn []MihomoGroup, proxies, groups map[string]struct{}) map[string]bool {
+	byName := make(map[string]MihomoGroup, len(groupsIn))
+	for _, group := range groupsIn {
+		byName[group.Name] = group
+	}
+	convertible := make(map[string]bool, len(groupsIn))
+	seen := make(map[string]bool, len(groupsIn))
+	var visit func(string) bool
+	visit = func(name string) bool {
+		if seen[name] {
+			return convertible[name]
+		}
+		seen[name] = true
+		group := byName[name]
+		if _, _, err := flatGroupPolicy(group.Type); err != nil {
+			return false
+		}
+		for _, member := range group.Proxies {
+			if _, nested := groups[member]; nested {
+				if visit(member) {
+					convertible[name] = true
+					return true
+				}
+				continue
+			}
+			if member != "DIRECT" && member != "REJECT" {
+				if _, proxy := proxies[member]; proxy {
+					convertible[name] = true
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, group := range groupsIn {
+		visit(group.Name)
+	}
+	return convertible
+}
+
+// validateMihomoGroupGraph validates the graph before it is rendered. The
+// returned bool slice records which declarations need explicit group(...) edges;
+// declarations are intentionally rendered in source order so existing outbound
+// ordering remains stable.
+func validateMihomoGroupGraph(groupsIn []MihomoGroup, groups map[string]struct{}) (map[string][]string, []bool, error) {
+	dependencies := make(map[string][]string, len(groupsIn))
+	hasNested := make([]bool, len(groupsIn))
+	for i, group := range groupsIn {
+		for _, member := range group.Proxies {
+			if _, ok := groups[member]; ok {
+				dependencies[group.Name] = append(dependencies[group.Name], member)
+				hasNested[i] = true
+			}
+		}
+	}
+
+	const (
+		unseen = iota
+		visiting
+		visited
+	)
+	state := make(map[string]int, len(groupsIn))
+	var visit func(string, int) error
+	visit = func(name string, depth int) error {
+		if depth > maxNestedGroupDepth {
+			return fmt.Errorf("nested group depth exceeds %d at %q", maxNestedGroupDepth, name)
+		}
+		switch state[name] {
+		case visiting:
+			return fmt.Errorf("nested group cycle includes %q", name)
+		case visited:
+			return nil
+		}
+		state[name] = visiting
+		for _, child := range dependencies[name] {
+			if err := visit(child, depth+1); err != nil {
+				return err
+			}
+		}
+		state[name] = visited
+		return nil
+	}
+	for _, group := range groupsIn {
+		if err := visit(group.Name, 1); err != nil {
+			return nil, nil, err
+		}
+	}
+	return dependencies, hasNested, nil
 }
 
 func flatGroupPolicy(groupType string) (policy string, approximate bool, err error) {
