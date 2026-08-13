@@ -6,6 +6,8 @@
 package cmd
 
 import (
+	"path/filepath"
+
 	"github.com/daeuniverse/dae/config"
 	"github.com/sirupsen/logrus"
 )
@@ -14,6 +16,7 @@ type Runner struct {
 	log               *logrus.Logger
 	conf              *config.Config
 	externGeoDataDirs []string
+	configFile        string
 }
 
 func newRunner(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) *Runner {
@@ -21,5 +24,13 @@ func newRunner(log *logrus.Logger, conf *config.Config, externGeoDataDirs []stri
 		log:               log,
 		conf:              conf,
 		externGeoDataDirs: externGeoDataDirs,
+		configFile:        cfgFile,
 	}
+}
+
+func (r *Runner) ruleProviderBaseDir() string {
+	if r.configFile == "" {
+		return ""
+	}
+	return filepath.Dir(r.configFile)
 }

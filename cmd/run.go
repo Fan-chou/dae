@@ -358,6 +358,27 @@ func (r *Runner) Run() (err error) {
 
 	reloadReqs := make(chan reloadRequest, 1)
 	reloadManager := newReloadManager(reloadReqs, runStateChanges, sigs)
+	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
+	var ruleProviderLifecycleCancel context.CancelFunc
+	var ruleProviderLifecycleDone <-chan struct{}
+	if interval := ruleProviderRefreshInterval(conf); interval > 0 {
+		holder, lifecycle, lifecycleErr := newRuleProviderLifecycleHolder(conf, r.ruleProviderBaseDir(), interval, reloadManager, log)
+		if lifecycleErr != nil {
+			log.WithError(lifecycleErr).Errorln("[RuleProvider] Failed to start refresh lifecycle")
+		} else {
+			ruleProviderLifecycleHolder = holder
+			lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			ruleProviderLifecycleCancel = cancelLifecycle
+			ruleProviderLifecycleDone = done
+			go func() {
+				defer close(done)
+				if lifecycleErr := lifecycle.Run(lifecycleCtx); lifecycleErr != nil && !errors.Is(lifecycleErr, context.Canceled) {
+					log.WithError(lifecycleErr).Errorln("[RuleProvider] Refresh lifecycle stopped")
+				}
+			}()
+		}
+	}
 	fastExit := false
 	var fatalRunErr error
 	failRun := func(err error) {
@@ -1300,6 +1321,9 @@ loop:
 					c = handoff.preparedGeneration.controlPlane
 					currCancel = handoff.preparedGeneration.cancel
 					conf = handoff.preparedGeneration.conf
+					if ruleProviderLifecycleHolder != nil {
+						ruleProviderLifecycleHolder.setConfig(conf)
+					}
 					listener = handoff.preparedGeneration.listener
 					reloadManager.clearPendingStagedHandoff()
 
@@ -1343,6 +1367,10 @@ loop:
 		}
 		_ = os.Remove(PidFilePath)
 	}()
+	if ruleProviderLifecycleCancel != nil {
+		ruleProviderLifecycleCancel()
+		<-ruleProviderLifecycleDone
+	}
 
 	// Stop accepting new ingress immediately so shutdown does not continue to
 	// create fresh UDP/TCP work while the control plane is being torn down.
