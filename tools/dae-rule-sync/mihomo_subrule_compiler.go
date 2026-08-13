@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -329,6 +330,12 @@ func cloneMihomoExpr(expr MihomoExpr) MihomoExpr {
 	if expr.ProviderRef != nil {
 		provider := *expr.ProviderRef
 		cloned.ProviderRef = &provider
+	}
+	if expr.ProviderDataRef != nil {
+		providerData := *expr.ProviderDataRef
+		providerData.Domains = append([]DomainRule(nil), expr.ProviderDataRef.Domains...)
+		providerData.Prefixes = append([]netip.Prefix(nil), expr.ProviderDataRef.Prefixes...)
+		cloned.ProviderDataRef = &providerData
 	}
 	if expr.SubRuleRef != nil {
 		ref := *expr.SubRuleRef

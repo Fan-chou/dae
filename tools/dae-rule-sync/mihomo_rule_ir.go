@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 )
@@ -16,7 +17,9 @@ type MihomoRuleSource struct {
 }
 
 // MihomoRuleIR is the ordered, typed representation of rules and sub-rules.
-// No provider content is loaded and no dae route is generated at this layer.
+// ParseMihomoRuleIR leaves provider content unloaded; the provider binding
+// layer may return the same IR shape with explicit provider-data expressions.
+// No dae route is generated at this layer.
 type MihomoRuleIR struct {
 	Rules    []MihomoRuleIRRule
 	SubRules []MihomoSubRuleIR
@@ -51,23 +54,25 @@ type MihomoSubRuleIR struct {
 type MihomoExprKind string
 
 const (
-	MihomoExprAtom    MihomoExprKind = "atom"
-	MihomoExprAnd     MihomoExprKind = "and"
-	MihomoExprOr      MihomoExprKind = "or"
-	MihomoExprNot     MihomoExprKind = "not"
-	MihomoExprRuleSet MihomoExprKind = "rule-set"
-	MihomoExprSubRule MihomoExprKind = "sub-rule"
+	MihomoExprAtom         MihomoExprKind = "atom"
+	MihomoExprAnd          MihomoExprKind = "and"
+	MihomoExprOr           MihomoExprKind = "or"
+	MihomoExprNot          MihomoExprKind = "not"
+	MihomoExprRuleSet      MihomoExprKind = "rule-set"
+	MihomoExprProviderData MihomoExprKind = "provider-data"
+	MihomoExprSubRule      MihomoExprKind = "sub-rule"
 )
 
 // MihomoExpr is a tagged expression tree. Exactly one of Atom, Children,
-// ProviderRef, or SubRuleRef is populated according to Kind.
+// ProviderRef, ProviderDataRef, or SubRuleRef is populated according to Kind.
 type MihomoExpr struct {
-	Kind        MihomoExprKind
-	Raw         string
-	Atom        *MihomoAtom
-	Children    []MihomoExpr
-	ProviderRef *MihomoRuleSetRef
-	SubRuleRef  *MihomoSubRuleRef
+	Kind            MihomoExprKind
+	Raw             string
+	Atom            *MihomoAtom
+	Children        []MihomoExpr
+	ProviderRef     *MihomoRuleSetRef
+	ProviderDataRef *MihomoProviderDataRef
+	SubRuleRef      *MihomoSubRuleRef
 }
 
 type MihomoAtom struct {
@@ -82,6 +87,29 @@ type MihomoAtom struct {
 
 type MihomoRuleSetRef struct {
 	Provider string
+}
+
+// MihomoProviderDataKind identifies the concrete data represented by a
+// provider-data expression. Actions and source order remain on the enclosing
+// rule/expression and are intentionally absent here.
+type MihomoProviderDataKind string
+
+const (
+	MihomoProviderDataDomain MihomoProviderDataKind = "domain"
+	MihomoProviderDataIPCIDR MihomoProviderDataKind = "ipcidr"
+)
+
+// MihomoProviderDataRef is the bound data behind one Mihomo RULE-SET. The
+// ProviderCode is always the normalized safe provider name. DAT-backed data
+// may omit the inline slices because generationDATSpec retains the complete
+// payload for the later writer.
+type MihomoProviderDataRef struct {
+	ProviderCode    string
+	Kind            MihomoProviderDataKind
+	Domains         []DomainRule
+	Prefixes        []netip.Prefix
+	UseDAT          bool
+	DATRelativePath string
 }
 
 // MihomoProviderRef is an alias kept as the provider-oriented name for the
