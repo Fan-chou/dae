@@ -39,6 +39,16 @@ type ConversionReport struct {
 	Unsupported []UnsupportedRule
 }
 
+const generationDATRuleThreshold = 256
+
+type generationDATSpec struct {
+	Provider     string
+	Kind         string
+	RelativePath string
+	Domains      []DomainRule
+	Prefixes     []netip.Prefix
+}
+
 func ParseProvider(data []byte, spec ProviderSpec) (ParsedRuleSet, error) {
 	items, err := providerItems(data, spec.Format)
 	if err != nil {
@@ -220,40 +230,51 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 }
 
 func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict bool) (string, ConversionReport, error) {
+	routes, report, _, err := generateDaeRoutes(manifest, sets, strict, false)
+	return routes, report, err
+}
+
+func GenerateGenerationDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict bool) (string, ConversionReport, []generationDATSpec, error) {
+	return generateDaeRoutes(manifest, sets, strict, true)
+}
+
+func generateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict, useDAT bool) (string, ConversionReport, []generationDATSpec, error) {
 	providerBehaviors := make(map[string]string, len(manifest.Providers))
 	for _, provider := range manifest.Providers {
 		providerBehaviors[provider.Name] = strings.ToLower(provider.Behavior)
 	}
 	var output strings.Builder
 	var report ConversionReport
+	var artifacts []generationDATSpec
+	specIndices := make(map[string]int)
 	for _, route := range manifest.Routes {
 		set, ok := sets[route.Provider]
 		if !ok {
-			return "", report, fmt.Errorf("route references missing provider %q", route.Provider)
+			return "", report, nil, fmt.Errorf("route references missing provider %q", route.Provider)
 		}
 		if err := validateRouteOutbound(route.Outbound); err != nil {
-			return "", report, fmt.Errorf("route for provider %q: %w", route.Provider, err)
+			return "", report, nil, fmt.Errorf("route for provider %q: %w", route.Provider, err)
 		}
 		kind := strings.ToLower(route.Kind)
 		if kind == "" {
 			kind = providerBehaviors[route.Provider]
 			if kind == "classical" {
-				return "", report, fmt.Errorf("route for classical provider %q requires explicit kind", route.Provider)
+				return "", report, nil, fmt.Errorf("route for classical provider %q requires explicit kind", route.Provider)
 			}
 		}
 		if kind != "domain" && kind != "ipcidr" {
-			return "", report, fmt.Errorf("unsupported route kind %q", route.Kind)
+			return "", report, nil, fmt.Errorf("unsupported route kind %q", route.Kind)
 		}
 		behavior := providerBehaviors[route.Provider]
 		if behavior != "classical" && behavior != "" && behavior != kind {
-			return "", report, fmt.Errorf("route kind %q does not match provider %q behavior %q", kind, route.Provider, behavior)
+			return "", report, nil, fmt.Errorf("route kind %q does not match provider %q behavior %q", kind, route.Provider, behavior)
 		}
 		if (kind == "domain" && len(set.Domains) == 0) || (kind == "ipcidr" && len(set.Prefixes) == 0) {
-			return "", report, fmt.Errorf("provider %q has no convertible %s rules", route.Provider, kind)
+			return "", report, nil, fmt.Errorf("provider %q has no convertible %s rules", route.Provider, kind)
 		}
 		if len(set.Unsupported) > 0 {
 			if strict {
-				return "", report, fmt.Errorf("provider %q contains %d unsupported rules", route.Provider, len(set.Unsupported))
+				return "", report, nil, fmt.Errorf("provider %q contains %d unsupported rules", route.Provider, len(set.Unsupported))
 			}
 			report.Unsupported = append(report.Unsupported, set.Unsupported...)
 			report.Skipped += len(set.Unsupported)
@@ -262,19 +283,51 @@ func GenerateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict 
 		case "domain":
 			for _, domain := range set.Domains {
 				if err := validateDaeLiteral(domain.Value); err != nil {
-					return "", report, fmt.Errorf("provider %q rule: %w", route.Provider, err)
+					return "", report, nil, fmt.Errorf("provider %q rule: %w", route.Provider, err)
 				}
+			}
+			if useDAT && len(set.Domains) >= generationDATRuleThreshold {
+				key := route.Provider + "\x00" + kind
+				if _, ok := specIndices[key]; !ok {
+					specIndices[key] = len(artifacts)
+					artifacts = append(artifacts, generationDATSpec{
+						Provider:     route.Provider,
+						Kind:         kind,
+						RelativePath: "generated/geosite/" + route.Provider + ".dat",
+						Domains:      append([]DomainRule(nil), set.Domains...),
+					})
+				}
+				fmt.Fprintf(&output, "domain(ext: %s) -> %s\n", daeQuote("generated/geosite/"+route.Provider+".dat:"+route.Provider), route.Outbound)
+				report.Generated += len(set.Domains)
+				continue
+			}
+			for _, domain := range set.Domains {
 				fmt.Fprintf(&output, "domain(%s: %s) -> %s\n", domain.Kind, daeQuote(domain.Value), route.Outbound)
 				report.Generated++
 			}
 		case "ipcidr":
+			if useDAT && len(set.Prefixes) >= generationDATRuleThreshold {
+				key := route.Provider + "\x00" + kind
+				if _, ok := specIndices[key]; !ok {
+					specIndices[key] = len(artifacts)
+					artifacts = append(artifacts, generationDATSpec{
+						Provider:     route.Provider,
+						Kind:         kind,
+						RelativePath: "generated/geoip/" + route.Provider + ".dat",
+						Prefixes:     append([]netip.Prefix(nil), set.Prefixes...),
+					})
+				}
+				fmt.Fprintf(&output, "dip(ext: %s) -> %s\n", daeQuote("generated/geoip/"+route.Provider+".dat:"+route.Provider), route.Outbound)
+				report.Generated += len(set.Prefixes)
+				continue
+			}
 			for _, prefix := range set.Prefixes {
 				fmt.Fprintf(&output, "dip(%s) -> %s\n", daeQuote(prefix.String()), route.Outbound)
 				report.Generated++
 			}
 		}
 	}
-	return output.String(), report, nil
+	return output.String(), report, artifacts, nil
 }
 
 func daeQuote(value string) string {

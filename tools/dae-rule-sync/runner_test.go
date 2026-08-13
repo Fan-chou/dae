@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -10,15 +11,22 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/common/assets"
+	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/daeuniverse/dae/pkg/geodata"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -90,6 +98,915 @@ func assertDAEConfigRejects(t *testing.T, routes, groups []byte) {
 	if _, err := config.New(sections); err == nil {
 		t.Fatalf("invalid candidate unexpectedly passed config.New(): routes=%q groups=%q", routes, groups)
 	}
+}
+
+const (
+	runnerLargeProviderRuleThreshold = 256
+	runnerLargeProviderRuleCount     = runnerLargeProviderRuleThreshold + 1
+)
+
+type runnerGenerationManifestProvider struct {
+	name     string
+	behavior string
+	data     string
+	outbound string
+}
+
+func runnerWriteGenerationManifest(t *testing.T, path string, providers ...runnerGenerationManifestProvider) {
+	t.Helper()
+	var manifest strings.Builder
+	manifest.WriteString("providers:\n")
+	for _, provider := range providers {
+		fmt.Fprintf(&manifest, "  - name: %s\n", provider.name)
+		manifest.WriteString("    type: inline\n")
+		fmt.Fprintf(&manifest, "    behavior: %s\n", provider.behavior)
+		manifest.WriteString("    format: yaml\n")
+		fmt.Fprintf(&manifest, "    data: %q\n", provider.data)
+	}
+	manifest.WriteString("routes:\n")
+	for _, provider := range providers {
+		fmt.Fprintf(&manifest, "  - provider: %s\n", provider.name)
+		fmt.Fprintf(&manifest, "    outbound: %s\n", provider.outbound)
+		fmt.Fprintf(&manifest, "    kind: %s\n", provider.behavior)
+	}
+	if err := os.WriteFile(path, []byte(manifest.String()), 0o600); err != nil {
+		t.Fatalf("WriteFile(generation manifest) error = %v", err)
+	}
+}
+
+func runnerWriteGenerationGroupsInput(t *testing.T, path, member string) {
+	t.Helper()
+	groups := fmt.Sprintf(`proxies:
+  - name: %s
+    type: anytls
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [%s]
+`, member, member)
+	if err := os.WriteFile(path, []byte(groups), 0o600); err != nil {
+		t.Fatalf("WriteFile(generation groups input) error = %v", err)
+	}
+}
+
+func runnerLargeDomainValues(count int, version string) []string {
+	values := make([]string, count)
+	for i := range values {
+		values[i] = fmt.Sprintf("%s-%03d.example.com", version, i)
+	}
+	return values
+}
+
+func runnerLargeDomainProviderData(count int, version string) string {
+	var body strings.Builder
+	body.WriteString("payload:\n")
+	for _, value := range runnerLargeDomainValues(count, version) {
+		fmt.Fprintf(&body, "  - %s\n", value)
+	}
+	return body.String()
+}
+
+func runnerGeoSiteRules(values []string, kind DomainKind) []DomainRule {
+	rules := make([]DomainRule, 0, len(values))
+	for _, value := range values {
+		rules = append(rules, DomainRule{Kind: kind, Value: value})
+	}
+	return rules
+}
+
+func runnerLargeGeoIPPrefixes(count int, version string) []netip.Prefix {
+	network := "192.0.2"
+	v6Network := "2001:db8::"
+	if version == "new" {
+		network = "198.51.100"
+		v6Network = "2001:db8:1::"
+	}
+	prefixes := make([]netip.Prefix, count)
+	for i := range prefixes {
+		if i < 256 {
+			prefixes[i] = netip.MustParsePrefix(fmt.Sprintf("%s.%d/32", network, i))
+			continue
+		}
+		prefixes[i] = netip.MustParsePrefix(fmt.Sprintf("%s%d/128", v6Network, i-255))
+	}
+	return prefixes
+}
+
+func runnerLargeGeoIPProviderData(count int, version string) string {
+	var body strings.Builder
+	body.WriteString("payload:\n")
+	for _, prefix := range runnerLargeGeoIPPrefixes(count, version) {
+		fmt.Fprintf(&body, "  - %s\n", prefix)
+	}
+	return body.String()
+}
+
+func runnerReadCurrentGenerationDetails(t *testing.T, root string) (string, string, []byte, []byte, map[string]any) {
+	t.Helper()
+	target, routes, groups := readCurrentGeneration(t, root)
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, "current"))
+	if err != nil {
+		t.Fatalf("EvalSymlinks(current) error = %v", err)
+	}
+	metadataBody, err := os.ReadFile(filepath.Join(resolved, "metadata.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(current metadata) error = %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(metadataBody, &metadata); err != nil {
+		t.Fatalf("json.Unmarshal(current metadata) error = %v", err)
+	}
+	return target, resolved, routes, groups, metadata
+}
+
+func runnerParseGenerationRouting(t *testing.T, routes, groups []byte) config.Routing {
+	t.Helper()
+	sections, err := config_parser.Parse("global {}\n" + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	if err != nil {
+		t.Fatalf("config_parser.Parse() error = %v; routes=%q groups=%q", err, routes, groups)
+	}
+	var parsed config.Routing
+	var routingSection *config_parser.Section
+	for _, section := range sections {
+		if section.Name == "routing" {
+			routingSection = section
+			break
+		}
+	}
+	if routingSection == nil {
+		t.Fatal("routing section is missing")
+	}
+	if err := config.SectionParser(reflect.ValueOf(&parsed), routingSection); err != nil {
+		t.Fatalf("config.SectionParser() error = %v", err)
+	}
+	if _, err := config.New(sections); err != nil {
+		t.Fatalf("config.New() error = %v; routes=%q groups=%q", err, routes, groups)
+	}
+	return parsed
+}
+
+func runnerOptimizeGenerationRouting(t *testing.T, routes, groups []byte, resolvedCurrent string) []*config_parser.RoutingRule {
+	t.Helper()
+	parsed := runnerParseGenerationRouting(t, routes, groups)
+	normalized, err := routing.ApplyRulesOptimizers(
+		parsed.Rules,
+		&routing.AliasOptimizer{},
+		&routing.DatReaderOptimizer{
+			Logger:         logrus.New(),
+			LocationFinder: assets.NewLocationFinder([]string{resolvedCurrent}),
+		},
+		&routing.MergeAndSortRulesOptimizer{},
+		&routing.DeduplicateParamsOptimizer{},
+	)
+	if err != nil {
+		t.Fatalf("routing.ApplyRulesOptimizers() error = %v", err)
+	}
+	return normalized
+}
+
+func runnerFindRoutingFunction(t *testing.T, rules []*config_parser.RoutingRule, name, outbound string) *config_parser.Function {
+	t.Helper()
+	for _, rule := range rules {
+		if rule.Outbound.Name != outbound {
+			continue
+		}
+		for _, function := range rule.AndFunctions {
+			if function.Name == name {
+				return function
+			}
+		}
+	}
+	t.Fatalf("routing function %q for outbound %q not found in normalized rules", name, outbound)
+	return nil
+}
+
+func runnerAssertExternalRoute(t *testing.T, routes, groups []byte, functionName, relativePath, outbound string, expectedRouteCount int) {
+	t.Helper()
+	parsed := runnerParseGenerationRouting(t, routes, groups)
+	if len(parsed.Rules) != expectedRouteCount {
+		preview := string(routes)
+		if len(preview) > 240 {
+			preview = preview[:240] + "..."
+		}
+		t.Fatalf("parsed candidate routes = %d, want %d external routes; route preview=%q", len(parsed.Rules), expectedRouteCount, preview)
+	}
+	rule := parsed.Rules[0]
+	if expectedRouteCount > 1 {
+		rule = nil
+		for _, candidate := range parsed.Rules {
+			if candidate.Outbound.Name != outbound {
+				continue
+			}
+			if rule != nil {
+				t.Fatalf("multiple external routes found for outbound %q", outbound)
+			}
+			rule = candidate
+		}
+		if rule == nil {
+			t.Fatalf("external route for outbound %q not found in %d parsed rules", outbound, len(parsed.Rules))
+		}
+	}
+	if rule.Outbound.Name != outbound {
+		t.Fatalf("external route outbound = %q, want %q", rule.Outbound.Name, outbound)
+	}
+	if len(rule.AndFunctions) != 1 || rule.AndFunctions[0].Name != functionName {
+		t.Fatalf("external route functions = %#v, want %s(ext)", rule.AndFunctions, functionName)
+	}
+	function := rule.AndFunctions[0]
+	if len(function.Params) != 1 || function.Params[0].Key != "ext" || function.Params[0].Val != relativePath {
+		t.Fatalf("external route params = %#v, want ext=%q", function.Params, relativePath)
+	}
+	if strings.Contains(string(routes), "-000.example.com") || strings.Count(string(routes), functionName+"(") != 1 {
+		t.Fatalf("candidate route still contains inline expansion: %q", routes)
+	}
+}
+
+func runnerReadDATMetadata(t *testing.T, metadata map[string]any, provider string) map[string]any {
+	t.Helper()
+	dats, ok := metadata["dats"].(map[string]any)
+	if !ok {
+		t.Fatalf("generation metadata dats = %#v, want provider-keyed DAT bindings", metadata["dats"])
+	}
+	binding, ok := dats[provider].(map[string]any)
+	if !ok {
+		t.Fatalf("generation metadata dats[%q] = %#v, want DAT binding", provider, dats[provider])
+	}
+	return binding
+}
+
+func runnerAssertDATMetadataBinding(t *testing.T, resolvedCurrent string, metadata map[string]any, provider, relativePath string, generated, skipped int) []byte {
+	t.Helper()
+	binding := runnerReadDATMetadata(t, metadata, provider)
+	if binding["path"] != relativePath {
+		t.Fatalf("generation metadata dats[%q].path = %#v, want %q", provider, binding["path"], relativePath)
+	}
+	path := filepath.Join(resolvedCurrent, filepath.FromSlash(relativePath))
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%s DAT) error = %v", relativePath, err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("%s DAT mode = %s, want regular file", relativePath, info.Mode())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s DAT) error = %v", relativePath, err)
+	}
+	if binding["sha256"] != digest(raw) {
+		t.Fatalf("generation metadata dats[%q].sha256 = %#v, want %q", provider, binding["sha256"], digest(raw))
+	}
+	if got, ok := binding["generated"].(float64); !ok || int(got) != generated {
+		t.Fatalf("generation metadata dats[%q].generated = %#v, want %d", provider, binding["generated"], generated)
+	}
+	if got, ok := binding["skipped"].(float64); !ok || int(got) != skipped {
+		t.Fatalf("generation metadata dats[%q].skipped = %#v, want %d", provider, binding["skipped"], skipped)
+	}
+	return raw
+}
+
+func runnerAssertNoStandaloneDAT(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("ReadDir(%s) error = %v", root, err)
+	}
+	var walk func(string) error
+	walk = func(path string) error {
+		children, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			childPath := filepath.Join(path, child.Name())
+			if child.IsDir() {
+				if err := walk(childPath); err != nil {
+					return err
+				}
+				continue
+			}
+			if strings.HasSuffix(child.Name(), ".dat") {
+				return fmt.Errorf("standalone DAT %q", childPath)
+			}
+		}
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.Name() == "generations" || entry.Name() == "current" || entry.Name() == "generation.lock" {
+			continue
+		}
+		if entry.IsDir() {
+			if err := walk(filepath.Join(root, entry.Name())); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".dat") {
+			t.Fatalf("standalone DAT %q", filepath.Join(root, entry.Name()))
+		}
+	}
+}
+
+func runnerAssertGeoSiteGeneration(t *testing.T, resolvedCurrent string, routes, groups []byte, provider, outbound string, values []string, expectedRouteCount int) []byte {
+	t.Helper()
+	relativePath := filepath.ToSlash(filepath.Join("generated", "geosite", provider+".dat"))
+	runnerAssertExternalRoute(t, routes, groups, "domain", relativePath+":"+provider, outbound, expectedRouteCount)
+	raw, err := os.ReadFile(filepath.Join(resolvedCurrent, filepath.FromSlash(relativePath)))
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", relativePath, err)
+	}
+	decoded, err := geodata.UnmarshalGeoSite(logrus.New(), filepath.Join(resolvedCurrent, filepath.FromSlash(relativePath)), provider)
+	if err != nil {
+		t.Fatalf("UnmarshalGeoSite() error = %v", err)
+	}
+	if len(decoded.Domain) != len(values) {
+		t.Fatalf("decoded GeoSite domain count = %d, want %d", len(decoded.Domain), len(values))
+	}
+	wantValues := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		wantValues[value] = struct{}{}
+	}
+	for _, domain := range decoded.Domain {
+		if domain.Type != geodata.Domain_RootDomain {
+			t.Fatalf("decoded GeoSite domain type = %v, want suffix/root domain", domain.Type)
+		}
+		if _, ok := wantValues[domain.Value]; !ok {
+			t.Fatalf("decoded GeoSite domain value = %q, not in expected provider values", domain.Value)
+		}
+	}
+	normalized := runnerOptimizeGenerationRouting(t, routes, groups, resolvedCurrent)
+	function := runnerFindRoutingFunction(t, normalized, consts.Function_Domain, outbound)
+	if len(function.Params) != len(values) {
+		t.Fatalf("normalized domain params = %d, want %d", len(function.Params), len(values))
+	}
+	gotValues := make(map[string]struct{}, len(function.Params))
+	for _, param := range function.Params {
+		if param.Key == "ext" {
+			t.Fatalf("normalized domain still contains ext parameter: %#v", param)
+		}
+		if param.Key != string(consts.RoutingDomainKey_Suffix) {
+			t.Fatalf("normalized domain param key = %q, want suffix", param.Key)
+		}
+		gotValues[param.Val] = struct{}{}
+	}
+	if !reflect.DeepEqual(gotValues, wantValues) {
+		t.Fatalf("normalized domain params = %#v, want values %#v", gotValues, wantValues)
+	}
+	return raw
+}
+
+func runnerAssertGeoIPGeneration(t *testing.T, resolvedCurrent string, routes, groups []byte, provider, outbound string, prefixes []netip.Prefix, expectedRouteCount int) []byte {
+	t.Helper()
+	relativePath := filepath.ToSlash(filepath.Join("generated", "geoip", provider+".dat"))
+	runnerAssertExternalRoute(t, routes, groups, "dip", relativePath+":"+provider, outbound, expectedRouteCount)
+	path := filepath.Join(resolvedCurrent, filepath.FromSlash(relativePath))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", relativePath, err)
+	}
+	decoded, err := geodata.UnmarshalGeoIp(logrus.New(), path, provider)
+	if err != nil {
+		t.Fatalf("UnmarshalGeoIp() error = %v", err)
+	}
+	if len(decoded.Cidr) != len(prefixes) {
+		t.Fatalf("decoded GeoIP prefix count = %d, want %d", len(decoded.Cidr), len(prefixes))
+	}
+	wantPrefixes := make(map[string]struct{}, len(prefixes))
+	for _, prefix := range prefixes {
+		wantPrefixes[prefix.Masked().String()] = struct{}{}
+	}
+	for _, cidr := range decoded.Cidr {
+		addr, ok := netip.AddrFromSlice(cidr.Ip)
+		if !ok {
+			t.Fatalf("AddrFromSlice(%v) failed", cidr.Ip)
+		}
+		prefix := netip.PrefixFrom(addr, int(cidr.Prefix)).Masked().String()
+		if _, ok := wantPrefixes[prefix]; !ok {
+			t.Fatalf("decoded GeoIP prefix = %q, not in expected provider prefixes", prefix)
+		}
+	}
+	normalized := runnerOptimizeGenerationRouting(t, routes, groups, resolvedCurrent)
+	function := runnerFindRoutingFunction(t, normalized, consts.Function_Ip, outbound)
+	if len(function.Params) != len(prefixes) {
+		t.Fatalf("normalized IP params = %d, want %d", len(function.Params), len(prefixes))
+	}
+	gotPrefixes := make(map[string]struct{}, len(function.Params))
+	for _, param := range function.Params {
+		if param.Key != "" {
+			t.Fatalf("normalized IP param key = %q, want empty", param.Key)
+		}
+		gotPrefixes[param.Val] = struct{}{}
+	}
+	if !reflect.DeepEqual(gotPrefixes, wantPrefixes) {
+		t.Fatalf("normalized IP params = %#v, want prefixes %#v", gotPrefixes, wantPrefixes)
+	}
+	return raw
+}
+
+func TestRunSyncGenerationUsesGeoSiteDATForLargeProvider(t *testing.T) {
+	const (
+		provider = "large-domain"
+		outbound = "proxy"
+	)
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	values := runnerLargeDomainValues(runnerLargeProviderRuleCount, "v1")
+	runnerWriteGenerationManifest(t, manifestPath, runnerGenerationManifestProvider{
+		name:     provider,
+		behavior: "domain",
+		data:     runnerLargeDomainProviderData(runnerLargeProviderRuleCount, "v1"),
+		outbound: outbound,
+	})
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+
+	if _, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath:    manifestPath,
+		CacheDir:        filepath.Join(dir, "cache"),
+		GroupsInputPath: groupsPath,
+		GenerationDir:   generationDir,
+	}); err != nil {
+		t.Fatalf("RunSync() error = %v", err)
+	}
+
+	_, resolvedCurrent, routes, groups, metadata := runnerReadCurrentGenerationDetails(t, generationDir)
+	runnerAssertGeoSiteGeneration(t, resolvedCurrent, routes, groups, provider, outbound, values, 1)
+	runnerAssertDATMetadataBinding(t, resolvedCurrent, metadata, provider, "generated/geosite/"+provider+".dat", runnerLargeProviderRuleCount, 0)
+	runnerAssertNoStandaloneDAT(t, generationDir)
+}
+
+func TestRunSyncGenerationUsesGeoIPDATForLargeProvider(t *testing.T) {
+	const (
+		provider = "large-ip"
+		outbound = "direct"
+	)
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	prefixes := runnerLargeGeoIPPrefixes(runnerLargeProviderRuleCount, "old")
+	runnerWriteGenerationManifest(t, manifestPath, runnerGenerationManifestProvider{
+		name:     provider,
+		behavior: "ipcidr",
+		data:     runnerLargeGeoIPProviderData(runnerLargeProviderRuleCount, "old"),
+		outbound: outbound,
+	})
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+
+	if _, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath:    manifestPath,
+		CacheDir:        filepath.Join(dir, "cache"),
+		GroupsInputPath: groupsPath,
+		GenerationDir:   generationDir,
+	}); err != nil {
+		t.Fatalf("RunSync() error = %v", err)
+	}
+
+	_, resolvedCurrent, routes, groups, metadata := runnerReadCurrentGenerationDetails(t, generationDir)
+	runnerAssertGeoIPGeneration(t, resolvedCurrent, routes, groups, provider, outbound, prefixes, 1)
+	runnerAssertDATMetadataBinding(t, resolvedCurrent, metadata, provider, "generated/geoip/"+provider+".dat", runnerLargeProviderRuleCount, 0)
+	runnerAssertNoStandaloneDAT(t, generationDir)
+}
+
+func TestRunSyncGenerationPublishesDATRoutesGroupsTogether(t *testing.T) {
+	const (
+		domainProvider = "large-domain"
+		ipProvider     = "large-ip"
+	)
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	writeManifest := func(domainVersion, ipVersion, domainOutbound, ipOutbound string) {
+		t.Helper()
+		runnerWriteGenerationManifest(t, manifestPath,
+			runnerGenerationManifestProvider{
+				name:     domainProvider,
+				behavior: "domain",
+				data:     runnerLargeDomainProviderData(runnerLargeProviderRuleCount, domainVersion),
+				outbound: domainOutbound,
+			},
+			runnerGenerationManifestProvider{
+				name:     ipProvider,
+				behavior: "ipcidr",
+				data:     runnerLargeGeoIPProviderData(runnerLargeProviderRuleCount, ipVersion),
+				outbound: ipOutbound,
+			},
+		)
+	}
+	options := SyncOptions{
+		ManifestPath:    manifestPath,
+		CacheDir:        filepath.Join(dir, "cache"),
+		GroupsInputPath: groupsPath,
+		GenerationDir:   generationDir,
+	}
+
+	writeManifest("old", "old", "proxy", "direct")
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-old")
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("initial RunSync() error = %v", err)
+	}
+	oldTarget, oldDir, oldRoutes, oldGroups, oldMetadata := runnerReadCurrentGenerationDetails(t, generationDir)
+	oldDomains := runnerLargeDomainValues(runnerLargeProviderRuleCount, "old")
+	oldPrefixes := runnerLargeGeoIPPrefixes(runnerLargeProviderRuleCount, "old")
+	oldDomainDAT := runnerAssertGeoSiteGeneration(t, oldDir, oldRoutes, oldGroups, domainProvider, "proxy", oldDomains, 2)
+	oldIPDAT := runnerAssertGeoIPGeneration(t, oldDir, oldRoutes, oldGroups, ipProvider, "direct", oldPrefixes, 2)
+	runnerAssertDATMetadataBinding(t, oldDir, oldMetadata, domainProvider, "generated/geosite/"+domainProvider+".dat", runnerLargeProviderRuleCount, 0)
+	runnerAssertDATMetadataBinding(t, oldDir, oldMetadata, ipProvider, "generated/geoip/"+ipProvider+".dat", runnerLargeProviderRuleCount, 0)
+	if !strings.Contains(string(oldGroups), "filter: name('hk-old')") {
+		t.Fatalf("initial generation groups = %q, want hk-old", oldGroups)
+	}
+	runnerAssertNoStandaloneDAT(t, generationDir)
+
+	writeManifest("new", "new", "proxy-v2", "direct-v2")
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-new")
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("second RunSync() error = %v", err)
+	}
+	newTarget, newDir, newRoutes, newGroups, newMetadata := runnerReadCurrentGenerationDetails(t, generationDir)
+	if newTarget == oldTarget || newDir == oldDir {
+		t.Fatalf("generation did not advance: old target/dir=%q/%q new=%q/%q", oldTarget, oldDir, newTarget, newDir)
+	}
+	newDomains := runnerLargeDomainValues(runnerLargeProviderRuleCount, "new")
+	newPrefixes := runnerLargeGeoIPPrefixes(runnerLargeProviderRuleCount, "new")
+	newDomainDAT := runnerAssertGeoSiteGeneration(t, newDir, newRoutes, newGroups, domainProvider, "proxy-v2", newDomains, 2)
+	newIPDAT := runnerAssertGeoIPGeneration(t, newDir, newRoutes, newGroups, ipProvider, "direct-v2", newPrefixes, 2)
+	runnerAssertDATMetadataBinding(t, newDir, newMetadata, domainProvider, "generated/geosite/"+domainProvider+".dat", runnerLargeProviderRuleCount, 0)
+	runnerAssertDATMetadataBinding(t, newDir, newMetadata, ipProvider, "generated/geoip/"+ipProvider+".dat", runnerLargeProviderRuleCount, 0)
+	if bytes.Equal(oldDomainDAT, newDomainDAT) || bytes.Equal(oldIPDAT, newIPDAT) {
+		t.Fatal("second generation DAT content did not change with provider content")
+	}
+	if !strings.Contains(string(newGroups), "filter: name('hk-new')") {
+		t.Fatalf("new generation groups = %q, want hk-new", newGroups)
+	}
+	if string(oldRoutes) == string(newRoutes) || string(oldGroups) == string(newGroups) {
+		t.Fatalf("second generation routes/groups did not advance: old=%q/%q new=%q/%q", oldRoutes, oldGroups, newRoutes, newGroups)
+	}
+	if _, err := os.Stat(filepath.Join(oldDir, "generated", "geosite", domainProvider+".dat")); err != nil {
+		t.Fatalf("old generation GeoSite DAT disappeared: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(oldDir, "generated", "geoip", ipProvider+".dat")); err != nil {
+		t.Fatalf("old generation GeoIP DAT disappeared: %v", err)
+	}
+	if newMetadata["previous_generation"] != filepath.Base(oldTarget) {
+		t.Fatalf("new generation previous_generation = %#v, want %q", newMetadata["previous_generation"], filepath.Base(oldTarget))
+	}
+	runnerAssertNoStandaloneDAT(t, generationDir)
+}
+
+func TestRunSyncGenerationValidatesClassicalProviderWithDomainAndIPDATs(t *testing.T) {
+	const (
+		provider       = "classical-large"
+		domainOutbound = "proxy"
+		ipOutbound     = "direct"
+	)
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	domainValues := runnerLargeDomainValues(runnerLargeProviderRuleCount, "v1")
+	prefixes := runnerLargeGeoIPPrefixes(runnerLargeProviderRuleCount, "old")
+	var providerData strings.Builder
+	providerData.WriteString("payload:\n")
+	for _, value := range domainValues {
+		fmt.Fprintf(&providerData, "  - %s\n", value)
+	}
+	for _, prefix := range prefixes {
+		fmt.Fprintf(&providerData, "  - %s\n", prefix)
+	}
+
+	var manifest strings.Builder
+	manifest.WriteString("providers:\n")
+	fmt.Fprintf(&manifest, "  - name: %s\n", provider)
+	manifest.WriteString("    type: inline\n")
+	manifest.WriteString("    behavior: classical\n")
+	manifest.WriteString("    format: yaml\n")
+	fmt.Fprintf(&manifest, "    data: %q\n", providerData.String())
+	manifest.WriteString("routes:\n")
+	fmt.Fprintf(&manifest, "  - provider: %s\n    outbound: %s\n    kind: domain\n", provider, domainOutbound)
+	fmt.Fprintf(&manifest, "  - provider: %s\n    outbound: %s\n    kind: ipcidr\n", provider, ipOutbound)
+	if err := os.WriteFile(manifestPath, []byte(manifest.String()), 0o600); err != nil {
+		t.Fatalf("WriteFile(classical generation manifest) error = %v", err)
+	}
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-classical")
+
+	if _, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath:    manifestPath,
+		CacheDir:        filepath.Join(dir, "cache"),
+		GroupsInputPath: groupsPath,
+		GenerationDir:   generationDir,
+	}); err != nil {
+		t.Fatalf("RunSync() error = %v; legal primary DAT binding Additional was rejected as nested Additional", err)
+	}
+
+	target, resolvedCurrent, routes, groups, metadata := runnerReadCurrentGenerationDetails(t, generationDir)
+	if strings.Count(string(routes), "domain(ext:") != 1 || strings.Count(string(routes), "dip(ext:") != 1 {
+		t.Fatalf("current routes = %q, want one domain ext route and one dip ext route", routes)
+	}
+	runnerAssertGeoSiteGeneration(t, resolvedCurrent, routes, groups, provider, domainOutbound, domainValues, 2)
+	runnerAssertGeoIPGeneration(t, resolvedCurrent, routes, groups, provider, ipOutbound, prefixes, 2)
+
+	binding := runnerReadDATMetadata(t, metadata, provider)
+	if binding["path"] != "generated/geosite/"+provider+".dat" || binding["kind"] != "domain" {
+		t.Fatalf("metadata dats[%q] primary binding = %#v, want geosite domain DAT", provider, binding)
+	}
+	additional, ok := binding["additional"].([]any)
+	if !ok || len(additional) != 1 {
+		t.Fatalf("metadata dats[%q].additional = %#v, want one legal additional binding", provider, binding["additional"])
+	}
+	additionalBinding, ok := additional[0].(map[string]any)
+	if !ok || additionalBinding["path"] != "generated/geoip/"+provider+".dat" || additionalBinding["kind"] != "ipcidr" {
+		t.Fatalf("metadata dats[%q].additional[0] = %#v, want geoip ipcidr DAT", provider, additional[0])
+	}
+	if got, ok := binding["generated"].(float64); !ok || int(got) != runnerLargeProviderRuleCount {
+		t.Fatalf("metadata dats[%q].generated = %#v, want %d", provider, binding["generated"], runnerLargeProviderRuleCount)
+	}
+	if got, ok := additionalBinding["generated"].(float64); !ok || int(got) != runnerLargeProviderRuleCount {
+		t.Fatalf("metadata dats[%q].additional[0].generated = %#v, want %d", provider, additionalBinding["generated"], runnerLargeProviderRuleCount)
+	}
+
+	if err := validateStoredGeneration(resolvedCurrent, filepath.Base(target)); err != nil {
+		t.Fatalf("validateStoredGeneration() error = %v; legal primary DAT binding Additional must validate", err)
+	}
+}
+
+const runnerGenerationValidationProvider = "large-domain-validation"
+
+func runnerPublishLargeDomainValidationGeneration(t *testing.T) (string, string, []byte, []byte, generationMetadata, []ProviderSnapshot) {
+	t.Helper()
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	values := runnerLargeDomainValues(runnerLargeProviderRuleCount, "v1")
+	runnerWriteGenerationManifest(t, manifestPath, runnerGenerationManifestProvider{
+		name:     runnerGenerationValidationProvider,
+		behavior: "domain",
+		data:     runnerLargeDomainProviderData(runnerLargeProviderRuleCount, "v1"),
+		outbound: "proxy",
+	})
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-validation")
+	if _, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath:    manifestPath,
+		GroupsInputPath: groupsPath,
+		GenerationDir:   generationDir,
+	}); err != nil {
+		t.Fatalf("RunSync() error = %v", err)
+	}
+
+	target, currentDir, routes, groups, _ := runnerReadCurrentGenerationDetails(t, generationDir)
+	generationID := filepath.Base(target)
+	metadata, err := readGenerationMetadata(currentDir, generationID)
+	if err != nil {
+		t.Fatalf("read generation metadata error = %v", err)
+	}
+	binding, ok := metadata.DATs[runnerGenerationValidationProvider]
+	if !ok {
+		t.Fatalf("generation metadata DAT binding for %q is missing", runnerGenerationValidationProvider)
+	}
+	raw := runnerAssertGeoSiteGeneration(t, currentDir, routes, groups, runnerGenerationValidationProvider, "proxy", values, 1)
+	if digest(raw) != binding.SHA256 {
+		t.Fatalf("generation metadata DAT sha256 = %q, want %q", binding.SHA256, digest(raw))
+	}
+	if binding.Generated != runnerLargeProviderRuleCount || binding.Skipped != 0 {
+		t.Fatalf("generation metadata DAT counts = generated:%d skipped:%d, want generated:%d skipped:0", binding.Generated, binding.Skipped, runnerLargeProviderRuleCount)
+	}
+	snapshots, err := readGenerationProviderSnapshots(currentDir)
+	if err != nil {
+		t.Fatalf("read generation provider snapshots error = %v", err)
+	}
+	selected := make([]ProviderSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		selected = append(selected, snapshot)
+	}
+	return generationDir, currentDir, routes, groups, metadata, selected
+}
+
+func writeRunnerGenerationMetadata(t *testing.T, currentDir string, metadata generationMetadata) {
+	t.Helper()
+	body, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		t.Fatalf("json.Marshal(generation metadata) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(currentDir, "metadata.json"), body, 0o600); err != nil {
+		t.Fatalf("WriteFile(generation metadata) error = %v", err)
+	}
+}
+
+func TestValidateStoredGenerationRejectsDATWithValidChecksumButInvalidProtobuf(t *testing.T) {
+	_, currentDir, _, _, metadata, _ := runnerPublishLargeDomainValidationGeneration(t)
+	binding := metadata.DATs[runnerGenerationValidationProvider]
+	datPath := filepath.Join(currentDir, filepath.FromSlash(binding.Path))
+	invalidDAT := []byte{0x80}
+	if err := os.WriteFile(datPath, invalidDAT, 0o600); err != nil {
+		t.Fatalf("WriteFile(invalid DAT) error = %v", err)
+	}
+	binding.SHA256 = digest(invalidDAT)
+	metadata.DATs[runnerGenerationValidationProvider] = binding
+	writeRunnerGenerationMetadata(t, currentDir, metadata)
+
+	if err := validateStoredGeneration(currentDir, metadata.Generation); err == nil {
+		t.Fatal("validateStoredGeneration() error = nil for invalid protobuf with matching DAT checksum")
+	}
+}
+
+func TestValidateStoredGenerationRejectsExtRouteWithoutDATBinding(t *testing.T) {
+	_, currentDir, _, _, metadata, _ := runnerPublishLargeDomainValidationGeneration(t)
+	metadata.DATs = nil
+	writeRunnerGenerationMetadata(t, currentDir, metadata)
+
+	if err := validateStoredGeneration(currentDir, metadata.Generation); err == nil {
+		t.Fatal("validateStoredGeneration() error = nil for ext route without DAT metadata binding")
+	}
+}
+
+func TestValidateStoredGenerationRejectsTamperedDATGeneratedCount(t *testing.T) {
+	_, currentDir, _, _, metadata, _ := runnerPublishLargeDomainValidationGeneration(t)
+	binding := metadata.DATs[runnerGenerationValidationProvider]
+	originalDAT, err := os.ReadFile(filepath.Join(currentDir, filepath.FromSlash(binding.Path)))
+	if err != nil {
+		t.Fatalf("ReadFile(original DAT) error = %v", err)
+	}
+	originalSHA := binding.SHA256
+	binding.Generated = 1
+	metadata.DATs[runnerGenerationValidationProvider] = binding
+	writeRunnerGenerationMetadata(t, currentDir, metadata)
+
+	if err := validateStoredGeneration(currentDir, metadata.Generation); err == nil {
+		t.Fatal("validateStoredGeneration() error = nil for tampered DAT generated count")
+	}
+	updatedDAT, err := os.ReadFile(filepath.Join(currentDir, filepath.FromSlash(binding.Path)))
+	if err != nil {
+		t.Fatalf("ReadFile(updated DAT) error = %v", err)
+	}
+	if !bytes.Equal(updatedDAT, originalDAT) || binding.SHA256 != originalSHA {
+		t.Fatalf("DAT content or checksum changed while tampering generated count: contentChanged=%t sha=%q want %q", !bytes.Equal(updatedDAT, originalDAT), binding.SHA256, originalSHA)
+	}
+}
+
+func TestGenerationMatchesCurrentRejectsDamagedCurrentDAT(t *testing.T) {
+	generationDir, currentDir, routes, groups, metadata, snapshots := runnerPublishLargeDomainValidationGeneration(t)
+	binding := metadata.DATs[runnerGenerationValidationProvider]
+	if err := os.WriteFile(filepath.Join(currentDir, filepath.FromSlash(binding.Path)), []byte{0x80}, 0o600); err != nil {
+		t.Fatalf("WriteFile(damaged current DAT) error = %v", err)
+	}
+	state := generationRootState{
+		root:        generationDir,
+		generations: filepath.Join(generationDir, "generations"),
+		previousID:  metadata.Generation,
+	}
+	matched, err := generationMatchesCurrent(state, routes, groups, snapshots)
+	if matched {
+		t.Fatalf("generationMatchesCurrent() = true for damaged current DAT (error = %v)", err)
+	}
+}
+
+func TestGenerationDATValidationDoesNotUseExternalSameNamedGeoSite(t *testing.T) {
+	t.Run("candidate-publication", func(t *testing.T) {
+		const provider = "candidate-external-asset"
+		dir := t.TempDir()
+		externalDir := filepath.Join(dir, "external")
+		candidateProbeDir := filepath.Join(dir, "candidate-probe")
+		relativePath := filepath.Join("generated", "geosite", provider+".dat")
+		externalPath := filepath.Join(externalDir, relativePath)
+		candidateProbePath := filepath.Join(candidateProbeDir, relativePath)
+		externalValues := []string{"external-only.example.com"}
+		candidateValues := runnerLargeDomainValues(runnerLargeProviderRuleCount, "candidate")
+		for _, path := range []string{externalPath, candidateProbePath} {
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
+			}
+		}
+		if _, err := writeGeoSiteDAT(externalPath, provider, runnerGeoSiteRules(externalValues, DomainSuffix)); err != nil {
+			t.Fatalf("writeGeoSiteDAT(external) error = %v", err)
+		}
+		if _, err := writeGeoSiteDAT(candidateProbePath, provider, runnerGeoSiteRules(candidateValues, DomainSuffix)); err != nil {
+			t.Fatalf("writeGeoSiteDAT(candidate probe) error = %v", err)
+		}
+
+		t.Setenv("DAE_LOCATION_ASSET", externalDir)
+		finder := assets.NewLocationFinder([]string{candidateProbeDir})
+		found, err := finder.GetLocationAsset(logrus.New(), filepath.ToSlash(relativePath))
+		if err != nil {
+			t.Fatalf("GetLocationAsset(%q) error = %v", relativePath, err)
+		}
+		if found != externalPath {
+			t.Fatalf("same-named GeoSite asset path = %q, want external asset %q to prove environment priority", found, externalPath)
+		}
+
+		manifestPath := filepath.Join(dir, "providers.yaml")
+		groupsPath := filepath.Join(dir, "mihomo.yaml")
+		generationDir := filepath.Join(dir, "generation")
+		runnerWriteGenerationManifest(t, manifestPath, runnerGenerationManifestProvider{
+			name:     provider,
+			behavior: "domain",
+			data:     runnerLargeDomainProviderData(runnerLargeProviderRuleCount, "candidate"),
+			outbound: "proxy",
+		})
+		runnerWriteGenerationGroupsInput(t, groupsPath, "hk-candidate")
+		if _, err := RunSync(context.Background(), SyncOptions{
+			ManifestPath:    manifestPath,
+			CacheDir:        filepath.Join(dir, "cache"),
+			GroupsInputPath: groupsPath,
+			GenerationDir:   generationDir,
+		}); err != nil {
+			t.Fatalf("RunSync() error = %v; candidate validation must use its own generated GeoSite DAT, not the same-named external asset", err)
+		}
+		t.Setenv("DAE_LOCATION_ASSET", "")
+
+		_, currentDir, routes, groups, _ := runnerReadCurrentGenerationDetails(t, generationDir)
+		candidateDAT := runnerAssertGeoSiteGeneration(t, currentDir, routes, groups, provider, "proxy", candidateValues, 1)
+		externalDAT, err := os.ReadFile(externalPath)
+		if err != nil {
+			t.Fatalf("ReadFile(external GeoSite DAT) error = %v", err)
+		}
+		if bytes.Equal(candidateDAT, externalDAT) {
+			t.Fatal("published candidate GeoSite DAT unexpectedly equals external same-named DAT")
+		}
+	})
+
+	t.Run("stored-current", func(t *testing.T) {
+		t.Setenv("DAE_LOCATION_ASSET", "")
+		_, currentDir, _, _, metadata, _ := runnerPublishLargeDomainValidationGeneration(t)
+		binding := metadata.DATs[runnerGenerationValidationProvider]
+		datPath := filepath.Join(currentDir, filepath.FromSlash(binding.Path))
+		originalDAT, err := os.ReadFile(datPath)
+		if err != nil {
+			t.Fatalf("ReadFile(original GeoSite DAT) error = %v", err)
+		}
+
+		externalDir := t.TempDir()
+		externalPath := filepath.Join(externalDir, filepath.FromSlash(binding.Path))
+		if err := os.MkdirAll(filepath.Dir(externalPath), 0o750); err != nil {
+			t.Fatalf("MkdirAll(external GeoSite DAT) error = %v", err)
+		}
+		snapshotValues := runnerLargeDomainValues(runnerLargeProviderRuleCount, "v1")
+		if _, err := writeGeoSiteDAT(externalPath, runnerGenerationValidationProvider, runnerGeoSiteRules(snapshotValues, DomainSuffix)); err != nil {
+			t.Fatalf("writeGeoSiteDAT(external snapshot) error = %v", err)
+		}
+		t.Setenv("DAE_LOCATION_ASSET", externalDir)
+		finder := assets.NewLocationFinder([]string{currentDir})
+		found, err := finder.GetLocationAsset(logrus.New(), filepath.ToSlash(binding.Path))
+		if err != nil {
+			t.Fatalf("GetLocationAsset(%q) error = %v", binding.Path, err)
+		}
+		if found != externalPath {
+			t.Fatalf("same-named stored GeoSite asset path = %q, want external asset %q to prove environment priority", found, externalPath)
+		}
+
+		if _, err := writeGeoSiteDAT(datPath, runnerGenerationValidationProvider, runnerGeoSiteRules([]string{"tampered-only.example.com"}, DomainSuffix)); err != nil {
+			t.Fatalf("writeGeoSiteDAT(tampered candidate) error = %v", err)
+		}
+		tamperedDAT, err := os.ReadFile(datPath)
+		if err != nil {
+			t.Fatalf("ReadFile(tampered GeoSite DAT) error = %v", err)
+		}
+		if bytes.Equal(tamperedDAT, originalDAT) {
+			t.Fatal("tampered stored GeoSite DAT did not change")
+		}
+		binding.SHA256 = digest(tamperedDAT)
+		metadata.DATs[runnerGenerationValidationProvider] = binding
+		writeRunnerGenerationMetadata(t, currentDir, metadata)
+
+		if err := validateStoredGeneration(currentDir, metadata.Generation); err == nil {
+			t.Fatal("validateStoredGeneration() error = nil for a legal same-code GeoSite DAT with changed contents")
+		}
+	})
+}
+
+func TestDirectRunSyncKeepsSmallProviderInlineAndDoesNotPublishDAT(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	routesPath := filepath.Join(dir, "routes.dae")
+	runnerWriteGenerationManifest(t, manifestPath, runnerGenerationManifestProvider{
+		name:     "small-domain",
+		behavior: "domain",
+		data:     "payload: [small.example.com]\n",
+		outbound: "proxy",
+	})
+
+	if _, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath: manifestPath,
+		CacheDir:     filepath.Join(dir, "cache"),
+		RoutesOutput: routesPath,
+	}); err != nil {
+		t.Fatalf("RunSync() error = %v", err)
+	}
+	routes, err := os.ReadFile(routesPath)
+	if err != nil {
+		t.Fatalf("ReadFile(routes) error = %v", err)
+	}
+	wantRoutes := "domain(suffix: 'small.example.com') -> proxy\n"
+	if string(routes) != wantRoutes {
+		t.Fatalf("direct routes = %q, want exact inline output %q", routes, wantRoutes)
+	}
+	if strings.Contains(string(routes), "ext:") {
+		t.Fatalf("direct small-provider routes unexpectedly use DAT/ext: %q", routes)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "generated")); !os.IsNotExist(err) {
+		t.Fatalf("direct mode generated sibling stat error = %v, want absent", err)
+	}
+	runnerAssertNoStandaloneDAT(t, dir)
 }
 
 func TestRunSyncRedactsQueryFromInvalidProviderURLPreflightError(t *testing.T) {

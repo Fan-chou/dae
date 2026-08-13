@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,8 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/daeuniverse/dae/pkg/geodata"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -178,7 +182,14 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		report.Providers = append(report.Providers, providerReport)
 	}
 
-	routes, routeReport, err := GenerateDaeRoutes(manifest, sets, options.Strict)
+	var routes string
+	var routeReport ConversionReport
+	var datSpecs []generationDATSpec
+	if generationMode {
+		routes, routeReport, datSpecs, err = GenerateGenerationDaeRoutes(manifest, sets, options.Strict)
+	} else {
+		routes, routeReport, err = GenerateDaeRoutes(manifest, sets, options.Strict)
+	}
 	if err != nil {
 		return SyncReport{}, err
 	}
@@ -227,7 +238,7 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 				return report, nil
 			}
 		}
-		generationPublication, err := beginGenerationPublicationAt(generationRoot, []byte(routes), groups, selectedSnapshots)
+		generationPublication, err := beginGenerationPublicationAt(generationRoot, []byte(routes), groups, selectedSnapshots, datSpecs...)
 		if err != nil {
 			return SyncReport{}, fmt.Errorf("prepare generation: %w", err)
 		}
@@ -284,7 +295,13 @@ func generationMatchesCurrent(state generationRootState, routes, groups []byte, 
 	if state.previousID == "" {
 		return false, nil
 	}
-	metadata, err := readGenerationMetadata(filepath.Join(state.generations, state.previousID), state.previousID)
+	currentDir := filepath.Join(state.generations, state.previousID)
+	if err := validateStoredGeneration(currentDir, state.previousID); err != nil {
+		// A broken current generation is not reusable. The caller can still
+		// publish the already prepared replacement generation.
+		return false, nil
+	}
+	metadata, err := readGenerationMetadata(currentDir, state.previousID)
 	if err != nil {
 		return false, err
 	}
@@ -753,6 +770,7 @@ type generationMetadata struct {
 	RoutesSHA256       string                               `json:"routes_sha256"`
 	GroupsSHA256       string                               `json:"groups_sha256"`
 	Providers          map[string]generationProviderBinding `json:"providers"`
+	DATs               map[string]generationDATBinding      `json:"dats,omitempty"`
 }
 
 type generationProviderBinding struct {
@@ -761,6 +779,15 @@ type generationProviderBinding struct {
 	MetadataSHA256 string `json:"metadata_sha256"`
 	Behavior       string `json:"behavior,omitempty"`
 	Format         string `json:"format,omitempty"`
+}
+
+type generationDATBinding struct {
+	Path       string                 `json:"path"`
+	SHA256     string                 `json:"sha256"`
+	Generated  int                    `json:"generated"`
+	Skipped    int                    `json:"skipped"`
+	Kind       string                 `json:"kind"`
+	Additional []generationDATBinding `json:"additional,omitempty"`
 }
 
 type generationProviderMetadata struct {
@@ -874,7 +901,7 @@ func beginGenerationPublication(root string, routes, groups []byte) (*generation
 	return beginGenerationPublicationAt(state, routes, groups, nil)
 }
 
-func beginGenerationPublicationAt(state generationRootState, routes, groups []byte, snapshots []ProviderSnapshot) (*generationPublication, error) {
+func beginGenerationPublicationAt(state generationRootState, routes, groups []byte, snapshots []ProviderSnapshot, datSpecs ...generationDATSpec) (*generationPublication, error) {
 	candidateDir, err := os.MkdirTemp(state.generations, "generation-")
 	if err != nil {
 		return nil, fmt.Errorf("create generation candidate: %w", err)
@@ -890,6 +917,12 @@ func beginGenerationPublicationAt(state generationRootState, routes, groups []by
 	metadata := generationMetadata{SchemaVersion: 2, Generation: generationID, PreviousGeneration: state.previousID, RoutesSHA256: digest(routes), GroupsSHA256: digest(groups), Providers: make(map[string]generationProviderBinding, len(snapshots))}
 	if err := writeGenerationProviderSnapshots(candidateDir, snapshots, metadata.Providers); err != nil {
 		return nil, err
+	}
+	if len(datSpecs) > 0 {
+		metadata.DATs = make(map[string]generationDATBinding, len(datSpecs))
+		if err := writeGenerationDATs(candidateDir, datSpecs, metadata.DATs); err != nil {
+			return nil, err
+		}
 	}
 	metadataBody, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
@@ -956,6 +989,75 @@ func writeGenerationProviderSnapshots(candidateDir string, snapshots []ProviderS
 		bindings[snapshot.Name] = generationProviderBinding{SHA256: snapshot.SHA256, SourceKey: snapshot.SourceKey, MetadataSHA256: digest(metadataBody), Behavior: snapshot.Behavior, Format: snapshot.Format}
 	}
 	return syncDirectory(providersDir)
+}
+
+func writeGenerationDATs(candidateDir string, specs []generationDATSpec, bindings map[string]generationDATBinding) error {
+	for _, spec := range specs {
+		if !providerNamePattern.MatchString(spec.Provider) {
+			return fmt.Errorf("invalid generation DAT provider %q", spec.Provider)
+		}
+		path, err := generationDATPath(candidateDir, spec.Provider, spec.Kind, spec.RelativePath)
+		if err != nil {
+			return err
+		}
+		parent := filepath.Dir(path)
+		if err := os.MkdirAll(parent, 0o700); err != nil {
+			return fmt.Errorf("create generation DAT directory: %w", err)
+		}
+
+		var report DATWriteReport
+		switch spec.Kind {
+		case "domain":
+			report, err = writeGeoSiteDAT(path, spec.Provider, spec.Domains)
+		case "ipcidr":
+			report, err = writeGeoIPDAT(path, spec.Provider, spec.Prefixes)
+		default:
+			return fmt.Errorf("unsupported generation DAT kind %q", spec.Kind)
+		}
+		if err != nil {
+			return fmt.Errorf("write generation DAT for provider %q: %w", spec.Provider, err)
+		}
+		if err := syncDirectory(filepath.Dir(parent)); err != nil {
+			return fmt.Errorf("sync generation DAT parent directory: %w", err)
+		}
+		binding := generationDATBinding{
+			Path:      spec.RelativePath,
+			SHA256:    report.SHA256,
+			Generated: report.Generated,
+			Skipped:   report.Skipped,
+			Kind:      spec.Kind,
+		}
+		if existing, ok := bindings[spec.Provider]; ok {
+			if existing.Kind == binding.Kind {
+				return fmt.Errorf("generation DAT provider %q repeats kind %q", spec.Provider, binding.Kind)
+			}
+			existing.Additional = append(existing.Additional, binding)
+			bindings[spec.Provider] = existing
+		} else {
+			bindings[spec.Provider] = binding
+		}
+	}
+	return nil
+}
+
+func generationDATPath(candidateDir, provider, kind, relativePath string) (string, error) {
+	var expected string
+	switch kind {
+	case "domain":
+		expected = "generated/geosite/" + provider + ".dat"
+	case "ipcidr":
+		expected = "generated/geoip/" + provider + ".dat"
+	default:
+		return "", fmt.Errorf("unsupported generation DAT kind %q", kind)
+	}
+	if relativePath != expected {
+		return "", fmt.Errorf("generation DAT path %q does not match %q", relativePath, expected)
+	}
+	path := filepath.FromSlash(relativePath)
+	if filepath.IsAbs(path) || filepath.Clean(path) != path || path == "." || path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("generation DAT path %q is outside candidate", relativePath)
+	}
+	return filepath.Join(candidateDir, path), nil
 }
 
 func (p *generationPublication) publish() error {
@@ -1182,7 +1284,10 @@ func validateCurrentLink(root, generationsRoot string) (string, error) {
 		return "", fmt.Errorf("current generation is not a directory")
 	}
 	if err := validateStoredGeneration(currentResolved, filepath.Base(target)); err != nil {
-		return "", fmt.Errorf("validate current generation: %w", err)
+		// The current link and generation directory have already passed the
+		// containment checks above. Treat invalid stored contents as unusable
+		// rather than preserving a broken generation as the fallback source.
+		return "", nil
 	}
 	return filepath.Base(target), nil
 }
@@ -1273,17 +1378,42 @@ func validateStoredGeneration(candidateDir, generationID string) error {
 	if metadata.RoutesSHA256 != digest(routes) || metadata.GroupsSHA256 != digest(groups) {
 		return errors.New("generation metadata does not match contents")
 	}
-	if _, err := readGenerationProviders(candidateDir, metadata); err != nil {
-		return err
-	}
-	sections, err := config_parser.Parse("global {}\n" + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	providers, err := readGenerationProviders(candidateDir, metadata)
 	if err != nil {
 		return err
 	}
-	if _, err := config.New(sections); err != nil {
+	rules, err := generationRoutingRules(routes, groups)
+	if err != nil {
+		return err
+	}
+	if err := validateGenerationDATBindings(candidateDir, metadata.DATs, rules, providers); err != nil {
 		return err
 	}
 	return nil
+}
+
+func generationRoutingRules(routes, groups []byte) ([]*config_parser.RoutingRule, error) {
+	sections, err := config_parser.Parse("global {}\n" + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := config.New(sections); err != nil {
+		return nil, err
+	}
+	for _, section := range sections {
+		if section.Name != "routing" {
+			continue
+		}
+		rules := make([]*config_parser.RoutingRule, 0, len(section.Items))
+		for _, item := range section.Items {
+			rule, ok := item.Value.(*config_parser.RoutingRule)
+			if ok {
+				rules = append(rules, rule)
+			}
+		}
+		return rules, nil
+	}
+	return nil, errors.New("generation routing section is missing")
 }
 
 func readGenerationMetadata(candidateDir, generationID string) (generationMetadata, error) {
@@ -1365,6 +1495,322 @@ func readGenerationProviders(candidateDir string, metadata generationMetadata) (
 	return snapshots, nil
 }
 
+type generationDATReference struct {
+	provider string
+	kind     string
+	path     string
+	function string
+	value    string
+}
+
+func generationDATBindingKey(provider, kind string) string {
+	return provider + "\x00" + kind
+}
+
+func generationDATReferences(rules []*config_parser.RoutingRule) ([]generationDATReference, error) {
+	var references []generationDATReference
+	for _, rule := range rules {
+		for _, function := range rule.AndFunctions {
+			var kind string
+			switch function.Name {
+			case consts.Function_Domain:
+				kind = "domain"
+			case "dip", consts.Function_Ip:
+				kind = "ipcidr"
+			}
+			for _, param := range function.Params {
+				if param.Key != "ext" {
+					continue
+				}
+				if kind == "" {
+					return nil, fmt.Errorf("unsupported generation DAT extension function %q", function.Name)
+				}
+				path, provider, ok := strings.Cut(param.Val, ":")
+				if !ok || path == "" || provider == "" || strings.Contains(provider, "@") {
+					return nil, fmt.Errorf("invalid generation DAT extension %q", param.Val)
+				}
+				references = append(references, generationDATReference{
+					provider: provider,
+					kind:     kind,
+					path:     path,
+					function: function.Name,
+					value:    param.Val,
+				})
+			}
+		}
+	}
+	return references, nil
+}
+
+func generationDATBindingList(bindings map[string]generationDATBinding) (map[string]generationDATBinding, error) {
+	flat := make(map[string]generationDATBinding, len(bindings))
+	for provider, binding := range bindings {
+		if !providerNamePattern.MatchString(provider) {
+			return nil, fmt.Errorf("invalid generation DAT provider %q", provider)
+		}
+		primaryBinding := binding
+		primaryBinding.Additional = nil
+		allBindings := append([]generationDATBinding{primaryBinding}, binding.Additional...)
+		for _, currentBinding := range allBindings {
+			if len(currentBinding.Additional) != 0 {
+				return nil, fmt.Errorf("generation DAT provider %q has nested additional bindings", provider)
+			}
+			if currentBinding.Path == "" || currentBinding.SHA256 == "" || currentBinding.Generated <= 0 || currentBinding.Skipped < 0 {
+				return nil, fmt.Errorf("generation DAT binding for provider %q is incomplete", provider)
+			}
+			key := generationDATBindingKey(provider, currentBinding.Kind)
+			if _, ok := flat[key]; ok {
+				return nil, fmt.Errorf("generation DAT provider %q repeats kind %q", provider, currentBinding.Kind)
+			}
+			flat[key] = currentBinding
+		}
+	}
+	return flat, nil
+}
+
+func validateGenerationDATBindings(candidateDir string, bindings map[string]generationDATBinding, rules []*config_parser.RoutingRule, providers map[string]ProviderSnapshot) error {
+	flatBindings, err := generationDATBindingList(bindings)
+	if err != nil {
+		return err
+	}
+	references, err := generationDATReferences(rules)
+	if err != nil {
+		return err
+	}
+	refsByBinding := make(map[string][]generationDATReference, len(references))
+	for _, reference := range references {
+		key := generationDATBindingKey(reference.provider, reference.kind)
+		binding, ok := flatBindings[key]
+		if !ok || binding.Path != reference.path {
+			return fmt.Errorf("generation DAT extension %q has no matching metadata binding", reference.value)
+		}
+		refsByBinding[key] = append(refsByBinding[key], reference)
+	}
+
+	logger := logrus.New()
+	for key, binding := range flatBindings {
+		references := refsByBinding[key]
+		if len(references) == 0 {
+			return fmt.Errorf("generation DAT binding %q is not referenced by a route", binding.Path)
+		}
+		provider := references[0].provider
+		path, err := generationDATPath(candidateDir, provider, binding.Kind, binding.Path)
+		if err != nil {
+			return err
+		}
+		if err := validateGenerationDATFile(candidateDir, binding.Path, path, binding.SHA256); err != nil {
+			return err
+		}
+		params, err := expandGenerationDAT(logger, path, references[0])
+		if err != nil {
+			return fmt.Errorf("expand generation DAT %q: %w", binding.Path, err)
+		}
+		if binding.Generated != len(params) {
+			return fmt.Errorf("generation DAT %q generated count = %d, want %d decoded rules", binding.Path, binding.Generated, len(params))
+		}
+		snapshot, ok := providers[provider]
+		if !ok {
+			return fmt.Errorf("generation DAT %q provider %q has no snapshot", binding.Path, provider)
+		}
+		if err := validateGenerationDATContents(logger, path, provider, binding, params, snapshot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGenerationDATFile(candidateDir, relativePath, path, checksum string) error {
+	parts := strings.Split(filepath.FromSlash(relativePath), string(filepath.Separator))
+	current := candidateDir
+	for index, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("stat generation DAT %q: %w", relativePath, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("generation DAT %q contains a symlink", relativePath)
+		}
+		if index < len(parts)-1 {
+			if !info.IsDir() {
+				return fmt.Errorf("generation DAT %q parent is not a directory", relativePath)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("generation DAT %q is not a regular file", relativePath)
+		}
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read generation DAT %q: %w", relativePath, err)
+	}
+	if len(body) == 0 || digest(body) != checksum {
+		return fmt.Errorf("generation DAT %q does not match metadata", relativePath)
+	}
+	return nil
+}
+
+func expandGenerationDAT(logger *logrus.Logger, path string, reference generationDATReference) ([]*config_parser.Param, error) {
+	switch reference.kind {
+	case "domain":
+		if reference.function != consts.Function_Domain {
+			return nil, fmt.Errorf("generation DAT function = %q, want domain", reference.function)
+		}
+		geoSite, err := geodata.UnmarshalGeoSite(logger, path, reference.provider)
+		if err != nil {
+			return nil, err
+		}
+		params := make([]*config_parser.Param, 0, len(geoSite.Domain))
+		for _, item := range geoSite.Domain {
+			var key string
+			switch item.Type {
+			case geodata.Domain_Full:
+				key = string(consts.RoutingDomainKey_Full)
+			case geodata.Domain_RootDomain:
+				key = string(consts.RoutingDomainKey_Suffix)
+			case geodata.Domain_Plain:
+				key = string(consts.RoutingDomainKey_Keyword)
+			case geodata.Domain_Regex:
+				key = string(consts.RoutingDomainKey_Regex)
+			default:
+				continue
+			}
+			params = append(params, &config_parser.Param{Key: key, Val: item.Value})
+		}
+		return params, nil
+	case "ipcidr":
+		if reference.function != "dip" && reference.function != consts.Function_Ip {
+			return nil, fmt.Errorf("generation DAT function = %q, want ip", reference.function)
+		}
+		geoIP, err := geodata.UnmarshalGeoIp(logger, path, reference.provider)
+		if err != nil {
+			return nil, err
+		}
+		if geoIP.InverseMatch {
+			return nil, errors.New("not support inverse match yet")
+		}
+		params := make([]*config_parser.Param, 0, len(geoIP.Cidr))
+		for _, item := range geoIP.Cidr {
+			ip, ok := netip.AddrFromSlice(item.Ip)
+			if !ok {
+				return nil, fmt.Errorf("bad geoip file: %v", path)
+			}
+			params = append(params, &config_parser.Param{
+				Val: netip.PrefixFrom(ip, int(item.Prefix)).String(),
+			})
+		}
+		return params, nil
+	default:
+		return nil, fmt.Errorf("unsupported generation DAT kind %q", reference.kind)
+	}
+}
+
+func validateGenerationDATContents(logger *logrus.Logger, path, provider string, binding generationDATBinding, params []*config_parser.Param, snapshot ProviderSnapshot) error {
+	parsed, err := ParseProvider(snapshot.Body, ProviderSpec{Name: provider, Behavior: snapshot.Behavior, Format: snapshot.Format})
+	if err != nil {
+		return fmt.Errorf("parse generation DAT provider %q snapshot: %w", provider, err)
+	}
+	switch binding.Kind {
+	case "domain":
+		geoSite, err := geodata.UnmarshalGeoSite(logger, path, provider)
+		if err != nil {
+			return fmt.Errorf("decode generation geosite DAT %q: %w", binding.Path, err)
+		}
+		if geoSite.CountryCode != provider || geoSite.Code != provider {
+			return fmt.Errorf("generation geosite DAT %q provider code does not match %q", binding.Path, provider)
+		}
+		if binding.Skipped != 0 {
+			return fmt.Errorf("generation geosite DAT %q skipped count = %d, want 0", binding.Path, binding.Skipped)
+		}
+		expected := make(map[string]int, len(parsed.Domains))
+		for _, domain := range parsed.Domains {
+			key, err := generationDomainParamKey(domain.Kind)
+			if err != nil {
+				return err
+			}
+			expected[key+"\x00"+domain.Value]++
+		}
+		if !generationDomainParamsMatch(params, expected) {
+			return fmt.Errorf("generation geosite DAT %q decoded rules do not match provider snapshot", binding.Path)
+		}
+	case "ipcidr":
+		geoIP, err := geodata.UnmarshalGeoIp(logger, path, provider)
+		if err != nil {
+			return fmt.Errorf("decode generation geoip DAT %q: %w", binding.Path, err)
+		}
+		if geoIP.CountryCode != provider || geoIP.Code != provider {
+			return fmt.Errorf("generation geoip DAT %q provider code does not match %q", binding.Path, provider)
+		}
+		expected := make(map[string]struct{}, len(parsed.Prefixes))
+		for _, prefix := range parsed.Prefixes {
+			expected[prefix.Masked().String()] = struct{}{}
+		}
+		if binding.Skipped != len(parsed.Prefixes)-len(expected) {
+			return fmt.Errorf("generation geoip DAT %q skipped count = %d, want %d decoded duplicates", binding.Path, binding.Skipped, len(parsed.Prefixes)-len(expected))
+		}
+		if !generationIPParamsMatch(params, expected) {
+			return fmt.Errorf("generation geoip DAT %q decoded rules do not match provider snapshot", binding.Path)
+		}
+	default:
+		return fmt.Errorf("unsupported generation DAT kind %q", binding.Kind)
+	}
+	return nil
+}
+
+func generationDomainParamKey(kind DomainKind) (string, error) {
+	switch kind {
+	case DomainFull:
+		return string(consts.RoutingDomainKey_Full), nil
+	case DomainSuffix:
+		return string(consts.RoutingDomainKey_Suffix), nil
+	case DomainKeyword:
+		return string(consts.RoutingDomainKey_Keyword), nil
+	case DomainRegex:
+		return string(consts.RoutingDomainKey_Regex), nil
+	default:
+		return "", fmt.Errorf("unsupported generation geosite domain kind %q", kind)
+	}
+}
+
+func generationDomainParamsMatch(params []*config_parser.Param, expected map[string]int) bool {
+	actual := make(map[string]int, len(params))
+	for _, param := range params {
+		actual[param.Key+"\x00"+param.Val]++
+	}
+	if len(actual) != len(expected) {
+		return false
+	}
+	for key, count := range expected {
+		if actual[key] != count {
+			return false
+		}
+	}
+	return true
+}
+
+func generationIPParamsMatch(params []*config_parser.Param, expected map[string]struct{}) bool {
+	if len(params) != len(expected) {
+		return false
+	}
+	actual := make(map[string]struct{}, len(params))
+	for _, param := range params {
+		if param.Key != "" {
+			return false
+		}
+		actual[param.Val] = struct{}{}
+	}
+	if len(actual) != len(expected) {
+		return false
+	}
+	for value := range expected {
+		if _, ok := actual[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func validateGenerationCandidate(candidateDir, generationID string, routes, groups []byte) error {
 	readRegular := func(name string) ([]byte, error) {
 		path := filepath.Join(candidateDir, name)
@@ -1416,15 +1862,16 @@ func validateGenerationCandidate(candidateDir, generationID string, routes, grou
 	if metadata.SchemaVersion != 2 || metadata.Providers == nil {
 		return fmt.Errorf("generation metadata is incomplete")
 	}
-	if _, err := readGenerationProviders(candidateDir, metadata); err != nil {
+	providers, err := readGenerationProviders(candidateDir, metadata)
+	if err != nil {
 		return fmt.Errorf("validate generation provider snapshots: %w", err)
 	}
-	sections, err := config_parser.Parse("global {}\n" + string(groupsBody) + "routing {\n" + string(routesBody) + "  fallback: direct\n}\n")
+	rules, err := generationRoutingRules(routesBody, groupsBody)
 	if err != nil {
 		return fmt.Errorf("parse generation DAE config: %w", err)
 	}
-	if _, err := config.New(sections); err != nil {
-		return fmt.Errorf("validate generation DAE config: %w", err)
+	if err := validateGenerationDATBindings(candidateDir, metadata.DATs, rules, providers); err != nil {
+		return fmt.Errorf("validate generation DAT bindings: %w", err)
 	}
 	return nil
 }
