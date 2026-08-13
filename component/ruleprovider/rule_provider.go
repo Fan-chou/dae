@@ -63,6 +63,13 @@ type ProviderRules struct {
 
 type Registry map[string]ProviderRules
 
+// RefreshReport describes whether Refresh published a new provider snapshot or
+// continued using an existing last-good snapshot after a source failure.
+type RefreshReport struct {
+	Changed      bool
+	UsedLastGood bool
+}
+
 // ErrProductionRuntimeDisabled is kept for source compatibility with callers
 // that used the phase-0 gate. The production loader is now enabled and never
 // returns this sentinel.
@@ -79,6 +86,7 @@ type preparedProvider struct {
 	rules                ProviderRules
 	generation           string
 	batchIdentity        string
+	usedLastGood         bool
 	descriptor           cacheDescriptor
 	candidate            *cacheCandidate
 	expectedCurrent      currentState
@@ -333,6 +341,68 @@ func loadWithOptions(ctx context.Context, providers []config.RuleProvider, baseD
 
 func LoadAndExpand(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) error {
 	return loadAndExpandWithOptions(ctx, conf, baseDir, client, loadOptions{})
+}
+
+// Refresh prepares a complete provider snapshot, validates that the current
+// routing rules can expand against it, then publishes any changed providers.
+// It intentionally leaves conf.Routing.Rules unchanged so callers can retain
+// ruleset() declarations for subsequent refreshes.
+func Refresh(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) (RefreshReport, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return RefreshReport{}, err
+		}
+	}
+	if conf == nil {
+		return RefreshReport{}, nil
+	}
+	if len(conf.RuleProvider) == 0 {
+		if _, err := ExpandRoutingRules(conf.Routing.Rules, Registry{}); err != nil {
+			return RefreshReport{}, err
+		}
+		return RefreshReport{}, nil
+	}
+	if baseDir != "" {
+		if err := recoverPendingPublish(baseDir); err != nil {
+			return RefreshReport{}, err
+		}
+	}
+	registry, prepared, err := prepareProviders(ctx, conf.RuleProvider, baseDir, client, loadOptions{})
+	if err != nil {
+		return RefreshReport{}, err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return RefreshReport{}, err
+		}
+	}
+	if _, err := ExpandRoutingRules(conf.Routing.Rules, registry); err != nil {
+		return RefreshReport{}, err
+	}
+
+	hasCandidate := false
+	usedLastGood := false
+	for _, provider := range prepared {
+		if provider.candidate != nil {
+			hasCandidate = true
+		}
+		if provider.usedLastGood {
+			usedLastGood = true
+		}
+	}
+	if !hasCandidate {
+		return RefreshReport{UsedLastGood: usedLastGood}, nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return RefreshReport{}, err
+		}
+	}
+	published, err := publishPreparedWithContext(ctx, prepared)
+	if err != nil {
+		return RefreshReport{}, err
+	}
+	return RefreshReport{Changed: published, UsedLastGood: usedLastGood}, nil
 }
 
 func loadAndExpandWithOptions(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, options loadOptions) error {
@@ -600,7 +670,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	if expectedCurrentErr != nil {
 		return preparedProvider{}, fmt.Errorf("inspect provider cache %q: %w", provider.Name, expectedCurrentErr)
 	}
-	makePrepared := func(rules ProviderRules, generation, batchIdentity string, candidate *cacheCandidate) preparedProvider {
+	makePrepared := func(rules ProviderRules, generation, batchIdentity string, candidate *cacheCandidate, usedLastGood bool) preparedProvider {
 		if candidate != nil {
 			candidate.expectedCurrent = expectedCurrent
 			candidate.expectedCurrentKnown = true
@@ -610,6 +680,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			rules:                rules,
 			generation:           generation,
 			batchIdentity:        batchIdentity,
+			usedLastGood:         usedLastGood,
 			descriptor:           descriptor,
 			candidate:            candidate,
 			expectedCurrent:      expectedCurrent,
@@ -623,14 +694,14 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 		body, readErr := readProviderFile(baseDir, provider.Path, provider.MaxSize)
 		if readErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
 			}
 			return preparedProvider{}, fmt.Errorf("read provider file: %v; cache failed: %w", readErr, cachedRulesErr)
 		}
 		rules, parseErr := parseProviderBody(body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
 			}
 			return preparedProvider{}, fmt.Errorf("validate file provider body: %w", parseErr)
 		}
@@ -651,14 +722,14 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, "", batchIdentity, candidate), nil
+		return makePrepared(rules, "", batchIdentity, candidate, false), nil
 	case "http":
 		cached, cacheErr := readCacheSnapshot(descriptor)
 		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider)
 		fetched, fetchErr := fetchHTTP(ctx, provider.URL, provider.MaxSize, client, options.allowPrivate, cached)
 		if fetchErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
 			}
 			if isSecurityError(fetchErr) {
 				return preparedProvider{}, fmt.Errorf("fetch rejected by provider security policy: %w", fetchErr)
@@ -682,12 +753,12 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 					return preparedProvider{}, fmt.Errorf("provider returned 304 generation %q inconsistent with cached generation %q", fetched.generation, generation)
 				}
 			}
-			return makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil), nil
+			return makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false), nil
 		}
 		rules, parseErr := parseProviderBody(fetched.body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
 			}
 			return preparedProvider{}, fmt.Errorf("validate fresh provider body: %w", parseErr)
 		}
@@ -713,7 +784,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, fetched.generation, batchIdentity, candidate), nil
+		return makePrepared(rules, fetched.generation, batchIdentity, candidate, false), nil
 	default:
 		return preparedProvider{}, fmt.Errorf("unsupported provider type %q", provider.Type)
 	}
@@ -1346,37 +1417,60 @@ func cacheMetadataMatches(metadata cacheMetadata, descriptor cacheDescriptor) bo
 }
 
 func publishPrepared(prepared []preparedProvider) error {
+	_, err := publishPreparedWithContext(context.Background(), prepared)
+	return err
+}
+
+// publishPreparedWithContext returns whether it replaced at least one current
+// cache snapshot. It keeps the established publishPrepared API for callers
+// that do not need cancellation or the publication result.
+func publishPreparedWithContext(ctx context.Context, prepared []preparedProvider) (bool, error) {
 	cachePublishMu.Lock()
 	defer cachePublishMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+	}
 	transactionRoot, err := preparedTransactionRoot(prepared)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var transaction transactionLock
 	if transactionRoot != "" {
 		transaction, err = acquireTransactionLock(transactionRoot)
 		if err != nil {
-			return err
+			return false, err
 		}
 		defer transaction.Close()
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 	}
 	transactionPath := ""
 	if transactionRoot != "" {
 		transactionPath = filepath.Join(transactionRoot, "transaction.journal")
 		if err := recoverPendingPublishLocked(transactionRoot, transactionPath); err != nil {
-			return fmt.Errorf("recover existing cache transaction journal before publish: %w", err)
+			return false, fmt.Errorf("recover existing cache transaction journal before publish: %w", err)
 		}
 	}
 	locks, err := acquireCacheLocks(prepared)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer locks.Close()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+	}
 	if err := validatePreparedCandidates(prepared); err != nil {
-		return err
+		return false, err
 	}
 	if err := validateUnversionedBatchConsistency(prepared); err != nil {
-		return err
+		return false, err
 	}
 
 	hasCandidate := false
@@ -1387,11 +1481,16 @@ func publishPrepared(prepared []preparedProvider) error {
 		}
 	}
 	if !hasCandidate {
-		return nil
+		return false, nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 	}
 	transactionID, err := newCacheTransactionID()
 	if err != nil {
-		return fmt.Errorf("generate provider cache transaction identity: %w", err)
+		return false, fmt.Errorf("generate provider cache transaction identity: %w", err)
 	}
 	batchIdentity := ""
 	if requiresUnversionedBatchIdentity(prepared) {
@@ -1410,19 +1509,19 @@ func publishPrepared(prepared []preparedProvider) error {
 		candidate := provider.candidate
 		if err := ensureCacheLayout(candidate.descriptor.root); err != nil {
 			cleanupPreparedCaches(caches)
-			return fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
+			return false, fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
 		}
 		old, err := readCurrentState(candidate.descriptor.root)
 		if err != nil {
 			cleanupPreparedCaches(caches)
-			return fmt.Errorf("inspect provider cache %q: %w", provider.name, err)
+			return false, fmt.Errorf("inspect provider cache %q: %w", provider.name, err)
 		}
 		history := generationHistory{}
 		if old.exists {
 			currentSnapshot, err := readCacheSnapshotForSourceChange(candidate.descriptor)
 			if err != nil {
 				cleanupPreparedCaches(caches)
-				return fmt.Errorf("inspect current provider cache %q: %w", provider.name, err)
+				return false, fmt.Errorf("inspect current provider cache %q: %w", provider.name, err)
 			}
 			history = currentSnapshot.metadata.GenerationHistory
 			currentGeneration := cacheSnapshotGeneration(currentSnapshot)
@@ -1430,14 +1529,14 @@ func publishPrepared(prepared []preparedProvider) error {
 				history, err = prependGenerationHistory(history, currentGeneration)
 				if err != nil {
 					cleanupPreparedCaches(caches)
-					return fmt.Errorf("prepare provider cache %q generation history: %w", provider.name, err)
+					return false, fmt.Errorf("prepare provider cache %q generation history: %w", provider.name, err)
 				}
 			}
 		}
 		versionDir, err := os.MkdirTemp(filepath.Join(candidate.descriptor.root, "versions"), "version-")
 		if err != nil {
 			cleanupPreparedCaches(caches)
-			return fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
+			return false, fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
 		}
 		metadata := cacheMetadata{
 			SchemaVersion:     cacheSchemaVersion,
@@ -1475,13 +1574,13 @@ func publishPrepared(prepared []preparedProvider) error {
 		if err != nil {
 			_ = os.RemoveAll(versionDir)
 			cleanupPreparedCaches(caches)
-			return fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
+			return false, fmt.Errorf("prepare provider cache %q: %w", provider.name, err)
 		}
 		prepared[index].expectedCurrent = old
 		caches = append(caches, preparedCache{candidate: candidate, versionDir: versionDir, old: old})
 	}
 	if len(caches) == 0 {
-		return nil
+		return false, nil
 	}
 
 	transactionRecord := cacheTransaction{
@@ -1508,7 +1607,7 @@ func publishPrepared(prepared []preparedProvider) error {
 	}
 	if err := writeCacheTransaction(transactionPath, transactionRecord); err != nil {
 		cleanupPreparedCaches(caches)
-		return fmt.Errorf("write cache transaction journal: %w", err)
+		return false, fmt.Errorf("write cache transaction journal: %w", err)
 	}
 
 	for index := range caches {
@@ -1518,7 +1617,7 @@ func publishPrepared(prepared []preparedProvider) error {
 				cleanupPreparedCaches(caches)
 				_ = removeCacheTransaction(transactionPath)
 			}
-			return combinePublishErrors(caches[index].candidate.descriptor.name, "replace current", err, rollbackErr)
+			return false, combinePublishErrors(caches[index].candidate.descriptor.name, "replace current", err, rollbackErr)
 		}
 		if err := syncDirectory(caches[index].candidate.descriptor.root); err != nil {
 			rollbackErr := rollbackCaches(caches, index)
@@ -1526,23 +1625,23 @@ func publishPrepared(prepared []preparedProvider) error {
 				cleanupPreparedCaches(caches)
 				_ = removeCacheTransaction(transactionPath)
 			}
-			return combinePublishErrors(caches[index].candidate.descriptor.name, "sync current", err, rollbackErr)
+			return false, combinePublishErrors(caches[index].candidate.descriptor.name, "sync current", err, rollbackErr)
 		}
 	}
 
 	transactionRecord.State = "committed"
 	if err := writeCacheTransaction(transactionPath, transactionRecord); err != nil {
-		return fmt.Errorf("commit cache transaction journal: %w", err)
+		return false, fmt.Errorf("commit cache transaction journal: %w", err)
 	}
 	if err := removeCacheTransaction(transactionPath); err != nil {
-		return fmt.Errorf("remove cache transaction journal: %w", err)
+		return false, fmt.Errorf("remove cache transaction journal: %w", err)
 	}
 	for _, cache := range caches {
 		if err := pruneCacheVersions(cache.candidate.descriptor.root, maxCacheVersions); err != nil {
-			return fmt.Errorf("prune provider cache %q: %w", cache.candidate.descriptor.name, err)
+			return false, fmt.Errorf("prune provider cache %q: %w", cache.candidate.descriptor.name, err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func validatePreparedCandidates(prepared []preparedProvider) error {
