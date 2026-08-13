@@ -24,8 +24,21 @@ type MihomoRuleIR struct {
 
 type MihomoRuleIRRule struct {
 	MihomoRuleSource
-	Expr   MihomoExpr
-	Action MihomoAction
+	Expr MihomoExpr
+	// CallTrace is empty for ordinary source rules. The sub-rule compiler
+	// records calls from outermost to innermost while retaining the leaf rule's
+	// own source metadata in MihomoRuleSource.
+	CallTrace []MihomoSubRuleCall
+	Action    MihomoAction
+}
+
+// MihomoSubRuleCall identifies one SUB-RULE edge used to produce an expanded
+// leaf rule. Source is the call-site source, not the referenced definition's
+// header source.
+type MihomoSubRuleCall struct {
+	Name   string
+	Source MihomoRuleSource
+	Guard  MihomoExpr
 }
 
 type MihomoSubRuleIR struct {
