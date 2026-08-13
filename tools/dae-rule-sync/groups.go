@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"strings"
@@ -88,6 +90,27 @@ func ParseMihomoConfig(data []byte) (MihomoConfig, error) {
 	return config, nil
 }
 
+// ParseMihomoConfigStrict is used by complete generation output. Mihomo has a
+// large configuration surface; silently dropping a field that this converter
+// does not model would make a generation look complete while changing its
+// meaning. Compatibility-only groups output retains the permissive parser.
+func ParseMihomoConfigStrict(data []byte) (MihomoConfig, error) {
+	var config MihomoConfig
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&config); err != nil {
+		return MihomoConfig{}, fmt.Errorf("parse Mihomo config strictly: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return MihomoConfig{}, errors.New("parse Mihomo config strictly: multiple YAML documents are not allowed")
+		}
+		return MihomoConfig{}, fmt.Errorf("parse Mihomo config strictly: %w", err)
+	}
+	return config, nil
+}
+
 func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, error) {
 	return generateFlatDaeGroups(config, nil)
 }
@@ -96,9 +119,21 @@ func GenerateFlatDaeGroups(config MihomoConfig) (string, GroupConversionReport, 
 // nodeNames is non-nil, ordinary Mihomo proxy references are replaced by the
 // generated dae node names before rendering.
 func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (string, GroupConversionReport, error) {
+	return generateMihomoGroups(config, nodeNames, false)
+}
+
+// generateFullMihomoGroups renders the generation-backed Mihomo conversion.
+// The compatibility renderer intentionally reports legacy approximations, but
+// the complete generation path only accepts mappings whose runtime semantics
+// are represented by dae.
+func generateFullMihomoGroups(config MihomoConfig, nodeNames map[string]string) (string, GroupConversionReport, error) {
+	return generateMihomoGroups(config, nodeNames, true)
+}
+
+func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, lossless bool) (string, GroupConversionReport, error) {
 	proxies := make(map[string]struct{}, len(config.Proxies))
 	for _, proxy := range config.Proxies {
-		if proxy.Name == "" {
+		if proxy.Name == "" || strings.TrimSpace(proxy.Name) == "" {
 			return "", GroupConversionReport{}, errors.New("proxy has empty name")
 		}
 		if _, exists := proxies[proxy.Name]; exists {
@@ -108,7 +143,7 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	}
 	groups := make(map[string]struct{}, len(config.Groups))
 	for _, group := range config.Groups {
-		if group.Name == "" {
+		if group.Name == "" || strings.TrimSpace(group.Name) == "" {
 			return "", GroupConversionReport{}, fmt.Errorf("group has empty name")
 		}
 		if _, exists := groups[group.Name]; exists {
@@ -131,12 +166,23 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	report := GroupConversionReport{NameMap: make(map[string]string, len(config.Groups))}
 	safeNames := make(map[string]string, len(config.Groups))
 	for _, group := range config.Groups {
+		if lossless && isReservedMihomoGroupName(group.Name) {
+			return "", GroupConversionReport{}, fmt.Errorf("group %q conflicts with a reserved Mihomo member or dae outbound", group.Name)
+		}
 		safeName := safeDaeIdentifier(group.Name)
 		if previous, exists := safeNames[safeName]; exists {
 			return "", GroupConversionReport{}, fmt.Errorf("groups %q and %q map to the same dae name %q", previous, group.Name, safeName)
 		}
+		if safeName == "direct" || safeName == "block" {
+			return "", GroupConversionReport{}, fmt.Errorf("group %q maps to reserved dae outbound %q", group.Name, safeName)
+		}
 		safeNames[safeName] = group.Name
 		report.NameMap[group.Name] = safeName
+	}
+	if nodeNames != nil {
+		if err := validateMihomoOutputNames(nodeNames, report.NameMap); err != nil {
+			return "", GroupConversionReport{}, err
+		}
 	}
 
 	_, hasNestedMembers, err := validateMihomoGroupGraph(config.Groups, groups)
@@ -150,7 +196,14 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 		members := make([]string, 0, len(group.Proxies))
 		selectionMembers := make([]string, 0, len(group.Proxies))
 		var reasons []string
+		seenMembers := make(map[string]struct{}, len(group.Proxies))
 		for _, member := range group.Proxies {
+			if lossless {
+				if _, exists := seenMembers[member]; exists {
+					return "", GroupConversionReport{}, fmt.Errorf("group %q repeats member %q", group.Name, member)
+				}
+				seenMembers[member] = struct{}{}
+			}
 			switch member {
 			case "DIRECT", "REJECT":
 				members = append(members, member)
@@ -193,6 +246,9 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 			return "", GroupConversionReport{}, fmt.Errorf("group %q has no members", group.Name)
 		}
 		if len(members) == 0 {
+			if lossless {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q cannot be converted: %s", group.Name, strings.Join(reasons, "; "))
+			}
 			if len(reasons) > 0 {
 				report.Unsupported = append(report.Unsupported, GroupUnsupported{Group: group.Name, Reason: strings.Join(reasons, "; ")})
 			}
@@ -201,10 +257,22 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 
 		policy, approximate, err := flatGroupPolicy(group.Type)
 		if err != nil {
+			if lossless {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q cannot be converted: %w", group.Name, err)
+			}
 			report.Unsupported = append(report.Unsupported, GroupUnsupported{Group: group.Name, Reason: err.Error()})
 			continue
 		}
+		if lossless {
+			policy, approximate, err = fullMihomoGroupPolicy(group.Type, selectionMembers)
+			if err != nil {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q cannot be converted: %w", group.Name, err)
+			}
+		}
 		if len(reasons) > 0 {
+			if lossless {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q cannot be converted: %s", group.Name, strings.Join(reasons, "; "))
+			}
 			report.Unsupported = append(report.Unsupported, GroupUnsupported{Group: group.Name, Reason: strings.Join(reasons, "; ")})
 		}
 		report.Converted++
@@ -254,6 +322,15 @@ func generateFlatDaeGroups(config MihomoConfig, nodeNames map[string]string) (st
 	}
 	output.WriteString("}\n")
 	return output.String(), report, nil
+}
+
+func isReservedMihomoGroupName(name string) bool {
+	switch strings.ToLower(name) {
+	case "direct", "reject", "block":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasMihomoGroupHealthOptions(group MihomoGroup) bool {
@@ -444,6 +521,58 @@ func flatGroupPolicy(groupType string) (policy string, approximate bool, err err
 	default:
 		return "", false, fmt.Errorf("group type %q is unsupported for flat conversion", groupType)
 	}
+}
+
+func fullMihomoGroupPolicy(groupType string, selectionMembers []string) (string, bool, error) {
+	policy, approximate, err := flatGroupPolicy(groupType)
+	if err != nil {
+		return "", false, err
+	}
+	switch strings.ToLower(groupType) {
+	case "select":
+		if !allSafeSelectionIdentities(selectionMembers) {
+			return "", false, errors.New("select group has no lossless member identity metadata")
+		}
+		// selection_members plus the persisted user-space choice preserves the
+		// Mihomo select identity; fixed(0) is only the safe initial fallback.
+		return policy, false, nil
+	case "fallback":
+		// first_alive is the exact ordered fallback policy implemented by dae.
+		return policy, false, nil
+	default:
+		// url-test currently maps to min_avg10 without Mihomo's complete
+		// tolerance/latency semantics, so it remains an explicit approximation.
+		return policy, approximate, nil
+	}
+}
+
+func validateMihomoOutputNames(nodeNames, groupNames map[string]string) error {
+	used := make(map[string]string, len(nodeNames)+len(groupNames))
+	for original, safeName := range nodeNames {
+		if original == "" || safeName == "" || !mihomoNodeIdentifierPattern.MatchString(safeName) {
+			return fmt.Errorf("Mihomo node name mapping for %q is invalid", original)
+		}
+		if safeName == "direct" || safeName == "block" {
+			return fmt.Errorf("Mihomo node %q maps to reserved dae outbound %q", original, safeName)
+		}
+		if previous, exists := used[safeName]; exists {
+			return fmt.Errorf("Mihomo node/group names %q and %q map to the same dae outbound %q", previous, original, safeName)
+		}
+		used[safeName] = original
+	}
+	for original, safeName := range groupNames {
+		if original == "" || safeName == "" || !daeIdentifierPattern.MatchString(safeName) {
+			return fmt.Errorf("Mihomo group name mapping for %q is invalid", original)
+		}
+		if safeName == "direct" || safeName == "block" {
+			return fmt.Errorf("Mihomo group %q maps to reserved dae outbound %q", original, safeName)
+		}
+		if previous, exists := used[safeName]; exists {
+			return fmt.Errorf("Mihomo node/group names %q and %q map to the same dae outbound %q", previous, original, safeName)
+		}
+		used[safeName] = original
+	}
+	return nil
 }
 
 func safeDaeIdentifier(name string) string {

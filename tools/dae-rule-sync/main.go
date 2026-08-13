@@ -19,10 +19,10 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	var options SyncOptions
 	flags.StringVar(&options.ManifestPath, "manifest", "", "provider manifest path")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "provider cache directory")
-	flags.StringVar(&options.RoutesOutput, "routes-output", "", "direct routes output path (compatibility mode; non-atomic publication)")
+	flags.StringVar(&options.RoutesOutput, "routes-output", "", "direct routes output path (compatibility-only; non-atomic complete-state publication)")
 	flags.StringVar(&options.GroupsInputPath, "mihomo-config", "", "optional Mihomo config for flat group conversion")
-	flags.StringVar(&options.GroupsOutput, "groups-output", "", "direct groups output path (compatibility mode; non-atomic publication)")
-	flags.StringVar(&options.NodesOutput, "nodes-output", "", "direct Mihomo node output path (compatibility mode; non-atomic publication)")
+	flags.StringVar(&options.GroupsOutput, "groups-output", "", "direct groups output path (compatibility-only; non-atomic complete-state publication)")
+	flags.StringVar(&options.NodesOutput, "nodes-output", "", "direct Mihomo node output path (compatibility-only; use generation-dir with routes)")
 	flags.StringVar(&options.GenerationDir, "generation-dir", "", "generation output directory; atomically publishes nodes, routes, groups, DATs, and provider snapshots together")
 	flags.BoolVar(&options.Strict, "strict", false, "fail when a rule cannot be converted")
 	if err := flags.Parse(args); err != nil {

@@ -2740,6 +2740,334 @@ routes:
 	}
 }
 
+func TestRunSyncGenerationFailsClosedForUnsupportedProviderByDefault(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	writeManifest := func(body string) {
+		t.Helper()
+		manifest := fmt.Sprintf(`providers:
+  - name: mixed
+    type: inline
+    behavior: classical
+    format: text
+    data: %q
+routes:
+  - provider: mixed
+    outbound: proxy
+    kind: domain
+`, body)
+		if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+			t.Fatalf("WriteFile(manifest) error = %v", err)
+		}
+	}
+	writeManifest("DOMAIN-SUFFIX,old.example\n")
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+	options := SyncOptions{ManifestPath: manifestPath, GroupsInputPath: groupsPath, GenerationDir: generationDir}
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("initial RunSync() error = %v", err)
+	}
+	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, generationDir)
+
+	writeManifest("DOMAIN-SUFFIX,new.example\nPROCESS-NAME,ignored\n")
+	if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), "unsupported") {
+		t.Fatalf("RunSync() error = %v, want default generation rejection for unsupported provider rule", err)
+	}
+	newTarget, newRoutes, newGroups := readCurrentGeneration(t, generationDir)
+	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+		t.Fatalf("current changed after default unsupported rejection: target=%q routes=%q groups=%q", newTarget, newRoutes, newGroups)
+	}
+}
+
+func TestRunSyncGenerationRejectsApproximateGroupAndKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	manifest := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [example.com]"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile(manifest) error = %v", err)
+	}
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+	options := SyncOptions{ManifestPath: manifestPath, GroupsInputPath: groupsPath, GenerationDir: generationDir}
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("initial RunSync() error = %v", err)
+	}
+	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, generationDir)
+	approximateGroups := strings.ReplaceAll(mustReadFile(t, groupsPath), "type: select", "type: url-test")
+	if err := os.WriteFile(groupsPath, []byte(approximateGroups), 0o600); err != nil {
+		t.Fatalf("WriteFile(approximate groups) error = %v", err)
+	}
+	if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), "approximated") {
+		t.Fatalf("RunSync() error = %v, want approximation gate rejection", err)
+	}
+	newTarget, newRoutes, newGroups := readCurrentGeneration(t, generationDir)
+	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+		t.Fatalf("current changed after approximation rejection: target=%q routes=%q groups=%q", newTarget, newRoutes, newGroups)
+	}
+}
+
+func TestRunSyncGenerationRejectsUnmodeledMihomoHealthFieldAndKeepsCurrent(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	generationDir := filepath.Join(dir, "generated")
+	manifest := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [example.com]"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile(manifest) error = %v", err)
+	}
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+	options := SyncOptions{ManifestPath: manifestPath, GroupsInputPath: groupsPath, GenerationDir: generationDir}
+	if _, err := RunSync(context.Background(), options); err != nil {
+		t.Fatalf("initial RunSync() error = %v", err)
+	}
+	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, generationDir)
+	unmodeled := strings.Replace(mustReadFile(t, groupsPath), "    proxies: [hk-1]\n", "    proxies: [hk-1]\n    health-check: true\n", 1)
+	if err := os.WriteFile(groupsPath, []byte(unmodeled), 0o600); err != nil {
+		t.Fatalf("WriteFile(unmodeled health field) error = %v", err)
+	}
+	if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), "strict") {
+		t.Fatalf("RunSync() error = %v, want strict unmodeled-field rejection", err)
+	}
+	newTarget, newRoutes, newGroups := readCurrentGeneration(t, generationDir)
+	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+		t.Fatalf("current changed after unmodeled health-field rejection: target=%q routes=%q groups=%q", newTarget, newRoutes, newGroups)
+	}
+}
+
+func TestRunSyncGenerationRejectsEmptyArtifactsAndKeepsCurrent(t *testing.T) {
+	cases := []struct {
+		name      string
+		mutate    func(*testing.T, string, string)
+		wantError string
+	}{
+		{
+			name: "empty provider",
+			mutate: func(t *testing.T, manifestPath, _ string) {
+				body := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: []"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+				if err := os.WriteFile(manifestPath, []byte(body), 0o600); err != nil {
+					t.Fatalf("WriteFile(empty provider manifest) error = %v", err)
+				}
+			},
+			wantError: "no convertible",
+		},
+		{
+			name: "empty routes",
+			mutate: func(t *testing.T, manifestPath, _ string) {
+				body := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [example.com]"
+routes: []
+`
+				if err := os.WriteFile(manifestPath, []byte(body), 0o600); err != nil {
+					t.Fatalf("WriteFile(empty routes manifest) error = %v", err)
+				}
+			},
+			wantError: "zero generated",
+		},
+		{
+			name: "empty groups",
+			mutate: func(t *testing.T, _, groupsPath string) {
+				if err := os.WriteFile(groupsPath, []byte("proxies:\n  - name: hk-1\n    type: anytls\n    server: 127.0.0.1\n    port: 443\n    password: test-password\nproxy-groups: []\n"), 0o600); err != nil {
+					t.Fatalf("WriteFile(empty groups) error = %v", err)
+				}
+			},
+			wantError: "converted groups",
+		},
+		{
+			name: "empty node pool",
+			mutate: func(t *testing.T, _, groupsPath string) {
+				body := `proxies: []
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [DIRECT]
+`
+				if err := os.WriteFile(groupsPath, []byte(body), 0o600); err != nil {
+					t.Fatalf("WriteFile(empty node pool) error = %v", err)
+				}
+			},
+			wantError: "node pool",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifestPath := filepath.Join(dir, "providers.yaml")
+			groupsPath := filepath.Join(dir, "mihomo.yaml")
+			generationDir := filepath.Join(dir, "generated")
+			validManifest := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [old.example]"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+			if err := os.WriteFile(manifestPath, []byte(validManifest), 0o600); err != nil {
+				t.Fatalf("WriteFile(valid manifest) error = %v", err)
+			}
+			runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+			options := SyncOptions{ManifestPath: manifestPath, GroupsInputPath: groupsPath, GenerationDir: generationDir}
+			if _, err := RunSync(context.Background(), options); err != nil {
+				t.Fatalf("initial RunSync() error = %v", err)
+			}
+			oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, generationDir)
+			tc.mutate(t, manifestPath, groupsPath)
+			if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.wantError) {
+				t.Fatalf("RunSync() error = %v, want diagnostic containing %q", err, tc.wantError)
+			}
+			newTarget, newRoutes, newGroups := readCurrentGeneration(t, generationDir)
+			if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+				t.Fatalf("current changed after %s rejection: target=%q routes=%q groups=%q", tc.name, newTarget, newRoutes, newGroups)
+			}
+		})
+	}
+}
+
+func TestGenerationCandidateWriteFailureRemovesCandidateAndKeepsCurrent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "generated")
+	routes := []byte("domain(suffix: 'example.com') -> proxy\n")
+	groups := []byte("group {\n    proxy {\n        filter: name('hk-1')\n        policy: fixed(0)\n    }\n}\n")
+	if err := publishGeneration(root, routes, groups); err != nil {
+		t.Fatalf("initial publishGeneration() error = %v", err)
+	}
+	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, root)
+	state, err := openGenerationRoot(root)
+	if err != nil {
+		t.Fatalf("openGenerationRoot() error = %v", err)
+	}
+	state, err = resolveGenerationRoot(state)
+	if err != nil {
+		t.Fatalf("resolveGenerationRoot() error = %v", err)
+	}
+	_, err = beginGenerationPublicationAt(state, routes, groups, []ProviderSnapshot{{Name: "invalid/name", Body: []byte("payload: [example.com]"), SHA256: digest([]byte("payload: [example.com]")), SourceKey: "source", Behavior: "domain", Format: "yaml"}})
+	if err == nil {
+		t.Fatal("beginGenerationPublicationAt() error = nil for candidate provider write failure")
+	}
+	newTarget, newRoutes, newGroups := readCurrentGeneration(t, root)
+	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+		t.Fatalf("current changed after candidate write failure: target=%q routes=%q groups=%q", newTarget, newRoutes, newGroups)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "generations"))
+	if err != nil {
+		t.Fatalf("ReadDir(generations) error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("generation entries after candidate write failure = %#v, want only old current", entries)
+	}
+}
+
+func TestGenerationCandidateRoundTripFailureKeepsCurrent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "generated")
+	routes := []byte("domain(suffix: 'example.com') -> proxy\n")
+	groups := []byte("group {\n    Proxy {\n        filter: name('hk-1')\n        selection_members: 'hk-1'\n        policy: fixed(0)\n    }\n}\n")
+	if err := publishGeneration(root, routes, groups); err != nil {
+		t.Fatalf("initial publishGeneration() error = %v", err)
+	}
+	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, root)
+	state, err := openGenerationRoot(root)
+	if err != nil {
+		t.Fatalf("openGenerationRoot() error = %v", err)
+	}
+	state, err = resolveGenerationRoot(state)
+	if err != nil {
+		t.Fatalf("resolveGenerationRoot() error = %v", err)
+	}
+	badNodes := []byte("node {\n    hk-1: 'not-a-dae-link'\n}\n")
+	metadata := &generationMihomoMetadata{
+		InputSHA256:  strings.Repeat("0", 64),
+		NodeNameMap:  map[string]string{"hk-1": "hk-1"},
+		GroupNameMap: map[string]string{"Proxy": "Proxy"},
+		NodeTypes:    map[string]string{"hk-1": "anytls"},
+	}
+	_, err = beginGenerationPublicationAtWithNodes(state, routes, badNodes, groups, nil, metadata)
+	if err == nil {
+		t.Fatal("beginGenerationPublicationAtWithNodes() error = nil for node-link round-trip failure")
+	}
+	newTarget, newRoutes, newGroups := readCurrentGeneration(t, root)
+	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {
+		t.Fatalf("current changed after round-trip failure: target=%q routes=%q groups=%q", newTarget, newRoutes, newGroups)
+	}
+}
+
+func TestRunSyncRejectsDirectCompleteMihomoOutputsWithoutGenerationDir(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "providers.yaml")
+	groupsPath := filepath.Join(dir, "mihomo.yaml")
+	manifest := `providers:
+  - name: p
+    type: inline
+    behavior: domain
+    format: yaml
+    data: "payload: [example.com]"
+routes:
+  - provider: p
+    outbound: proxy
+    kind: domain
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("WriteFile(manifest) error = %v", err)
+	}
+	runnerWriteGenerationGroupsInput(t, groupsPath, "hk-1")
+	_, err := RunSync(context.Background(), SyncOptions{
+		ManifestPath:    manifestPath,
+		GroupsInputPath: groupsPath,
+		RoutesOutput:    filepath.Join(dir, "routes.dae"),
+		GroupsOutput:    filepath.Join(dir, "groups.dae"),
+		NodesOutput:     filepath.Join(dir, "nodes.dae"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "generation-dir") {
+		t.Fatalf("RunSync() error = %v, want direct complete-output limitation", err)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", path, err)
+	}
+	return string(body)
+}
+
 func TestRunSyncStrictHTTPGenerationFallsBackToPreviousProviderSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "providers.yaml")

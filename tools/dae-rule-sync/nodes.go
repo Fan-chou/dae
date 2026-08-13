@@ -51,6 +51,9 @@ func GenerateMihomoNodes(config MihomoConfig) (string, NodeConversionReport, err
 		seenNames[proxy.Name] = struct{}{}
 
 		safeName := safeMihomoNodeName(proxy.Name)
+		if safeName == "direct" || safeName == "block" {
+			return "", NodeConversionReport{}, fmt.Errorf("mihomo proxy %q maps to reserved dae outbound %q", proxy.Name, safeName)
+		}
 		if previous, exists := seenSafeNames[safeName]; exists && previous != proxy.Name {
 			return "", NodeConversionReport{}, fmt.Errorf("proxies %q and %q map to the same dae node name %q", previous, proxy.Name, safeName)
 		}
@@ -116,7 +119,7 @@ func validateGenerationMihomoMetadata(metadata *generationMihomoMetadata) error 
 	}
 	seenSafeNames := make(map[string]string, len(metadata.NodeNameMap))
 	for original, safeName := range metadata.NodeNameMap {
-		if safeName == "" || safeMihomoNodeName(original) != safeName {
+		if original == "" || original == "DIRECT" || original == "REJECT" || safeName == "" || safeMihomoNodeName(original) != safeName {
 			return fmt.Errorf("generation Mihomo node name mapping is invalid")
 		}
 		if previous, exists := seenSafeNames[safeName]; exists && previous != original {
@@ -130,15 +133,26 @@ func validateGenerationMihomoMetadata(metadata *generationMihomoMetadata) error 
 			return fmt.Errorf("generation Mihomo node protocol is unsupported")
 		}
 	}
+	for safeName := range metadata.NodeTypes {
+		if _, exists := seenSafeNames[safeName]; !exists {
+			return fmt.Errorf("generation Mihomo node type has no name mapping")
+		}
+	}
 	seenSafeNames = make(map[string]string, len(metadata.GroupNameMap))
 	for original, safeName := range metadata.GroupNameMap {
-		if safeName == "" || safeDaeIdentifier(original) != safeName {
+		if original == "" || safeName == "" || safeDaeIdentifier(original) != safeName {
 			return fmt.Errorf("generation Mihomo group name mapping is invalid")
+		}
+		if isReservedMihomoGroupName(original) {
+			return fmt.Errorf("generation Mihomo group name %q is reserved", original)
 		}
 		if previous, exists := seenSafeNames[safeName]; exists && previous != original {
 			return fmt.Errorf("generation Mihomo group name mapping collides")
 		}
 		seenSafeNames[safeName] = original
+	}
+	if err := validateMihomoOutputNames(metadata.NodeNameMap, metadata.GroupNameMap); err != nil {
+		return err
 	}
 	return nil
 }
