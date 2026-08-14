@@ -956,9 +956,14 @@ const authorizedSyntheticProviderHost = "download.readfun.me"
 
 var authorizedSyntheticProviderAddress = net.ParseIP("198.18.11.216")
 
+const authorizedSyntheticProviderSKKHost = "ruleset.skk.moe"
+
+var authorizedSyntheticProviderSKKAddress = net.ParseIP("198.18.11.217")
+
 func authorizedSyntheticProviderIP(host string, ip net.IP) bool {
 	// This provider's authorized synthetic address is required for Mihomo rule conversion.
-	return host == authorizedSyntheticProviderHost && ip.Equal(authorizedSyntheticProviderAddress)
+	return (host == authorizedSyntheticProviderHost && ip.Equal(authorizedSyntheticProviderAddress)) ||
+		(host == authorizedSyntheticProviderSKKHost && ip.Equal(authorizedSyntheticProviderSKKAddress))
 }
 
 var blockedProviderNetworks = mustProviderNetworks([]string{
