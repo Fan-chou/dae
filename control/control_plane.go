@@ -402,6 +402,40 @@ func NewPreparedReloadControlPlaneWithContext(
 	)
 }
 
+// closeUniqueDialers closes construction-time parent health views that are not
+// already covered by another wrapper's cleanup. CloneWithGlobalOptionContext
+// may share a transport when a concrete dialer cannot be reconstructed from a
+// link, so blindly closing every wrapper would close the same transport twice.
+// Once egressRuntime takes ownership, it performs the equivalent identity-aware
+// cleanup; this helper is only for the pre-runtime construction error path.
+func closeUniqueDialers(dialers, shared []*dialer.Dialer) error {
+	sharedIdentities := make(map[any]struct{}, len(shared))
+	for _, d := range shared {
+		if d != nil {
+			sharedIdentities[egressDialerIdentity(d)] = struct{}{}
+		}
+	}
+	closedIdentities := make(map[any]struct{}, len(dialers))
+	var errs []error
+	for _, d := range dialers {
+		if d == nil {
+			continue
+		}
+		identity := egressDialerIdentity(d)
+		if _, alreadyShared := sharedIdentities[identity]; alreadyShared {
+			continue
+		}
+		if _, alreadyClosed := closedIdentities[identity]; alreadyClosed {
+			continue
+		}
+		closedIdentities[identity] = struct{}{}
+		if err := d.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return stderrors.Join(errs...)
+}
+
 func newControlPlaneWithContextOptions(
 	ctx context.Context,
 	log *logrus.Logger,
@@ -701,6 +735,34 @@ func newControlPlaneWithContextOptions(
 		dialer.CleanupTransportCacheNamespace(option.TransportCacheNamespace)
 		return nil
 	})
+	builtGroups := make(map[string]*outbound.DialerGroup)
+	var parentHealthViews []*dialer.Dialer
+	deferFuncs = append(deferFuncs, func() error {
+		sharedDialers := dialerSet.AllDialers()
+		for _, group := range outbounds {
+			if group != nil {
+				sharedDialers = append(sharedDialers, group.Dialers...)
+			}
+		}
+		for _, group := range builtGroups {
+			if group != nil {
+				sharedDialers = append(sharedDialers, group.Dialers...)
+			}
+		}
+		parentViewSet := make(map[*dialer.Dialer]struct{}, len(parentHealthViews))
+		for _, view := range parentHealthViews {
+			if view != nil {
+				parentViewSet[view] = struct{}{}
+			}
+		}
+		filteredSharedDialers := make([]*dialer.Dialer, 0, len(sharedDialers))
+		for _, shared := range sharedDialers {
+			if _, isParentView := parentViewSet[shared]; !isParentView {
+				filteredSharedDialers = append(filteredSharedDialers, shared)
+			}
+		}
+		return closeUniqueDialers(parentHealthViews, filteredSharedDialers)
+	})
 	groupPlans, groupBuildOrder, err := planNestedGroupBuild(groups)
 	if err != nil {
 		return nil, fmt.Errorf("validate group graph: %w", err)
@@ -709,7 +771,6 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("too many outbounds")
 	}
 	baseOutboundCount := len(outbounds)
-	builtGroups := make(map[string]*outbound.DialerGroup, len(groupPlans))
 	groupSelectionStore := groupSelectionStoreFromContext(ctx)
 	groupSelectionMembers := make(map[string][]string)
 	for _, planIndex := range groupBuildOrder {
@@ -723,8 +784,14 @@ func newControlPlaneWithContextOptions(
 		callback := core.outboundAliveChangeCallback(uint8(baseOutboundCount+plan.index), disableKernelAliveCallback)
 
 		if plan.hasNestedReferences() {
-			if group.HasHealthCheckOverride() {
-				return nil, fmt.Errorf("nested group %q cannot override health-check options", group.Name)
+			groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create nested group %q health-check override: %w", group.Name, err)
+			}
+			finalOption := option
+			if groupOption != nil {
+				finalOption = groupOption
+				log.Infof(`Nested group "%v"'s check option has been override.`, group.Name)
 			}
 
 			members := make([]outbound.NestedDialerGroupMember, 0)
@@ -767,10 +834,22 @@ func newControlPlaneWithContextOptions(
 				log.Debugf(`Nested group "%v" has %d ordered members.`, group.Name, len(members))
 			}
 			applyPersistedGroupSelection(groupSelectionStore, group, policy, memberIdentities, log)
-			dialerGroup, err := outbound.NewNestedDialerGroup(option, group.Name, members, *policy, callback)
+			dialerGroup, err := outbound.NewNestedDialerGroupWithRuntimeOptions(
+				finalOption,
+				group.Name,
+				members,
+				*policy,
+				callback,
+				outbound.DialerGroupRuntimeOptions{
+					HealthCheckEnabled: group.EnablesHealthCheck(),
+					Lazy:               group.Lazy,
+				},
+			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create nested group %q: %w", group.Name, err)
 			}
+			parentHealthViews = append(parentHealthViews, dialerGroup.ParentHealthViewDialers()...)
+			deferFuncs = append(deferFuncs, dialerGroup.Close)
 			builtGroups[group.Name] = dialerGroup
 			if len(group.SelectionMembers) > 0 {
 				groupSelectionMembers[group.Name] = append([]string(nil), memberIdentities...)

@@ -274,6 +274,259 @@ func TestDialerGroup_NestedActivationRespectsChildLazyCheck(t *testing.T) {
 	}
 }
 
+func TestDialerGroup_NestedParentHealthViewRetriesChildAlternative(t *testing.T) {
+	childOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	parentOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	leaves := []*dialer.Dialer{newDirectDialer(childOption, false), newDirectDialer(childOption, false)}
+	child := NewDialerGroup(childOption, "child", leaves, newEmptyAnnotations(len(leaves)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(parentOption, "parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, leaf := range leaves {
+		defer leaf.Close()
+	}
+
+	firstView := parent.parentHealthViews[leaves[0]]
+	if firstView == nil {
+		t.Fatal("parent did not create a health view for the first child leaf")
+	}
+	if firstView == leaves[0] || firstView.GlobalOption != parentOption {
+		t.Fatal("parent health view did not retain the parent-specific health option")
+	}
+	if leaves[0].GlobalOption != childOption {
+		t.Fatal("parent health view overwrote the child leaf health option")
+	}
+	snapshot := firstView.HealthSnapshot()
+	for i := range snapshot.Collections {
+		snapshot.Collections[i].Alive = false
+	}
+	firstView.RestoreHealthSnapshot(snapshot)
+
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if selected != leaves[1] {
+		t.Fatalf("selected dialer = %p, want child alternative %p", selected, leaves[1])
+	}
+}
+
+func TestDialerGroup_NestedParentHealthViewPreservesFixedSelection(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := newDirectDialer(option, false)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "fixed-parent", []NestedDialerGroupMember{{Dialer: leaf}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer leaf.Close()
+
+	view := parent.parentHealthViews[leaf]
+	snapshot := view.HealthSnapshot()
+	for i := range snapshot.Collections {
+		snapshot.Collections[i].Alive = false
+	}
+	view.RestoreHealthSnapshot(snapshot)
+
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if selected != leaf {
+		t.Fatalf("selected dialer = %p, want fixed dialer %p", selected, leaf)
+	}
+}
+
+func TestDialerGroup_NestedParentHealthViewEnablesExplicitCheckForDisabledMember(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	underlay, property := dialer.NewDirectDialer(option, true)
+	leaf := dialer.NewDialer(underlay, option, dialer.InstanceOption{DisableCheck: true}, property)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "disabled-member-parent", []NestedDialerGroupMember{{Dialer: leaf}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer leaf.Close()
+
+	view := parent.parentHealthViews[leaf]
+	if view == nil {
+		t.Fatal("parent did not create a health view for the disabled member")
+	}
+	if view.DisableCheck {
+		t.Fatal("explicit parent health view inherited DisableCheck and cannot run its own check")
+	}
+}
+
+func TestDialerGroup_NestedParentMinLatencyUsesParentHealthView(t *testing.T) {
+	childOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	parentOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	leaves := []*dialer.Dialer{newDirectDialer(childOption, false), newDirectDialer(childOption, false)}
+	leaves[0].MustGetLatencies10(TestNetworkType).AppendLatency(10 * time.Millisecond)
+	leaves[1].MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(parentOption, "min-parent", []NestedDialerGroupMember{
+		{Dialer: leaves[0]}, {Dialer: leaves[1]},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinAverage10Latencies}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	for _, leaf := range leaves {
+		defer leaf.Close()
+	}
+
+	parent.parentHealthViews[leaves[0]].MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
+	parent.parentHealthViews[leaves[1]].MustGetLatencies10(TestNetworkType).AppendLatency(10 * time.Millisecond)
+
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if selected != leaves[1] {
+		t.Fatalf("selected dialer = %p, want parent-health fastest leaf %p", selected, leaves[1])
+	}
+}
+
+func TestDialerGroup_EnsureReloadSelectionFloorMapsConcreteFallbackToParentView(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := newDirectDialer(option, false)
+	child := NewDialerGroup(option, "reload-child", []*dialer.Dialer{leaf}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "reload-parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer leaf.Close()
+
+	view := parent.parentHealthViews[leaf]
+	if view == nil {
+		t.Fatal("parent did not create a health view for the concrete leaf")
+	}
+	fallback := parent.CaptureReloadSelectionFallback()
+	if got := fallback[TestNetworkType.Index()]; got != leaf {
+		t.Fatalf("reload fallback = %p, want concrete leaf %p", got, leaf)
+	}
+
+	set := parent.MustGetAliveDialerSet(TestNetworkType)
+	set.NotifyLatencyChange(view, false)
+	if set.Len() != 0 {
+		t.Fatalf("parent alive set length before floor = %d, want 0", set.Len())
+	}
+
+	parent.EnsureReloadSelectionFloor(fallback)
+	if !set.IsAlive(view) {
+		t.Fatal("reload floor did not mark the parent health view alive")
+	}
+	if set.IsAlive(leaf) {
+		t.Fatal("parent alive set unexpectedly admitted the concrete leaf instead of its view")
+	}
+}
+
+func TestDialerGroup_NestedLazyParentActivatesOnlyParentViewUntilChildSelection(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := newDirectDialer(option, false)
+	child := NewDialerGroupWithRuntimeOptions(
+		option,
+		"lazy-child",
+		[]*dialer.Dialer{leaf},
+		newEmptyAnnotations(1),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		func(bool, *dialer.NetworkType, bool) {},
+		DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true},
+	)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "lazy-parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer leaf.Close()
+
+	parentView := parent.parentHealthViews[leaf]
+	checkActivated := func(d *dialer.Dialer) bool {
+		return reflect.ValueOf(d).Elem().FieldByName("checkActivated").Bool()
+	}
+	parent.ActivateCheck()
+	if checkActivated(parentView) || checkActivated(leaf) {
+		t.Fatal("lazy parent activation started parent view or lazy child")
+	}
+	if _, _, err := parent.Select(TestNetworkType, true); err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if !checkActivated(parentView) {
+		t.Fatal("first parent selection did not activate the parent health view")
+	}
+	if !checkActivated(leaf) {
+		t.Fatal("parent selection did not activate the selected lazy child")
+	}
+}
+
 func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 
 	option := &dialer.GlobalOption{

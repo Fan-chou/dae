@@ -612,8 +612,11 @@ ID、kernel map 协议”和“候选 generation 完整通过后才发布”的�
    `builtGroups` 直接绑定 control-plane 已创建的两个内置组。用户配置不得再声明同名 group。
 3. `group('direct')` / `group('block')` 只能是单独的精确成员引用，不能放入 `name()`、正则、
    `!`、AND 或 OR 表达式中。
-4. `select` 中的两个成员按普通有序成员处理；`fallback` 中按声明顺序参与选择；`DIRECT`
-   视为始终可用，`REJECT` 视为可选择的终止动作，不执行网络健康探测。
+4. `select` 中的两个成员按普通有序成员处理；`fallback` 中按声明顺序参与选择；没有父级
+   显式 health spec 时，`DIRECT` 视为始终可用，`REJECT` 视为可选择的终止动作，内置
+   concrete member 不执行网络健康探测。若 nested parent 显式配置 health spec，则只为该
+   parent 创建可探测的独立 health view，不能因为内置 concrete member 的 `DisableCheck`
+   而静默跳过 parent check。
 5. `url-test` 包含 `REJECT` 时，在无损模式直接拒绝生成，因为 `REJECT` 没有可测量延迟。
    `url-test` 仅包含 `DIRECT` 时固定映射为可用的直连成员，并在报告中记录该特殊语义。
 6. 特殊成员处理后为空的 group、只剩 unsupported 成员的 group，以及父 group 引用的空 child
@@ -756,8 +759,12 @@ result。`min_moving_avg` 仍保留给原生 dae 配置，不能全局替换。
    不能继续仅由 `DisableCheck` 推导两者。
 4. flat group 可以完整承载自己的 URL、interval、lazy、tolerance。nested group 的 child
    保留自己的 health spec；parent 没有显式 health spec 时只消费 child 的可用性。
-5. 在 nested parent 上显式设置 health spec 的第一版实现先拒绝无损发布，直到定义清楚“父组
-   URL 检查 child group 还是 child 当前选中 leaf”的语义；不能静默套用 global 配置。
+5. nested parent 的显式 health spec 为每个可递归选中的 concrete leaf 创建独立的 parent
+   health view：parent 只以该 view 准入，不覆盖 child 的 option/state。parent 拒绝 child
+   选中的 leaf 时，child 的非 fixed policy 先排除该 leaf 重选一次；fixed 保留用户指定意图。
+   parent lazy 只延迟 parent view，不能绕过 child 的 lazy；显式 parent option 必须原样使用，
+   不能静默退回 global 配置。parent 的 min-latency policy 在 parent view 已有观测时使用
+   parent view latency；冷启动无 parent 观测时保留既有 child selection 作为排序回退。
 6. `url-test` 使用 `min_avg10` 加 `tolerance`；`fallback` 使用 `first_alive`，不使用
    tolerance 进行延迟排序；`select` 保存选择但不自动因延迟切换。
 7. 通过 `config.New` 后，还要检查最终 runtime 的 `CheckInterval`、`CheckTolerance`、

@@ -155,12 +155,6 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 		if err := validateMihomoGroupHealth(group); err != nil {
 			return "", GroupConversionReport{}, fmt.Errorf("group %q: %w", group.Name, err)
 		}
-		if hasMihomoNestedMember(group, groups) && hasMihomoGroupHealthOptions(group) {
-			return "", GroupConversionReport{}, fmt.Errorf(
-				"group %q has explicit health-check options but nested members have no unambiguous group-level health semantics",
-				group.Name,
-			)
-		}
 	}
 
 	report := GroupConversionReport{NameMap: make(map[string]string, len(config.Groups))}
@@ -331,24 +325,6 @@ func isReservedMihomoGroupName(name string) bool {
 	default:
 		return false
 	}
-}
-
-func hasMihomoGroupHealthOptions(group MihomoGroup) bool {
-	// lazy is ignored for nested groups until dae has unambiguous group-level
-	// lazy semantics; explicit check URL, interval, and tolerance remain guarded.
-	return group.URL != nil || group.Interval != nil || group.Tolerance != nil
-}
-
-func hasMihomoNestedMember(group MihomoGroup, groups map[string]struct{}) bool {
-	for _, member := range group.Proxies {
-		if _, nested := groups[member]; nested {
-			return true
-		}
-		if _, special := specialMihomoGroupReference(member); special {
-			return true
-		}
-	}
-	return false
 }
 
 func validateMihomoGroupHealth(group MihomoGroup) error {

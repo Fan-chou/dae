@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -35,10 +36,18 @@ type DialerGroup struct {
 	// selection preserves each child group's own policy instead of treating its
 	// leaf dialers as ordinary parent members.
 	nestedMembers []dialerGroupMember
+	// concreteDialers are the dialers returned by nested selection. They remain
+	// distinct from Dialers when this group has a parent health view.
+	concreteDialers []*dialer.Dialer
+	// parentHealthViews maps concrete nested leaves to this group's private
+	// health-check dialers. The clones let a parent apply its own check option
+	// without changing a child's health state or check lifecycle.
+	parentHealthViews map[*dialer.Dialer]*dialer.Dialer
 
 	selectionState   atomic.Pointer[dialerGroupSelectionState]
 	selectionStateMu sync.Mutex
 	lazyCheckOnce    sync.Once
+	closeOnce        sync.Once
 
 	dialersAnnotations  []*dialer.Annotation
 	checkTolerance      time.Duration
@@ -147,6 +156,22 @@ func NewNestedDialerGroup(
 	p DialerSelectionPolicy,
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool),
 ) (*DialerGroup, error) {
+	return NewNestedDialerGroupWithRuntimeOptions(
+		option, name, members, p, aliveChangeCallback, DialerGroupRuntimeOptions{},
+	)
+}
+
+// NewNestedDialerGroupWithRuntimeOptions builds an ordered recursive selection
+// tree with optional parent-specific health views. Existing callers that do not
+// need a parent health layer should keep using NewNestedDialerGroup.
+func NewNestedDialerGroupWithRuntimeOptions(
+	option *dialer.GlobalOption,
+	name string,
+	members []NestedDialerGroupMember,
+	p DialerSelectionPolicy,
+	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool),
+	runtimeOptions DialerGroupRuntimeOptions,
+) (*DialerGroup, error) {
 	if len(members) == 0 {
 		return nil, fmt.Errorf("nested group %q has no members", name)
 	}
@@ -172,11 +197,12 @@ func NewNestedDialerGroup(
 			}
 			continue
 		}
-		if len(member.Group.Dialers) == 0 {
+		childLeaves := member.Group.nestedConcreteDialers()
+		if len(childLeaves) == 0 {
 			return nil, fmt.Errorf("nested group %q references empty child group %q", name, member.Group.Name)
 		}
 		internalMembers = append(internalMembers, dialerGroupMember{group: member.Group})
-		for _, childDialer := range member.Group.Dialers {
+		for _, childDialer := range childLeaves {
 			if childDialer == nil {
 				return nil, fmt.Errorf("nested group %q child group %q contains a nil dialer", name, member.Group.Name)
 			}
@@ -188,9 +214,52 @@ func NewNestedDialerGroup(
 			leafAnnotations = append(leafAnnotations, &dialer.Annotation{})
 		}
 	}
-	group := NewDialerGroupWithRuntimeOptions(option, name, leafDialers, leafAnnotations, p, aliveChangeCallback, DialerGroupRuntimeOptions{})
+	groupDialers := leafDialers
+	var parentHealthViews map[*dialer.Dialer]*dialer.Dialer
+	if runtimeOptions.HealthCheckEnabled || runtimeOptions.Lazy {
+		groupDialers = make([]*dialer.Dialer, 0, len(leafDialers))
+		parentHealthViews = make(map[*dialer.Dialer]*dialer.Dialer, len(leafDialers))
+		for _, leaf := range leafDialers {
+			view := leaf.CloneWithGlobalOptionContext(context.Background(), option)
+			// A parent health layer is an explicit admission policy. Built-in
+			// DIRECT/REJECT dialers and other disabled concrete members may skip
+			// their own checks, but that must not suppress the parent's check.
+			view.DisableCheck = false
+			parentHealthViews[leaf] = view
+			groupDialers = append(groupDialers, view)
+		}
+	}
+	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, leafAnnotations, p, aliveChangeCallback, runtimeOptions)
 	group.nestedMembers = internalMembers
+	group.concreteDialers = leafDialers
+	group.parentHealthViews = parentHealthViews
 	return group, nil
+}
+
+func (g *DialerGroup) nestedConcreteDialers() []*dialer.Dialer {
+	if g != nil && len(g.concreteDialers) != 0 {
+		return g.concreteDialers
+	}
+	if g == nil {
+		return nil
+	}
+	return g.Dialers
+}
+
+// ParentHealthViewDialers returns the parent-owned dialers created for a
+// nested group health layer. Control-plane construction uses this to retain
+// them on error paths before egressRuntime assumes ownership.
+func (g *DialerGroup) ParentHealthViewDialers() []*dialer.Dialer {
+	if g == nil || len(g.parentHealthViews) == 0 {
+		return nil
+	}
+	views := make([]*dialer.Dialer, 0, len(g.parentHealthViews))
+	for _, d := range g.Dialers {
+		if d != nil {
+			views = append(views, d)
+		}
+	}
+	return views
 }
 
 // IsLazyCheck reports whether ControlPlane should defer this group's health
@@ -204,12 +273,15 @@ func (g *DialerGroup) activateChecks() {
 		return
 	}
 	if len(g.nestedMembers) != 0 {
+		for _, view := range g.parentHealthViews {
+			view.ActivateCheck()
+		}
 		for _, member := range g.nestedMembers {
 			if member.group != nil {
 				member.group.ActivateCheck()
 				continue
 			}
-			if member.dialer != nil {
+			if member.dialer != nil && len(g.parentHealthViews) == 0 {
 				member.dialer.ActivateCheck()
 			}
 		}
@@ -240,7 +312,12 @@ func (g *DialerGroup) activateLazyCheck() {
 }
 
 func (g *DialerGroup) Close() error {
-	g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
+	if g == nil {
+		return nil
+	}
+	g.closeOnce.Do(func() {
+		g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
+	})
 	return nil
 }
 
@@ -364,10 +441,14 @@ func (g *DialerGroup) EnsureReloadSelectionFloor(fallback ReloadSelectionFallbac
 		if candidate == nil {
 			continue
 		}
-		candidate.MarkAliveForReloadFallback(nt)
+		admissionCandidate := g.parentHealthViewForConcrete(candidate)
+		if admissionCandidate == nil {
+			admissionCandidate = candidate
+		}
+		admissionCandidate.MarkAliveForReloadFallback(nt)
 		if g.log != nil && g.log.IsLevelEnabled(logrus.DebugLevel) {
 			dialerName := ""
-			if p := candidate.Property(); p != nil {
+			if p := admissionCandidate.Property(); p != nil {
 				dialerName = p.Name
 			}
 			g.log.WithFields(logrus.Fields{
@@ -377,6 +458,13 @@ func (g *DialerGroup) EnsureReloadSelectionFloor(fallback ReloadSelectionFallbac
 			}).Debugln("Reload health inheritance kept a selection fallback alive")
 		}
 	}
+}
+
+func (g *DialerGroup) parentHealthViewForConcrete(concrete *dialer.Dialer) *dialer.Dialer {
+	if g == nil || concrete == nil {
+		return nil
+	}
+	return g.parentHealthViews[concrete]
 }
 
 // tryDoRateLimitedAction checks if an action can be performed based on a rate limit.
@@ -558,13 +646,13 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		if policy.FixedIndex < 0 || policy.FixedIndex >= len(g.nestedMembers) {
 			return nil, 0, nil, fmt.Errorf("selected nested group member index is out of range")
 		}
-		return g.nestedMembers[policy.FixedIndex].selectForNestedGroup(networkType, policy.Policy, excluded, true, activateLazy)
+		return g.selectNestedMember(networkType, policy.Policy, g.nestedMembers[policy.FixedIndex], excluded, true, activateLazy)
 
 	case consts.DialerSelectionPolicy_Random:
 		start := fastrand.Intn(len(g.nestedMembers))
 		for offset := range len(g.nestedMembers) {
 			member := g.nestedMembers[(start+offset)%len(g.nestedMembers)]
-			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
+			d, latency, selectedNetworkType, err := g.selectNestedMember(networkType, policy.Policy, member, excluded, false, activateLazy)
 			if err == nil {
 				return d, latency, selectedNetworkType, nil
 			}
@@ -576,7 +664,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 
 	case consts.DialerSelectionPolicy_FirstAlive:
 		for _, member := range g.nestedMembers {
-			d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
+			d, latency, selectedNetworkType, err := g.selectNestedMember(networkType, policy.Policy, member, excluded, false, activateLazy)
 			if err == nil {
 				return d, latency, selectedNetworkType, nil
 			}
@@ -593,7 +681,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		var bestNetworkType *dialer.NetworkType
 		bestLatency := time.Hour
 		for _, member := range g.nestedMembers {
-			d, latency, memberNetworkType, err := member.selectForNestedGroup(networkType, policy.Policy, excluded, false, activateLazy)
+			d, latency, memberNetworkType, err := g.selectNestedMember(networkType, policy.Policy, member, excluded, false, activateLazy)
 			if err == nil {
 				if bestDialer == nil || latency < bestLatency {
 					bestDialer, bestLatency, bestNetworkType = d, latency, memberNetworkType
@@ -611,6 +699,65 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 	default:
 		return nil, 0, nil, fmt.Errorf("unsupported DialerSelectionPolicy: %v", policy.Policy)
 	}
+}
+
+func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, excluded *dialer.Dialer, fixed bool, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
+	d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy, excluded, fixed, activateLazy)
+	// Fixed parent selection keeps the established flat-group contract: the
+	// explicit user choice is returned even when a health view currently marks
+	// it unavailable. The parent view still runs for observability and reload.
+	if err != nil || len(g.parentHealthViews) == 0 || policy == consts.DialerSelectionPolicy_Fixed {
+		return d, latency, selectedNetworkType, err
+	}
+	if g.parentHealthViewAlive(d, selectedNetworkType) {
+		latency = g.parentHealthViewSelectionLatency(d, selectedNetworkType, policy, latency, member.annotation)
+		return d, latency, selectedNetworkType, nil
+	}
+
+	// A parent rejection is local to the parent health view. Give a non-fixed
+	// child one opportunity to select another concrete leaf before this parent
+	// proceeds to its next declared member. A fixed child remains fixed intent.
+	if member.group != nil && member.group.GetSelectionPolicy() != consts.DialerSelectionPolicy_Fixed {
+		d, latency, selectedNetworkType, err = member.selectForNestedGroup(networkType, policy, d, false, activateLazy)
+		if err == nil && d != excluded && g.parentHealthViewAlive(d, selectedNetworkType) {
+			latency = g.parentHealthViewSelectionLatency(d, selectedNetworkType, policy, latency, member.annotation)
+			return d, latency, selectedNetworkType, nil
+		}
+		if err != nil && !errors.Is(err, ErrNoAliveDialer) {
+			return nil, latency, selectedNetworkType, err
+		}
+	}
+	return nil, time.Hour, nil, ErrNoAliveDialer
+}
+
+func (g *DialerGroup) parentHealthViewAlive(concrete *dialer.Dialer, networkType *dialer.NetworkType) bool {
+	if concrete == nil || networkType == nil {
+		return false
+	}
+	view, ok := g.parentHealthViews[concrete]
+	return ok && view != nil && view.MustGetAlive(networkType)
+}
+
+func (g *DialerGroup) parentHealthViewSelectionLatency(concrete *dialer.Dialer, networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, fallback time.Duration, annotation *dialer.Annotation) time.Duration {
+	switch policy {
+	case consts.DialerSelectionPolicy_MinLastLatency,
+		consts.DialerSelectionPolicy_MinAverage10Latencies,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+	default:
+		return fallback
+	}
+	view := g.parentHealthViews[concrete]
+	if view == nil {
+		return fallback
+	}
+	latency, ok := view.SelectionLatency(networkType, policy)
+	if !ok {
+		return fallback
+	}
+	if annotation != nil {
+		latency += annotation.AddLatency
+	}
+	return latency
 }
 
 func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, excluded *dialer.Dialer, fixed bool, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {

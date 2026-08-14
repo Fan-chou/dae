@@ -270,19 +270,33 @@ func TestGenerateFlatDaeGroupsRejectsInvalidHealthOptions(t *testing.T) {
 	}
 }
 
-func TestGenerateFlatDaeGroupsRejectsNestedParentHealthOptions(t *testing.T) {
+func TestGenerateFlatDaeGroupsRetainsNestedParentHealthOptions(t *testing.T) {
 	config := MihomoConfig{
 		Proxies: []MihomoProxy{{Name: "node"}},
 		Groups: []MihomoGroup{
 			{Name: "Inner", Type: "select", Proxies: []string{"node"}, URL: mihomoStringPtr("https://example.com/check")},
-			{Name: "Outer", Type: "fallback", Proxies: []string{"Inner"}, Interval: mihomoInt64Ptr(30)},
+			{Name: "Outer", Type: "fallback", Proxies: []string{"Inner"}, URL: mihomoStringPtr("https://outer.example/check"), Interval: mihomoInt64Ptr(30), Tolerance: mihomoInt64Ptr(5), Lazy: mihomoBoolPtr(true)},
 		},
 	}
-	if _, _, err := GenerateFlatDaeGroups(config); err == nil || !strings.Contains(err.Error(), "nested members") {
-		t.Fatalf("GenerateFlatDaeGroups() error = %v, want nested health rejection", err)
+	output, _, err := GenerateFlatDaeGroups(config)
+	if err != nil {
+		t.Fatalf("GenerateFlatDaeGroups() error = %v", err)
+	}
+	for _, want := range []string{
+		"tcp_check_url: 'https://outer.example/check'",
+		"check_interval: 30s",
+		"check_tolerance: 5ms",
+		"lazy: true",
+		"filter: group('Inner')",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, missing %q", output, want)
+		}
 	}
 }
 
 func mihomoStringPtr(value string) *string { return &value }
 
 func mihomoInt64Ptr(value int64) *int64 { return &value }
+
+func mihomoBoolPtr(value bool) *bool { return &value }
