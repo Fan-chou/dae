@@ -137,16 +137,20 @@ func (l *MihomoRuleLowerer) LowerRules(ir MihomoRuleIR) ([]MihomoLoweredRoutingR
 }
 
 func (l *MihomoRuleLowerer) lowerRule(rule MihomoRuleIRRule, limit int) ([]MihomoLoweredRoutingRule, error) {
-	if err := l.validateActionOptions(rule.Action, rule.Source); err != nil {
+	if err := l.validateRuleOptions(rule.Expr, rule.Action, rule.Source); err != nil {
+		return nil, err
+	}
+	expr, err := l.applyRuleOptions(rule.Expr, rule.Action.Options, rule.Source)
+	if err != nil {
 		return nil, err
 	}
 	if rule.Action.NoResolve || mihomoActionHasNoResolve(rule.Action) {
-		if err := l.validateNoResolve(rule.Expr, rule.Source); err != nil {
+		if err := l.validateNoResolve(expr, rule.Source); err != nil {
 			return nil, err
 		}
 	}
 
-	terms, err := l.lowerExpression(rule.Expr, false, rule.Source, limit)
+	terms, err := l.lowerExpression(expr, false, rule.Source, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -326,12 +330,12 @@ func combineMihomoTerms(left, right []mihomoLoweredTerm, limit int) ([]mihomoLow
 }
 
 func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*config_parser.Function, error) {
-	arguments := atom.Arguments
-	if len(arguments) == 0 && atom.Value != "" {
-		arguments = []string{atom.Value}
-	}
+	arguments, options := mihomoAtomArguments(atom)
 	if len(arguments) == 0 {
 		return nil, mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q has no value", atom.Type))
+	}
+	if err := validateMihomoAtomOptions(atom.Type, options, source); err != nil {
+		return nil, err
 	}
 	params := make([]*config_parser.Param, 0, len(arguments))
 	for _, argument := range arguments {
@@ -376,12 +380,73 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 		}
 		return nil, mihomoLoweringError(source, fmt.Sprintf("unsupported unknown Mihomo atom %q", atom.Type))
 	}
+	if mihomoAtomHasOption(options, "src") {
+		switch strings.ToUpper(atom.Type) {
+		case "IP-CIDR", "IP-CIDR6":
+			functionName = "sip"
+		}
+	}
 	if key != "" {
 		for _, param := range params {
 			param.Key = key
 		}
 	}
 	return &config_parser.Function{Name: functionName, Not: negated, Params: params}, nil
+}
+
+// mihomoAtomArguments separates the primary match value from condition
+// parameters that are legal in nested AND/OR/NOT/SUB-RULE expressions. The
+// parser intentionally keeps the original slice intact; this helper is the
+// single place where a known atom's grammar is interpreted for lowering.
+func mihomoAtomArguments(atom MihomoAtom) (arguments, options []string) {
+	arguments = append([]string(nil), atom.Arguments...)
+	if len(arguments) == 0 && atom.Value != "" {
+		arguments = []string{atom.Value}
+	}
+	if isKnownMihomoAtom(atom.Type) && len(arguments) > 1 {
+		options = append([]string(nil), arguments[1:]...)
+		arguments = arguments[:1]
+	}
+	return arguments, options
+}
+
+func validateMihomoAtomOptions(typeName string, options []string, source MihomoRuleSource) error {
+	if len(options) == 0 {
+		return nil
+	}
+	upperType := strings.ToUpper(typeName)
+	for _, option := range options {
+		option = strings.TrimSpace(option)
+		switch {
+		case strings.EqualFold(option, "no-resolve"):
+			switch upperType {
+			case "IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR":
+				// kdae's IP matchers do not perform the Mihomo hostname
+				// resolution fallback, so this option is semantically inert
+				// after the condition has been lowered to an IP matcher.
+			default:
+				return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
+			}
+		case strings.EqualFold(option, "src"):
+			if upperType != "IP-CIDR" && upperType != "IP-CIDR6" && upperType != "SRC-IP-CIDR" {
+				return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
+			}
+		case strings.EqualFold(option, "match-mac"):
+			return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
+		default:
+			return mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo atom %q option %q", typeName, option))
+		}
+	}
+	return nil
+}
+
+func mihomoAtomHasOption(options []string, wanted string) bool {
+	for _, option := range options {
+		if strings.EqualFold(strings.TrimSpace(option), wanted) {
+			return true
+		}
+	}
+	return false
 }
 
 func lowerMihomoProviderData(ref *MihomoProviderDataRef, negated bool, source MihomoRuleSource) (*config_parser.Function, error) {
@@ -525,14 +590,57 @@ func (l *MihomoRuleLowerer) lowerAction(action MihomoAction, source MihomoRuleSo
 	return &config_parser.Function{Name: outbound}, nil
 }
 
-func (l *MihomoRuleLowerer) validateActionOptions(action MihomoAction, source MihomoRuleSource) error {
+func (l *MihomoRuleLowerer) validateRuleOptions(expr MihomoExpr, action MihomoAction, source MihomoRuleSource) error {
 	for _, option := range action.Options {
-		if strings.EqualFold(strings.TrimSpace(option), "no-resolve") {
+		option = strings.TrimSpace(option)
+		switch {
+		case strings.EqualFold(option, "no-resolve"):
 			continue
+		case strings.EqualFold(option, "src"):
+			if !mihomoExprSupportsSourceIP(expr) {
+				return mihomoLoweringError(source, fmt.Sprintf("Mihomo rule option %q has no exact kdae equivalent for expression %q", option, expr.Kind))
+			}
+			continue
+		default:
+			return mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo rule option %q", option))
 		}
-		return mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo action option %q", option))
 	}
 	return nil
+}
+
+func mihomoExprSupportsSourceIP(expr MihomoExpr) bool {
+	if expr.Kind != MihomoExprAtom || expr.Atom == nil {
+		return false
+	}
+	switch strings.ToUpper(expr.Atom.Type) {
+	case "IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR":
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *MihomoRuleLowerer) applyRuleOptions(expr MihomoExpr, options []string, source MihomoRuleSource) (MihomoExpr, error) {
+	for _, option := range options {
+		if !strings.EqualFold(strings.TrimSpace(option), "src") {
+			continue
+		}
+		if !mihomoExprSupportsSourceIP(expr) {
+			return MihomoExpr{}, mihomoLoweringError(source, fmt.Sprintf("Mihomo rule option %q has no exact kdae equivalent for expression %q", option, expr.Kind))
+		}
+		cloned := expr
+		atom := *expr.Atom
+		atom.Arguments = append([]string(nil), expr.Atom.Arguments...)
+		if len(atom.Arguments) == 0 && atom.Value != "" {
+			atom.Arguments = []string{atom.Value}
+		}
+		if len(atom.Arguments) <= 1 || !mihomoAtomHasOption(atom.Arguments[1:], "src") {
+			atom.Arguments = append(atom.Arguments, "src")
+		}
+		cloned.Atom = &atom
+		expr = cloned
+	}
+	return expr, nil
 }
 
 func mihomoActionHasNoResolve(action MihomoAction) bool {

@@ -78,8 +78,14 @@ type MihomoExpr struct {
 type MihomoAtom struct {
 	// Type is upper-case for known and unknown atom types alike, so a later
 	// capability lowerer can dispatch without reparsing the source text.
-	Type      string
-	Value     string
+	Type  string
+	Value string
+	// Arguments preserves every field after Type in source order. For a known
+	// atom the first argument is the match value and the remaining arguments
+	// are Mihomo condition parameters (for example no-resolve or src); they
+	// are deliberately kept here instead of being discarded or folded into
+	// the value list. Unknown atoms retain all fields as well so an explicit
+	// unsupported diagnostic can be produced later.
 	Arguments []string
 	Known     bool
 	Raw       string
@@ -122,7 +128,10 @@ type MihomoSubRuleRef struct {
 }
 
 type MihomoAction struct {
-	Target    string
+	Target string
+	// Options contains the raw Mihomo parameters that follow the outbound
+	// target. Mihomo applies these to the rule condition (for example
+	// no-resolve), so lowerers must not assume they are outbound features.
 	Options   []string
 	NoResolve bool
 }
@@ -367,8 +376,11 @@ func parseMihomoExpression(raw string, source MihomoRuleSource) (MihomoExpr, err
 		}
 		return parseMihomoLogicExpression(typeName, fields[1], source)
 	case "RULE-SET":
-		if len(fields) != 2 || fields[1] == "" {
+		if len(fields) < 2 || fields[1] == "" {
 			return MihomoExpr{}, errors.New("RULE-SET condition requires provider")
+		}
+		if len(fields) > 2 {
+			return MihomoExpr{}, errors.New("RULE-SET condition parameters are unsupported in nested expressions")
 		}
 		return MihomoExpr{Kind: MihomoExprRuleSet, Raw: strings.Join(fields, ","), ProviderRef: &MihomoRuleSetRef{Provider: fields[1]}}, nil
 	case "SUB-RULE":
@@ -384,6 +396,10 @@ func parseMihomoExpression(raw string, source MihomoRuleSource) (MihomoExpr, err
 		if len(fields) < 2 {
 			return MihomoExpr{}, fmt.Errorf("%s condition requires a value", typeName)
 		}
+		// Keep the complete payload. For known atoms the lowerer interprets
+		// the first field as the value and the rest as condition parameters;
+		// retaining them here is what prevents nested no-resolve/match-mac
+		// fields from becoming extra match values or disappearing.
 		return makeMihomoAtomExpression(typeName, fields[1:], strings.Join(fields, ",")), nil
 	}
 }
