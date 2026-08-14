@@ -130,12 +130,30 @@ nodes、groups 和 DAT。
 远程 provider 必须能从当前运行环境访问。配置中的活动 `SCRIPT`、未定义的 provider/group、
 不支持的代理节点字段等问题会导致完整 generation 不发布。
 
-### 5.2 推荐命令
+### 5.2 构建并安装正式工具
+
+仓库提供 `make dae-rule-sync` 作为正式构建入口，默认生成：
+
+```text
+build/dae-rule-sync
+```
 
 在仓库根目录执行：
 
 ```bash
-go run ./tools/dae-rule-sync \
+make dae-rule-sync
+```
+
+如果需要交给系统服务或独立部署目录使用，安装到固定路径：
+
+```bash
+sudo install -Dm755 build/dae-rule-sync /usr/local/libexec/dae/dae-rule-sync
+```
+
+之后统一调用已安装的可执行文件：
+
+```bash
+/usr/local/libexec/dae/dae-rule-sync \
   -mihomo-routing-config /absolute/path/config-home-mihomo.yaml \
   -generation-dir /absolute/path/mihomo-generation \
   -cache-dir /absolute/path/mihomo-cache \
@@ -151,14 +169,6 @@ go run ./tools/dae-rule-sync \
 - `-strict`：主要影响 manifest/旧兼容路径；完整 Mihomo generation 对 provider、引用和节点/组结构始终严格校验，但单条 rule lowering 仍按本分支的日志后跳过策略处理；
 - stdout：转换汇总 JSON；
 - stderr：无法无损转换、忽略条件和 provider fallback 等 warning。
-
-也可以先构建工具：
-
-```bash
-go build -o /absolute/path/dae-rule-sync ./tools/dae-rule-sync
-```
-
-再将上面的 `go run ./tools/dae-rule-sync` 替换为构建出的工具路径。
 
 完整 Mihomo 模式不能同时使用 `-manifest`、`-mihomo-config`、`-routes-output`、
 `-groups-output` 或 `-nodes-output`。这些参数属于旧的 provider/flat group 兼容路径，不具备
