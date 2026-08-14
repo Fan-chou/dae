@@ -56,15 +56,17 @@
 这不表示任意 Mihomo 配置都已可转换。当前实现只发布可证明等价的规则：domain（含
 `DOMAIN-WILDCARD`）/IP/port/network/process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入
 支持范围；`IN-PORT`、`IP-ASN`、`GEO*`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确
-能力缺口，除非未来证明存在精确 kdae 等价物，否则必须报错并保持上一代 generation。
+能力缺口，除非已有明确的兼容策略，否则必须报错并保持上一代 generation。当前兼容策略是：
+忽略 `IN-PORT` 条件和 `match-mac` 选项，`REJECT-DROP` 降级为 `REJECT`/`block`；
+`IP-ASN`、`GEO*` 和活动 `SCRIPT` 仍然 fail closed。
 
-2026-08-14 使用用户提供的完整 Mihomo 配置进行了真实转换：节点、代理组和嵌套组阶段已通过，
-随后在第一个顶层 `IN-PORT`（源文件第 1232 行）处按设计 fail closed；在 `7470e48`、
-`5cec0d0` 之后对原始配置复跑仍得到同一阻塞点。另用诊断副本移除 `IN-PORT`、将
-`REJECT-DROP`/`IP-ASN` 替换为仅用于定位的可转换条件并移除 `match-mac` 后，转换完整走通：
-8 个节点、36 个代理组、远程规则集快照、geoip/geosite DAT 和 routes 均生成成功。该结果只证明
-这些已支持链路可用，不代表诊断副本与原配置语义等价；原配置仍不可无损发布。当前阻塞不是
-测试流程或 DAT 数据缺失，而是配置仍包含 kdae 没有精确运行时维度的规则。
+2026-08-14 使用用户提供的完整 Mihomo 配置进行了真实转换：节点、代理组和嵌套组阶段已通过。
+按当前兼容策略忽略 `IN-PORT`（含第 1232、1233 行及 OR 分支）、忽略 `match-mac` 选项，并将
+`REJECT-DROP` 降级为 `block` 后，原始配置继续推进到第 49 条规则、源文件第 1297 行的
+`IP-ASN`，随后按设计 fail closed。此前的诊断副本在替换剩余不支持条件后已完整生成 8 个节点、
+36 个代理组、远程规则集快照、geoip/geosite DAT 和 routes；该结果只证明已支持链路可用，
+不代表原配置已完成语义等价转换。当前阻塞不是测试流程或 DAT 数据缺失，而是 `IP-ASN` 仍无
+kdae 等价条件。
 
 ## 3. 不可改变的约束
 
@@ -972,14 +974,15 @@ SubRuleRef(SUB-RULE, name, guard)
 | Mihomo 动作 | 目标 | 当前策略 |
 | --- | --- | --- |
 | `DIRECT` | `direct` | 直接映射内置 outbound |
-| `REJECT` | `block` | 已按精确 block 语义映射；不与 `REJECT-DROP` 混同 |
-| `REJECT-DROP` | drop/block | 没有精确等价物时拒绝，不降级成普通 reject |
+| `REJECT` | `block` | 映射到 kdae `block` |
+| `REJECT-DROP` | `block` | 按当前兼容策略降级为 `REJECT`/`block` |
 | group/node 名称 | safe outbound/group 名称 | 使用现有 NodeNameMap/GroupNameMap |
 | `MATCH` | 默认目标 | 必须解析为明确 group/node，不能凭空选第一个节点 |
 
-`b3868c1` 已确保已支持规则的选项不会在 parser/lowerer 中被静默丢弃。每个选项都进入
-capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就把源行加入 unsupported 并阻止
-无损发布。特别是 `match-mac` 仍不支持，不能因其它 option 已保真而被忽略。
+`b3868c1` 已确保已支持规则的选项不会在 parser/lowerer 中被静默丢弃。当前用户指定的
+兼容例外是：`match-mac` 选项直接忽略但保留同一 `SRC-IP-CIDR` 条件；`IN-PORT` 条件按
+分支忽略，整条只含该条件的规则不生成，避免错误变成无条件规则。其它没有明确兼容策略的
+选项仍会阻止发布。
 
 #### 条件能力边界
 
@@ -1006,22 +1009,19 @@ capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就�
 | provider/DAT | 支持 | DAT 仅编码 domain/IP 数据；不编码 action、顺序、逻辑、端口、进程或 option |
 | 已支持规则 option（含可精确表达的 `no-resolve`） | 支持 | `b3868c1` 保留语义；不能表达时不发布 |
 | `DOMAIN-WILDCARD` | 支持 | 小写规范化后降低为 kdae domain regex：字面正则字符转义，`*` 为零或多个字符，`?` 为一个字符，整体完整锚定；显式 classical-provider 条目复用 `DomainRegex`/DAT binding |
-| `IN-PORT` | 不支持 | 显式错误，不能删除或猜测入站端口语义；当前 kdae 没有入站监听器身份 |
+| `IN-PORT` | 忽略 | 不映射为 `sport`/`dport`/`tproxy_port`；整条仅含该条件的规则跳过，OR 中仅移除该分支 |
 | `IP-ASN`、`GEO*` | 不支持 | 显式错误；地理/ASN 分类和其运行时语义不能由 DAT 自动获得 |
-| `match-mac` | 不支持 | 显式错误；MAC 匹配不是 DAT 可表达的数据条件 |
+| `match-mac` | 忽略 | 忽略该选项，保留同一规则中的源 IP 条件 |
 | 活动 `SCRIPT` | 不支持 | 显式错误；未使用 script 定义可仅记录 ignored |
-| `REJECT-DROP` | 不支持 | 显式错误；不得降级成普通 `REJECT`/`block` |
+| `REJECT-DROP` | 兼容降级 | 映射为 `REJECT`/`block` |
 
-任何“不支持”行只有在未来已证明精确 kdae 等价、并经独立 capability 实现后才能改为支持；
-在此之前，它们使候选 generation fail closed。特别地，DAT 是 domain/IP 数据文件而不是规则
+任何“不支持”行仍会使候选 generation fail closed。`忽略`和`兼容降级`是当前明确选择的
+有损兼容策略，不宣称与 Mihomo 完全等价；特别地，DAT 是 domain/IP 数据文件而不是规则
 执行语言，不能承载这些非数据语义。
 
-`IN-PORT` 的边界需要单独说明：Mihomo 将它定义为入站监听器端口。用户配置中 7893、7894、
-7895 是三个 SOCKS 入站监听端口，而 kdae 的 `tproxy_port` 是单一的内部透明代理监听端口，
-并且现有路由/eBPF 上下文只保留原始流量的源端口和目标端口。把 `IN-PORT` 错降为 `sport`、
-`dport` 或固定的 `tproxy_port` 都会改变命中集合；要实现精确语义必须新增多入站监听器及其
-运行时身份传递，这已经超出本计划“不改基本透明代理架构”的范围。因此该配置的这些规则
-只能显式阻断转换，不能通过 DAT、规则展开或代理组改造绕过。
+`IN-PORT` 的精确语义仍未实现：Mihomo 将它定义为入站监听器端口，而当前 kdae 没有对应的
+入站监听器身份。按当前兼容选择不猜测映射，直接忽略该条件；这会有意丢失入口分流语义，
+但不会把它错误转换成 `sport`、`dport` 或固定的 `tproxy_port`。
 
 ### 17.5 `sub-rules` 图编译
 
