@@ -238,10 +238,6 @@ func mihomoAnyTLSLink(proxy MihomoProxy) (string, error) {
 	if proxy.UDP != nil && !*proxy.UDP {
 		return "", fmt.Errorf("mihomo proxy %q anytls udp=false is unsupported by dae", proxy.Name)
 	}
-	if proxy.ClientFingerprint != "" {
-		return "", fmt.Errorf("mihomo proxy %q anytls client-fingerprint is unsupported by dae", proxy.Name)
-	}
-
 	query := url.Values{}
 	if sni := mihomoProxySNI(proxy); sni != "" {
 		query.Set("sni", sni)
