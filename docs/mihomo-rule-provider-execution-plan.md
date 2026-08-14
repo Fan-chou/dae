@@ -14,9 +14,10 @@
 后续规则编译设计的优先依据；前面保留的阶段说明包含历史计划，若与当前状态冲突，以当前
 状态为准。
 
-> 状态修正（2026-08-14）：DAT/ext writer 和 generation 路由接入已经完成，不再属于待实现
-> 项。当前真正缺口是：转换器还没有从原始 Mihomo 配置直接读取 `rule-providers`、有序
-> `rules`、`sub-rules` 并编译成 routing IR；`script` 明确不在本轮设计范围内。
+> 状态修正（2026-08-14）：截至 `b3868c1`，原始 Mihomo YAML routing 入口、provider 归一化、
+> 有序 rules IR、sub-rules 展开、provider/DAT 绑定和同 generation 原子发布均已实现；
+> `b3868c1` 进一步补齐了已支持规则的选项保真。先前把这些能力列为待实现的段落仅保留为
+> 历史设计记录，不能再作为当前状态或后续步骤。
 
 > 最终目标修正：本项目不是把 Mihomo 配置“尽量生成”为 kdae 文件，而是将 Mihomo `rules`
 > 逐条转换为语义等价的 kdae routes。任何无法保持匹配条件、规则顺序、命中动作或选项语义
@@ -28,29 +29,29 @@
 
 ## 2. 当前基线
 
-当前分支为 `feat/mihomo-rule-provider-groups`，当前 HEAD 为 `4c6e1a4`，相对
-`kix/kdae` ahead 26 个提交。与本次设计直接相关的已完成能力包括：
+当前分支的文档基线是 `b3868c1`（已包含 `910ecb3` 及此前的 routing 提交），不再使用
+`4c6e1a4` 或“转换入口只建模 proxies/proxy-groups”的旧状态。与本次设计直接相关的已完成能力
+包括：
 
 - manifest 校验、HTTP/file provider fetch/cache、规则解析和 generation-atomic 发布；
 - `98f4321`：GeoSite/GeoIP DAT writer；
 - `ac187b9`：大型 provider 自动生成 `domain(ext: ...)` / `dip(ext: ...)` 路由；
+- 原始 Mihomo YAML routing document 读取：`rule-providers`、有序 `rules`、`sub-rules` 与
+  script 引用分析；
+- provider 规范化、ordered routing IR、sub-rule graph 展开、provider leaf 的 inline/DAT 绑定，
+  并将 routes、provider snapshot、DAT 和 metadata 作为同一 generation 发布；
+- 已支持规则选项的保真 lowering（`b3868c1`）；不能精确保真的选项继续 fail closed；
 - Mihomo 节点、DIRECT/REJECT、nested group、select/fallback/health-check 的用户态转换；
 - `4c6e1a4`：非 Linux 链路验证注册 `shadowsocks_2022`。
 
-当前转换入口仍有一个重要边界：`MihomoConfig` 只建模 `proxies` 和 `proxy-groups`，严格解析
-会拒绝 `rule-providers`、`rules`、`sub-rules`、`script` 以及其它未建模顶层字段。见
-`tools/dae-rule-sync/groups.go` 的 `MihomoConfig` 与 `ParseMihomoConfigStrict`。
+这不表示任意 Mihomo 配置都已可转换。当前实现只发布可证明等价的规则：domain/IP/port/network/
+process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入支持范围；`IN-PORT`、`IP-ASN`、
+`GEO*`、`DOMAIN-WILDCARD`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确能力缺口，
+除非未来证明存在精确 kdae 等价物，否则必须报错并保持上一代 generation。
 
-这不表示 DAT/ext 不可用。当前 `tools/dae-rule-sync` 已经可以消费单独的 manifest，把 provider
-规则解析为 domain/IP 集合，大集合写成 DAT 并由 `ext` 路由引用；但 manifest 仍是人工/外部
-中间表示，尚未由原始 Mihomo 配置自动生成，也没有保留原始 `rules` 的完整顺序和组合条件。
-
-对用户配置最近一次分层验证的事实记录：修正 YAML 引号后有 8 个活动节点、36 个代理组；兼容
-规则路径生成 73,852 条路由规则，6 条 `DOMAIN-WILDCARD` 和 2 条 `PROCESS-NAME` 仍属于当前
-规则转换器的明确不支持项；完整生成首先被 provider 严格门禁和原始配置严格解析入口阻断。
-
-因此当前剩余工作不是重做 DAT，而是新增“原始 Mihomo routing sections → routing IR”的适配
-层。本轮规划包括 `rule-providers`、`rules`、`sub-rules`，不实现 `script` 表达式执行。
+本文档没有在本次同步中运行测试、独立审查或运行时验证；上述状态仅记录用户指定的已提交实现
+边界，不能据此宣称用户给出的完整配置当前可转换。只要仍有活动的上述不支持规则，完整生成
+必须 fail closed。
 
 ## 3. 不可改变的约束
 
@@ -70,22 +71,24 @@
 ```text
 已完成：provider fetch/cache、generation-atomic、DAT writer、DAT-backed routes、节点/组基础转换
     ↓
-Step 1：原始 Mihomo YAML → routing document extractor
+已完成（截至 `910ecb3`）：原始 Mihomo YAML → routing document extractor
     ↓
-Step 2：rule-providers → normalized provider snapshot / inline 或 DAT
+已完成（截至 `910ecb3`）：rule-providers → normalized provider snapshot / inline 或 DAT
     ↓
-Step 3：有序 rules → routing IR 与 action lowerer
+已完成（截至 `910ecb3`）：有序 rules → routing IR 与 action lowerer
     ↓
-Step 4：sub-rules → 有界 graph compiler
+已完成（截至 `910ecb3`）：sub-rules → 有界 graph compiler
     ↓
-Step 5：nodes、groups、routes、provider snapshot、DAT → 同一 generation 发布
+已完成（截至 `910ecb3`）：nodes、groups、routes、provider snapshot、DAT → 同一 generation 发布
     ↓
-后续：flat group runtime、nested group runtime、完整 control-plane 集成
+已完成（`b3868c1`）：已支持 rule options 的保真；不支持 option/action fail closed
+    ↓
+仍待未来证明精确等价后再实现：未支持的条件/选项/动作；不包含 script engine 或数据面重设计
 ```
 
-本顺序不包含 script engine 或 script 表达式编译。对 source 中 script 字段的处理只保留
-必要的边界行为：不能因未使用定义阻断其它 routing sections，也不能对活动引用做近似转换。
-已有 DAT/ext 作为 Step 2 的实现依赖复用，不重新设计或重复实现。
+本顺序中的 routing 步骤已经完成，保留它们是为了说明依赖和提交边界。它不包含 script engine
+或 script 表达式编译：未使用定义不会阻断其它 routing sections，活动引用不能近似转换。DAT/ext
+继续只是 provider 数据载体，不重新设计或重复实现。
 
 ## 5. 阶段 0：计划纠偏、状态冻结与安全入口收口
 
@@ -525,17 +528,16 @@ git diff --check
 56e3fa9 fix: fail closed on incomplete Mihomo generations
 98f4321 feat: add geosite and geoip dat writer
 ac187b9 feat: generate DAT-backed routes for large providers
+910ecb3 routing: 原始 YAML routing entry、provider normalization、ordered rules IR、
+        sub-rules expansion、provider/DAT binding 与 generation-atomic publish
+b3868c1 routing: 已支持 rule options 的语义保真；无精确等价的 option/action 继续 fail closed
 
-后续规则编译垂直步骤：
-1. feat: parse mihomo routing sections
-2. feat: lower mihomo rules into ordered routing IR
-3. feat: compile mihomo sub-rules graph
-4. feat: bind routing IR to DAT-backed provider references
+规则编译垂直步骤：全部完成（截至 `b3868c1`）。当前没有可在既定能力边界内继续实现的
+pending routing 步骤；不支持的条件、选项和动作只能在证明精确 kdae 等价后另行立项。
 ```
 
-每个规则编译步骤单独提交，不把 provider 解析、规则顺序、sub-rules 展开合并成一个 WIP
-提交。`script` 表达式编译不在本轮范围内；如果为了读取完整 YAML 必须识别该字段，只做
-未使用定义的记录或对活动引用显式失败，不把它作为独立功能实现。
+已完成的规则编译提交保持原有分步边界；`script` 表达式编译不在本轮范围内。读取完整 YAML
+时可以记录未使用定义，但活动引用必须显式失败，不能把 script 作为近似功能实现。
 
 ## 14. 风险与回滚策略
 
@@ -569,12 +571,14 @@ ac187b9 feat: generate DAT-backed routes for large providers
 
 ## 16. Mihomo 配置兼容补充设计（需求 2～7）
 
-本节针对真实配置验证后暴露的六项缺口补充设计。规则语法转换（`PROCESS-NAME`、
-`DOMAIN-WILDCARD`、混合 classical provider 等）属于前置的需求 1，本节假设规则转换器已经
-能把每条被引用规则明确表示为“可转换”或“不可转换”，不在这里重新定义规则匹配语法。
+本节针对当时真实配置验证暴露的六项缺口补充设计。其历史描述中的 `PROCESS-NAME` 已由当前
+routing lowerer 支持；`DOMAIN-WILDCARD` 与其它 capability matrix 所列项仍不支持。本节假设
+规则转换器已经能把每条被引用规则明确表示为“可转换”或“不可转换”，不在这里重新定义规则
+匹配语法。
 
-本节是设计基线，不表示代码已经实现。实现必须继续遵守“不改 eBPF 数据面、outbound ID、
-kernel map 协议”和“候选 generation 完整通过后才发布”的约束。
+本节保留 routing sections 之外的历史扩展设计，不是对当前 routing 实现状态的否定或待办
+清单。无论未来是否采用其中的 group-runtime 方案，仍必须遵守“不改 eBPF 数据面、outbound
+ID、kernel map 协议”和“候选 generation 完整通过后才发布”的约束。
 
 ### 16.1 `DIRECT` / `REJECT` 映射
 
@@ -813,7 +817,7 @@ fix: fail closed before publishing incompatible mihomo generation
 
 ### 17.1 范围和目标
 
-本节把“原始 Mihomo 配置 → manifest/DAT/routes”的缺口单独定义出来。目标是将用户关心的
+本节记录已完成的“原始 Mihomo 配置 → manifest/DAT/routes”实现。其目标是将用户关心的
 Mihomo `rules` 逐条降低为语义等价的 kdae routes；不宣称迁移 Mihomo 的全部运行时配置，
 但对纳入范围的每条规则都要求条件、顺序、动作和选项保持等价。
 
@@ -835,10 +839,11 @@ Mihomo `rules` 逐条降低为语义等价的 kdae routes；不宣称迁移 Miho
 
 ### 17.2 输入模型和中间表示
 
-当前 `MihomoConfig` 只有 `proxies` 和 `proxy-groups`，需要新增 routing 文档模型；不要把
-全部 Mihomo 顶层字段塞进一个无限扩大的结构体。
+实现已新增独立 routing 文档模型来读取 `rule-providers`、`rules`、`sub-rules` 和 script
+引用，不再以“`MihomoConfig` 只有 `proxies` 和 `proxy-groups`”作为转换边界；仍不把全部
+Mihomo 顶层字段塞进一个无限扩大的结构体。
 
-建议模型：
+实现模型的语义如下：
 
 ```go
 type MihomoRoutingDocument struct {
@@ -876,7 +881,7 @@ type MihomoRule struct {
 
 #### 归一化
 
-每个 Mihomo provider 转换为现有 `ProviderSpec`，字段映射如下：
+每个 Mihomo provider 已转换为现有 `ProviderSpec`，字段映射如下：
 
 | Mihomo | 中间表示 | 约束 |
 | --- | --- | --- |
@@ -892,7 +897,7 @@ metadata 的脱敏映射中，不拼入 dae 配置语法。
 
 #### 使用分析
 
-先扫描 `rules` 和 `sub-rules` 中的 provider 引用，再决定输出：
+实现先扫描 `rules` 和 `sub-rules` 中的 provider 引用，再决定输出：
 
 - 未被引用的 provider 不生成 route，可以保留快照并在报告中标记 unused；
 - 被引用的 provider 必须非空、可解析且所有被使用的条目可分类；
@@ -909,19 +914,20 @@ domain(ext: 'generated/geosite/<provider>.dat:<provider>') -> <outbound>
 dip(ext: 'generated/geoip/<provider>.dat:<provider>') -> <outbound>
 ```
 
-DAT 只保存匹配数据，不保存“匹配后走哪个 outbound”、规则顺序、`AND/OR/NOT` 条件或
-`sub-rules` 调用。上述控制语义必须留在 routing IR 和 `routes.dae` 中。
+DAT 只保存匹配数据，不能保存“匹配后走哪个 outbound”、规则顺序、`AND/OR/NOT` 条件、
+进程/端口等运行时条件、规则选项或 `sub-rules` 调用。这些控制语义已经留在 routing IR 和
+`routes.dae` 中；因此不能把任何不支持的非数据语义塞进 DAT 后宣称可转换。
 
 ### 17.4 `rules` 有序规则编译
 
 #### AST
 
-`MihomoExpr` 至少支持以下节点：
+已实现的 `MihomoExpr` 覆盖以下可精确 lowering 的节点；列举不等于把未列类型视为可近似：
 
 ```text
 Atom(DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX)
 Atom(IP-CIDR / IP-CIDR6 / SRC-IP-CIDR)
-Atom(DST-PORT / NETWORK / IN-PORT)
+Atom(DST-PORT / NETWORK / PROCESS-NAME)
 ProviderRef(RULE-SET, provider)
 All(AND, children...)
 Any(OR, children...)
@@ -935,31 +941,58 @@ SubRuleRef(SUB-RULE, name, guard)
 
 #### 动作和选项
 
-建立显式 `ActionLowerer`：
+已建立显式 `ActionLowerer`：
 
-| Mihomo 动作 | 目标 | 第一版策略 |
+| Mihomo 动作 | 目标 | 当前策略 |
 | --- | --- | --- |
 | `DIRECT` | `direct` | 直接映射内置 outbound |
-| `REJECT` | `block` | 仅在 kdae block 语义等价时映射 |
+| `REJECT` | `block` | 已按精确 block 语义映射；不与 `REJECT-DROP` 混同 |
 | `REJECT-DROP` | drop/block | 没有精确等价物时拒绝，不降级成普通 reject |
 | group/node 名称 | safe outbound/group 名称 | 使用现有 NodeNameMap/GroupNameMap |
 | `MATCH` | 默认目标 | 必须解析为明确 group/node，不能凭空选第一个节点 |
 
-`no-resolve`、`match-mac` 等选项不得在 parser 中简单丢弃。每个选项都进入 capability
-检查：kdae 有精确字段就降低到 IR；没有精确语义就把源行加入 unsupported 并阻止无损发布。
+`b3868c1` 已确保已支持规则的选项不会在 parser/lowerer 中被静默丢弃。每个选项都进入
+capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就把源行加入 unsupported 并阻止
+无损发布。特别是 `match-mac` 仍不支持，不能因其它 option 已保真而被忽略。
 
 #### 条件能力边界
 
-`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、IP-CIDR、网络/端口和
-provider leaf 按 kdae 当前 routing function registry 逐项降低。`PROCESS-NAME`、`IP-ASN`、
-`match-mac` 等不是 provider 数据，不能借 DAT 绕过能力检查；是否支持由独立 lowerer 明确
-决定，未实现时保留原始规则诊断。
+`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、IP-CIDR、网络、端口、
+`PROCESS-NAME` 和 provider leaf 已按 kdae routing function registry 降低。`IP-ASN`、
+`match-mac` 等不是 provider 数据，不能借 DAT 绕过 capability gate。
+
+#### 用户配置 capability matrix
+
+下表是当前已提交实现的边界，不是对用户完整配置可转换的声明。只有“支持”行在条件、顺序、
+动作和选项均可精确保留时才允许进入 published generation。
+
+| Mihomo 条件、选项或动作 | 当前状态 | 发布规则 |
+| --- | --- | --- |
+| domain（含 suffix/keyword/regex） | 支持 | 降低为等价 domain 条件；provider 大集合可经 DAT |
+| IP / CIDR（含 v4/v6、源/目的 IP 路径） | 支持 | 降低为等价 IP 条件；provider 大集合可经 DAT |
+| port、network | 支持 | 降低为等价运行时 routing 条件 |
+| `PROCESS-NAME` | 支持 | 作为进程条件保留在 IR/routes，不进入 DAT |
+| `AND` / `OR` / `NOT`、first-match 顺序 | 支持 | 保留在 ordered IR；不得按 provider 重排或合并源行 |
+| `SUB-RULE` | 支持 | 有界 graph 展开，保留 guard、分支动作和顺序 |
+| `RULE-SET` / provider | 支持 | 归一化后使用 inline 或 DAT binding；调用点仍保留自身条件和动作 |
+| provider/DAT | 支持 | DAT 仅编码 domain/IP 数据；不编码 action、顺序、逻辑、端口、进程或 option |
+| 已支持规则 option（含可精确表达的 `no-resolve`） | 支持 | `b3868c1` 保留语义；不能表达时不发布 |
+| `IN-PORT` | 不支持 | 显式错误，不能删除或猜测入站端口语义 |
+| `IP-ASN`、`GEO*` | 不支持 | 显式错误；地理/ASN 分类和其运行时语义不能由 DAT 自动获得 |
+| `DOMAIN-WILDCARD` | 不支持 | 显式错误；不能改写为 suffix/regex 后假称等价 |
+| `match-mac` | 不支持 | 显式错误；MAC 匹配不是 DAT 可表达的数据条件 |
+| 活动 `SCRIPT` | 不支持 | 显式错误；未使用 script 定义可仅记录 ignored |
+| `REJECT-DROP` | 不支持 | 显式错误；不得降级成普通 `REJECT`/`block` |
+
+任何“不支持”行只有在未来已证明精确 kdae 等价、并经独立 capability 实现后才能改为支持；
+在此之前，它们使候选 generation fail closed。特别地，DAT 是 domain/IP 数据文件而不是规则
+执行语言，不能承载这些非数据语义。
 
 ### 17.5 `sub-rules` 图编译
 
 #### 图模型
 
-把 `sub-rules` 解析为有向图：节点是命名子规则，边是 `SUB-RULE` 引用。加载后立即执行：
+实现把 `sub-rules` 解析为有向图：节点是命名子规则，边是 `SUB-RULE` 引用。加载后立即执行：
 
 1. 重复名称检查；
 2. 未定义引用检查；
@@ -1000,7 +1033,7 @@ lower:
 
 本轮不实现 script engine，也不把 Mihomo Expr 翻译成另一套表达式语言。
 
-解析器只做引用分析：
+实现的解析器只做引用分析：
 
 - 顶层 `script` 定义存在但没有活动 `SCRIPT` 引用：允许继续转换，报告 ignored；
 - 有活动 `SCRIPT` 规则或被 `sub-rules` 间接引用：无损模式明确报错，指出源规则和 shortcut；
@@ -1010,7 +1043,7 @@ lower:
 这样可以转换“带有未使用 script 定义、但实际 routing 不依赖 script”的配置，同时不把
 未实现的脚本语义伪装成已实现。
 
-### 17.7 总体流水线和发布边界
+### 17.7 已实现的总体流水线和发布边界
 
 ```text
 原始 Mihomo YAML
@@ -1036,36 +1069,34 @@ metadata 至少记录：
 
 候选 generation 必须同时具备 nodes、groups、routes、provider snapshots、DAT 和 metadata；
 任何一项失败都保留上一代 current。不能用“provider/DAT 已生成”来掩盖 `rules` 或
-`sub-rules` 尚未完整编译。
+`sub-rules` 尚未完整编译。该 publication boundary 已在 `910ecb3` 前后的 routing 提交中完成；
+本次文档同步没有重新执行其测试或运行时验证。
 
 ### 17.8 实现步骤和提交边界
 
-按以下垂直步骤推进，每步单独提交；本节只是设计，不在文档更新时执行这些步骤：
+下列垂直步骤均已完成；它们按原有分步边界提交，汇总状态截至 `910ecb3`，随后由
+`b3868c1` 补齐 rule-option fidelity：
 
-1. **routing document extractor**：读取 `rule-providers`、`rules`、`sub-rules`，保留顺序、
-   源位置和 script 引用；输出兼容旧工具的 manifest。
-2. **ordered rule IR/lowerer**：实现 provider leaf、基础 domain/IP/port/network 条件、
-   动作映射和 capability gate；不再把 provider route 当作完整 `rules`。
-3. **sub-rule graph compiler**：实现引用、循环、深度/展开上限和 guard 继承；保持首个命中
-   顺序。
-4. **DAT binding integration**：让 IR 的 provider leaf 复用现有 DAT writer/ext route，保证
-   多调用点共享 DAT 但不共享动作和顺序。
-5. **full routing generation**：将 extractor、nodes/groups、IR、DAT 和 generation metadata
-   接入同一发布路径；不实现 script engine 或 script 表达式编译。
+1. **已完成：routing document extractor**：读取 `rule-providers`、`rules`、`sub-rules`，
+   保留顺序、源位置和 script 引用；输出兼容旧工具的 manifest。
+2. **已完成：ordered rule IR/lowerer**：provider leaf、domain/IP/port/network/process 条件、
+   动作映射和 capability gate 已实现；不再把 provider route 当作完整 `rules`。
+3. **已完成：sub-rule graph compiler**：引用、循环、深度/展开上限和 guard 继承已实现，
+   保持首个命中顺序。
+4. **已完成：DAT binding integration**：IR 的 provider leaf 已复用 DAT writer/ext route；
+   多调用点共享 DAT，但不共享动作、顺序或非数据条件。
+5. **已完成：full routing generation**：extractor、nodes/groups、IR、DAT 和 generation
+   metadata 已接入同一发布路径；不实现 script engine 或 script 表达式编译。
+6. **已完成：rule-option fidelity**：`b3868c1` 使可精确表达的规则选项保留到 IR/routes；
+   任何没有精确等价的 option/action 都阻止发布。
 
-建议提交消息：
-
-```text
-feat: parse mihomo routing sections
-feat: lower mihomo rules into ordered routing IR
-feat: compile mihomo sub-rules graph
-feat: bind routing IR to DAT-backed providers
-feat: publish mihomo routing generation atomically
-```
+真正 pending 的工作只有 capability matrix 中明确不支持的语义在“先证明精确 kdae 等价”后的
+独立立项；它们不是本轮 routing 实现的遗留 TODO。
 
 ### 17.9 设计出口条件
 
-实施完成后，按用户明确要求再执行验证；设计上的出口条件为：
+截至 `b3868c1`，实现状态已满足以下设计出口；本次文档同步未重新执行测试、独立审查或
+运行时验证，因此这些条目不是新的验证结论：
 
 - 原始 `rule-providers` 不再需要手工先写 manifest；
 - provider 内容、规则顺序、动作、条件组合和 sub-rule 调用均有对应 IR 或明确失败诊断；
