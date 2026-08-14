@@ -138,7 +138,7 @@ func newMihomoProviderBinder(
 
 func (b *mihomoProviderBinder) bindRule(rule MihomoRuleIRRule) (MihomoRuleIRRule, error) {
 	cloned := cloneMihomoRuleIRRule(rule)
-	expr, err := b.bindExpression(cloned.Expr, cloned.Source)
+	expr, err := b.bindExpression(cloned.Expr, cloned.MihomoRuleSource)
 	if err != nil {
 		return MihomoRuleIRRule{}, err
 	}

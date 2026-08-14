@@ -120,7 +120,7 @@ func (l *MihomoRuleLowerer) LowerIR(ir MihomoRuleIR) ([]MihomoLoweredRoutingRule
 	for _, rule := range ir.Rules {
 		remaining := limit - len(result)
 		if remaining <= 0 {
-			return nil, mihomoLoweringError(rule.Source, fmt.Sprintf("expanded routing rules exceed %d", limit))
+			return nil, mihomoLoweringError(rule.MihomoRuleSource, fmt.Sprintf("expanded routing rules exceed %d", limit))
 		}
 		lowered, err := l.lowerRule(rule, remaining)
 		if err != nil {
@@ -137,29 +137,29 @@ func (l *MihomoRuleLowerer) LowerRules(ir MihomoRuleIR) ([]MihomoLoweredRoutingR
 }
 
 func (l *MihomoRuleLowerer) lowerRule(rule MihomoRuleIRRule, limit int) ([]MihomoLoweredRoutingRule, error) {
-	if err := l.validateRuleOptions(rule.Expr, rule.Action, rule.Source); err != nil {
+	if err := l.validateRuleOptions(rule.Expr, rule.Action, rule.MihomoRuleSource); err != nil {
 		return nil, err
 	}
-	expr, err := l.applyRuleOptions(rule.Expr, rule.Action.Options, rule.Source)
+	expr, err := l.applyRuleOptions(rule.Expr, rule.Action.Options, rule.MihomoRuleSource)
 	if err != nil {
 		return nil, err
 	}
 	if rule.Action.NoResolve || mihomoActionHasNoResolve(rule.Action) {
-		if err := l.validateNoResolve(expr, rule.Source); err != nil {
+		if err := l.validateNoResolve(expr, rule.MihomoRuleSource); err != nil {
 			return nil, err
 		}
 	}
 
-	terms, err := l.lowerExpression(expr, false, rule.Source, limit)
+	terms, err := l.lowerExpression(expr, false, rule.MihomoRuleSource, limit)
 	if err != nil {
 		return nil, err
 	}
-	outbound, err := l.lowerAction(rule.Action, rule.Source)
+	outbound, err := l.lowerAction(rule.Action, rule.MihomoRuleSource)
 	if err != nil {
 		return nil, err
 	}
 	if len(terms) > limit {
-		return nil, mihomoLoweringError(rule.Source, fmt.Sprintf("expanded routing rules exceed %d", limit))
+		return nil, mihomoLoweringError(rule.MihomoRuleSource, fmt.Sprintf("expanded routing rules exceed %d", limit))
 	}
 
 	result := make([]MihomoLoweredRoutingRule, 0, len(terms))
@@ -169,7 +169,7 @@ func (l *MihomoRuleLowerer) lowerRule(rule MihomoRuleIRRule, limit int) ([]Mihom
 			functions[i] = term[i]
 		}
 		result = append(result, MihomoLoweredRoutingRule{
-			Source:           rule.Source,
+			Source:           rule.MihomoRuleSource,
 			Rule:             &config_parser.RoutingRule{AndFunctions: functions, Outbound: *outbound},
 			AlternativeIndex: index,
 			AlternativeCount: len(terms),

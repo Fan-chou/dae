@@ -316,11 +316,11 @@ func collectMihomoRuleSetReferences(ir MihomoRuleIR) map[string]MihomoRuleSource
 		}
 	}
 	for _, rule := range ir.Rules {
-		visit(rule.Expr, rule.Source)
+		visit(rule.Expr, rule.MihomoRuleSource)
 	}
 	for _, subRule := range ir.SubRules {
 		for _, rule := range subRule.Rules {
-			visit(rule.Expr, rule.Source)
+			visit(rule.Expr, rule.MihomoRuleSource)
 		}
 	}
 	return refs

@@ -148,11 +148,11 @@ func (c *MihomoSubRuleCompiler) Compile(ir MihomoRuleIR) (MihomoRuleIR, error) {
 			compiled = append(compiled, expanded...)
 			continue
 		}
-		if err := mihomoRejectEmbeddedSubRule(rule.Expr, rule.Source); err != nil {
+		if err := mihomoRejectEmbeddedSubRule(rule.Expr, rule.MihomoRuleSource); err != nil {
 			return MihomoRuleIR{}, err
 		}
 		copied := cloneMihomoRuleIRRule(rule)
-		if err := c.emit(copied.Source); err != nil {
+		if err := c.emit(copied.MihomoRuleSource); err != nil {
 			return MihomoRuleIR{}, err
 		}
 		compiled = append(compiled, copied)
@@ -163,25 +163,25 @@ func (c *MihomoSubRuleCompiler) Compile(ir MihomoRuleIR) (MihomoRuleIR, error) {
 func (c *MihomoSubRuleCompiler) expandCall(call MihomoRuleIRRule, inherited *MihomoExpr, depth int, path []string, trace []MihomoSubRuleCall) ([]MihomoRuleIRRule, error) {
 	ref := call.Expr.SubRuleRef
 	if ref == nil || strings.TrimSpace(ref.Name) == "" {
-		return nil, c.error(call.Source, "", "SUB-RULE expression has no referenced name", ErrMihomoSubRuleUndefined)
+		return nil, c.error(call.MihomoRuleSource, "", "SUB-RULE expression has no referenced name", ErrMihomoSubRuleUndefined)
 	}
 	if call.Action.Target != "" || len(call.Action.Options) != 0 || call.Action.NoResolve {
-		return nil, c.error(call.Source, ref.Name, "SUB-RULE call cannot carry an action or options", ErrMihomoSubRuleCompile)
+		return nil, c.error(call.MihomoRuleSource, ref.Name, "SUB-RULE call cannot carry an action or options", ErrMihomoSubRuleCompile)
 	}
 	if ref.Guard.Kind == "" {
-		return nil, c.error(call.Source, ref.Name, "SUB-RULE call has an empty guard", ErrMihomoSubRuleCompile)
+		return nil, c.error(call.MihomoRuleSource, ref.Name, "SUB-RULE call has an empty guard", ErrMihomoSubRuleCompile)
 	}
-	if err := mihomoRejectEmbeddedSubRule(ref.Guard, call.Source); err != nil {
+	if err := mihomoRejectEmbeddedSubRule(ref.Guard, call.MihomoRuleSource); err != nil {
 		return nil, err
 	}
 
 	effectiveGuard := mihomoCombineSubRuleGuards(inherited, ref.Guard)
 	nextTrace := appendMihomoSubRuleTrace(trace, MihomoSubRuleCall{
 		Name:   ref.Name,
-		Source: call.Source,
+		Source: call.MihomoRuleSource,
 		Guard:  cloneMihomoExpr(ref.Guard),
 	})
-	return c.expandNamed(ref.Name, effectiveGuard, depth, path, nextTrace, call.Source)
+	return c.expandNamed(ref.Name, effectiveGuard, depth, path, nextTrace, call.MihomoRuleSource)
 }
 
 func (c *MihomoSubRuleCompiler) expandNamed(name string, guard *MihomoExpr, depth int, path []string, trace []MihomoSubRuleCall, callSource MihomoRuleSource) ([]MihomoRuleIRRule, error) {
@@ -219,13 +219,13 @@ func (c *MihomoSubRuleCompiler) expandNamed(name string, guard *MihomoExpr, dept
 			compiled = append(compiled, expanded...)
 			continue
 		}
-		if err := mihomoRejectEmbeddedSubRule(child.Expr, child.Source); err != nil {
+		if err := mihomoRejectEmbeddedSubRule(child.Expr, child.MihomoRuleSource); err != nil {
 			return nil, err
 		}
 		leaf := cloneMihomoRuleIRRule(child)
 		leaf.Expr = mihomoCombineSubRuleGuards(guard, leaf.Expr)
 		leaf.CallTrace = appendMihomoSubRuleTrace(nil, trace...)
-		if err := c.emit(leaf.Source); err != nil {
+		if err := c.emit(leaf.MihomoRuleSource); err != nil {
 			return nil, err
 		}
 		compiled = append(compiled, leaf)
