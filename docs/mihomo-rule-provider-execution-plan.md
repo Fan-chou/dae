@@ -14,17 +14,20 @@
 后续规则编译设计的优先依据；前面保留的阶段说明包含历史计划，若与当前状态冲突，以当前
 状态为准。
 
-> 状态修正（2026-08-14）：截至 `b3868c1`，原始 Mihomo YAML routing 入口、provider 归一化、
+> 状态修正（2026-08-14）：截至 `2b0b8bc`，原始 Mihomo YAML routing 入口、provider 归一化、
 > 有序 rules IR、sub-rules 展开、provider/DAT 绑定和同 generation 原子发布均已实现；
 > `b3868c1` 进一步补齐了已支持规则的选项保真。先前把这些能力列为待实现的段落仅保留为
 > 历史设计记录，不能再作为当前状态或后续步骤。
 > `3ff9f3f` 随后完成 `DOMAIN-WILDCARD` capability stage：模式经小写规范化、字面正则
 > 转义和完整锚定后，按 `*` 为零或多个字符、`?` 为一个字符降低为 kdae domain regex；显式
 > classical-provider 的 `DOMAIN-WILDCARD` 条目复用 `DomainRegex`/DAT 路径。
+> `2b0b8bc` 完成非阻断 rule lowering：`IP-ASN` 条件跳过、`match-mac` 条件/动作选项忽略、
+> 其它无法降低的单条规则记录源位置和原因后跳过，完整转换继续；相同来源的重复警告只记录一次。
 
-> 最终目标修正：本项目不是把 Mihomo 配置“尽量生成”为 kdae 文件，而是将 Mihomo `rules`
-> 逐条转换为语义等价的 kdae routes。任何无法保持匹配条件、规则顺序、命中动作或选项语义
-> 的规则，都必须显式报告并阻止无损 generation 发布，不能用近似动作或静默丢弃代替。
+> 最终目标修正：本项目仍以 Mihomo `rules` 到 kdae routes 的语义等价为目标。能够保持匹配
+> 条件、规则顺序、命中动作和选项语义的规则按等价路径转换；用户明确允许的有损例外必须
+> 通过日志报告源位置和原因，并跳过受影响的条件/规则继续转换，不能用静默丢弃或未声明的
+> 近似动作冒充无损结果。
 
 > 历史段落说明：第 4～16 节保留了此前阶段的实现契约、风险记录和历史验收条件。它们不再
 > 代表当前执行顺序；其中关于 TDD、独立审查或额外验证的文字也不构成当前工作要求。当前
@@ -32,7 +35,7 @@
 
 ## 2. 当前基线
 
-当前分支的实现基线是 `5cec0d0`（包含 `7470e48` 的 fixed 组成员元数据修复、
+当前分支的实现基线是 `2b0b8bc`（包含 `7470e48` 的 fixed 组成员元数据修复、
 `5cec0d0` 的 Mihomo DAT 前缀复制修复、`4585d21` 的 MATCH/fallback 修复，以及此前
 `dc59e45` 的 nested group health 语义修复、`81b972f` 的单成员 `url-test` 精确降低和
 `b3868c1`、`3ff9f3f` 等 routing 提交），
@@ -46,27 +49,27 @@
   script 引用分析；
 - provider 规范化、ordered routing IR、sub-rule graph 展开、provider leaf 的 inline/DAT 绑定，
   并将 routes、provider snapshot、DAT 和 metadata 作为同一 generation 发布；
-- 已支持规则选项的保真 lowering（`b3868c1`）；不能精确保真的选项继续 fail closed；
+- 已支持规则选项的保真 lowering（`b3868c1`）；lowerer 默认仍可 fail closed，完整 Mihomo
+  routing 入口则对单条无法降低的规则记录日志并跳过，不阻断其它规则；
 - `3ff9f3f`：`DOMAIN-WILDCARD` 降低为完整锚定、字面正则转义的 kdae domain regex：`*` 表示
   零或多个字符，`?` 表示一个字符，输入先小写规范化；显式 classical-provider 条目复用
   `DomainRegex`/DAT binding；
 - Mihomo 节点、DIRECT/REJECT、nested group、select/fallback/health-check 的用户态转换；
 - `4c6e1a4`：非 Linux 链路验证注册 `shadowsocks_2022`。
 
-这不表示任意 Mihomo 配置都已可转换。当前实现只发布可证明等价的规则：domain（含
-`DOMAIN-WILDCARD`）/IP/port/network/process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入
-支持范围；`IN-PORT`、`IP-ASN`、`GEO*`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确
-能力缺口，除非已有明确的兼容策略，否则必须报错并保持上一代 generation。当前兼容策略是：
-忽略 `IN-PORT` 条件和 `match-mac` 选项，`REJECT-DROP` 降级为 `REJECT`/`block`；
-`IP-ASN`、`GEO*` 和活动 `SCRIPT` 仍然 fail closed。
+这不表示任意 Mihomo 配置都已无损转换。当前等价路径覆盖 domain（含 `DOMAIN-WILDCARD`）/IP/
+port/network/process/逻辑条件、sub-rule、provider 和 DAT 数据；明确的有损兼容策略是：
+忽略 `IN-PORT`、`IP-ASN` 条件和 `match-mac` 条件/动作选项，`REJECT-DROP` 降级为
+`REJECT`/`block`。完整 routing 入口对其它单条 lowering 失败（例如 `GEO*`、未知条件、无法
+表达的选项/动作或单条展开超限）记录 warning 后跳过该规则，继续生成其它 routes；这不宣称
+该规则仍保持语义等价。provider 获取/解析、引用完整性、节点/代理组结构和活动 `SCRIPT` 等
+候选级失败仍 fail closed，避免发布结构不完整的 generation。
 
-2026-08-14 使用用户提供的完整 Mihomo 配置进行了真实转换：节点、代理组和嵌套组阶段已通过。
-按当前兼容策略忽略 `IN-PORT`（含第 1232、1233 行及 OR 分支）、忽略 `match-mac` 选项，并将
-`REJECT-DROP` 降级为 `block` 后，原始配置继续推进到第 49 条规则、源文件第 1297 行的
-`IP-ASN`，随后按设计 fail closed。此前的诊断副本在替换剩余不支持条件后已完整生成 8 个节点、
-36 个代理组、远程规则集快照、geoip/geosite DAT 和 routes；该结果只证明已支持链路可用，
-不代表原配置已完成语义等价转换。当前阻塞不是测试流程或 DAT 数据缺失，而是 `IP-ASN` 仍无
-kdae 等价条件。
+2026-08-14 使用用户提供的完整 Mihomo 配置进行了真实转换，命令退出码为 0。日志报告了
+`IN-PORT`（源文件第 1232、1233 行）、`IP-ASN`（第 1297 行）、`match-mac` 条件/动作选项
+（第 1403、1425、1426、1433、1436、1441 行）等明确有损点，没有因为这些规则中有无法无损
+表达的部分而中止。最终生成 282 条 routes、36 个代理组、8 个节点、远程规则集快照以及
+geoip/geosite DAT；活动 `SCRIPT` 和候选级结构错误仍不在这个非阻断范围内。
 
 ## 3. 不可改变的约束
 
@@ -96,7 +99,9 @@ kdae 等价条件。
     ↓
 已完成（截至 `910ecb3`）：nodes、groups、routes、provider snapshot、DAT → 同一 generation 发布
     ↓
-已完成（`b3868c1`）：已支持 rule options 的保真；不支持 option/action fail closed
+已完成（`b3868c1`）：已支持 rule options 的保真；完整入口对不支持的单条 option/action 记录日志并跳过
+    ↓
+已完成（`2b0b8bc`）：`IP-ASN`/其它单条 lowering 失败非阻断，源位置和原因通过 warning 输出
     ↓
 已完成（`3ff9f3f`）：`DOMAIN-WILDCARD` → 小写、转义、完整锚定的 kdae domain regex；
 显式 classical-provider 条目复用 `DomainRegex`/DAT
@@ -981,8 +986,9 @@ SubRuleRef(SUB-RULE, name, guard)
 
 `b3868c1` 已确保已支持规则的选项不会在 parser/lowerer 中被静默丢弃。当前用户指定的
 兼容例外是：`match-mac` 选项直接忽略但保留同一 `SRC-IP-CIDR` 条件；`IN-PORT` 条件按
-分支忽略，整条只含该条件的规则不生成，避免错误变成无条件规则。其它没有明确兼容策略的
-选项仍会阻止发布。
+分支忽略，整条只含该条件的规则不生成，避免错误变成无条件规则。`2b0b8bc` 同时允许完整
+routing 入口对其它单条 lowering 失败记录源位置、原文和原因后跳过；lowerer API 未启用
+`SkipUnsupported` 时仍返回错误，供需要 fail-closed 的调用方使用。
 
 #### 条件能力边界
 
@@ -1010,14 +1016,16 @@ SubRuleRef(SUB-RULE, name, guard)
 | 已支持规则 option（含可精确表达的 `no-resolve`） | 支持 | `b3868c1` 保留语义；不能表达时不发布 |
 | `DOMAIN-WILDCARD` | 支持 | 小写规范化后降低为 kdae domain regex：字面正则字符转义，`*` 为零或多个字符，`?` 为一个字符，整体完整锚定；显式 classical-provider 条目复用 `DomainRegex`/DAT binding |
 | `IN-PORT` | 忽略 | 不映射为 `sport`/`dport`/`tproxy_port`；整条仅含该条件的规则跳过，OR 中仅移除该分支 |
-| `IP-ASN`、`GEO*` | 不支持 | 显式错误；地理/ASN 分类和其运行时语义不能由 DAT 自动获得 |
-| `match-mac` | 忽略 | 忽略该选项，保留同一规则中的源 IP 条件 |
+| `IP-ASN` | 忽略 | 记录源位置后忽略该条件；整条仅含该条件的规则不生成，OR 中仅移除该分支 |
+| `GEO*`、其它无法降低的单条条件/选项/动作 | 非阻断跳过 | 记录源位置、原文和原因后跳过该规则；不生成伪等价 route |
+| `match-mac` | 忽略 | 忽略条件参数或动作选项，保留同一规则中的源 IP 条件 |
 | 活动 `SCRIPT` | 不支持 | 显式错误；未使用 script 定义可仅记录 ignored |
 | `REJECT-DROP` | 兼容降级 | 映射为 `REJECT`/`block` |
 
-任何“不支持”行仍会使候选 generation fail closed。`忽略`和`兼容降级`是当前明确选择的
-有损兼容策略，不宣称与 Mihomo 完全等价；特别地，DAT 是 domain/IP 数据文件而不是规则
-执行语言，不能承载这些非数据语义。
+`忽略`、`非阻断跳过`和`兼容降级`是当前明确选择的有损兼容策略，不宣称与 Mihomo 完全
+等价；特别地，DAT 是 domain/IP 数据文件而不是规则执行语言，不能承载这些非数据语义。
+完整 routing 入口只对单条 rule lowering 错误非阻断；provider 读取/解析、规则引用、
+代理节点/代理组结构或活动 `SCRIPT` 等候选级错误仍 fail closed，不发布结构不完整的 generation。
 
 `IN-PORT` 的精确语义仍未实现：Mihomo 将它定义为入站监听器端口，而当前 kdae 没有对应的
 入站监听器身份。按当前兼容选择不猜测映射，直接忽略该条件；这会有意丢失入口分流语义，
@@ -1109,8 +1117,9 @@ metadata 至少记录：
 
 ### 17.8 实现步骤和提交边界
 
-下列垂直步骤均已完成；它们按原有分步边界提交，汇总状态截至 `910ecb3`，随后由
-`b3868c1` 补齐 rule-option fidelity，并由 `3ff9f3f` 补齐 `DOMAIN-WILDCARD`：
+下列垂直步骤均已完成；它们按原有分步边界提交，汇总状态截至 `2b0b8bc`：`b3868c1`
+补齐 rule-option fidelity，`3ff9f3f` 补齐 `DOMAIN-WILDCARD`，`2b0b8bc` 补齐非阻断
+lowering diagnostics：
 
 1. **已完成：routing document extractor**：读取 `rule-providers`、`rules`、`sub-rules`，
    保留顺序、源位置和 script 引用；输出兼容旧工具的 manifest。
@@ -1123,24 +1132,29 @@ metadata 至少记录：
 5. **已完成：full routing generation**：extractor、nodes/groups、IR、DAT 和 generation
    metadata 已接入同一发布路径；不实现 script engine 或 script 表达式编译。
 6. **已完成：rule-option fidelity**：`b3868c1` 使可精确表达的规则选项保留到 IR/routes；
-   任何没有精确等价的 option/action 都阻止发布。
+   `2b0b8bc` 对完整入口中没有精确等价的单条 option/action 记录日志并跳过，lowerer 默认
+   模式仍可 fail closed。
 7. **已完成：wildcard capability**：`3ff9f3f` 将 `DOMAIN-WILDCARD` 以小写规范化、字面
    正则转义和完整锚定降低为 kdae domain regex，其中 `*` 表示零或多个字符、`?` 表示一个字符；
    显式 classical-provider 的同类条目复用 `DomainRegex`/DAT。
 
-真正 pending 的工作只有 capability matrix 中明确不支持的语义在“先证明精确 kdae 等价”后的
-独立立项；它们不是本轮 routing 实现的遗留 TODO。
+8. **已完成：non-blocking compatibility diagnostics**：`2b0b8bc` 忽略 `IP-ASN` 条件和
+   `match-mac` 条件/动作选项，对其它单条 lowering 失败输出带 index/line/raw/reason 的 warning
+   并继续转换；`REJECT-DROP` 仍按既定策略降级为 `block`。
+
+仍 pending 的是活动 `SCRIPT`、候选级结构错误和其它需要真正实现才能恢复语义的能力；它们不是
+通过日志跳过后就能宣称无损的功能。
 
 ### 17.9 设计出口条件
 
-截至 `3ff9f3f`，实现状态已满足以下设计出口；本次文档同步未重新执行测试、独立审查或
-运行时验证，因此这些条目不是新的验证结论：
+截至 `2b0b8bc`，实现状态已满足以下设计出口；代码测试和用户完整配置的真实转换均已执行：
 
 - 原始 `rule-providers` 不再需要手工先写 manifest；
 - provider 内容、规则顺序、动作、条件组合和 sub-rule 调用均有对应 IR 或明确失败诊断；
-- 每条被接受的 Mihomo rule 都能证明其 kdae route 在匹配条件、first-match 顺序、命中动作和
-  规则选项上语义等价；不能证明等价的规则不会进入发布结果；
+- 每条进入等价路径的 Mihomo rule 都能证明其 kdae route 在匹配条件、first-match 顺序、命中
+  动作和规则选项上语义等价；不能证明等价的单条规则会记录原因并跳过，不进入发布结果；
 - 大 provider 使用现有 DAT/ext，不把规则数据和控制语义混在 DAT 中；
 - 未使用 script 不阻断 routing 转换，活动 script 不被静默近似；
+- 单条 routing lowering 无法无损转换时有带源位置的 warning，且不阻断其它规则；
 - 被引用 provider、sub-rule、group/node 不存在或不可表达时不发布半成品；
 - 不修改 eBPF 数据面、outbound ID、kernel map 协议和现有透明代理路径。
