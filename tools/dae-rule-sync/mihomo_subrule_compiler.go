@@ -181,7 +181,7 @@ func (c *MihomoSubRuleCompiler) expandCall(call MihomoRuleIRRule, inherited *Mih
 		Source: call.MihomoRuleSource,
 		Guard:  cloneMihomoExpr(ref.Guard),
 	})
-	return c.expandNamed(ref.Name, effectiveGuard, depth, path, nextTrace, call.MihomoRuleSource)
+	return c.expandNamed(ref.Name, &effectiveGuard, depth, path, nextTrace, call.MihomoRuleSource)
 }
 
 func (c *MihomoSubRuleCompiler) expandNamed(name string, guard *MihomoExpr, depth int, path []string, trace []MihomoSubRuleCall, callSource MihomoRuleSource) ([]MihomoRuleIRRule, error) {

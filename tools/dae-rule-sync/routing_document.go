@@ -106,7 +106,7 @@ func ParseMihomoRoutingDocument(data []byte) (MihomoRoutingDocument, error) {
 	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 || root.Content[0] == nil {
 		return MihomoRoutingDocument{}, errors.New("parse Mihomo routing document: top level must be one YAML mapping")
 	}
-	root = *root.Content[0]
+	root = root.Content[0]
 	if root.Kind != yaml.MappingNode {
 		return MihomoRoutingDocument{}, fmt.Errorf("parse Mihomo routing document: top level must be a mapping, got %s", yamlNodeKind(root.Kind))
 	}
