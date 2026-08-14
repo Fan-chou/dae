@@ -18,6 +18,9 @@
 > 有序 rules IR、sub-rules 展开、provider/DAT 绑定和同 generation 原子发布均已实现；
 > `b3868c1` 进一步补齐了已支持规则的选项保真。先前把这些能力列为待实现的段落仅保留为
 > 历史设计记录，不能再作为当前状态或后续步骤。
+> `3ff9f3f` 随后完成 `DOMAIN-WILDCARD` capability stage：模式经小写规范化、字面正则
+> 转义和完整锚定后，按 `*` 为零或多个字符、`?` 为一个字符降低为 kdae domain regex；显式
+> classical-provider 的 `DOMAIN-WILDCARD` 条目复用 `DomainRegex`/DAT 路径。
 
 > 最终目标修正：本项目不是把 Mihomo 配置“尽量生成”为 kdae 文件，而是将 Mihomo `rules`
 > 逐条转换为语义等价的 kdae routes。任何无法保持匹配条件、规则顺序、命中动作或选项语义
@@ -29,9 +32,9 @@
 
 ## 2. 当前基线
 
-当前分支的文档基线是 `b3868c1`（已包含 `910ecb3` 及此前的 routing 提交），不再使用
-`4c6e1a4` 或“转换入口只建模 proxies/proxy-groups”的旧状态。与本次设计直接相关的已完成能力
-包括：
+当前分支的文档基线是 `3ff9f3f`（已包含 `b3868c1`、`910ecb3` 及此前的 routing 提交），
+不再使用 `4c6e1a4` 或“转换入口只建模 proxies/proxy-groups”的旧状态。与本次设计直接相关的
+已完成能力包括：
 
 - manifest 校验、HTTP/file provider fetch/cache、规则解析和 generation-atomic 发布；
 - `98f4321`：GeoSite/GeoIP DAT writer；
@@ -41,13 +44,16 @@
 - provider 规范化、ordered routing IR、sub-rule graph 展开、provider leaf 的 inline/DAT 绑定，
   并将 routes、provider snapshot、DAT 和 metadata 作为同一 generation 发布；
 - 已支持规则选项的保真 lowering（`b3868c1`）；不能精确保真的选项继续 fail closed；
+- `3ff9f3f`：`DOMAIN-WILDCARD` 降低为完整锚定、字面正则转义的 kdae domain regex：`*` 表示
+  零或多个字符，`?` 表示一个字符，输入先小写规范化；显式 classical-provider 条目复用
+  `DomainRegex`/DAT binding；
 - Mihomo 节点、DIRECT/REJECT、nested group、select/fallback/health-check 的用户态转换；
 - `4c6e1a4`：非 Linux 链路验证注册 `shadowsocks_2022`。
 
-这不表示任意 Mihomo 配置都已可转换。当前实现只发布可证明等价的规则：domain/IP/port/network/
-process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入支持范围；`IN-PORT`、`IP-ASN`、
-`GEO*`、`DOMAIN-WILDCARD`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确能力缺口，
-除非未来证明存在精确 kdae 等价物，否则必须报错并保持上一代 generation。
+这不表示任意 Mihomo 配置都已可转换。当前实现只发布可证明等价的规则：domain（含
+`DOMAIN-WILDCARD`）/IP/port/network/process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入
+支持范围；`IN-PORT`、`IP-ASN`、`GEO*`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确
+能力缺口，除非未来证明存在精确 kdae 等价物，否则必须报错并保持上一代 generation。
 
 本文档没有在本次同步中运行测试、独立审查或运行时验证；上述状态仅记录用户指定的已提交实现
 边界，不能据此宣称用户给出的完整配置当前可转换。只要仍有活动的上述不支持规则，完整生成
@@ -82,6 +88,9 @@ process/逻辑条件、sub-rule、provider 和 DAT 数据路径已纳入支持�
 已完成（截至 `910ecb3`）：nodes、groups、routes、provider snapshot、DAT → 同一 generation 发布
     ↓
 已完成（`b3868c1`）：已支持 rule options 的保真；不支持 option/action fail closed
+    ↓
+已完成（`3ff9f3f`）：`DOMAIN-WILDCARD` → 小写、转义、完整锚定的 kdae domain regex；
+显式 classical-provider 条目复用 `DomainRegex`/DAT
     ↓
 仍待未来证明精确等价后再实现：未支持的条件/选项/动作；不包含 script engine 或数据面重设计
 ```
@@ -531,8 +540,10 @@ ac187b9 feat: generate DAT-backed routes for large providers
 910ecb3 routing: 原始 YAML routing entry、provider normalization、ordered rules IR、
         sub-rules expansion、provider/DAT binding 与 generation-atomic publish
 b3868c1 routing: 已支持 rule options 的语义保真；无精确等价的 option/action 继续 fail closed
+3ff9f3f routing: DOMAIN-WILDCARD 以小写、转义和完整锚定的 domain regex 降低；
+        显式 classical-provider 条目复用 DomainRegex/DAT
 
-规则编译垂直步骤：全部完成（截至 `b3868c1`）。当前没有可在既定能力边界内继续实现的
+规则编译垂直步骤：全部完成（截至 `3ff9f3f`）。当前没有可在既定能力边界内继续实现的
 pending routing 步骤；不支持的条件、选项和动作只能在证明精确 kdae 等价后另行立项。
 ```
 
@@ -572,9 +583,9 @@ pending routing 步骤；不支持的条件、选项和动作只能在证明精�
 ## 16. Mihomo 配置兼容补充设计（需求 2～7）
 
 本节针对当时真实配置验证暴露的六项缺口补充设计。其历史描述中的 `PROCESS-NAME` 已由当前
-routing lowerer 支持；`DOMAIN-WILDCARD` 与其它 capability matrix 所列项仍不支持。本节假设
-规则转换器已经能把每条被引用规则明确表示为“可转换”或“不可转换”，不在这里重新定义规则
-匹配语法。
+routing lowerer 支持，`DOMAIN-WILDCARD` 也已由 `3ff9f3f` 支持；其余 capability matrix 所列
+不支持项仍 fail closed。本节假设规则转换器已经能把每条被引用规则明确表示为“可转换”或
+“不可转换”，不在这里重新定义规则匹配语法。
 
 本节保留 routing sections 之外的历史扩展设计，不是对当前 routing 实现状态的否定或待办
 清单。无论未来是否采用其中的 group-runtime 方案，仍必须遵守“不改 eBPF 数据面、outbound
@@ -957,9 +968,11 @@ capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就�
 
 #### 条件能力边界
 
-`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、IP-CIDR、网络、端口、
-`PROCESS-NAME` 和 provider leaf 已按 kdae routing function registry 降低。`IP-ASN`、
-`match-mac` 等不是 provider 数据，不能借 DAT 绕过 capability gate。
+`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DOMAIN-REGEX`、`DOMAIN-WILDCARD`、IP-CIDR、
+网络、端口、`PROCESS-NAME` 和 provider leaf 已按 kdae routing function registry 降低。
+`DOMAIN-WILDCARD` 先小写规范化，转义字面正则字符，再将 `*` 降低为零或多个字符、`?` 降低为
+一个字符，并将得到的 kdae domain regex 完整锚定；显式 classical-provider 的同类条目复用
+`DomainRegex`/DAT。`IP-ASN`、`match-mac` 等不是 provider 数据，不能借 DAT 绕过 capability gate。
 
 #### 用户配置 capability matrix
 
@@ -977,9 +990,9 @@ capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就�
 | `RULE-SET` / provider | 支持 | 归一化后使用 inline 或 DAT binding；调用点仍保留自身条件和动作 |
 | provider/DAT | 支持 | DAT 仅编码 domain/IP 数据；不编码 action、顺序、逻辑、端口、进程或 option |
 | 已支持规则 option（含可精确表达的 `no-resolve`） | 支持 | `b3868c1` 保留语义；不能表达时不发布 |
+| `DOMAIN-WILDCARD` | 支持 | 小写规范化后降低为 kdae domain regex：字面正则字符转义，`*` 为零或多个字符，`?` 为一个字符，整体完整锚定；显式 classical-provider 条目复用 `DomainRegex`/DAT binding |
 | `IN-PORT` | 不支持 | 显式错误，不能删除或猜测入站端口语义 |
 | `IP-ASN`、`GEO*` | 不支持 | 显式错误；地理/ASN 分类和其运行时语义不能由 DAT 自动获得 |
-| `DOMAIN-WILDCARD` | 不支持 | 显式错误；不能改写为 suffix/regex 后假称等价 |
 | `match-mac` | 不支持 | 显式错误；MAC 匹配不是 DAT 可表达的数据条件 |
 | 活动 `SCRIPT` | 不支持 | 显式错误；未使用 script 定义可仅记录 ignored |
 | `REJECT-DROP` | 不支持 | 显式错误；不得降级成普通 `REJECT`/`block` |
@@ -1075,7 +1088,7 @@ metadata 至少记录：
 ### 17.8 实现步骤和提交边界
 
 下列垂直步骤均已完成；它们按原有分步边界提交，汇总状态截至 `910ecb3`，随后由
-`b3868c1` 补齐 rule-option fidelity：
+`b3868c1` 补齐 rule-option fidelity，并由 `3ff9f3f` 补齐 `DOMAIN-WILDCARD`：
 
 1. **已完成：routing document extractor**：读取 `rule-providers`、`rules`、`sub-rules`，
    保留顺序、源位置和 script 引用；输出兼容旧工具的 manifest。
@@ -1089,13 +1102,16 @@ metadata 至少记录：
    metadata 已接入同一发布路径；不实现 script engine 或 script 表达式编译。
 6. **已完成：rule-option fidelity**：`b3868c1` 使可精确表达的规则选项保留到 IR/routes；
    任何没有精确等价的 option/action 都阻止发布。
+7. **已完成：wildcard capability**：`3ff9f3f` 将 `DOMAIN-WILDCARD` 以小写规范化、字面
+   正则转义和完整锚定降低为 kdae domain regex，其中 `*` 表示零或多个字符、`?` 表示一个字符；
+   显式 classical-provider 的同类条目复用 `DomainRegex`/DAT。
 
 真正 pending 的工作只有 capability matrix 中明确不支持的语义在“先证明精确 kdae 等价”后的
 独立立项；它们不是本轮 routing 实现的遗留 TODO。
 
 ### 17.9 设计出口条件
 
-截至 `b3868c1`，实现状态已满足以下设计出口；本次文档同步未重新执行测试、独立审查或
+截至 `3ff9f3f`，实现状态已满足以下设计出口；本次文档同步未重新执行测试、独立审查或
 运行时验证，因此这些条目不是新的验证结论：
 
 - 原始 `rule-providers` 不再需要手工先写 manifest；
