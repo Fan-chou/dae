@@ -32,7 +32,8 @@
 
 ## 2. 当前基线
 
-当前分支的文档基线是 `3ff9f3f`（已包含 `b3868c1`、`910ecb3` 及此前的 routing 提交），
+当前分支的实现基线是 `81b972f`（包含 `dc59e45` 的 nested group health 语义修复、
+`81b972f` 的单成员 `url-test` 精确降低，以及此前 `b3868c1`、`3ff9f3f` 等 routing 提交），
 不再使用 `4c6e1a4` 或“转换入口只建模 proxies/proxy-groups”的旧状态。与本次设计直接相关的
 已完成能力包括：
 
@@ -55,9 +56,10 @@
 支持范围；`IN-PORT`、`IP-ASN`、`GEO*`、`match-mac`、活动 `SCRIPT` 与 `REJECT-DROP` 仍是明确
 能力缺口，除非未来证明存在精确 kdae 等价物，否则必须报错并保持上一代 generation。
 
-本文档没有在本次同步中运行测试、独立审查或运行时验证；上述状态仅记录用户指定的已提交实现
-边界，不能据此宣称用户给出的完整配置当前可转换。只要仍有活动的上述不支持规则，完整生成
-必须 fail closed。
+2026-08-14 使用用户提供的完整 Mihomo 配置进行了真实转换：节点、代理组和嵌套组阶段已通过，
+随后在第一个顶层 `IN-PORT`（源文件第 1232 行）处按设计 fail closed。单成员
+`GGIPLC-KeepAlive` 的 `url-test` 误差也已修复并单独提交，但这不改变完整配置仍不可无损发布的
+结论。当前阻塞不是测试流程或 DAT 数据缺失，而是配置仍包含 kdae 没有精确运行时维度的规则。
 
 ## 3. 不可改变的约束
 
@@ -999,7 +1001,7 @@ capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就�
 | provider/DAT | 支持 | DAT 仅编码 domain/IP 数据；不编码 action、顺序、逻辑、端口、进程或 option |
 | 已支持规则 option（含可精确表达的 `no-resolve`） | 支持 | `b3868c1` 保留语义；不能表达时不发布 |
 | `DOMAIN-WILDCARD` | 支持 | 小写规范化后降低为 kdae domain regex：字面正则字符转义，`*` 为零或多个字符，`?` 为一个字符，整体完整锚定；显式 classical-provider 条目复用 `DomainRegex`/DAT binding |
-| `IN-PORT` | 不支持 | 显式错误，不能删除或猜测入站端口语义 |
+| `IN-PORT` | 不支持 | 显式错误，不能删除或猜测入站端口语义；当前 kdae 没有入站监听器身份 |
 | `IP-ASN`、`GEO*` | 不支持 | 显式错误；地理/ASN 分类和其运行时语义不能由 DAT 自动获得 |
 | `match-mac` | 不支持 | 显式错误；MAC 匹配不是 DAT 可表达的数据条件 |
 | 活动 `SCRIPT` | 不支持 | 显式错误；未使用 script 定义可仅记录 ignored |
@@ -1008,6 +1010,13 @@ capability 检查：kdae 有精确字段才降低到 IR；没有精确语义就�
 任何“不支持”行只有在未来已证明精确 kdae 等价、并经独立 capability 实现后才能改为支持；
 在此之前，它们使候选 generation fail closed。特别地，DAT 是 domain/IP 数据文件而不是规则
 执行语言，不能承载这些非数据语义。
+
+`IN-PORT` 的边界需要单独说明：Mihomo 将它定义为入站监听器端口。用户配置中 7893、7894、
+7895 是三个 SOCKS 入站监听端口，而 kdae 的 `tproxy_port` 是单一的内部透明代理监听端口，
+并且现有路由/eBPF 上下文只保留原始流量的源端口和目标端口。把 `IN-PORT` 错降为 `sport`、
+`dport` 或固定的 `tproxy_port` 都会改变命中集合；要实现精确语义必须新增多入站监听器及其
+运行时身份传递，这已经超出本计划“不改基本透明代理架构”的范围。因此该配置的这些规则
+只能显式阻断转换，不能通过 DAT、规则展开或代理组改造绕过。
 
 ### 17.5 `sub-rules` 图编译
 
