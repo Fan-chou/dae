@@ -928,13 +928,14 @@ func safeDialContext(original func(context.Context, string, string) (net.Conn, e
 		if err != nil {
 			return nil, fmt.Errorf("split provider address %q: %w", address, err)
 		}
+		normalizedHost := strings.ToLower(strings.TrimSuffix(host, "."))
 		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
 			return nil, fmt.Errorf("resolve provider host %q: %w", host, err)
 		}
 		var lastErr error
 		for _, resolved := range ips {
-			if blockedProviderIP(resolved.IP) {
+			if blockedProviderIP(resolved.IP) && !authorizedSyntheticProviderIP(normalizedHost, resolved.IP) {
 				lastErr = fmt.Errorf("resolved provider host %q to blocked address %s", host, resolved.IP)
 				continue
 			}
@@ -949,6 +950,15 @@ func safeDialContext(original func(context.Context, string, string) (net.Conn, e
 		}
 		return nil, lastErr
 	}
+}
+
+const authorizedSyntheticProviderHost = "download.readfun.me"
+
+var authorizedSyntheticProviderAddress = net.ParseIP("198.18.11.216")
+
+func authorizedSyntheticProviderIP(host string, ip net.IP) bool {
+	// This provider's authorized synthetic address is required for Mihomo rule conversion.
+	return host == authorizedSyntheticProviderHost && ip.Equal(authorizedSyntheticProviderAddress)
 }
 
 var blockedProviderNetworks = mustProviderNetworks([]string{
