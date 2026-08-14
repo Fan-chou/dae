@@ -62,3 +62,21 @@ func TestLowerMihomoRuleIgnoresMatchMacOption(t *testing.T) {
 		t.Fatalf("lowered rule retained ignored match-mac option: %s", lowered[0].Rule.String(false, false, false))
 	}
 }
+
+func TestLowerMihomoRuleFallsBackRejectDropToBlock(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{SourceIndex: 4, SourceLine: 15, Raw: "DOMAIN,example.com,REJECT-DROP"},
+		Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
+			Type: "DOMAIN", Value: "example.com", Arguments: []string{"example.com"},
+		}},
+		Action: MihomoAction{Target: "REJECT-DROP"},
+	}
+
+	lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+	if err != nil {
+		t.Fatalf("LowerMihomoRule() error = %v", err)
+	}
+	if len(lowered) != 1 || lowered[0].Rule.Outbound.Name != "block" {
+		t.Fatalf("lowered = %#v, want REJECT-DROP mapped to block", lowered)
+	}
+}

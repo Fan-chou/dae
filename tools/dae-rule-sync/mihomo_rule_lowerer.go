@@ -601,7 +601,9 @@ func (l *MihomoRuleLowerer) lowerAction(action MihomoAction, source MihomoRuleSo
 	case "REJECT":
 		outbound = "block"
 	case "REJECT-DROP":
-		return nil, mihomoLoweringError(source, "REJECT-DROP has no exact kdae outbound equivalent")
+		// The requested compatibility policy treats Mihomo's silent-drop
+		// action as kdae's block outbound.
+		outbound = "block"
 	default:
 		var ok bool
 		outbound, ok = l.options.OutboundNameMap[target]
