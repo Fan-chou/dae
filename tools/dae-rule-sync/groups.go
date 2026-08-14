@@ -334,7 +334,9 @@ func isReservedMihomoGroupName(name string) bool {
 }
 
 func hasMihomoGroupHealthOptions(group MihomoGroup) bool {
-	return group.URL != nil || group.Interval != nil || group.Lazy != nil || group.Tolerance != nil
+	// lazy is ignored for nested groups until dae has unambiguous group-level
+	// lazy semantics; explicit check URL, interval, and tolerance remain guarded.
+	return group.URL != nil || group.Interval != nil || group.Tolerance != nil
 }
 
 func hasMihomoNestedMember(group MihomoGroup, groups map[string]struct{}) bool {
