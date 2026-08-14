@@ -315,6 +315,9 @@ func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsExact(t *testing.T) 
 	if !strings.Contains(output, "policy: fixed(0)") {
 		t.Fatalf("output = %q, missing fixed single-member policy", output)
 	}
+	if !strings.Contains(output, "selection_members: 'direct'") {
+		t.Fatalf("output = %q, missing fixed single-member metadata", output)
+	}
 }
 
 func mihomoStringPtr(value string) *string { return &value }
