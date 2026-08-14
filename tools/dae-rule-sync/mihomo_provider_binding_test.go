@@ -6,6 +6,25 @@ import (
 	"testing"
 )
 
+func TestCloneGenerationDATSpecsDoesNotDuplicatePrefixes(t *testing.T) {
+	specs := []generationDATSpec{{
+		Provider: "ip-safe",
+		Kind:     "ipcidr",
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.0.2.0/24"),
+			netip.MustParsePrefix("198.51.100.0/24"),
+		},
+	}}
+
+	cloned := cloneGenerationDATSpecs(specs)
+	if len(cloned) != 1 || len(cloned[0].Prefixes) != len(specs[0].Prefixes) {
+		t.Fatalf("cloned DAT specs = %#v, want one copy of each prefix", cloned)
+	}
+	if &cloned[0].Prefixes[0] == &specs[0].Prefixes[0] {
+		t.Fatal("cloned DAT prefixes share the source backing array")
+	}
+}
+
 func TestBindMihomoProviderDataPreservesLogicAndBindsDAT(t *testing.T) {
 	providers := MihomoProviderNormalization{
 		Providers: []ProviderSpec{

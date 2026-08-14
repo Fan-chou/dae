@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -354,7 +355,7 @@ func cloneGenerationDATSpecs(specs []generationDATSpec) []generationDATSpec {
 	for index, spec := range specs {
 		result[index] = spec
 		result[index].Domains = append([]DomainRule(nil), spec.Domains...)
-		result[index].Prefixes = append(result[index].Prefixes, spec.Prefixes...)
+		result[index].Prefixes = append([]netip.Prefix(nil), spec.Prefixes...)
 	}
 	return result
 }
