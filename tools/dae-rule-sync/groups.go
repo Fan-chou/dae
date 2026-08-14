@@ -517,6 +517,14 @@ func fullMihomoGroupPolicy(groupType string, selectionMembers []string) (string,
 	case "fallback":
 		// first_alive is the exact ordered fallback policy implemented by dae.
 		return policy, false, nil
+	case "url-test":
+		// A single DIRECT member has no latency choice to approximate: it is
+		// always the selected member, while the group health options remain
+		// available for observability and reload behavior.
+		if len(selectionMembers) == 1 && selectionMembers[0] == "direct" {
+			return "fixed(0)", false, nil
+		}
+		return policy, approximate, nil
 	default:
 		// url-test currently maps to min_avg10 without Mihomo's complete
 		// tolerance/latency semantics, so it remains an explicit approximation.

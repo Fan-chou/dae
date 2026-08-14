@@ -295,6 +295,28 @@ func TestGenerateFlatDaeGroupsRetainsNestedParentHealthOptions(t *testing.T) {
 	}
 }
 
+func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsExact(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "node"}},
+		Groups: []MihomoGroup{{
+			Name:    "KeepAlive",
+			Type:    "url-test",
+			Proxies: []string{"DIRECT"},
+			URL:     mihomoStringPtr("http://example.com/generate_204"),
+		}},
+	}
+	output, report, err := generateFullMihomoGroups(config, map[string]string{"node": "node"})
+	if err != nil {
+		t.Fatalf("generateFullMihomoGroups() error = %v", err)
+	}
+	if report.Approximated != 0 || len(report.Unsupported) != 0 {
+		t.Fatalf("report = %#v, want exact conversion", report)
+	}
+	if !strings.Contains(output, "policy: fixed(0)") {
+		t.Fatalf("output = %q, missing fixed single-member policy", output)
+	}
+}
+
 func mihomoStringPtr(value string) *string { return &value }
 
 func mihomoInt64Ptr(value int64) *int64 { return &value }

@@ -765,8 +765,9 @@ result。`min_moving_avg` 仍保留给原生 dae 配置，不能全局替换。
    parent lazy 只延迟 parent view，不能绕过 child 的 lazy；显式 parent option 必须原样使用，
    不能静默退回 global 配置。parent 的 min-latency policy 在 parent view 已有观测时使用
    parent view latency；冷启动无 parent 观测时保留既有 child selection 作为排序回退。
-6. `url-test` 使用 `min_avg10` 加 `tolerance`；`fallback` 使用 `first_alive`，不使用
-   tolerance 进行延迟排序；`select` 保存选择但不自动因延迟切换。
+6. `url-test` 使用 `min_avg10` 加 `tolerance`；只有单一 `DIRECT` 成员的 `url-test` 映射为
+   `fixed(0)`，因为没有可竞速的选择空间；`fallback` 使用 `first_alive`，不使用 tolerance
+   进行延迟排序；`select` 保存选择但不自动因延迟切换。
 7. 通过 `config.New` 后，还要检查最终 runtime 的 `CheckInterval`、`CheckTolerance`、
    check URL 和 lazy 状态，防止只验证配置文本而漏掉运行时默认值。
 
