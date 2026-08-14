@@ -1,10 +1,11 @@
 # Mihomo 规则集 / 代理组改造进展与后续方案
 
-> 本文件以 `kix/kdae` (`4f7e283`) 到当前 `HEAD` (`d0126a6`) 的真实历史为基线，记录阶段 1
-> 原生 rule-provider runtime 的实现、测试、审查结论和已知问题。`bf855b9` 是其历史 WIP
-> predecessor，`d0126a6` 是已经存在的阶段 0 gate 提交。DAT/ext 输出、生命周期、完整控制面
-> 集成以及 sidecar routes/groups 的 generation-atomic 发布仍需后续独立出口审查；本文不宣称
-> 整个 Mihomo 改造已完成。
+> 本文件保留 `kix/kdae` (`4f7e283`) 到历史 checkpoint 的阶段 1 runtime 记录；当前执行基线
+> 以 `docs/mihomo-rule-provider-execution-plan.md` 为准，当前分支已推进到 `5cec0d0`。下文关于
+> TDD、独立审查、DAT 尚未实现和旧阶段出口的描述属于历史记录，不覆盖当前 routing 实现状态。
+> 当前已完成原始 Mihomo YAML routing、provider/DAT、rules/sub-rules、节点/代理组和同 generation
+> 发布；完整用户配置仍因 `IN-PORT`、`IP-ASN`、`match-mac`、`REJECT-DROP` 等无精确 kdae 等价物
+> 而 fail closed，详见执行计划的当前基线与 capability matrix。
 
 ## 1. 目标与架构约束
 
