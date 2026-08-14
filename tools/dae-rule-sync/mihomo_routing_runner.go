@@ -365,9 +365,25 @@ func mergeMihomoOutboundMaps(nodes, groups map[string]string) (map[string]string
 func renderMihomoLoweredRoutes(rules []MihomoLoweredRoutingRule) (string, ConversionReport, error) {
 	var output strings.Builder
 	report := ConversionReport{}
+	fallback := ""
 	for _, lowered := range rules {
 		if lowered.Rule == nil {
 			return "", report, errors.New("lowered Mihomo route is nil")
+		}
+		if len(lowered.Rule.AndFunctions) == 0 {
+			if fallback == "" {
+				fallback = strings.TrimSpace(lowered.Rule.Outbound.Name)
+				if fallback == "" || lowered.Rule.Outbound.Not || len(lowered.Rule.Outbound.Params) != 0 {
+					return "", report, fmt.Errorf("lowered Mihomo MATCH route has an invalid fallback outbound")
+				}
+			}
+			// A MATCH rule is a first-match catch-all. Any following Mihomo
+			// rules are unreachable and must not be emitted as ordinary kdae
+			// routes after the fallback.
+			continue
+		}
+		if fallback != "" {
+			continue
 		}
 		line := strings.TrimSpace(lowered.Rule.String(false, false, true))
 		if line == "" {
@@ -378,8 +394,34 @@ func renderMihomoLoweredRoutes(rules []MihomoLoweredRoutingRule) (string, Conver
 		output.WriteByte('\n')
 		report.Generated++
 	}
+	if fallback != "" {
+		output.WriteString("    fallback: ")
+		output.WriteString(fallback)
+		output.WriteByte('\n')
+		report.Generated++
+	}
 	if report.Generated == 0 {
 		return "", report, errors.New("Mihomo routing produced no routes")
 	}
 	return output.String(), report, nil
+}
+
+func generatedRoutingSection(routes []byte) string {
+	var output strings.Builder
+	output.WriteString("routing {\n")
+	output.Write(routes)
+	if !generatedRoutesContainFallback(routes) {
+		output.WriteString("  fallback: direct\n")
+	}
+	output.WriteString("}\n")
+	return output.String()
+}
+
+func generatedRoutesContainFallback(routes []byte) bool {
+	for _, line := range strings.Split(string(routes), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "fallback:") {
+			return true
+		}
+	}
+	return false
 }

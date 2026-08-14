@@ -1587,7 +1587,7 @@ func validateStoredGeneration(candidateDir, generationID string) error {
 }
 
 func generationRoutingRules(routes, groups []byte) ([]*config_parser.RoutingRule, error) {
-	sections, err := config_parser.Parse("global {}\n" + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	sections, err := config_parser.Parse("global {}\n" + string(groups) + generatedRoutingSection(routes))
 	if err != nil {
 		return nil, err
 	}
@@ -1622,7 +1622,9 @@ func validateGeneratedMihomoConfig(nodes, groups, routes []byte) error {
 		return errors.New("generated Mihomo groups are empty")
 	}
 	if len(conf.Routing.Rules) == 0 {
-		return errors.New("generated Mihomo routes are empty")
+		if _, err := config.ParseFunctionOrString(conf.Routing.Fallback); err != nil {
+			return errors.New("generated Mihomo routes are empty")
+		}
 	}
 	if err := validateMihomoOutputNames(identityNameMap(nodeNames), identityNameMap(groupNames)); err != nil {
 		return err
@@ -1735,7 +1737,7 @@ func inspectGeneratedMihomoConfig(nodes, groups, routes []byte) (*config.Config,
 	if len(strings.TrimSpace(string(nodes))) == 0 || len(strings.TrimSpace(string(groups))) == 0 || len(strings.TrimSpace(string(routes))) == 0 {
 		return nil, nil, nil, errors.New("generated Mihomo config contains an empty artifact")
 	}
-	sections, err := config_parser.Parse("global {}\n" + string(nodes) + string(groups) + "routing {\n" + string(routes) + "  fallback: direct\n}\n")
+	sections, err := config_parser.Parse("global {}\n" + string(nodes) + string(groups) + generatedRoutingSection(routes))
 	if err != nil {
 		return nil, nil, nil, err
 	}
