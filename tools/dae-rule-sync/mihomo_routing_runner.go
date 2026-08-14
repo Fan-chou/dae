@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 )
 
 // runMihomoRoutingSync is the complete-config path. It deliberately enters
@@ -181,10 +183,13 @@ func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport,
 			providerBehaviors[original] = provider.Behavior
 		}
 	}
+	logger := logrus.New()
 	lowered, err := LowerMihomoRuleIR(bound.IR, MihomoRuleLowererOptions{
 		ProviderNameMap:   normalization.NameMap,
 		OutboundNameMap:   outboundMap,
 		ProviderBehaviors: providerBehaviors,
+		SkipUnsupported:   true,
+		Logf:              logger.Warnf,
 	})
 	if err != nil {
 		return SyncReport{}, err

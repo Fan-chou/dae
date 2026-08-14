@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -63,6 +64,24 @@ func TestLowerMihomoRuleIgnoresMatchMacOption(t *testing.T) {
 	}
 }
 
+func TestLowerMihomoRuleIgnoresMatchMacActionOption(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{SourceIndex: 7, SourceLine: 18, Raw: "SRC-IP-CIDR,192.0.2.0/24,REJECT-DROP,match-mac"},
+		Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
+			Type: "SRC-IP-CIDR", Value: "192.0.2.0/24", Arguments: []string{"192.0.2.0/24"},
+		}},
+		Action: MihomoAction{Target: "REJECT-DROP", Options: []string{"match-mac"}},
+	}
+
+	lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+	if err != nil {
+		t.Fatalf("LowerMihomoRule() error = %v", err)
+	}
+	if len(lowered) != 1 || lowered[0].Rule.Outbound.Name != "block" {
+		t.Fatalf("lowered = %#v, want action match-mac ignored and REJECT-DROP mapped to block", lowered)
+	}
+}
+
 func TestLowerMihomoRuleFallsBackRejectDropToBlock(t *testing.T) {
 	rule := MihomoRuleIRRule{
 		MihomoRuleSource: MihomoRuleSource{SourceIndex: 4, SourceLine: 15, Raw: "DOMAIN,example.com,REJECT-DROP"},
@@ -78,5 +97,37 @@ func TestLowerMihomoRuleFallsBackRejectDropToBlock(t *testing.T) {
 	}
 	if len(lowered) != 1 || lowered[0].Rule.Outbound.Name != "block" {
 		t.Fatalf("lowered = %#v, want REJECT-DROP mapped to block", lowered)
+	}
+}
+
+func TestLowerMihomoRuleIRSkipsUnsupportedRulesAndLogsDetails(t *testing.T) {
+	var logs []string
+	ir := MihomoRuleIR{Rules: []MihomoRuleIRRule{
+		{
+			MihomoRuleSource: MihomoRuleSource{SourceIndex: 5, SourceLine: 16, Raw: "IP-ASN,38365,REJECT"},
+			Expr:             MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "IP-ASN", Value: "38365", Arguments: []string{"38365"}}},
+			Action:           MihomoAction{Target: "REJECT"},
+		},
+		{
+			MihomoRuleSource: MihomoRuleSource{SourceIndex: 6, SourceLine: 17, Raw: "UNKNOWN,value,REJECT"},
+			Expr:             MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "UNKNOWN", Value: "value", Arguments: []string{"value"}}},
+			Action:           MihomoAction{Target: "REJECT"},
+		},
+	}}
+
+	lowered, err := NewMihomoRuleLowerer(MihomoRuleLowererOptions{
+		SkipUnsupported: true,
+		Logf: func(format string, args ...any) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	}).LowerIR(ir)
+	if err != nil {
+		t.Fatalf("LowerIR() error = %v", err)
+	}
+	if len(lowered) != 0 {
+		t.Fatalf("lowered = %#v, want unsupported rules skipped", lowered)
+	}
+	if len(logs) != 2 || !strings.Contains(logs[0], "line 16") || !strings.Contains(logs[0], "IP-ASN") || !strings.Contains(logs[1], "line 17") || !strings.Contains(logs[1], "UNKNOWN") {
+		t.Fatalf("logs = %#v, want source locations and reasons for skipped rules", logs)
 	}
 }

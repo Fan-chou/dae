@@ -32,6 +32,12 @@ type MihomoRuleLowererOptions struct {
 	// MaxExpandedRules is the maximum number of output rules for the complete
 	// lowering operation. Zero selects DefaultMihomoRuleMaxExpandedRules.
 	MaxExpandedRules int
+
+	// SkipUnsupported omits rules that cannot be lowered instead of returning
+	// an error. Logf receives the source location and reason for every omitted
+	// rule or ignored condition.
+	SkipUnsupported bool
+	Logf            func(format string, args ...any)
 }
 
 // MihomoLowererOptions is kept as a concise alias for callers that do not
@@ -73,13 +79,14 @@ func (e *MihomoRuleLoweringError) Unwrap() error { return ErrMihomoRuleLoweringU
 // generated configuration.
 type MihomoRuleLowerer struct {
 	options MihomoRuleLowererOptions
+	logged  map[string]struct{}
 }
 
 // NewMihomoRuleLowerer constructs a lowerer. Invalid options are reported by
 // LowerRule or LowerIR, keeping construction convenient for configuration
 // plumbing.
 func NewMihomoRuleLowerer(options MihomoRuleLowererOptions) *MihomoRuleLowerer {
-	return &MihomoRuleLowerer{options: options}
+	return &MihomoRuleLowerer{options: options, logged: make(map[string]struct{})}
 }
 
 // LowerMihomoRule lowers one source rule and returns its contiguous
@@ -106,7 +113,12 @@ func (l *MihomoRuleLowerer) LowerRule(rule MihomoRuleIRRule) ([]MihomoLoweredRou
 	if err != nil {
 		return nil, err
 	}
-	return l.lowerRule(rule, limit)
+	lowered, err := l.lowerRule(rule, limit)
+	if err != nil && l.options.SkipUnsupported && errors.Is(err, ErrMihomoRuleLoweringUnsupported) {
+		l.logRuleSkip(rule.MihomoRuleSource, err)
+		return nil, nil
+	}
+	return lowered, err
 }
 
 // LowerIR lowers top-level rules while enforcing the expansion bound across
@@ -120,10 +132,19 @@ func (l *MihomoRuleLowerer) LowerIR(ir MihomoRuleIR) ([]MihomoLoweredRoutingRule
 	for _, rule := range ir.Rules {
 		remaining := limit - len(result)
 		if remaining <= 0 {
-			return nil, mihomoLoweringError(rule.MihomoRuleSource, fmt.Sprintf("expanded routing rules exceed %d", limit))
+			err := mihomoLoweringError(rule.MihomoRuleSource, fmt.Sprintf("expanded routing rules exceed %d", limit))
+			if l.options.SkipUnsupported {
+				l.logRuleSkip(rule.MihomoRuleSource, err)
+				break
+			}
+			return nil, err
 		}
 		lowered, err := l.lowerRule(rule, remaining)
 		if err != nil {
+			if l.options.SkipUnsupported && errors.Is(err, ErrMihomoRuleLoweringUnsupported) {
+				l.logRuleSkip(rule.MihomoRuleSource, err)
+				continue
+			}
 			return nil, err
 		}
 		result = append(result, lowered...)
@@ -186,11 +207,13 @@ func (l *MihomoRuleLowerer) lowerExpression(expr MihomoExpr, negated bool, sourc
 		if expr.Atom == nil {
 			return nil, mihomoLoweringError(source, "atom expression has no atom")
 		}
+		l.logIgnoredAtomOptions(*expr.Atom, source)
 		if ignoredMihomoAtom(expr.Atom.Type) {
-			// IN-PORT depends on Mihomo's inbound-listener identity, which is
-			// intentionally outside kdae's routing context. Treat the condition
-			// as an ignored branch: conjunctions containing it are skipped and
-			// OR expressions may still lower their representable branches.
+			// IN-PORT and IP-ASN depend on runtime data that is intentionally not
+			// modeled here. Treat either condition as an ignored branch:
+			// conjunctions containing it are skipped and OR expressions may still
+			// lower their representable branches.
+			l.logOnce(fmt.Sprintf("condition:%d:%d:%s:%s", source.SourceIndex, source.SourceLine, source.Raw, expr.Atom.Type), "ignore Mihomo condition at index %d line %d (%q): atom %q", source.SourceIndex, source.SourceLine, source.Raw, expr.Atom.Type)
 			return nil, nil
 		}
 		if strings.EqualFold(expr.Atom.Type, "MATCH") {
@@ -337,7 +360,42 @@ func combineMihomoTerms(left, right []mihomoLoweredTerm, limit int) ([]mihomoLow
 }
 
 func ignoredMihomoAtom(typeName string) bool {
-	return strings.EqualFold(strings.TrimSpace(typeName), "IN-PORT")
+	switch strings.ToUpper(strings.TrimSpace(typeName)) {
+	case "IN-PORT", "IP-ASN":
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *MihomoRuleLowerer) logIgnoredAtomOptions(atom MihomoAtom, source MihomoRuleSource) {
+	_, options := mihomoAtomArguments(atom)
+	for _, option := range options {
+		if strings.EqualFold(strings.TrimSpace(option), "match-mac") {
+			l.logOnce(fmt.Sprintf("condition-option:%d:%d:%s:%s:%s", source.SourceIndex, source.SourceLine, source.Raw, atom.Type, option), "ignore Mihomo condition option at index %d line %d (%q): atom %q option %q", source.SourceIndex, source.SourceLine, source.Raw, atom.Type, option)
+		}
+	}
+}
+
+func (l *MihomoRuleLowerer) logRuleSkip(source MihomoRuleSource, err error) {
+	l.logOnce(fmt.Sprintf("rule-skip:%d:%d:%s:%v", source.SourceIndex, source.SourceLine, source.Raw, err), "skip Mihomo rule at index %d line %d (%q): %v", source.SourceIndex, source.SourceLine, source.Raw, err)
+}
+
+func (l *MihomoRuleLowerer) logf(format string, args ...any) {
+	if l.options.Logf != nil {
+		l.options.Logf(format, args...)
+	}
+}
+
+func (l *MihomoRuleLowerer) logOnce(key, format string, args ...any) {
+	if l.options.Logf == nil {
+		return
+	}
+	if _, ok := l.logged[key]; ok {
+		return
+	}
+	l.logged[key] = struct{}{}
+	l.logf(format, args...)
 }
 
 func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*config_parser.Function, error) {
@@ -624,6 +682,9 @@ func (l *MihomoRuleLowerer) validateRuleOptions(expr MihomoExpr, action MihomoAc
 			if !mihomoExprSupportsSourceIP(expr) {
 				return mihomoLoweringError(source, fmt.Sprintf("Mihomo rule option %q has no exact kdae equivalent for expression %q", option, expr.Kind))
 			}
+			continue
+		case strings.EqualFold(option, "match-mac"):
+			l.logOnce(fmt.Sprintf("action-option:%d:%d:%s:%s", source.SourceIndex, source.SourceLine, source.Raw, option), "ignore Mihomo rule option at index %d line %d (%q): action option %q", source.SourceIndex, source.SourceLine, source.Raw, option)
 			continue
 		default:
 			return mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo rule option %q", option))
