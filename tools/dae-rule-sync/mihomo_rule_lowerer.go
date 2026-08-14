@@ -186,6 +186,13 @@ func (l *MihomoRuleLowerer) lowerExpression(expr MihomoExpr, negated bool, sourc
 		if expr.Atom == nil {
 			return nil, mihomoLoweringError(source, "atom expression has no atom")
 		}
+		if ignoredMihomoAtom(expr.Atom.Type) {
+			// IN-PORT depends on Mihomo's inbound-listener identity, which is
+			// intentionally outside kdae's routing context. Treat the condition
+			// as an ignored branch: conjunctions containing it are skipped and
+			// OR expressions may still lower their representable branches.
+			return nil, nil
+		}
 		if strings.EqualFold(expr.Atom.Type, "MATCH") {
 			if negated {
 				return nil, mihomoLoweringError(source, "NOT MATCH has no exact kdae routing equivalent")
@@ -312,7 +319,7 @@ func (l *MihomoRuleLowerer) lowerNegatedConjunction(children []MihomoExpr, sourc
 
 func combineMihomoTerms(left, right []mihomoLoweredTerm, limit int) ([]mihomoLoweredTerm, error) {
 	if len(left) == 0 || len(right) == 0 {
-		return nil, errors.New("expression produced no DNF alternatives")
+		return []mihomoLoweredTerm{}, nil
 	}
 	if len(left) > limit/len(right) {
 		return nil, fmt.Errorf("expanded routing rules exceed %d", limit)
@@ -327,6 +334,10 @@ func combineMihomoTerms(left, right []mihomoLoweredTerm, limit int) ([]mihomoLow
 		}
 	}
 	return result, nil
+}
+
+func ignoredMihomoAtom(typeName string) bool {
+	return strings.EqualFold(strings.TrimSpace(typeName), "IN-PORT")
 }
 
 func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*config_parser.Function, error) {
@@ -441,7 +452,9 @@ func validateMihomoAtomOptions(typeName string, options []string, source MihomoR
 				return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
 			}
 		case strings.EqualFold(option, "match-mac"):
-			return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
+			// Mihomo's match-mac qualification is intentionally ignored. The
+			// remaining source-IP condition is still lowered to kdae's sip().
+			continue
 		default:
 			return mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo atom %q option %q", typeName, option))
 		}
@@ -666,6 +679,9 @@ func (l *MihomoRuleLowerer) validateNoResolve(expr MihomoExpr, source MihomoRule
 	case MihomoExprAtom:
 		if expr.Atom == nil {
 			return mihomoLoweringError(source, "no-resolve is not valid for an empty atom")
+		}
+		if ignoredMihomoAtom(expr.Atom.Type) {
+			return nil
 		}
 		switch strings.ToUpper(expr.Atom.Type) {
 		case "IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR":
