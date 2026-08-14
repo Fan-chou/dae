@@ -192,6 +192,18 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
 		return DomainRegex, value, netip.Prefix{}, nil, nil
+	case "DOMAIN-WILDCARD":
+		if behavior == "ipcidr" {
+			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
+		}
+		if len(strings.Split(raw, ",")) != 2 {
+			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "DOMAIN-WILDCARD requires exactly one pattern"}, nil
+		}
+		wildcardRegex, err := mihomoDomainWildcardRegex(value)
+		if err != nil {
+			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: err.Error()}, nil
+		}
+		return DomainRegex, wildcardRegex, netip.Prefix{}, nil, nil
 	case "IP-CIDR", "IP-CIDR6":
 		if behavior == "domain" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "ip entry in domain provider"}, nil
@@ -201,7 +213,7 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 			return "", "", netip.Prefix{}, nil, fmt.Errorf("invalid CIDR %q: %w", value, err)
 		}
 		return "", "", prefix, nil, nil
-	case "DOMAIN-WILDCARD", "GEOSITE", "GEOIP", "IP-ASN", "PROCESS-NAME", "DST-PORT", "SRC-IP-CIDR", "NETWORK", "AND", "OR", "NOT":
+	case "GEOSITE", "GEOIP", "IP-ASN", "PROCESS-NAME", "DST-PORT", "SRC-IP-CIDR", "NETWORK", "AND", "OR", "NOT":
 		return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: fmt.Sprintf("unsupported classical rule %s", kind)}, nil
 	}
 

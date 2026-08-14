@@ -337,6 +337,13 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 	if err := validateMihomoAtomOptions(atom.Type, options, source); err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(atom.Type, "DOMAIN-WILDCARD") {
+		wildcardRegex, err := mihomoDomainWildcardRegex(arguments[0])
+		if err != nil {
+			return nil, mihomoLoweringError(source, err.Error())
+		}
+		arguments[0] = wildcardRegex
+	}
 	params := make([]*config_parser.Param, 0, len(arguments))
 	for _, argument := range arguments {
 		if strings.TrimSpace(argument) == "" {
@@ -356,6 +363,8 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 		functionName, key = "domain", "keyword"
 	case "DOMAIN-REGEX":
 		functionName, key = "domain", "regex"
+	case "DOMAIN-WILDCARD":
+		functionName, key = "domain", "regex"
 	case "IP-CIDR":
 		functionName = "dip"
 	case "IP-CIDR6":
@@ -372,7 +381,7 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 		functionName = "l4proto"
 	case "PROCESS-NAME":
 		functionName = "pname"
-	case "IN-PORT", "IP-ASN", "DOMAIN-WILDCARD":
+	case "IN-PORT", "IP-ASN":
 		return nil, mihomoLoweringError(source, fmt.Sprintf("unsupported Mihomo atom %q", atom.Type))
 	default:
 		if strings.HasPrefix(strings.ToUpper(atom.Type), "GEO") {

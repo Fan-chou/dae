@@ -460,7 +460,7 @@ func makeMihomoAtomExpression(typeName string, arguments []string, raw string) M
 
 func isKnownMihomoAtom(typeName string) bool {
 	switch typeName {
-	case "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX",
+	case "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
 		"IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR", "DST-PORT", "SRC-PORT",
 		"IN-PORT", "NETWORK", "PROCESS-NAME", "MATCH":
 		return true
