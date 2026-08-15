@@ -215,21 +215,30 @@ func NewNestedDialerGroupWithRuntimeOptions(
 		}
 	}
 	groupDialers := leafDialers
+	groupAnnotations := leafAnnotations
 	var parentHealthViews map[*dialer.Dialer]*dialer.Dialer
 	if runtimeOptions.HealthCheckEnabled || runtimeOptions.Lazy {
 		groupDialers = make([]*dialer.Dialer, 0, len(leafDialers))
+		groupAnnotations = make([]*dialer.Annotation, 0, len(leafDialers))
 		parentHealthViews = make(map[*dialer.Dialer]*dialer.Dialer, len(leafDialers))
-		for _, leaf := range leafDialers {
+		for i, leaf := range leafDialers {
+			if skipsParentHealthAdmission(leaf) {
+				// REJECT/block cannot complete HTTP/DNS probes. Creating a
+				// parent view with DisableCheck=false would mark it dead and
+				// remove it from first_alive/url-test fallback.
+				continue
+			}
 			view := leaf.CloneWithGlobalOptionContext(context.Background(), option)
 			// A parent health layer is an explicit admission policy. Built-in
-			// DIRECT/REJECT dialers and other disabled concrete members may skip
-			// their own checks, but that must not suppress the parent's check.
+			// DIRECT and other disabled concrete members may skip their own
+			// checks, but that must not suppress the parent's check.
 			view.DisableCheck = false
 			parentHealthViews[leaf] = view
 			groupDialers = append(groupDialers, view)
+			groupAnnotations = append(groupAnnotations, leafAnnotations[i])
 		}
 	}
-	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, leafAnnotations, p, aliveChangeCallback, runtimeOptions)
+	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, aliveChangeCallback, runtimeOptions)
 	group.nestedMembers = internalMembers
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
@@ -734,8 +743,23 @@ func (g *DialerGroup) parentHealthViewAlive(concrete *dialer.Dialer, networkType
 	if concrete == nil || networkType == nil {
 		return false
 	}
+	if skipsParentHealthAdmission(concrete) {
+		return true
+	}
 	view, ok := g.parentHealthViews[concrete]
 	return ok && view != nil && view.MustGetAlive(networkType)
+}
+
+// skipsParentHealthAdmission reports leaves that a parent HTTP/DNS health
+// layer must not admit or reject. Builtin REJECT/block is constructed with
+// DisableCheck and has no proxy link; probing it can only fail, which would
+// drop the Mihomo fallback member. DIRECT remains probeable.
+func skipsParentHealthAdmission(d *dialer.Dialer) bool {
+	if d == nil || !d.DisableCheck {
+		return false
+	}
+	property := d.Property()
+	return property != nil && property.Name == consts.OutboundBlock.String() && property.Link == ""
 }
 
 func (g *DialerGroup) parentHealthViewSelectionLatency(concrete *dialer.Dialer, networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, fallback time.Duration, annotation *dialer.Annotation) time.Duration {

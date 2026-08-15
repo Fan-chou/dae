@@ -56,6 +56,11 @@ func newDirectDialer(option *dialer.GlobalOption, fullcone bool) *dialer.Dialer 
 	return d
 }
 
+func newBuiltinBlockDialer(option *dialer.GlobalOption) *dialer.Dialer {
+	underlay, property := dialer.NewBlockDialer(option, func() {})
+	return dialer.NewDialer(underlay, option, dialer.InstanceOption{DisableCheck: true}, property)
+}
+
 func newEmptyAnnotations(n int) []*dialer.Annotation {
 	annotations := make([]*dialer.Annotation, n)
 	for i := range annotations {
@@ -1037,6 +1042,83 @@ func TestDialerGroup_Select_FirstAliveNestedSkipsFailedChildAndUsesBuiltinSiblin
 			}
 			if selected != builtinDialer {
 				t.Fatalf("selected dialer = %p, want %s builtin sibling %p", selected, builtinName, builtinDialer)
+			}
+		})
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveNestedHealthKeepsBlockFallback(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	policies := []DialerSelectionPolicy{
+		{Policy: consts.DialerSelectionPolicy_FirstAlive},
+		{Policy: consts.DialerSelectionPolicy_MinAverage10Latencies},
+	}
+	for _, policy := range policies {
+		t.Run(string(policy.Policy), func(t *testing.T) {
+			childDialers := []*dialer.Dialer{
+				newDirectDialer(option, false),
+				newDirectDialer(option, false),
+			}
+			child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+				Policy: consts.DialerSelectionPolicy_FirstAlive,
+			}, func(bool, *dialer.NetworkType, bool) {})
+			childSet := child.MustGetAliveDialerSet(TestNetworkType)
+			for _, d := range childDialers {
+				childSet.NotifyLatencyChange(d, false)
+			}
+
+			blockDialer := newBuiltinBlockDialer(option)
+			if !skipsParentHealthAdmission(blockDialer) {
+				t.Fatalf("builtin block dialer name=%q link=%q disableCheck=%v should skip parent health admission", blockDialer.Property().Name, blockDialer.Property().Link, blockDialer.DisableCheck)
+			}
+			block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+				Policy:     consts.DialerSelectionPolicy_Fixed,
+				FixedIndex: 0,
+			}, func(bool, *dialer.NetworkType, bool) {})
+			parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+				{Group: child},
+				{Group: block},
+			}, policy, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+			if err != nil {
+				t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+			}
+			defer parent.Close()
+			defer child.Close()
+			defer block.Close()
+			defer blockDialer.Close()
+			for _, view := range parent.ParentHealthViewDialers() {
+				defer view.Close()
+			}
+			for _, d := range childDialers {
+				defer d.Close()
+			}
+
+			if view := parent.parentHealthViews[blockDialer]; view != nil {
+				t.Fatal("parent created a health view for REJECT/block; probes would mark the fallback dead")
+			}
+			for _, leaf := range childDialers {
+				if parent.parentHealthViews[leaf] == nil {
+					t.Fatal("parent omitted a health view for a probeable child leaf")
+				}
+				snapshot := parent.parentHealthViews[leaf].HealthSnapshot()
+				for i := range snapshot.Collections {
+					snapshot.Collections[i].Alive = false
+				}
+				parent.parentHealthViews[leaf].RestoreHealthSnapshot(snapshot)
+			}
+
+			selected, _, err := parent.Select(TestNetworkType, true)
+			if err != nil {
+				t.Fatalf("Select() error = %v", err)
+			}
+			if selected != blockDialer {
+				t.Fatalf("selected dialer = %p, want builtin block fallback %p", selected, blockDialer)
 			}
 		})
 	}
