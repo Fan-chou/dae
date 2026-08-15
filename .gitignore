@@ -6,7 +6,7 @@ bpf*_bpfeb*.go
 bpf*_bpfel*.go
 bpf*_*_bpfeb*.go
 bpf*_*_bpfel*.go
-dae
+/dae
 outline.json
 go-mod/
 node_modules/
