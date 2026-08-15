@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -83,14 +82,6 @@ func GenerateMihomoNodes(config MihomoConfig) (string, NodeConversionReport, err
 	}
 	output.WriteString("}\n")
 	return output.String(), report, nil
-}
-
-func safeMihomoNodeName(name string) string {
-	if len(name) <= maxMihomoNodeNameLength && mihomoNodeIdentifierPattern.MatchString(name) {
-		return name
-	}
-	digest := sha256.Sum256([]byte(name))
-	return fmt.Sprintf("mihomo_%x", digest[:6])
 }
 
 func cloneStringMap(source map[string]string) map[string]string {

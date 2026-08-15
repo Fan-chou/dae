@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -562,12 +561,4 @@ func validateMihomoOutputNames(nodeNames, groupNames map[string]string) error {
 		used[safeName] = original
 	}
 	return nil
-}
-
-func safeDaeIdentifier(name string) string {
-	if daeIdentifierPattern.MatchString(name) {
-		return name
-	}
-	digest := sha256.Sum256([]byte(name))
-	return fmt.Sprintf("mihomo_%x", digest[:6])
 }
