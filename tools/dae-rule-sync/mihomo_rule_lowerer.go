@@ -467,6 +467,9 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 	if key != "" {
 		for _, param := range params {
 			param.Key = key
+			if key == "keyword" {
+				param.Val = canonicalizeMihomoDomainKeyword(param.Val)
+			}
 		}
 	}
 	return &config_parser.Function{Name: functionName, Not: negated, Params: params}, nil

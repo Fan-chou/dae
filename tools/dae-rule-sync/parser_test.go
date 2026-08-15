@@ -79,6 +79,16 @@ func TestParseClassicalProviderReportsUnsupportedRules(t *testing.T) {
 	}
 }
 
+func TestParseDomainProviderLowercasesKeyword(t *testing.T) {
+	rules, err := ParseProvider([]byte("DOMAIN-KEYWORD,Torrent\n"), ProviderSpec{Name: "p", Behavior: "domain", Format: "text"})
+	if err != nil {
+		t.Fatalf("ParseProvider() error = %v", err)
+	}
+	if len(rules.Domains) != 1 || rules.Domains[0] != (DomainRule{Kind: DomainKeyword, Value: "torrent"}) {
+		t.Fatalf("domains = %#v, want lowercase keyword", rules.Domains)
+	}
+}
+
 func TestParseProviderRejectsInvalidCIDR(t *testing.T) {
 	_, err := ParseProvider([]byte("payload:\n  - 192.0.2.0/99\n"), ProviderSpec{Name: "p", Behavior: "ipcidr", Format: "yaml"})
 	if err == nil {

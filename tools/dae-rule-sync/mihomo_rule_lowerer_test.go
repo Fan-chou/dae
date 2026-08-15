@@ -82,6 +82,28 @@ func TestLowerMihomoRuleIgnoresMatchMacActionOption(t *testing.T) {
 	}
 }
 
+func TestLowerMihomoRuleLowercasesDomainKeyword(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{SourceIndex: 8, SourceLine: 19, Raw: "DOMAIN-KEYWORD,Torrent,DIRECT"},
+		Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
+			Type: "DOMAIN-KEYWORD", Value: "Torrent", Arguments: []string{"Torrent"},
+		}},
+		Action: MihomoAction{Target: "DIRECT"},
+	}
+
+	lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+	if err != nil {
+		t.Fatalf("LowerMihomoRule() error = %v", err)
+	}
+	if len(lowered) != 1 || len(lowered[0].Rule.AndFunctions) != 1 {
+		t.Fatalf("lowered = %#v, want one domain keyword rule", lowered)
+	}
+	got := lowered[0].Rule.AndFunctions[0]
+	if got.Name != "domain" || len(got.Params) != 1 || got.Params[0].Key != "keyword" || got.Params[0].Val != "torrent" {
+		t.Fatalf("condition = %#v, want domain(keyword: \"torrent\")", got)
+	}
+}
+
 func TestLowerMihomoRuleFallsBackRejectDropToBlock(t *testing.T) {
 	rule := MihomoRuleIRRule{
 		MihomoRuleSource: MihomoRuleSource{SourceIndex: 4, SourceLine: 15, Raw: "DOMAIN,example.com,REJECT-DROP"},

@@ -22,6 +22,13 @@ type DomainRule struct {
 	Value string
 }
 
+// canonicalizeMihomoDomainKeyword lowercases DOMAIN-KEYWORD values. kdae's
+// Aho-Corasick matcher only accepts lowercase domain characters and fatals on
+// uppercase; DNS matching is case-insensitive, so this preserves Mihomo intent.
+func canonicalizeMihomoDomainKeyword(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
 type UnsupportedRule struct {
 	Raw    string
 	Reason string
@@ -186,7 +193,7 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
-		return DomainKeyword, value, netip.Prefix{}, nil, nil
+		return DomainKeyword, canonicalizeMihomoDomainKeyword(value), netip.Prefix{}, nil, nil
 	case "DOMAIN-REGEX":
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
