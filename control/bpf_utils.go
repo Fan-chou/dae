@@ -80,6 +80,9 @@ func (r bpfPortRange) Encode() (b [16]byte) {
 }
 
 func ParsePortRange(b []byte) (portStart, portEnd uint16) {
+	if len(b) < 4 {
+		return 0, 0
+	}
 	portStart = binary.LittleEndian.Uint16(b[:2])
 	portEnd = binary.LittleEndian.Uint16(b[2:])
 	return portStart, portEnd
@@ -380,7 +383,6 @@ type loadBpfOptions struct {
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
-	fastSockPlaceholderMaxEntries = 1
 )
 
 func loadBpfObjectsWithConstantsAndCustomizer(
@@ -433,30 +435,11 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func tunePlaceholderBpfMaps(spec *ebpf.CollectionSpec) error {
-	if spec == nil {
-		return fmt.Errorf("nil collection spec")
-	}
-
-	fastSock, ok := spec.Maps["fast_sock"]
-	if !ok || fastSock == nil {
-		return fmt.Errorf("missing map spec %q", "fast_sock")
-	}
-	// fast_sock is retained only to keep the generated Go ABI stable while the
-	// sockhash redirect path remains disabled, so a single placeholder slot is
-	// sufficient.
-	fastSock.MaxEntries = fastSockPlaceholderMaxEntries
-	return nil
-}
-
 func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
-		return err
-	}
-	if err := tunePlaceholderBpfMaps(spec); err != nil {
 		return err
 	}
 	return nil
@@ -530,7 +513,9 @@ retryLoadBpf:
 
 	// bpf_redirect_peer() is only safe under specific conditions:
 	// 1. Netkit device with scrub=NONE (preserves skb->mark across netns boundary)
-	// 2. Kernel >= 6.8 (fixes CVE-2025-37959 skb metadata leak)
+	// 2. A kernel containing the CVE-2025-37959 fix (mainline >= 6.14.7 or
+	//    official stable backports 6.1.139/6.6.91/6.12.29); distro backports
+	//    can be opted in with DAE_ALLOW_REDIRECT_PEER=1
 	// 3. TC ingress direction ONLY (egress must use bpf_redirect())
 	//
 	// When enabled, provides ~50% throughput improvement by bypassing CPU backlog.
@@ -541,12 +526,15 @@ retryLoadBpf:
 		switch {
 		case err != nil:
 			log.Warnf("Failed to get kernel version: %v; bpf_redirect_peer() disabled", err)
-		case kernelVersion.Less(consts.RedirectPeerSafeVersion):
-			log.Debugf("Kernel %v < %v (CVE-2025-37959 fix); bpf_redirect_peer() disabled",
-				kernelVersion, consts.RedirectPeerSafeVersion)
-		default:
+		case consts.IsRedirectPeerSafeKernel(kernelVersion):
 			useRedirectPeer = 1
 			log.Infof("Safely enabled bpf_redirect_peer() (kernel %v, netkit+scrub=NONE)", kernelVersion)
+		case os.Getenv("DAE_ALLOW_REDIRECT_PEER") == "1":
+			useRedirectPeer = 1
+			log.Warnf("Enabling bpf_redirect_peer() via DAE_ALLOW_REDIRECT_PEER on kernel %v; make sure the kernel contains the CVE-2025-37959 backport", kernelVersion)
+		default:
+			log.Debugf("Kernel %v lacks a known CVE-2025-37959 fix; bpf_redirect_peer() disabled (set DAE_ALLOW_REDIRECT_PEER=1 to override)",
+				kernelVersion)
 		}
 	}
 

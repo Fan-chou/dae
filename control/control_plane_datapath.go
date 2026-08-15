@@ -138,7 +138,7 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 			c.log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
 		}
 		if err := c.core.setupTCPRelayOffload(); err != nil {
-			c.log.WithError(err).Debugln("TCP relay eBPF offload disabled")
+			c.log.WithError(err).Warnln("TCP relay eBPF offload disabled; the accounting hook may already be attached by another eBPF program (check 'bpftool link list')")
 		}
 		for _, ifname := range c.wanInterface {
 			if len(c.lanInterface) > 0 && c.autoConfigKernelParameter {
@@ -166,6 +166,7 @@ func (c *ControlPlane) replayDnsReloadCache() error {
 	if c == nil || c.dnsController == nil || c.pendingDnsReloadCache == nil {
 		return nil
 	}
+	start := time.Now()
 	count, err := c.dnsController.RestoreReloadCacheAndProject(
 		c.pendingDnsReloadCache,
 		c.routingMatcher.domainMatcher.MatchDomainBitmap,
@@ -175,7 +176,7 @@ func (c *ControlPlane) replayDnsReloadCache() error {
 		return err
 	}
 	if count > 0 {
-		c.log.Infof("Restored %d DNS cache entries from previous control plane", count)
+		c.log.Infof("Restored %d DNS cache entries from previous control plane in %v", count, time.Since(start))
 	}
 	c.pendingDnsReloadCache = nil
 	return nil

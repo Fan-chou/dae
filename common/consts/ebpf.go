@@ -110,8 +110,67 @@ var (
 	BpfLoopFeatureVersion                     = internal.Version{5, 17, 0}
 	TcxFeatureVersion                         = internal.Version{6, 6, 0}
 	NetkitFeatureVersion                      = internal.Version{6, 7, 0}
-	RedirectPeerSafeVersion                   = internal.Version{6, 8, 0}
+	// RedirectPeerSafeVersion is the mainline kernel version that fixed
+	// CVE-2025-37959 ("bpf: Scrub packet on bpf_redirect_peer"): stale skb
+	// metadata could be exposed when bpf_redirect_peer() crossed a netns
+	// boundary. Fixed in mainline 6.14.7 / 6.15-rc6.
+	// See https://cve.org/CVERecord?id=CVE-2025-37959.
+	RedirectPeerSafeVersion = internal.Version{6, 14, 7}
+	// RedirectPeerCveFixedStable lists the official stable backports of the
+	// CVE-2025-37959 fix (per the linux-cve-announce notification). Distro
+	// backports to other versions cannot be detected by version alone; opt in
+	// with the DAE_ALLOW_REDIRECT_PEER=1 environment variable.
+	RedirectPeerCveFixedStable = []internal.Version{
+		{6, 1, 139},
+		{6, 6, 91},
+		{6, 12, 29},
+	}
+	// TcpSockmapPanicSafeVersion is the mainline kernel version that fixed
+	// CVE-2025-38165 ("bpf, sockmap: Fix panic when calling skb_linearize"):
+	// a message larger than MAX_MSG_FRAGS redirected into a sockmap ingress
+	// queue hit BUG_ON(skb_shared(skb)) in skb_linearize. This is the panic
+	// class that forced upstream dae to disable its sockmap fast redirect.
+	// See https://cve.org/CVERecord?id=CVE-2025-38165.
+	TcpSockmapPanicSafeVersion = internal.Version{6, 15, 3}
+	// TcpSockmapPanicFixedStable lists the official stable backports of the
+	// CVE-2025-38165 fix (per the linux-cve-announce notification). Distro
+	// backports to other versions cannot be detected by version alone; opt in
+	// with the DAE_ALLOW_TCP_SOCKMAP=1 environment variable.
+	TcpSockmapPanicFixedStable = []internal.Version{
+		{6, 1, 142},
+		{6, 6, 94},
+		{6, 12, 34},
+	}
 )
+
+// IsRedirectPeerSafeKernel reports whether the kernel is known to contain the
+// CVE-2025-37959 fix (mainline 6.14.7+ or an official stable backport).
+func IsRedirectPeerSafeKernel(v internal.Version) bool {
+	if !v.Less(RedirectPeerSafeVersion) {
+		return true
+	}
+	for _, stable := range RedirectPeerCveFixedStable {
+		if v[0] == stable[0] && v[1] == stable[1] && v[2] >= stable[2] {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTcpSockmapPanicSafeKernel reports whether the kernel is known to contain the
+// CVE-2025-38165 fix (mainline 6.15.3+ or an official stable backport). Only
+// kernels passing this gate enable the TCP relay eBPF offload by default.
+func IsTcpSockmapPanicSafeKernel(v internal.Version) bool {
+	if !v.Less(TcpSockmapPanicSafeVersion) {
+		return true
+	}
+	for _, stable := range TcpSockmapPanicFixedStable {
+		if v[0] == stable[0] && v[1] == stable[1] && v[2] >= stable[2] {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	TproxyMark       uint32 = 0x08000000

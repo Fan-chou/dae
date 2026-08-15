@@ -26,7 +26,26 @@ var (
 	UdpTaskPoolAgingTime = 100 * time.Millisecond
 )
 
-type UdpTask = func()
+// UdpTask is the unit of per-flow UDP work. It used to be a plain func
+// closure; it is an interface so hot paths can submit pooled owned
+// structures (see udpIngressTask) instead of allocating an escaping closure
+// per packet. udpTaskFunc keeps func literals usable for tests and benches.
+type UdpTask interface {
+	Run()
+}
+
+// udpTaskFunc adapts a func literal to UdpTask.
+type udpTaskFunc func()
+
+func (f udpTaskFunc) Run() { f() }
+
+// udpTaskFuncOrNil adapts an optional func literal; nil stays nil.
+func udpTaskFuncOrNil(f func()) UdpTask {
+	if f == nil {
+		return nil
+	}
+	return udpTaskFunc(f)
+}
 
 // UdpTaskQueue makes sure packets with the same UDP flow key are sent in order.
 // Field order optimized for memory alignment (Go best practice).
@@ -47,6 +66,7 @@ type UdpTaskQueue struct {
 	// 1-byte fields
 	overflowLen  atomic.Int32 // track overflow length for lock-free idle check
 	overflowMode bool
+	chReturned   atomic.Bool // guards queueChPool.Put so Close and convoy cannot double-put
 
 	key UdpFlowKey
 }
@@ -162,7 +182,7 @@ func (q *UdpTaskQueue) convoy() {
 		drainedAny := false
 		for {
 			if task, ok := q.popReadyTask(); ok {
-				task()
+				task.Run()
 				drainedAny = true
 				continue
 			}
@@ -175,12 +195,12 @@ func (q *UdpTaskQueue) convoy() {
 
 		select {
 		case task := <-q.ch:
-			task()
+			task.Run()
 			// Drain follow-up tasks that arrived while we were running the
 			// first one, then re-arm the timer once.
 			for {
 				if task, ok := q.popReadyTask(); ok {
-					task()
+					task.Run()
 					continue
 				}
 				break
@@ -207,13 +227,13 @@ func (q *UdpTaskQueue) convoy() {
 
 			// Try to delete from pool using CAS-like semantics via sync.Map
 			if q.p.tryDeleteQueue(q.key, q) {
-				q.p.queueChPool.Put(q.ch)
+				q.p.releaseQueueCh(q)
 				return
 			}
 			// Check if mapping still points to current queue.
 			// If not, this convoy is stale and must exit to prevent goroutine leak.
 			if v, ok := q.p.queues.Load(q.key); !ok || v.(*UdpTaskQueue) != q {
-				q.p.queueChPool.Put(q.ch)
+				q.p.releaseQueueCh(q)
 				return
 			}
 
@@ -328,10 +348,20 @@ func (p *UdpTaskPool) Close() {
 		if q, ok := p.queues.LoadAndDelete(key); ok {
 			queue := q.(*UdpTaskQueue)
 			queue.close()
-			p.queueChPool.Put(queue.ch)
+			p.releaseQueueCh(queue)
 		}
 		return true
 	})
+}
+
+// releaseQueueCh returns the queue channel to the pool exactly once. Close
+// and the exiting convoy goroutine race over the same channel; the CAS makes
+// double-put impossible (a double-put would let sync.Pool hand the same
+// channel to two different queues, silently cross-mixing flows).
+func (p *UdpTaskPool) releaseQueueCh(q *UdpTaskQueue) {
+	if q.chReturned.CompareAndSwap(false, true) {
+		p.queueChPool.Put(q.ch)
+	}
 }
 
 // close signals the convoy goroutine to exit by setting refs to a sentinel value

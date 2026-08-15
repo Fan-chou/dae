@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -486,6 +487,12 @@ func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPo
 //   - from: source address of the packet (for logging/metadata only)
 //   - realTo: destination address where the packet should be sent
 //   - afp: optional cached Anyfrom socket for Symmetric NAT sessions
+//
+// udpReplyReinjectionDrops counts reply packets dropped by local reinjection
+// failures. Dropping is deliberate (the endpoint stays alive to avoid rebuild
+// storms), but the drop rate is otherwise invisible to operators.
+var udpReplyReinjectionDrops atomic.Uint64
+
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)
 	var cacheSlot udpEndpointResponseConnSlot
@@ -500,6 +507,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	// for every subsequent client packet after a transient local send failure.
 	if send == nil {
 		if err := sendPktWithResponseConnSlot(log, data, from, clientAddr, replySoMark, cacheSlot, cacheProvider); err != nil {
+			udpReplyReinjectionDrops.Add(1)
 			if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 				log.WithFields(logrus.Fields{
 					"from":      from.String(),
@@ -514,6 +522,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 		return nil
 	}
 	if err := send(log, data, from, clientAddr, cacheSlot); err != nil {
+		udpReplyReinjectionDrops.Add(1)
 		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 			log.WithFields(logrus.Fields{
 				"from":      from.String(),
@@ -545,7 +554,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
-	_, err := ue.WriteTo(data, realDst.String())
+	_, err := ue.WriteTo(data, ue.dialTargetForWrite(realDst))
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
@@ -798,7 +807,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			// It is quic ...
 			// Fast path.
 			domain = ue.SniffedDomain
-			dialTarget := realDst.String()
+			dialTarget := ue.dialTargetForWrite(realDst)
 
 			if !c.checkUdpEndpointHealth(ue, ueKey, true) {
 				ue = nil
@@ -1038,7 +1047,7 @@ afterSniffing:
 		UdpHealthDomain: dialer.UdpHealthDomainData,
 	}
 	// Keep UDP target pinned to original destination IP to avoid QUIC session issues.
-	dialTarget := realDst.String()
+	dialTarget := ue.dialTargetForWrite(realDst)
 getNew:
 	if retry > MaxRetry {
 		c.log.WithFields(logrus.Fields{

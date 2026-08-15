@@ -28,6 +28,26 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// offloadSkipLog state rate-limits the per-connection "Skip TCP relay eBPF
+// offload" debug line: when the offload is unavailable for a stable reason
+// (e.g. "offload disabled"), every connection would otherwise spam the log.
+var (
+	offloadSkipLogMu    sync.Mutex
+	offloadSkipLogAt    = map[string]time.Time{}
+	offloadSkipInterval = time.Minute
+)
+
+func logOffloadSkipRateLimited(l *logrus.Logger, reason string) {
+	now := time.Now()
+	offloadSkipLogMu.Lock()
+	defer offloadSkipLogMu.Unlock()
+	if last, ok := offloadSkipLogAt[reason]; ok && now.Sub(last) < offloadSkipInterval {
+		return
+	}
+	offloadSkipLogAt[reason] = now
+	l.Debugf("Skip TCP relay eBPF offload: %s", reason)
+}
+
 const (
 	// tcpRoutingLookupRetryAttempts keeps TCP on the kernel-derived routing
 	// path across very short conn-state publication windows. The steady-state
@@ -284,6 +304,19 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	offloaded := false
 	offloadReason := ""
 	annotateOffload := false
+
+	// Attempt kernel-side splice via fast_sock/sk_skb before falling back to
+	// the user-space relay. A registered offload session blocks until both
+	// sockets close; any pre-registration failure falls through silently.
+	var offloadErr error
+	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
+	if offloadErr != nil {
+		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
+	}
+	annotateOffload = canAnnotateTCPRelayOffload(rConn)
+	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
+		logOffloadSkipRateLimited(c.log, offloadReason)
+	}
 
 	// Log new TCP connections at Info level for visibility (consistent with UDP behavior)
 	// Note: TCP connections are inherently "new" at this point, unlike UDP endpoints which may be reused
