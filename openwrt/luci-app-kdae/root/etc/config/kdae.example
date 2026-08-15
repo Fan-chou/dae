@@ -1,0 +1,17 @@
+config dae 'config'
+	option enabled '0'
+	option config_file '/etc/dae/config.dae'
+	option log_maxbackups '1'
+	option log_maxsize '1'
+	option lan_interface 'br-lan,Home,IEPL'
+	option wan_interface ''
+	option admin_listen '192.168.124.223:2025'
+	option admin_secret ''
+	option mihomo_config ''
+	option generation_dir '/etc/dae'
+
+# config subscription
+#	option tag 'main'
+#	option url 'https://example.com/clash'
+#	option role 'routing'
+#	option persist '1'

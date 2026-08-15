@@ -1,0 +1,30 @@
+{
+	"luci-app-kdae": {
+		"description": "Grant access to kdae configuration",
+		"read": {
+			"file": {
+				"/etc/dae/config.dae": [ "read" ],
+				"/etc/dae/example.dae": [ "read" ],
+				"/etc/dae/local.dae": [ "read" ],
+				"/etc/dae/metadata.json": [ "read" ],
+				"/var/log/dae/dae.log": [ "read" ],
+				"/var/run/kdae-last-sync.json": [ "read" ],
+				"/etc/init.d/dae": [ "exec" ],
+				"/usr/bin/dae": [ "exec" ],
+				"/usr/libexec/dae/kdae-sync.sh": [ "exec" ],
+				"/usr/libexec/dae/kdae-write-local.sh": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "dae" ]
+		},
+		"write": {
+			"file": {
+				"/etc/dae/config.dae": [ "write" ],
+				"/etc/dae/local.dae": [ "write" ]
+			},
+			"uci": [ "dae" ]
+		}
+	}
+}

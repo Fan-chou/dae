@@ -1,0 +1,47 @@
+{
+	"admin/services/kdae": {
+		"title": "kdae",
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-kdae" ],
+			"fs": {
+				"/etc/init.d/dae": "executable"
+			},
+			"uci": { "dae": true }
+		}
+	},
+	"admin/services/kdae/settings": {
+		"title": "设置",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "kdae/settings"
+		}
+	},
+	"admin/services/kdae/config": {
+		"title": "配置",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "kdae/config"
+		}
+	},
+	"admin/services/kdae/sync": {
+		"title": "规则同步",
+		"order": 25,
+		"action": {
+			"type": "view",
+			"path": "kdae/sync"
+		}
+	},
+	"admin/services/kdae/log": {
+		"title": "日志",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "kdae/log"
+		}
+	}
+}
