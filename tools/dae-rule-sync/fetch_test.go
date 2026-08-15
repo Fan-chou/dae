@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -774,5 +775,57 @@ func TestProviderFetcherDoesNotReuseCacheWhenURLChanges(t *testing.T) {
 	}
 	if string(result.Snapshot.Body) != "second" {
 		t.Fatalf("body = %q, want second", result.Snapshot.Body)
+	}
+}
+
+func TestProviderFetcherReusesTransportAcrossSequentialFetches(t *testing.T) {
+	var dials atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "payload")
+	}))
+	t.Cleanup(server.Close)
+
+	base, ok := server.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("httptest client transport is not *http.Transport")
+	}
+	transport := base.Clone()
+	originalDial := transport.DialContext
+	if originalDial == nil {
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		originalDial = dialer.DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return originalDial(ctx, network, address)
+	}
+	fetcher := newTestProviderFetcher(&http.Client{Transport: transport, Timeout: 5 * time.Second}, t.TempDir())
+	for i, name := range []string{"a", "b"} {
+		spec := ProviderSpec{Name: name, Type: "http", URL: server.URL + "/" + name, MaxSize: 1024}
+		if _, err := fetcher.Fetch(context.Background(), spec); err != nil {
+			t.Fatalf("Fetch(%d) error = %v", i, err)
+		}
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 reused connection", got)
+	}
+}
+
+func TestProviderFetcherCachesSafeTransport(t *testing.T) {
+	client := &http.Client{}
+	fetcher := NewProviderFetcher(client, t.TempDir())
+	first, err := fetcher.sharedRoundTripper(client)
+	if err != nil {
+		t.Fatalf("sharedRoundTripper() error = %v", err)
+	}
+	second, err := fetcher.sharedRoundTripper(client)
+	if err != nil {
+		t.Fatalf("sharedRoundTripper() error = %v", err)
+	}
+	if first == nil || first != second {
+		t.Fatal("safe transport was not reused")
+	}
+	if cloned, ok := first.(*http.Transport); !ok || cloned.MaxIdleConnsPerHost < providerFetchConcurrency {
+		t.Fatalf("safe transport idle per host = %#v, want at least %d", first, providerFetchConcurrency)
 	}
 }

@@ -40,6 +40,11 @@ type FetchResult struct {
 	Warning   error
 }
 
+const (
+	defaultProviderFetchTimeout = 45 * time.Second
+	providerFetchConcurrency    = 8
+)
+
 type ProviderFetcher struct {
 	Client       *http.Client
 	CacheDir     string
@@ -49,10 +54,14 @@ type ProviderFetcher struct {
 	AllowPrivate bool
 	// DeferCacheCommit lets a caller validate and publish a complete output
 	// generation before making a fetched snapshot the provider's last-good.
-	DeferCacheCommit bool
-	flightMu         sync.Mutex
-	flights          map[string]*providerFlight
-	cacheMu          sync.Mutex
+	DeferCacheCommit   bool
+	flightMu           sync.Mutex
+	flights            map[string]*providerFlight
+	cacheMu            sync.Mutex
+	transportMu        sync.Mutex
+	sharedTransport    http.RoundTripper
+	sharedClient       *http.Client
+	sharedAllowPrivate bool
 }
 
 type providerFlight struct {
@@ -282,30 +291,9 @@ func (f *ProviderFetcher) validateHTTPSpec(spec ProviderSpec) error {
 }
 
 func (f *ProviderFetcher) fetchRemote(ctx context.Context, spec ProviderSpec, cached ProviderSnapshot, cacheErr error, allowCacheCommit bool, validateBody func(ProviderSpec, []byte) error, stale func(error) (FetchResult, error)) (FetchResult, error) {
-	validateURL := f.ValidateURL
-	if validateURL == nil {
-		validateURL = validateProviderURL
-	}
-	baseClient := f.Client
-	if baseClient == nil {
-		baseClient = http.DefaultClient
-	}
-	client := *baseClient
-	if client.Timeout == 0 {
-		client.Timeout = 45 * time.Second
-	}
-	if !f.AllowPrivate {
-		transport, err := safeTransport(client.Transport)
-		if err != nil {
-			return FetchResult{}, err
-		}
-		client.Transport = transport
-	}
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 5 {
-			return errors.New("too many redirects")
-		}
-		return validateURL(req.URL.String())
+	client, err := f.requestClient()
+	if err != nil {
+		return FetchResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
 	if err != nil {
@@ -898,6 +886,66 @@ func syncDirectory(path string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func (f *ProviderFetcher) requestClient() (*http.Client, error) {
+	if f == nil {
+		return nil, errors.New("nil provider fetcher")
+	}
+	base := f.Client
+	if base == nil {
+		base = http.DefaultClient
+	}
+	transport, err := f.sharedRoundTripper(base)
+	if err != nil {
+		return nil, err
+	}
+	client := *base
+	if client.Timeout == 0 {
+		client.Timeout = defaultProviderFetchTimeout
+	}
+	client.Transport = transport
+	validateURL := f.ValidateURL
+	if validateURL == nil {
+		validateURL = validateProviderURL
+	}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many redirects")
+		}
+		return validateURL(req.URL.String())
+	}
+	return &client, nil
+}
+
+func (f *ProviderFetcher) sharedRoundTripper(client *http.Client) (http.RoundTripper, error) {
+	f.transportMu.Lock()
+	defer f.transportMu.Unlock()
+	if f.sharedTransport != nil && f.sharedClient == client && f.sharedAllowPrivate == f.AllowPrivate {
+		return f.sharedTransport, nil
+	}
+	base := client.Transport
+	var transport http.RoundTripper
+	if f.AllowPrivate {
+		if base == nil {
+			transport = http.DefaultTransport
+		} else {
+			transport = base
+		}
+	} else {
+		safe, err := safeTransport(base)
+		if err != nil {
+			return nil, err
+		}
+		if cloned, ok := safe.(*http.Transport); ok && cloned.MaxIdleConnsPerHost < providerFetchConcurrency {
+			cloned.MaxIdleConnsPerHost = providerFetchConcurrency
+		}
+		transport = safe
+	}
+	f.sharedTransport = transport
+	f.sharedClient = client
+	f.sharedAllowPrivate = f.AllowPrivate
+	return transport, nil
 }
 
 func safeTransport(roundTripper http.RoundTripper) (http.RoundTripper, error) {

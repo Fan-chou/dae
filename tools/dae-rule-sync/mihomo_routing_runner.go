@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 )
@@ -92,6 +93,7 @@ func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport,
 		})
 	}
 
+	jobs := make([]mihomoProviderFetchJob, 0, len(normalization.Providers))
 	for _, spec := range normalization.Providers {
 		originalName := normalization.ReverseNameMap[spec.Name]
 		if _, used := providerRefs[originalName]; !used {
@@ -103,33 +105,29 @@ func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport,
 			// by the original name while the name was already safe.
 			fallback = previousSnapshots[originalName]
 		}
-		snapshot, fetchResult, err := loadMihomoGenerationProvider(ctx, fetcher, spec, baseDir, fallback)
-		if err != nil {
-			return SyncReport{}, fmt.Errorf("provider %q: %w", originalName, redactProviderError(err))
-		}
-		parsed, err := parseCompleteMihomoProvider(spec, snapshot.Body)
-		if err != nil {
-			return SyncReport{}, fmt.Errorf("provider %q: %w", originalName, err)
-		}
-		snapshot.Behavior = normalizedProviderBehavior(spec)
-		snapshot.Format = normalizedProviderFormat(spec)
-		snapshots[spec.Name] = snapshot
-		sets[originalName] = parsed
-		sets[spec.Name] = parsed
-
-		index := reportIndex[originalName]
+		jobs = append(jobs, mihomoProviderFetchJob{spec: spec, originalName: originalName, fallback: fallback})
+	}
+	loaded, err := loadMihomoGenerationProviders(ctx, fetcher, baseDir, jobs)
+	if err != nil {
+		return SyncReport{}, err
+	}
+	for _, item := range loaded {
+		snapshots[item.spec.Name] = item.snapshot
+		sets[item.originalName] = item.parsed
+		sets[item.spec.Name] = item.parsed
+		index := reportIndex[item.originalName]
 		report.Providers[index] = ProviderSyncReport{
-			Name:        originalName,
-			Updated:     fetchResult.Updated,
-			UsedCache:   fetchResult.UsedCache,
-			SHA256:      snapshot.SHA256,
-			RuleCount:   len(parsed.Domains) + len(parsed.Prefixes),
-			Unsupported: len(parsed.Unsupported),
+			Name:        item.originalName,
+			Updated:     item.fetchResult.Updated,
+			UsedCache:   item.fetchResult.UsedCache,
+			SHA256:      item.snapshot.SHA256,
+			RuleCount:   len(item.parsed.Domains) + len(item.parsed.Prefixes),
+			Unsupported: len(item.parsed.Unsupported),
 		}
-		if fetchResult.Warning != nil {
-			report.Providers[index].Warning = fetchResult.Warning.Error()
+		if item.fetchResult.Warning != nil {
+			report.Providers[index].Warning = item.fetchResult.Warning.Error()
 		}
-		if !fetchResult.UsedCache || fetchResult.Updated || spec.Type != "http" {
+		if !item.fetchResult.UsedCache || item.fetchResult.Updated || item.spec.Type != "http" {
 			generationReused = false
 		}
 	}
@@ -270,6 +268,104 @@ func openMihomoGenerationState(ctx context.Context, path string) (generationRoot
 		}
 	}
 	return root, lock, snapshots, nil
+}
+
+type mihomoProviderFetchJob struct {
+	spec         ProviderSpec
+	originalName string
+	fallback     ProviderSnapshot
+}
+
+type mihomoProviderFetchOutcome struct {
+	spec         ProviderSpec
+	originalName string
+	snapshot     ProviderSnapshot
+	fetchResult  FetchResult
+	parsed       ParsedRuleSet
+}
+
+func loadMihomoGenerationProviders(ctx context.Context, fetcher *ProviderFetcher, baseDir string, jobs []mihomoProviderFetchJob) ([]mihomoProviderFetchOutcome, error) {
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+	startCtx, stopStarting := context.WithCancel(ctx)
+	defer stopStarting()
+
+	type indexed struct {
+		index   int
+		outcome mihomoProviderFetchOutcome
+		err     error
+	}
+	sem := make(chan struct{}, providerFetchConcurrency)
+	results := make(chan indexed, len(jobs))
+	var wg sync.WaitGroup
+	for i, job := range jobs {
+		wg.Add(1)
+		go func(i int, job mihomoProviderFetchJob) {
+			defer wg.Done()
+			select {
+			case <-startCtx.Done():
+				return
+			default:
+			}
+			select {
+			case <-startCtx.Done():
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+
+			snapshot, fetchResult, err := loadMihomoGenerationProvider(ctx, fetcher, job.spec, baseDir, job.fallback)
+			if err != nil {
+				results <- indexed{index: i, err: fmt.Errorf("provider %q: %w", job.originalName, redactProviderError(err))}
+				stopStarting()
+				return
+			}
+			parsed, err := parseCompleteMihomoProvider(job.spec, snapshot.Body)
+			if err != nil {
+				results <- indexed{index: i, err: fmt.Errorf("provider %q: %w", job.originalName, err)}
+				stopStarting()
+				return
+			}
+			snapshot.Behavior = normalizedProviderBehavior(job.spec)
+			snapshot.Format = normalizedProviderFormat(job.spec)
+			results <- indexed{
+				index: i,
+				outcome: mihomoProviderFetchOutcome{
+					spec:         job.spec,
+					originalName: job.originalName,
+					snapshot:     snapshot,
+					fetchResult:  fetchResult,
+					parsed:       parsed,
+				},
+			}
+		}(i, job)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	outcomes := make([]mihomoProviderFetchOutcome, len(jobs))
+	var firstErr error
+	firstIdx := len(jobs)
+	for item := range results {
+		if item.err != nil {
+			if item.index < firstIdx {
+				firstIdx = item.index
+				firstErr = item.err
+			}
+			continue
+		}
+		outcomes[item.index] = item.outcome
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return outcomes, nil
 }
 
 func loadMihomoGenerationProvider(ctx context.Context, fetcher *ProviderFetcher, spec ProviderSpec, baseDir string, fallback ProviderSnapshot) (ProviderSnapshot, FetchResult, error) {
