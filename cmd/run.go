@@ -320,6 +320,13 @@ func (r *Runner) Run() (err error) {
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 		go func() { _ = pprofServer.ListenAndServe() }()
 	}
+	adminHTTP := newAdminServer(log, logFile, filepath.Dir(cfgFile), func() adminPlane {
+		active := runtimeSupervisor.snapshot().active
+		if active == nil {
+			return nil
+		}
+		return active.controlPlane
+	}, nil)
 	sigs := make(chan os.Signal, 1)
 	// Keep internal wake-ups separate so queued OS signals cannot mask reload handoff notifications.
 	runStateChanges := make(chan struct{}, 1)
@@ -358,6 +365,13 @@ func (r *Runner) Run() (err error) {
 
 	reloadReqs := make(chan reloadRequest, 1)
 	reloadManager := newReloadManager(reloadReqs, runStateChanges, sigs)
+	adminHTTP.reload = func() bool {
+		return reloadManager.queueReloadRequest(log, reloadRequest{
+			requestedAt:     time.Now(),
+			requestedAtMono: monotonicNowNano(),
+		})
+	}
+	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
 	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
 	var ruleProviderLifecycleCancel context.CancelFunc
 	var ruleProviderLifecycleDone <-chan struct{}
@@ -930,6 +944,7 @@ func (r *Runner) Run() (err error) {
 			releaseReloadTransition()
 
 			reloadManager.refreshPprofServer(log, &pprofServer, newConf.Global.PprofPort)
+			adminHTTP.refresh(newConf.Global.AdminListen, newConf.Global.AdminSecret)
 
 			notifyRunStateChange(runStateChanges)
 
@@ -1365,6 +1380,7 @@ loop:
 			_ = pprofServer.Shutdown(ctx)
 			cancel()
 		}
+		adminHTTP.shutdown()
 		_ = os.Remove(PidFilePath)
 	}()
 	if ruleProviderLifecycleCancel != nil {

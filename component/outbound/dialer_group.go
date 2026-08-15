@@ -396,6 +396,15 @@ func (g *DialerGroup) GetSelectionPolicy() (policy consts.DialerSelectionPolicy)
 	return g.currentSelectionState().policy.Policy
 }
 
+// CurrentSelectionPolicy returns the live selection policy, including the
+// fixed-member index used by converted Mihomo select groups.
+func (g *DialerGroup) CurrentSelectionPolicy() DialerSelectionPolicy {
+	if g == nil {
+		return DialerSelectionPolicy{}
+	}
+	return g.currentSelectionState().policy
+}
+
 func (g *DialerGroup) MinCheckInterval() time.Duration {
 	if len(g.Dialers) == 0 {
 		return 30 * time.Second

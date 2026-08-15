@@ -29,6 +29,12 @@ global {
     # Set non-zero value to enable pprof.
     pprof_port: 0
 
+    # Optional LAN-only HTTP management API (default off). Bind a private
+    # address, never 0.0.0.0/::, and never port 9090 (that port is Clash).
+    # A failed listen does not stop tproxy.
+    # admin_listen: '192.168.124.223:2025'
+    # admin_secret: 'change-me'
+
     # Maximum entries for the shared TCP/UDP eBPF connection-state map.
     # Lower values reduce locked kernel memory but lower the maximum tracked concurrent flows.
     # Takes effect on fresh eBPF load or restart; same-port reload keeps the live map.

@@ -62,6 +62,8 @@ var GlobalDesc = Desc{
 	"mptcp":                        "Enable Multipath TCP.  If is true, dae will try to use MPTCP to connect all nodes, but it will only take effects when the node supports MPTCP. It can use for load balance and failover to multiple interfaces and IPs.",
 	"bootstrap_resolver":           "Explicit DNS resolver used only for bootstrap lookups that must happen before dae DNS routing is available, such as resolving named DNS upstream hosts and dial_mode real-domain probes. When unset, dae falls back to 119.29.29.29:53 and 223.5.5.5:53 in order. Setting bootstrap_resolver disables those defaults and uses only the configured resolver.",
 	"bpf_conn_state_map_size":      "Maximum entries for the shared TCP/UDP eBPF connection-state map. Lower values reduce locked kernel memory but also lower the maximum tracked concurrent flows. This takes effect on fresh eBPF load or restart; same-port reload keeps the live map to preserve connections.",
+	"admin_listen":                 "Optional LAN-only HTTP management API, for example 192.168.124.223:2025. Empty disables the API. Unspecified addresses (0.0.0.0, ::) and port 9090 are rejected. A failed listen does not stop tproxy.",
+	"admin_secret":                 "Bearer token for the management API. The API stays disabled when this is empty.",
 }
 
 var DnsDesc = Desc{

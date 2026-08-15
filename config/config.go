@@ -47,13 +47,21 @@ type Global struct {
 	TlsFragmentLength      string        `mapstructure:"tls_fragment_length" default:"50-100"`
 	TlsFragmentInterval    string        `mapstructure:"tls_fragment_interval" default:"10-20"`
 	PprofPort              uint16        `mapstructure:"pprof_port" default:"0"`
-	Mptcp                  bool          `mapstructure:"mptcp" default:"false"`
-	BootstrapResolver      string        `mapstructure:"bootstrap_resolver"`
-	FallbackResolver       string        `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
-	BandwidthMaxTx         string        `mapstructure:"bandwidth_max_tx" default:"0"`
-	BandwidthMaxRx         string        `mapstructure:"bandwidth_max_rx" default:"0"`
-	UDPHopInterval         time.Duration `mapstructure:"udphop_interval" default:"30s"`
-	BpfConnStateMapSize    uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
+	// AdminListen is the optional LAN-only HTTP management API (default off).
+	// Bind a private address such as 192.168.124.223:2025. Unspecified
+	// addresses (0.0.0.0, ::) and port 9090 are rejected so this is never
+	// confused with a Clash-compatible API.
+	AdminListen string `mapstructure:"admin_listen"`
+	// AdminSecret is the Bearer token required by the management API.
+	// The API stays disabled when this is empty, even if admin_listen is set.
+	AdminSecret         string        `mapstructure:"admin_secret"`
+	Mptcp               bool          `mapstructure:"mptcp" default:"false"`
+	BootstrapResolver   string        `mapstructure:"bootstrap_resolver"`
+	FallbackResolver    string        `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
+	BandwidthMaxTx      string        `mapstructure:"bandwidth_max_tx" default:"0"`
+	BandwidthMaxRx      string        `mapstructure:"bandwidth_max_rx" default:"0"`
+	UDPHopInterval      time.Duration `mapstructure:"udphop_interval" default:"30s"`
+	BpfConnStateMapSize uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
 }
 
 type Utls struct {

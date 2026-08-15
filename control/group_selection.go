@@ -60,10 +60,10 @@ func applyPersistedGroupSelection(
 	policy.FixedIndex = result.Index
 }
 
-// SetGroupSelection is the minimal internal user-space setting seam for a
-// converted Mihomo select group. It validates the member against the current
-// generation before persisting and changing the live group policy. No HTTP
-// endpoint is introduced.
+// SetGroupSelection is the user-space setting seam for a converted Mihomo
+// select group. It validates the member against the current generation before
+// persisting and changing the live group policy. The optional admin HTTP
+// API calls this without a full reload.
 func (c *ControlPlane) SetGroupSelection(groupName, memberName string) error {
 	if c == nil {
 		return fmt.Errorf("control plane is nil")
