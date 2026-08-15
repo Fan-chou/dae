@@ -4,7 +4,7 @@
 > 以 `docs/mihomo-rule-provider-execution-plan.md` 为准，当前分支已推进到 `2b0b8bc`。下文关于
 > TDD、独立审查、DAT 尚未实现和旧阶段出口的描述属于历史记录，不覆盖当前 routing 实现状态。
 > 当前已完成原始 Mihomo YAML routing、provider/DAT、rules/sub-rules、节点/代理组和同 generation
-> 发布；按当前兼容策略 `IN-PORT`/`IP-ASN` 被忽略、`match-mac` 条件/动作选项被忽略、
+> 发布；按当前兼容策略 `IN-PORT`/`IP-ASN` 被忽略、`match-mac` 转为 `sip(match_mac:)`、
 > `REJECT-DROP` 降级为 block。完整 routing 入口对其它单条无法降低的规则记录源位置和原因后
 > 跳过，不阻断其它规则；provider/引用/节点组结构和活动 SCRIPT 等候选级错误仍 fail closed。
 > 使用用户完整配置实测已成功生成 282 条 routes、36 个代理组、8 个节点及远程规则集/DAT。

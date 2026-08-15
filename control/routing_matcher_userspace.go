@@ -22,6 +22,7 @@ type RoutingMatcher struct {
 
 	compiledMatches []compiledRoutingMatch
 	predicateGroups []routingMatcherPredicateGroupSpan
+	lookupMacAssoc  macAssocLookup
 }
 
 // routingMatcherPredicateGroupSpan maps one immutable policy predicate group
@@ -55,6 +56,7 @@ type routingMatcherFacts struct {
 	ipSetBin       string
 	sourceIPSetBin string
 	macBin         string
+	macAssocBins   []string
 	domainBitmap   []uint32
 }
 
@@ -83,7 +85,7 @@ func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
 	}
 
 	switch compiled.matchType {
-	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
+	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 		compiled.lpmIndex = binary.LittleEndian.Uint32(match.Value[:4])
 	case consts.MatchType_Port, consts.MatchType_SourcePort:
 		compiled.portStart, compiled.portEnd = ParsePortRange(match.Value[:])
@@ -145,6 +147,12 @@ func (m *RoutingMatcher) newFacts(
 		sourceIPSetBin: trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(sourceAddr), 128)),
 		macBin:         trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(mac), 128)),
 	}
+	if m.lookupMacAssoc != nil {
+		mac6 := mac6FromRoutedMac(mac)
+		if mac6[0]|mac6[1]|mac6[2]|mac6[3]|mac6[4]|mac6[5] != 0 {
+			facts.macAssocBins = m.lookupMacAssoc(mac6)
+		}
+	}
 	if domain != "" {
 		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
 	}
@@ -160,7 +168,7 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 	}
 
 	switch match.matchType {
-	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
+	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 		lpmIndex := int(match.lpmIndex)
 		if lpmIndex < 0 || lpmIndex >= len(m.lpmMatcher) {
 			return false, fmt.Errorf("bad lpm index: %d", lpmIndex)
@@ -171,6 +179,16 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 			targetBin = facts.ipSetBin
 		case consts.MatchType_SourceIpSet:
 			targetBin = facts.sourceIPSetBin
+		case consts.MatchType_SourceIpSetMatchMac:
+			if m.lpmMatcher[lpmIndex].HasPrefix(facts.sourceIPSetBin) {
+				return true, nil
+			}
+			for _, bin := range facts.macAssocBins {
+				if m.lpmMatcher[lpmIndex].HasPrefix(bin) {
+					return true, nil
+				}
+			}
+			return false, nil
 		case consts.MatchType_Mac:
 			targetBin = facts.macBin
 		}

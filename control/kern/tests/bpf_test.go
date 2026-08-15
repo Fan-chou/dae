@@ -126,6 +126,25 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 	return
 }
 
+func clearHashMap(t *testing.T, m *ebpf.Map) {
+	t.Helper()
+	if m == nil {
+		return
+	}
+	iter := m.Iterate()
+	key := make([]byte, m.KeySize())
+	val := make([]byte, m.ValueSize())
+	var keys [][]byte
+	for iter.Next(&key, &val) {
+		keys = append(keys, append([]byte(nil), key...))
+	}
+	for _, k := range keys {
+		if err := m.Delete(k); err != nil {
+			t.Fatalf("failed to delete hash map key: %v", err)
+		}
+	}
+}
+
 func markAllOutboundsAlive(t *testing.T, obj *bpftestObjects) {
 	aliveVal := uint32(1)
 
@@ -391,6 +410,8 @@ func Test(t *testing.T) {
 				t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 			}
 		}
+		clearHashMap(t, obj.MacAssocMap)
+		clearHashMap(t, obj.IpMacAssocMap)
 
 		t.Logf("Running test: %s\n", progset.id)
 		// create ctx with the max allowed size(4k - head room - tailroom)

@@ -1003,6 +1003,7 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
 	}
+	routingMatcher.lookupMacAssoc = newMacAssocLookup(core.bpf.Load())
 
 	// Get referenced outbounds to limit health checks.
 	referencedOutbounds := builder.GetReferencedOutbounds()

@@ -124,6 +124,48 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } redirect_track SEC(".maps");
 
+#define MAC_ASSOC_IP_SLOTS 8
+#define MAC_ASSOC_MAX_ENTRIES 4096
+
+struct mac_assoc_key {
+	__u8 mac[6];
+	__u8 pad[2];
+};
+
+struct mac_assoc_ip {
+	__u8 ip[16];
+	__u64 last_seen_ns;
+};
+
+struct mac_assoc_entry {
+	struct mac_assoc_ip ips[MAC_ASSOC_IP_SLOTS];
+};
+
+struct ip_mac_assoc_key {
+	__u8 ip[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct mac_assoc_key);
+	__type(value, struct mac_assoc_entry);
+	__uint(max_entries, MAC_ASSOC_MAX_ENTRIES);
+} mac_assoc_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct ip_mac_assoc_key);
+	__type(value, struct mac_assoc_key);
+	__uint(max_entries, MAC_ASSOC_MAX_ENTRIES * MAC_ASSOC_IP_SLOTS);
+} ip_mac_assoc_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct mac_assoc_entry);
+	__uint(max_entries, 1);
+} mac_assoc_scratch_map SEC(".maps");
+
 struct ip_port {
 	union ip6 ip;
 	__be16 port;
@@ -1187,6 +1229,173 @@ conntrack_args_pname_or_null(const struct conntrack_args *a)
 	return a->flags & CT_ARGS_HAS_PNAME ? (const char *)a->pname : NULL;
 }
 
+static __always_inline int ip16_is_unspecified(const __u8 *ip)
+{
+	return !(ip[0] | ip[1] | ip[2] | ip[3] | ip[4] | ip[5] | ip[6] | ip[7] |
+		 ip[8] | ip[9] | ip[10] | ip[11] | ip[12] | ip[13] | ip[14] |
+		 ip[15]);
+}
+
+static __always_inline int ip16_equal(const __u8 *a, const __u8 *b)
+{
+	return !__builtin_memcmp(a, b, 16);
+}
+
+static __always_inline int mac6_is_learnable(const __u8 *mac)
+{
+	if (!(mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]))
+		return 0;
+	if (mac[0] & 0x1)
+		return 0;
+	return 1;
+}
+
+static __always_inline void mac_assoc_key_from_mac(struct mac_assoc_key *key,
+						     const __u8 *mac)
+{
+	__builtin_memcpy(key->mac, mac, 6);
+	key->pad[0] = 0;
+	key->pad[1] = 0;
+}
+
+static __always_inline void
+mac_assoc_key_from_route_mac(struct mac_assoc_key *key, const __be32 *mac)
+{
+	const __u8 *p = (const __u8 *)mac;
+
+	__builtin_memcpy(key->mac, p + 10, 6);
+	key->pad[0] = 0;
+	key->pad[1] = 0;
+}
+
+static __always_inline void mac_assoc_remove_ip(struct mac_assoc_entry *entry,
+						const __u8 *ip)
+{
+	int i;
+
+#pragma unroll
+	for (i = 0; i < MAC_ASSOC_IP_SLOTS; i++) {
+		if (ip16_equal(entry->ips[i].ip, ip)) {
+			__builtin_memset(&entry->ips[i], 0,
+					 sizeof(entry->ips[i]));
+			return;
+		}
+	}
+}
+
+static __always_inline void mac_assoc_upsert_ip(struct mac_assoc_entry *entry,
+						const __u8 *ip, __u64 now)
+{
+	int i;
+	int empty = -1;
+	int oldest = 0;
+	__u64 oldest_ns = entry->ips[0].last_seen_ns;
+
+#pragma unroll
+	for (i = 0; i < MAC_ASSOC_IP_SLOTS; i++) {
+		if (ip16_equal(entry->ips[i].ip, ip)) {
+			entry->ips[i].last_seen_ns = now;
+			return;
+		}
+		if (empty < 0 && ip16_is_unspecified(entry->ips[i].ip))
+			empty = i;
+		if (entry->ips[i].last_seen_ns < oldest_ns) {
+			oldest_ns = entry->ips[i].last_seen_ns;
+			oldest = i;
+		}
+	}
+	if (empty < 0)
+		empty = oldest;
+	__builtin_memcpy(entry->ips[empty].ip, ip, 16);
+	entry->ips[empty].last_seen_ns = now;
+}
+
+static __always_inline void mac_assoc_learn(const __u8 *mac, const __u8 *ip)
+{
+	struct mac_assoc_key key = {};
+	struct ip_mac_assoc_key ip_key = {};
+	struct mac_assoc_key *old_mac;
+	struct mac_assoc_entry *entry;
+	struct mac_assoc_entry *scratch;
+	__u32 scratch_key = 0;
+	__u64 now;
+
+	if (!mac6_is_learnable(mac) || ip16_is_unspecified(ip))
+		return;
+
+	now = bpf_ktime_get_ns();
+	mac_assoc_key_from_mac(&key, mac);
+	__builtin_memcpy(ip_key.ip, ip, 16);
+
+	old_mac = bpf_map_lookup_elem(&ip_mac_assoc_map, &ip_key);
+	if (old_mac && __builtin_memcmp(old_mac->mac, mac, 6) != 0) {
+		entry = bpf_map_lookup_elem(&mac_assoc_map, old_mac);
+		if (entry)
+			mac_assoc_remove_ip(entry, ip);
+	}
+	bpf_map_update_elem(&ip_mac_assoc_map, &ip_key, &key, BPF_ANY);
+
+	entry = bpf_map_lookup_elem(&mac_assoc_map, &key);
+	if (entry) {
+		mac_assoc_upsert_ip(entry, ip, now);
+		return;
+	}
+
+	scratch = bpf_map_lookup_elem(&mac_assoc_scratch_map, &scratch_key);
+	if (!scratch)
+		return;
+	__builtin_memset(scratch, 0, sizeof(*scratch));
+	mac_assoc_upsert_ip(scratch, ip, now);
+	bpf_map_update_elem(&mac_assoc_map, &key, scratch, BPF_ANY);
+}
+
+static __noinline int
+route_match_mac_assoc(struct route_ctx *ctx, const struct match_set *match_set)
+{
+	struct mac_assoc_key key = {};
+	struct mac_assoc_entry *entry;
+	struct map_lpm_type *lpm;
+	struct lpm_key host_key;
+	__u32 lpm_index;
+	int i;
+
+	mac_assoc_key_from_route_mac(&key, ctx->mac);
+	if (!mac6_is_learnable(key.mac))
+		return 0;
+
+	entry = bpf_map_lookup_elem(&mac_assoc_map, &key);
+	if (!entry)
+		return 0;
+
+	if (unlikely(ctx->routing_epoch_slot >= ROUTING_EPOCH_SLOT_NUM ||
+		     match_set->index >= MAX_MATCH_SET_LEN)) {
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+	lpm_index = ctx->routing_epoch_slot * MAX_MATCH_SET_LEN +
+		    match_set->index;
+	lpm = bpf_map_lookup_elem(&lpm_array_map, &lpm_index);
+	if (unlikely(!lpm)) {
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+#pragma unroll
+	for (i = 0; i < MAC_ASSOC_IP_SLOTS; i++) {
+		if (ip16_is_unspecified(entry->ips[i].ip))
+			continue;
+		__builtin_memset(&host_key, 0, sizeof(host_key));
+		host_key.prefixlen = IPV6_BYTE_LENGTH * 8;
+		__builtin_memcpy(host_key.data, entry->ips[i].ip, 16);
+		if (bpf_map_lookup_elem(lpm, &host_key)) {
+			ctx->route_state |= ROUTE_STATE_GOOD_SUBRULE;
+			return 0;
+		}
+	}
+	return 0;
+}
+
 static __always_inline int
 route_match_lpm(struct route_ctx *ctx, const struct match_set *match_set,
 		struct lpm_key *lpm_key)
@@ -1282,6 +1491,16 @@ route_eval_match(struct route_ctx *ctx, const struct match_set *match_set,
 		bpf_printk("\tip: %pI6", lpm_key->data);
 #endif
 		if (route_match_lpm(ctx, match_set, lpm_key))
+			return 1;
+		break;
+	}
+	case MatchType_SourceIpSetMatchMac:
+	{
+		if (route_match_lpm(ctx, match_set, &ctx->lpm_key_saddr))
+			return 1;
+		if (ctx->route_state & ROUTE_STATE_GOOD_SUBRULE)
+			break;
+		if (route_match_mac_assoc(ctx, match_set))
 			return 1;
 		break;
 	}
@@ -2212,6 +2431,10 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		}
 		return TC_ACT_OK;
 	}
+
+	if (link_h_len == ETH_HLEN)
+		mac_assoc_learn(pkt->ethh.h_source,
+				pkt->tuples.five.sip.u6_addr8);
 
 	/*
    * ip rule add fwmark 0x8000000/0x8000000 table 2023

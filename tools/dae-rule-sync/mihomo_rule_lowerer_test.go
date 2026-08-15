@@ -43,7 +43,7 @@ func TestLowerMihomoRuleDropsIgnoredINPortORBranch(t *testing.T) {
 	}
 }
 
-func TestLowerMihomoRuleIgnoresMatchMacOption(t *testing.T) {
+func TestLowerMihomoRuleEmitsSipMatchMac(t *testing.T) {
 	rule := MihomoRuleIRRule{
 		MihomoRuleSource: MihomoRuleSource{SourceIndex: 3, SourceLine: 14, Raw: "SRC-IP-CIDR"},
 		Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
@@ -57,14 +57,15 @@ func TestLowerMihomoRuleIgnoresMatchMacOption(t *testing.T) {
 		t.Fatalf("LowerMihomoRule() error = %v", err)
 	}
 	if len(lowered) != 1 || len(lowered[0].Rule.AndFunctions) != 1 || lowered[0].Rule.AndFunctions[0].Name != "sip" {
-		t.Fatalf("lowered = %#v, want source-IP condition without match-mac", lowered)
+		t.Fatalf("lowered = %#v, want sip(match_mac: ...)", lowered)
 	}
-	if strings.Contains(lowered[0].Rule.String(false, false, false), "match-mac") {
-		t.Fatalf("lowered rule retained ignored match-mac option: %s", lowered[0].Rule.String(false, false, false))
+	got := lowered[0].Rule.AndFunctions[0]
+	if len(got.Params) != 1 || got.Params[0].Key != "match_mac" || got.Params[0].Val != "192.0.2.0/24" {
+		t.Fatalf("sip params = %#v, want match_mac:192.0.2.0/24", got.Params)
 	}
 }
 
-func TestLowerMihomoRuleIgnoresMatchMacActionOption(t *testing.T) {
+func TestLowerMihomoRuleEmitsSipMatchMacFromActionOption(t *testing.T) {
 	rule := MihomoRuleIRRule{
 		MihomoRuleSource: MihomoRuleSource{SourceIndex: 7, SourceLine: 18, Raw: "SRC-IP-CIDR,192.0.2.0/24,REJECT-DROP,match-mac"},
 		Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
@@ -78,7 +79,82 @@ func TestLowerMihomoRuleIgnoresMatchMacActionOption(t *testing.T) {
 		t.Fatalf("LowerMihomoRule() error = %v", err)
 	}
 	if len(lowered) != 1 || lowered[0].Rule.Outbound.Name != "block" {
-		t.Fatalf("lowered = %#v, want action match-mac ignored and REJECT-DROP mapped to block", lowered)
+		t.Fatalf("lowered = %#v, want REJECT-DROP mapped to block", lowered)
+	}
+	got := lowered[0].Rule.AndFunctions[0]
+	if got.Name != "sip" || len(got.Params) != 1 || got.Params[0].Key != "match_mac" || got.Params[0].Val != "192.0.2.0/24" {
+		t.Fatalf("sip params = %#v, want match_mac:192.0.2.0/24", got.Params)
+	}
+}
+
+func TestLowerMihomoRuleEmitsSipMatchMacFromANDActionOption(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{
+			SourceIndex: 0,
+			SourceLine:  1425,
+			Raw:         "SRC-IP-CIDR,192.168.124.142/32,REJECT-DROP,match-mac",
+		},
+		Expr: MihomoExpr{Kind: MihomoExprAnd, Children: []MihomoExpr{
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "NETWORK", Value: "UDP", Arguments: []string{"UDP"}}},
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "DST-PORT", Value: "3478", Arguments: []string{"3478"}}},
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "SRC-IP-CIDR", Value: "192.168.124.142/32", Arguments: []string{"192.168.124.142/32"}}},
+		}},
+		Action: MihomoAction{Target: "REJECT-DROP", Options: []string{"match-mac"}},
+	}
+
+	lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+	if err != nil {
+		t.Fatalf("LowerMihomoRule() error = %v", err)
+	}
+	if len(lowered) != 1 || lowered[0].Rule.Outbound.Name != "block" {
+		t.Fatalf("lowered = %#v, want one block rule", lowered)
+	}
+
+	got := lowered[0].Rule.AndFunctions
+	if len(got) != 3 || got[0].Name != "l4proto" || got[1].Name != "dport" {
+		t.Fatalf("functions = %#v, want l4proto && dport && sip(match_mac:)", got)
+	}
+	sip := got[2]
+	if sip.Name != "sip" || len(sip.Params) != 1 || sip.Params[0].Key != "match_mac" || sip.Params[0].Val != "192.168.124.142/32" {
+		t.Fatalf("sip params = %#v, want match_mac:192.168.124.142/32", sip.Params)
+	}
+}
+
+func TestLowerMihomoRuleEmitsSipMatchMacFromIPCIDRSrcAndAction(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{SourceIndex: 10, SourceLine: 21, Raw: "AND"},
+		Expr: MihomoExpr{Kind: MihomoExprAnd, Children: []MihomoExpr{
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "NETWORK", Value: "TCP", Arguments: []string{"TCP"}}},
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "IP-CIDR", Value: "192.0.2.1/32", Arguments: []string{"192.0.2.1/32", "src"}}},
+		}},
+		Action: MihomoAction{Target: "DIRECT", Options: []string{"match-mac"}},
+	}
+
+	lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+	if err != nil {
+		t.Fatalf("LowerMihomoRule() error = %v", err)
+	}
+	if len(lowered) != 1 || len(lowered[0].Rule.AndFunctions) != 2 {
+		t.Fatalf("lowered = %#v, want l4proto && sip(match_mac:)", lowered)
+	}
+	sip := lowered[0].Rule.AndFunctions[1]
+	if sip.Name != "sip" || len(sip.Params) != 1 || sip.Params[0].Key != "match_mac" || sip.Params[0].Val != "192.0.2.1/32" {
+		t.Fatalf("sip params = %#v, want match_mac:192.0.2.1/32", sip.Params)
+	}
+}
+
+func TestLowerMihomoRuleRejectsMatchMacWithoutSourceIP(t *testing.T) {
+	rule := MihomoRuleIRRule{
+		MihomoRuleSource: MihomoRuleSource{SourceIndex: 9, SourceLine: 20, Raw: "AND"},
+		Expr: MihomoExpr{Kind: MihomoExprAnd, Children: []MihomoExpr{
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "DOMAIN", Value: "example.com", Arguments: []string{"example.com"}}},
+			{Kind: MihomoExprAtom, Atom: &MihomoAtom{Type: "DST-PORT", Value: "443", Arguments: []string{"443"}}},
+		}},
+		Action: MihomoAction{Target: "REJECT-DROP", Options: []string{"match-mac"}},
+	}
+
+	if _, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{}); err == nil {
+		t.Fatal("LowerMihomoRule() error = nil, want match-mac rejected without a source IP matcher")
 	}
 }
 

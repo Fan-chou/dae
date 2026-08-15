@@ -26,6 +26,7 @@ enum __attribute__((packed)) MatchType {
 	MatchType_MustRules = 11,
 	MatchType_Upstream = 12,
 	MatchType_QType = 13,
+	MatchType_SourceIpSetMatchMac = 14,
 };
 
 enum L4ProtoType {

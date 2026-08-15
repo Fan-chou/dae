@@ -96,6 +96,28 @@ type bpfRedirectTuple struct {
 	}
 }
 
+type bpfMacAssocKey struct {
+	_   structs.HostLayout
+	Mac [6]uint8
+	Pad [2]uint8
+}
+
+type bpfMacAssocIp struct {
+	_          structs.HostLayout
+	Ip         [16]uint8
+	LastSeenNs uint64
+}
+
+type bpfMacAssocEntry struct {
+	_   structs.HostLayout
+	Ips [8]bpfMacAssocIp
+}
+
+type bpfIpMacAssocKey struct {
+	_  structs.HostLayout
+	Ip [16]uint8
+}
+
 type bpfRoutingResult struct {
 	_                  structs.HostLayout
 	Mark               uint32
@@ -231,6 +253,9 @@ type bpfMapSpecs struct {
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.MapSpec `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.MapSpec `ebpf:"pkt_scratch_map"`
+	MacAssocMap              *ebpf.MapSpec `ebpf:"mac_assoc_map"`
+	IpMacAssocMap            *ebpf.MapSpec `ebpf:"ip_mac_assoc_map"`
+	MacAssocScratchMap       *ebpf.MapSpec `ebpf:"mac_assoc_scratch_map"`
 }
 
 type bpfVariableSpecs struct {
@@ -273,6 +298,9 @@ type bpfMaps struct {
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
 	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
+	MacAssocMap              *ebpf.Map `ebpf:"mac_assoc_map"`
+	IpMacAssocMap            *ebpf.Map `ebpf:"ip_mac_assoc_map"`
+	MacAssocScratchMap       *ebpf.Map `ebpf:"mac_assoc_scratch_map"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -299,6 +327,9 @@ func (m *bpfMaps) Close() error {
 		m.UnusedLpmType,
 		m.WanEgressRouteScratchMap,
 		m.PktScratchMap,
+		m.MacAssocMap,
+		m.IpMacAssocMap,
+		m.MacAssocScratchMap,
 	)
 }
 

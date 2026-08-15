@@ -31,6 +31,8 @@ dip(geoip:private) -> direct
 ### Source IP rule
 sip(192.168.0.0/24) -> my_group
 sip(192.168.50.0/24) -> direct
+# Extend the CIDR to other IPs learned from the same LAN source MAC
+sip(match_mac: 192.168.124.142/32) -> block
 
 ### Dest port rule
 dport(80) -> direct

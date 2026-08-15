@@ -31,6 +31,8 @@ dip(geoip:private) -> direct
 ### 源 IP 规则
 sip(192.168.0.0/24) -> my_group
 sip(192.168.50.0/24) -> direct
+# 按 LAN 源 MAC 扩展：该设备学过的任意 IP 也命中同一 CIDR（关联在数据面存活期内保持）
+sip(match_mac: 192.168.124.142/32) -> block
 
 ### 目标端口规则
 dport(80) -> direct

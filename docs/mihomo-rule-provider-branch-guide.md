@@ -105,8 +105,7 @@ nodes、groups 和 DAT。
 | --- | --- | --- |
 | `IN-PORT` | 忽略条件 | 不转换成 `sport`、`dport` 或 `tproxy_port`；仅有该条件的规则不生成，OR 分支只移除该分支 |
 | `IP-ASN` | 暂时忽略条件 | ASN 匹配不会在 kdae 中生效；包含该条件的 AND 分支整体不生成，避免错误变成更宽的规则；OR 中只移除该分支 |
-| `match-mac` 条件选项 | 忽略选项 | 保留同一条规则的源 IP 条件，但 MAC 限定不再生效，匹配范围可能扩大 |
-| `match-mac` 动作选项 | 忽略选项 | 规则主体继续转换，但 MAC 限定不再生效 |
+| `match-mac` 条件/动作选项 | 转为 `sip(match_mac: cidr)` | kdae 在 LAN 上学源 MAC↔IP，把 CIDR 扩到同一设备用过的地址；无 MAC 时退化为普通 `sip` |
 | `REJECT-DROP` | 降级为 kdae `block` | 不保证与 Mihomo 的 drop 时机和连接处理完全一致 |
 | `GEO*`、未知条件、未知 option/action | 记录 warning，跳过该条规则 | 该条规则不会生成伪等价 route，后续规则继续转换 |
 | 活动 `SCRIPT` | 直接拒绝完整 generation | 当前没有脚本执行器，不能把脚本静默当作普通规则 |
@@ -212,7 +211,7 @@ dae。将生成文件接入实际运行环境前，必须先按项目现有的�
 - 36 个代理组转换成功；
 - 282 条 routes 生成；
 - 远程规则集快照和 geoip/geosite DAT 生成；
-- `IN-PORT`、`IP-ASN`、`match-mac` 等有损点被 warning 记录；
+- `IN-PORT`、`IP-ASN` 等有损点被 warning 记录；`match-mac` 转为 `sip(match_mac:)`；
 - 命令没有因为这些单条规则问题中止。
 
 这证明“当前配置可以进入 kdae 的生成链路”，不等价于“当前配置已经完全无损迁移”。尤其要
@@ -251,9 +250,7 @@ provider 内容会影响最终路由，必须视为不可信输入。不要把�
 
 ### 7.5 注意有损规则扩大匹配范围的风险
 
-忽略 `match-mac` 后，保留的源 IP 规则可能匹配更多设备；忽略 `IN-PORT` 后，入口分流可能
-消失；跳过 ASN/GEO 规则后，原本由这些分类保护的流量可能落到后续规则。对于安全、审计、
-分流和拒绝规则，必须逐条确认后再使用。
+忽略 `IN-PORT` 后，入口分流可能消失；跳过 ASN/GEO 规则后，原本由这些分类保护的流量可能落到后续规则。对于安全、审计、分流和拒绝规则，必须逐条确认后再使用。
 
 ### 7.6 活动脚本和结构错误不能靠重试解决
 
@@ -288,7 +285,6 @@ provider 内容会影响最终路由，必须视为不可信输入。不要把�
 - Mihomo `dns`、`tun`、`listeners`、`inbounds`、`hosts` 等非 routing 配置迁移；
 - `IP-ASN` 的 kdae 原生等价匹配；
 - `IN-PORT` 的入站监听器身份匹配；
-- `match-mac` 的 kdae 数据面语义；
 - `REJECT-DROP` 的完全等价 drop 行为；
 - 所有 Mihomo 私有 option、plugin 和动作的自动推断。
 

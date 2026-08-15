@@ -2235,6 +2235,143 @@ int testcheck_not_match(struct __sk_buff *skb)
 				      19233, 80);
 }
 
+SEC("tc/pktgen/source_ipset_match_mac_assoc")
+int testpktgen_source_ipset_match_mac_assoc(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,51,1), IPV4(1,1,1,1), 19233, 80);
+}
+
+SEC("tc/setup/source_ipset_match_mac_assoc")
+int testsetup_source_ipset_match_mac_assoc(struct __sk_buff *skb)
+{
+	/* sip(match_mac: 192.168.50.1/32) -> direct */
+	struct match_set ms = {};
+
+	ms.not = false;
+	ms.type = MatchType_SourceIpSetMatchMac;
+	ms.outbound = 0;
+	ms.must = false;
+	ms.mark = 0;
+	bpf_map_update_elem(&routing_map, &zero_key, &ms, BPF_ANY);
+
+	struct lpm_key lpm_key = {
+		.prefixlen = 128,
+	};
+	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[3] = bpf_ntohl(0xc0a83201); // 192.168.50.1
+	__u32 lpm_value = bpf_ntohl(0x01000000);
+
+	bpf_map_update_elem(&unused_lpm_type, &lpm_key, &lpm_value, BPF_ANY);
+
+	struct mac_assoc_key key = {
+		.mac = { 0x6, 0x7, 0x8, 0x9, 0xa, 0xb },
+	};
+	struct mac_assoc_entry entry = {};
+
+	__builtin_memcpy(entry.ips[0].ip, lpm_key.data, 16);
+	entry.ips[0].last_seen_ns = 1;
+	bpf_map_update_elem(&mac_assoc_map, &key, &entry, BPF_ANY);
+
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/source_ipset_match_mac_assoc")
+int testcheck_source_ipset_match_mac_assoc(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp(skb,
+				      TC_ACT_OK,
+				      IPV4(192,168,51,1), IPV4(1,1,1,1),
+				      19233, 80);
+}
+
+SEC("tc/pktgen/source_ipset_match_mac_miss")
+int testpktgen_source_ipset_match_mac_miss(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,51,1), IPV4(1,1,1,1), 19233, 80);
+}
+
+SEC("tc/setup/source_ipset_match_mac_miss")
+int testsetup_source_ipset_match_mac_miss(struct __sk_buff *skb)
+{
+	/* sip(match_mac: 192.168.50.1/32) -> direct; no association */
+	struct match_set ms = {};
+
+	ms.not = false;
+	ms.type = MatchType_SourceIpSetMatchMac;
+	ms.outbound = 0;
+	ms.must = false;
+	ms.mark = 0;
+	bpf_map_update_elem(&routing_map, &zero_key, &ms, BPF_ANY);
+
+	struct lpm_key lpm_key = {
+		.prefixlen = 128,
+	};
+	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[3] = bpf_ntohl(0xc0a83201); // 192.168.50.1
+	__u32 lpm_value = bpf_ntohl(0x01000000);
+
+	bpf_map_update_elem(&unused_lpm_type, &lpm_key, &lpm_value, BPF_ANY);
+
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+
+	bpf_tail_call(skb, &entry_call_map, 0);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/source_ipset_match_mac_miss")
+int testcheck_source_ipset_match_mac_miss(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp(skb,
+				      TC_ACT_REDIRECT,
+				      IPV4(192,168,51,1), IPV4(1,1,1,1),
+				      19233, 80);
+}
+
+SEC("tc/pktgen/mac_assoc_learn_keeps_ip")
+int testpktgen_mac_assoc_learn_keeps_ip(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,50,1), IPV4(1,1,1,1), 19233, 80);
+}
+
+SEC("tc/setup/mac_assoc_learn_keeps_ip")
+int testsetup_mac_assoc_learn_keeps_ip(struct __sk_buff *skb)
+{
+	__u8 mac[6] = { 0x6, 0x7, 0x8, 0x9, 0xa, 0xb };
+	struct lpm_key host = {
+		.prefixlen = 128,
+	};
+	struct mac_assoc_key key = {
+		.mac = { 0x6, 0x7, 0x8, 0x9, 0xa, 0xb },
+	};
+	struct mac_assoc_entry *entry;
+	int i;
+
+	host.data[2] = bpf_ntohl(0xffff);
+	host.data[3] = bpf_ntohl(0xc0a83201);
+	mac_assoc_learn(mac, (__u8 *)host.data);
+	entry = bpf_map_lookup_elem(&mac_assoc_map, &key);
+	if (!entry)
+		return TC_ACT_SHOT;
+#pragma unroll
+	for (i = 0; i < MAC_ASSOC_IP_SLOTS; i++) {
+		if (__builtin_memcmp(entry->ips[i].ip, host.data, 16) == 0)
+			return TC_ACT_OK;
+	}
+	return TC_ACT_SHOT;
+}
+
+SEC("tc/check/mac_assoc_learn_keeps_ip")
+int testcheck_mac_assoc_learn_keeps_ip(struct __sk_buff *skb)
+{
+	return check_routing_ipv4_tcp(skb,
+				      TC_ACT_OK,
+				      IPV4(192,168,50,1), IPV4(1,1,1,1),
+				      19233, 80);
+}
+
 SEC("tc/pktgen/not_mismtach")
 int testpktgen_not_mismtach(struct __sk_buff *skb)
 {

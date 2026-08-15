@@ -171,7 +171,7 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
 	b.registerProgramParser(rulesBuilder, consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
 	b.registerProgramParser(rulesBuilder, consts.Function_Ip, routing.IpParserFactory(b.addIp))
-	b.registerProgramParser(rulesBuilder, consts.Function_SourceIp, routing.IpParserFactory(b.addSourceIp))
+	b.registerProgramParser(rulesBuilder, consts.Function_SourceIp, b.parseSourceIp)
 	b.registerProgramParser(rulesBuilder, consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
 	b.registerProgramParser(rulesBuilder, consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
 	b.registerProgramParser(rulesBuilder, consts.Function_L4Proto, routing.L4ProtoParserFactory(b.addL4Proto))
@@ -384,7 +384,18 @@ func (b *RoutingMatcherBuilder) addPort(f *config_parser.Function, values [][2]u
 	return nil
 }
 
-func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) (err error) {
+func (b *RoutingMatcherBuilder) parseSourceIp(log *logrus.Logger, f *config_parser.Function, key string, paramValueGroup []string, overrideOutbound *routing.Outbound) error {
+	switch key {
+	case "", consts.RoutingSipKey_MatchMac:
+	default:
+		return fmt.Errorf("unknown sip key: %q", key)
+	}
+	return routing.IpParserFactory(func(f *config_parser.Function, cidrs []netip.Prefix, outbound *routing.Outbound) error {
+		return b.addSourceIp(f, cidrs, outbound, key == consts.RoutingSipKey_MatchMac)
+	})(log, f, key, paramValueGroup, overrideOutbound)
+}
+
+func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound, matchMac bool) (err error) {
 	values = canonicalizePrefixes(values)
 	// Deduplication: check if we've seen this IP set before with collision detection
 	hash := hashLpmSet(values)
@@ -408,16 +419,21 @@ func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []
 	if err != nil {
 		return err
 	}
+	matchType := consts.MatchType_SourceIpSet
+	if matchMac {
+		matchType = consts.MatchType_SourceIpSetMatchMac
+		b.packetMetadataSensitiveRouting = true
+	}
 	set := bpfMatchSet{
 		Value:    [16]byte{},
-		Type:     uint8(consts.MatchType_SourceIpSet),
+		Type:     uint8(matchType),
 		Not:      bpfBool(f.Not),
 		Outbound: outboundId,
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
 	binary.LittleEndian.PutUint32(set.Value[:], lpmTrieIndex)
-	compiled := newCompiledRoutingBase(consts.MatchType_SourceIpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
+	compiled := newCompiledRoutingBase(matchType, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
 	return nil
@@ -621,7 +637,7 @@ func rewriteKernRulesWithRingLpmIndex(rules []bpfMatchSet, allocStartIdx uint32,
 	for i, rule := range kernRules {
 		matchType := consts.MatchType(rule.Type)
 		switch matchType {
-		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
+		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 			oldLpmIndex := binary.LittleEndian.Uint32(rule.Value[:4])
 			if oldLpmIndex >= lpmCount {
 				return nil, fmt.Errorf("bad lpm index in rule[%d]: %d >= %d", i, oldLpmIndex, lpmCount)

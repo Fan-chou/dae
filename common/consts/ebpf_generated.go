@@ -19,6 +19,7 @@ const (
 	MatchType_MustRules
 	MatchType_Upstream
 	MatchType_QType
+	MatchType_SourceIpSetMatchMac
 )
 
 type OutboundIndex uint8

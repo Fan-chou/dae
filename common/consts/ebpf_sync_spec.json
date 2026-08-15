@@ -13,7 +13,8 @@
     "Fallback",
     "MustRules",
     "Upstream",
-    "QType"
+    "QType",
+    "SourceIpSetMatchMac"
   ],
   "l4_proto": [
     {
