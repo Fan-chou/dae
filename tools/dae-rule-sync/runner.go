@@ -28,17 +28,47 @@ import (
 var runSyncMu sync.Mutex
 
 type SyncOptions struct {
-	ManifestPath      string
-	MihomoRoutingPath string
-	CacheDir          string
-	RoutesOutput      string
-	GroupsInputPath   string
-	GroupsOutput      string
-	NodesOutput       string
-	GenerationDir     string
-	Client            *http.Client
-	Strict            bool
-	AllowPrivate      bool
+	ManifestPath         string
+	MihomoRoutingPath    string
+	MihomoRoutingURL     string
+	MihomoRoutingURLFile string
+	CacheDir             string
+	RoutesOutput         string
+	GroupsInputPath      string
+	GroupsOutput         string
+	NodesOutput          string
+	GenerationDir        string
+	Client               *http.Client
+	Strict               bool
+	AllowPrivate         bool
+}
+
+func (options SyncOptions) hasMihomoRoutingSource() bool {
+	count := 0
+	if strings.TrimSpace(options.MihomoRoutingPath) != "" {
+		count++
+	}
+	if strings.TrimSpace(options.MihomoRoutingURL) != "" {
+		count++
+	}
+	if strings.TrimSpace(options.MihomoRoutingURLFile) != "" {
+		count++
+	}
+	return count > 0
+}
+
+func (options SyncOptions) mihomoRoutingSourceCount() int {
+	count := 0
+	if strings.TrimSpace(options.MihomoRoutingPath) != "" {
+		count++
+	}
+	if strings.TrimSpace(options.MihomoRoutingURL) != "" {
+		count++
+	}
+	if strings.TrimSpace(options.MihomoRoutingURLFile) != "" {
+		count++
+	}
+	return count
 }
 
 type ProviderSyncReport struct {
@@ -62,10 +92,13 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 	runSyncMu.Lock()
 	defer runSyncMu.Unlock()
 
-	if options.ManifestPath != "" && options.MihomoRoutingPath != "" {
+	if options.mihomoRoutingSourceCount() > 1 {
+		return SyncReport{}, errors.New("use only one of -mihomo-routing-config, -mihomo-routing-url, or -mihomo-routing-url-file")
+	}
+	if options.ManifestPath != "" && options.hasMihomoRoutingSource() {
 		return SyncReport{}, errors.New("manifest path and Mihomo routing config cannot be combined")
 	}
-	if options.MihomoRoutingPath != "" {
+	if options.hasMihomoRoutingSource() {
 		return runMihomoRoutingSync(ctx, options)
 	}
 	if options.ManifestPath == "" {

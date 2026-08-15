@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,32 +18,31 @@ import (
 // provider snapshots separately would leave mixed generations observable.
 func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 	if options.GenerationDir == "" {
-		return SyncReport{}, errors.New("-mihomo-routing-config requires -generation-dir")
+		return SyncReport{}, errors.New("Mihomo routing generation requires -generation-dir")
 	}
 	if options.RoutesOutput != "" || options.GroupsOutput != "" || options.NodesOutput != "" {
 		return SyncReport{}, errors.New("Mihomo routing generation cannot use direct routes, groups, or nodes output")
 	}
 	if options.GroupsInputPath != "" {
-		return SyncReport{}, errors.New("-mihomo-routing-config cannot be combined with -mihomo-config")
+		return SyncReport{}, errors.New("Mihomo routing generation cannot be combined with -mihomo-config")
 	}
 
-	routingBody, err := os.ReadFile(options.MihomoRoutingPath)
+	routingBody, baseDir, err := loadMihomoRoutingSource(ctx, options)
 	if err != nil {
-		return SyncReport{}, fmt.Errorf("read Mihomo routing config: %w", err)
+		return SyncReport{}, err
 	}
 	document, err := ParseMihomoRoutingDocument(routingBody)
 	if err != nil {
-		return SyncReport{}, err
+		if strings.TrimSpace(options.MihomoRoutingPath) != "" {
+			return SyncReport{}, err
+		}
+		return SyncReport{}, errors.New("subscription is not a Mihomo routing YAML (need proxies/proxy-groups/rules); use role=nodes for URI lists")
 	}
 	if len(document.ScriptRefs) != 0 {
 		reference := document.ScriptRefs[0]
 		return SyncReport{}, fmt.Errorf("Mihomo script at index %d line %d is active and unsupported", reference.SourceIndex, reference.SourceLine)
 	}
 
-	baseDir, err := filepath.Abs(filepath.Dir(options.MihomoRoutingPath))
-	if err != nil {
-		return SyncReport{}, fmt.Errorf("resolve Mihomo routing config directory: %w", err)
-	}
 	normalization, err := NormalizeMihomoRuleProviders(document, baseDir)
 	if err != nil {
 		return SyncReport{}, err

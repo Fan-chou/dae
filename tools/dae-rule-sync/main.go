@@ -19,6 +19,8 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	var options SyncOptions
 	flags.StringVar(&options.ManifestPath, "manifest", "", "provider manifest path")
 	flags.StringVar(&options.MihomoRoutingPath, "mihomo-routing-config", "", "complete Mihomo routing config path; requires generation-dir")
+	flags.StringVar(&options.MihomoRoutingURL, "mihomo-routing-url", "", "fetch a complete Mihomo YAML subscription; requires generation-dir")
+	flags.StringVar(&options.MihomoRoutingURLFile, "mihomo-routing-url-file", "", "read the Mihomo YAML subscription URL from a 0600 file (avoids argv leaks)")
 	flags.StringVar(&options.CacheDir, "cache-dir", "", "provider cache directory")
 	flags.StringVar(&options.RoutesOutput, "routes-output", "", "direct routes output path (compatibility-only; non-atomic complete-state publication)")
 	flags.StringVar(&options.GroupsInputPath, "mihomo-config", "", "optional Mihomo config for flat group conversion")
@@ -29,11 +31,14 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	if err := flags.Parse(args); err != nil {
 		return SyncOptions{}, err
 	}
-	if options.ManifestPath == "" && options.MihomoRoutingPath == "" {
-		return SyncOptions{}, fmt.Errorf("-manifest or -mihomo-routing-config is required")
+	if options.ManifestPath == "" && !options.hasMihomoRoutingSource() {
+		return SyncOptions{}, fmt.Errorf("-manifest, -mihomo-routing-config, -mihomo-routing-url, or -mihomo-routing-url-file is required")
 	}
-	if options.ManifestPath != "" && options.MihomoRoutingPath != "" {
-		return SyncOptions{}, fmt.Errorf("-manifest and -mihomo-routing-config cannot be combined")
+	if options.ManifestPath != "" && options.hasMihomoRoutingSource() {
+		return SyncOptions{}, fmt.Errorf("-manifest cannot be combined with Mihomo routing sources")
+	}
+	if options.mihomoRoutingSourceCount() > 1 {
+		return SyncOptions{}, fmt.Errorf("use only one Mihomo routing source")
 	}
 	return options, nil
 }
