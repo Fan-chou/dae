@@ -178,14 +178,13 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 		}
 	}
 
-	_, hasNestedMembers, err := validateMihomoGroupGraph(config.Groups, groups)
-	if err != nil {
+	if _, _, err := validateMihomoGroupGraph(config.Groups, groups); err != nil {
 		return "", GroupConversionReport{}, err
 	}
 	convertibleGroups := convertibleMihomoGroups(config.Groups, proxies, groups)
 	var output strings.Builder
 	output.WriteString("group {\n")
-	for groupIndex, group := range config.Groups {
+	for _, group := range config.Groups {
 		members := make([]string, 0, len(group.Proxies))
 		selectionMembers := make([]string, 0, len(group.Proxies))
 		var reasons []string
@@ -203,7 +202,6 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 				if reference, special := specialMihomoGroupReference(member); special {
 					selectionMembers = append(selectionMembers, reference)
 				}
-				hasNestedMembers[groupIndex] = true
 			default:
 				if _, nested := groups[member]; nested {
 					if !convertibleGroups[member] {
@@ -291,27 +289,19 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 		if group.Lazy != nil {
 			fmt.Fprintf(&output, "        lazy: %t\n", *group.Lazy)
 		}
-		if !hasNestedMembers[groupIndex] {
-			fmt.Fprintf(&output, "        filter: name(")
-			for i, member := range members {
-				if i > 0 {
-					output.WriteString(", ")
-				}
-				output.WriteString(daeQuote(member))
+		// One filter per member keeps Mihomo proxy order. A combined
+		// name('a', 'b') is only an OR match; node-list order would otherwise
+		// win for first_alive.
+		for _, member := range members {
+			if reference, special := specialMihomoGroupReference(member); special {
+				fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(reference))
+				continue
 			}
-			output.WriteString(")\n")
-		} else {
-			for _, member := range members {
-				if reference, special := specialMihomoGroupReference(member); special {
-					fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(reference))
-					continue
-				}
-				if _, nested := groups[member]; nested {
-					fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(report.NameMap[member]))
-					continue
-				}
-				fmt.Fprintf(&output, "        filter: name(%s)\n", daeQuote(member))
+			if _, nested := groups[member]; nested {
+				fmt.Fprintf(&output, "        filter: group(%s)\n", daeQuote(report.NameMap[member]))
+				continue
 			}
+			fmt.Fprintf(&output, "        filter: name(%s)\n", daeQuote(member))
 		}
 		fmt.Fprintf(&output, "        policy: %s\n", policy)
 		output.WriteString("    }\n")
@@ -517,7 +507,8 @@ func fullMihomoGroupPolicy(groupType string, selectionMembers []string) (string,
 		// Mihomo select identity; fixed(0) is only the safe initial fallback.
 		return policy, false, nil
 	case "fallback":
-		// first_alive is the exact ordered fallback policy implemented by dae.
+		// first_alive follows the generated filter-line order, which matches
+		// the Mihomo proxy list.
 		return policy, false, nil
 	case "url-test":
 		// A single DIRECT member has no latency choice to approximate: it is

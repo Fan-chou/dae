@@ -211,6 +211,36 @@ func (s *DialerSet) filterHit(dialer *dialer.Dialer, filters []*config_parser.Fu
 	return true, nil
 }
 
+func exactNameList(filters []*config_parser.Function) ([]string, bool) {
+	if len(filters) != 1 || filters[0] == nil {
+		return nil, false
+	}
+	filter := filters[0]
+	if filter.Name != FilterInput_Name || filter.Not || len(filter.Params) == 0 {
+		return nil, false
+	}
+	names := make([]string, 0, len(filter.Params))
+	for _, param := range filter.Params {
+		if param == nil || param.Key != "" || param.Val == "" {
+			return nil, false
+		}
+		names = append(names, param.Val)
+	}
+	return names, true
+}
+
+func allExactNameFilters(filters [][]*config_parser.Function) bool {
+	if len(filters) == 0 {
+		return false
+	}
+	for _, clause := range filters {
+		if _, ok := exactNameList(clause); !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *DialerSet) FilterAndAnnotate(filters [][]*config_parser.Function, annotations [][]*config_parser.Param) (dialers []*dialer.Dialer, filterAnnotations []*dialer.Annotation, err error) {
 	if len(filters) != len(annotations) {
 		return nil, nil, fmt.Errorf("[CODE BUG]: unmatched annotations length: %v filters and %v annotations", len(filters), len(annotations))
@@ -221,6 +251,9 @@ func (s *DialerSet) FilterAndAnnotate(filters [][]*config_parser.Function, annot
 			anno[i] = &dialer.Annotation{}
 		}
 		return s.dialers, anno, nil
+	}
+	if allExactNameFilters(filters) {
+		return s.filterExactNamesInDeclarationOrder(filters, annotations)
 	}
 nextDialerLoop:
 	for _, d := range s.dialers {
@@ -239,6 +272,45 @@ nextDialerLoop:
 				filterAnnotations = append(filterAnnotations, anno)
 				continue nextDialerLoop
 			}
+		}
+	}
+	return dialers, filterAnnotations, nil
+}
+
+func (s *DialerSet) filterExactNamesInDeclarationOrder(filters [][]*config_parser.Function, annotations [][]*config_parser.Param) ([]*dialer.Dialer, []*dialer.Annotation, error) {
+	byName := make(map[string]*dialer.Dialer, len(s.dialers))
+	for _, d := range s.dialers {
+		if d == nil || d.Property() == nil || d.Property().Name == "" {
+			continue
+		}
+		if _, exists := byName[d.Property().Name]; exists {
+			continue
+		}
+		byName[d.Property().Name] = d
+	}
+	var dialers []*dialer.Dialer
+	var filterAnnotations []*dialer.Annotation
+	seen := make(map[*dialer.Dialer]struct{}, len(byName))
+	for j, clause := range filters {
+		names, ok := exactNameList(clause)
+		if !ok {
+			return nil, nil, fmt.Errorf("[CODE BUG]: expected exact name filter")
+		}
+		anno, err := dialer.NewAnnotation(annotations[j])
+		if err != nil {
+			return nil, nil, fmt.Errorf("apply filter annotation: %w", err)
+		}
+		for _, name := range names {
+			d := byName[name]
+			if d == nil {
+				continue
+			}
+			if _, exists := seen[d]; exists {
+				continue
+			}
+			seen[d] = struct{}{}
+			dialers = append(dialers, d)
+			filterAnnotations = append(filterAnnotations, anno)
 		}
 	}
 	return dialers, filterAnnotations, nil

@@ -42,8 +42,8 @@ func TestGenerateFlatDaeGroupsMapsSimplePolicies(t *testing.T) {
 	if report.Converted != 1 || report.Approximated != 1 || len(report.Unsupported) != 0 {
 		t.Fatalf("report = %#v", report)
 	}
-	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1', 'us-1')") || !strings.Contains(output, "policy: first_alive") {
-		t.Fatalf("output = %q, want fallback mapped to first_alive", output)
+	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1')\n        filter: name('us-1')") || !strings.Contains(output, "policy: first_alive") {
+		t.Fatalf("output = %q, want fallback mapped to ordered first_alive filters", output)
 	}
 }
 
@@ -317,6 +317,31 @@ func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsExact(t *testing.T) 
 	}
 	if !strings.Contains(output, "selection_members: 'direct'") {
 		t.Fatalf("output = %q, missing fixed single-member metadata", output)
+	}
+}
+
+func TestGenerateFullMihomoGroupsEmitsOneFallbackFilterPerMember(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "🇭🇰 DMIT.HK | Hysteria"}, {Name: "🇭🇰 GG.IPLC -> Dmit.HK"}},
+		Groups: []MihomoGroup{{
+			Name:    "🍒",
+			Type:    "fallback",
+			Proxies: []string{"🇭🇰 GG.IPLC -> Dmit.HK", "🇭🇰 DMIT.HK | Hysteria"},
+		}},
+	}
+	output, report, err := generateFullMihomoGroups(config, map[string]string{
+		"🇭🇰 DMIT.HK | Hysteria": "HK_DMIT_HK_Hysteria",
+		"🇭🇰 GG.IPLC -> Dmit.HK": "HK_GG_IPLC_Dmit_HK",
+	})
+	if err != nil {
+		t.Fatalf("generateFullMihomoGroups() error = %v", err)
+	}
+	if report.Approximated != 0 {
+		t.Fatalf("report = %#v, want exact fallback conversion", report)
+	}
+	want := "filter: name('HK_GG_IPLC_Dmit_HK')\n        filter: name('HK_DMIT_HK_Hysteria')"
+	if !strings.Contains(output, want) {
+		t.Fatalf("output = %q, want declared fallback order %q", output, want)
 	}
 }
 
