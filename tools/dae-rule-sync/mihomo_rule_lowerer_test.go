@@ -104,6 +104,38 @@ func TestLowerMihomoRuleLowercasesDomainKeyword(t *testing.T) {
 	}
 }
 
+func TestLowerMihomoRuleLowercasesDomainSuffixAndFull(t *testing.T) {
+	tests := []struct {
+		atomType string
+		value    string
+		key      string
+		want     string
+	}{
+		{atomType: "DOMAIN-SUFFIX", value: "Example.COM", key: "suffix", want: "example.com"},
+		{atomType: "DOMAIN", value: "Full.Example.COM", key: "full", want: "full.example.com"},
+	}
+	for _, test := range tests {
+		rule := MihomoRuleIRRule{
+			MihomoRuleSource: MihomoRuleSource{SourceIndex: 9, SourceLine: 20, Raw: test.atomType + "," + test.value + ",DIRECT"},
+			Expr: MihomoExpr{Kind: MihomoExprAtom, Atom: &MihomoAtom{
+				Type: test.atomType, Value: test.value, Arguments: []string{test.value},
+			}},
+			Action: MihomoAction{Target: "DIRECT"},
+		}
+		lowered, err := LowerMihomoRule(rule, MihomoRuleLowererOptions{})
+		if err != nil {
+			t.Fatalf("LowerMihomoRule(%s) error = %v", test.atomType, err)
+		}
+		if len(lowered) != 1 || len(lowered[0].Rule.AndFunctions) != 1 {
+			t.Fatalf("LowerMihomoRule(%s) = %#v, want one domain rule", test.atomType, lowered)
+		}
+		got := lowered[0].Rule.AndFunctions[0]
+		if got.Name != "domain" || len(got.Params) != 1 || got.Params[0].Key != test.key || got.Params[0].Val != test.want {
+			t.Fatalf("condition = %#v, want domain(%s: %q)", got, test.key, test.want)
+		}
+	}
+}
+
 func TestLowerMihomoRuleFallsBackRejectDropToBlock(t *testing.T) {
 	rule := MihomoRuleIRRule{
 		MihomoRuleSource: MihomoRuleSource{SourceIndex: 4, SourceLine: 15, Raw: "DOMAIN,example.com,REJECT-DROP"},

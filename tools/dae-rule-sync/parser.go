@@ -22,10 +22,10 @@ type DomainRule struct {
 	Value string
 }
 
-// canonicalizeMihomoDomainKeyword lowercases DOMAIN-KEYWORD values. kdae's
-// Aho-Corasick matcher only accepts lowercase domain characters and fatals on
-// uppercase; DNS matching is case-insensitive, so this preserves Mihomo intent.
-func canonicalizeMihomoDomainKeyword(value string) string {
+// canonicalizeMihomoDomainName lowercases DOMAIN / DOMAIN-SUFFIX /
+// DOMAIN-KEYWORD values. kdae's domain matcher only accepts lowercase
+// characters; DNS matching is case-insensitive, so this preserves Mihomo intent.
+func canonicalizeMihomoDomainName(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
@@ -166,7 +166,7 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
-		return DomainSuffix, value, netip.Prefix{}, nil, nil
+		return DomainSuffix, canonicalizeMihomoDomainName(value), netip.Prefix{}, nil, nil
 	}
 	parts := strings.SplitN(raw, ",", 2)
 	kind := strings.ToUpper(strings.TrimSpace(parts[0]))
@@ -183,17 +183,17 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
-		return DomainFull, value, netip.Prefix{}, nil, nil
+		return DomainFull, canonicalizeMihomoDomainName(value), netip.Prefix{}, nil, nil
 	case "DOMAIN-SUFFIX":
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
-		return DomainSuffix, value, netip.Prefix{}, nil, nil
+		return DomainSuffix, canonicalizeMihomoDomainName(value), netip.Prefix{}, nil, nil
 	case "DOMAIN-KEYWORD":
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
 		}
-		return DomainKeyword, canonicalizeMihomoDomainKeyword(value), netip.Prefix{}, nil, nil
+		return DomainKeyword, canonicalizeMihomoDomainName(value), netip.Prefix{}, nil, nil
 	case "DOMAIN-REGEX":
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: "domain entry in ipcidr provider"}, nil
@@ -243,7 +243,7 @@ func parseProviderItem(raw, behavior string) (DomainKind, string, netip.Prefix, 
 		if behavior == "ipcidr" {
 			return "", "", netip.Prefix{}, nil, fmt.Errorf("invalid CIDR %q", raw)
 		}
-		return DomainSuffix, raw, netip.Prefix{}, nil, nil
+		return DomainSuffix, canonicalizeMihomoDomainName(raw), netip.Prefix{}, nil, nil
 	}
 	return "", "", netip.Prefix{}, &UnsupportedRule{Raw: raw, Reason: fmt.Sprintf("unsupported rule type %s", kind)}, nil
 }

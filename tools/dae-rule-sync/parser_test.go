@@ -89,6 +89,26 @@ func TestParseDomainProviderLowercasesKeyword(t *testing.T) {
 	}
 }
 
+func TestParseDomainProviderLowercasesSuffixAndFull(t *testing.T) {
+	rules, err := ParseProvider([]byte("+.Example.COM\nDOMAIN,Full.Example.COM\nDOMAIN-SUFFIX,Suffix.Example.COM\n"), ProviderSpec{Name: "p", Behavior: "domain", Format: "text"})
+	if err != nil {
+		t.Fatalf("ParseProvider() error = %v", err)
+	}
+	want := []DomainRule{
+		{Kind: DomainSuffix, Value: "example.com"},
+		{Kind: DomainFull, Value: "full.example.com"},
+		{Kind: DomainSuffix, Value: "suffix.example.com"},
+	}
+	if len(rules.Domains) != len(want) {
+		t.Fatalf("domains = %#v, want %#v", rules.Domains, want)
+	}
+	for i := range want {
+		if rules.Domains[i] != want[i] {
+			t.Fatalf("domains[%d] = %#v, want %#v", i, rules.Domains[i], want[i])
+		}
+	}
+}
+
 func TestParseProviderRejectsInvalidCIDR(t *testing.T) {
 	_, err := ParseProvider([]byte("payload:\n  - 192.0.2.0/99\n"), ProviderSpec{Name: "p", Behavior: "ipcidr", Format: "yaml"})
 	if err == nil {

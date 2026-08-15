@@ -467,8 +467,8 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 	if key != "" {
 		for _, param := range params {
 			param.Key = key
-			if key == "keyword" {
-				param.Val = canonicalizeMihomoDomainKeyword(param.Val)
+			if key == "full" || key == "suffix" || key == "keyword" {
+				param.Val = canonicalizeMihomoDomainName(param.Val)
 			}
 		}
 	}
