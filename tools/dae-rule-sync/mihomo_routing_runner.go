@@ -169,11 +169,17 @@ func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport,
 	if len(groupReport.Unsupported) != 0 || groupReport.Approximated != 0 {
 		return SyncReport{}, errors.New("Mihomo routing generation contains unsupported or approximated groups")
 	}
+	groupsText, nodeActionGroups, err := applyMihomoNodeActionGroups(bound.IR, groupsText, nodeReport.NameMap, &groupReport)
+	if err != nil {
+		return SyncReport{}, err
+	}
+	report.Groups = groupReport
 
 	outboundMap, err := mergeMihomoOutboundMaps(nodeReport.NameMap, groupReport.NameMap)
 	if err != nil {
 		return SyncReport{}, err
 	}
+	remapMihomoNodeActionOutbounds(outboundMap, nodeActionGroups)
 	providerBehaviors := make(map[string]string, len(normalization.Providers)*2)
 	for _, provider := range normalization.Providers {
 		providerBehaviors[provider.Name] = provider.Behavior
