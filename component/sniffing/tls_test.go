@@ -7,6 +7,7 @@ package sniffing
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"testing"
@@ -49,6 +50,44 @@ func TestSniffer_SniffTls(t *testing.T) {
 			t.Fatal(d)
 		}
 		t.Log(d)
+	}
+}
+
+func splitTlsClientHelloAcrossRecords(hello []byte, firstPayload int) []byte {
+	if hello[0] != ContentType_HandShake {
+		panic("not a handshake record")
+	}
+	recLen := int(binary.BigEndian.Uint16(hello[3:5]))
+	payload := hello[5 : 5+recLen]
+	if firstPayload <= 0 || firstPayload >= len(payload) {
+		panic("firstPayload must split the handshake")
+	}
+	var out []byte
+	writeRecord := func(chunk []byte) {
+		var hdr [5]byte
+		hdr[0] = ContentType_HandShake
+		hdr[1] = hello[1]
+		hdr[2] = hello[2]
+		binary.BigEndian.PutUint16(hdr[3:5], uint16(len(chunk)))
+		out = append(out, hdr[:]...)
+		out = append(out, chunk...)
+	}
+	writeRecord(payload[:firstPayload])
+	writeRecord(payload[firstPayload:])
+	return out
+}
+
+func TestSniffTcp_TLSClientHelloSpansRecords(t *testing.T) {
+	payload := splitTlsClientHelloAcrossRecords(tlsCurlIpsb, 80)
+	sniffer := NewStreamSniffer(bytes.NewReader(payload), 300*time.Millisecond)
+	defer func() { _ = sniffer.Close() }()
+
+	got, err := sniffer.SniffTcp()
+	if err != nil {
+		t.Fatalf("SniffTcp() error = %v", err)
+	}
+	if got != "ip.sb" {
+		t.Fatalf("domain = %q, want ip.sb", got)
 	}
 }
 

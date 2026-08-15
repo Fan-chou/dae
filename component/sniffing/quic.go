@@ -6,6 +6,7 @@
 package sniffing
 
 import (
+	"encoding/binary"
 	"errors"
 	"io/fs"
 
@@ -21,39 +22,45 @@ const (
 	QuicFlag_HeaderForm         = 7
 )
 const (
-	QuicFlag_HeaderForm_LongHeader  = 1
-	QuicFlag_LongPacketType_Initial = 0
+	QuicFlag_HeaderForm_LongHeader    = 1
+	QuicFlag_LongPacketType_Initial   = 0
+	QuicFlag_LongPacketType_InitialV2 = 1
 )
 
 const (
 	QuicVersion1 = 0x00000001
+	QuicVersion2 = 0x6b3343cf
 )
 
-// IsLikelyQuicInitialPacket checks if the buffer appears to be a QUIC Initial packet.
-// It validates the Long Header format and Initial packet type.
-//
-// Version and FixedBit are NOT strictly checked to maintain compatibility with
-// various QUIC implementations (e.g., Nginx, Cloudflare) and versions (v1, v2, drafts).
-// This follows the principle of being liberal in what we accept for sniffing purposes.
-func IsLikelyQuicInitialPacket(buf []byte) bool {
+func quicInitialPacketTypeForVersion(version uint32) byte {
+	if v, err := quicutils.ParseVersion(version); err == nil && v == quicutils.Version_V2 {
+		return QuicFlag_LongPacketType_InitialV2
+	}
+	return QuicFlag_LongPacketType_Initial
+}
+
+func isQuicInitialLongHeader(buf []byte) bool {
 	const minQuicInitialHeaderLen = 7
 	if len(buf) < minQuicInitialHeaderLen {
 		return false
 	}
-	protectedFlag := buf[0]
-
-	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b1) != QuicFlag_HeaderForm_LongHeader {
+	if ((buf[0] >> QuicFlag_HeaderForm) & 0b1) != QuicFlag_HeaderForm_LongHeader {
 		return false
 	}
-	if ((protectedFlag >> QuicFlag_LongPacketType) & 0b11) != QuicFlag_LongPacketType_Initial {
-		return false
-	}
+	version := binary.BigEndian.Uint32(buf[1:5])
+	packetType := (buf[0] >> QuicFlag_LongPacketType) & 0b11
+	return packetType == quicInitialPacketTypeForVersion(version)
+}
 
-	// Note: Version and FixedBit checks intentionally omitted to support all QUIC versions.
-	// The header form and packet type checks are sufficient for identifying likely
-	// QUIC Initial packets for sniffing purposes.
-
-	return true
+// IsLikelyQuicInitialPacket checks if the buffer appears to be a QUIC Initial packet.
+// It validates the Long Header format and Initial packet type.
+//
+// FixedBit is NOT strictly checked to maintain compatibility with various QUIC
+// implementations (e.g., Nginx, Cloudflare). Packet type bits are version-aware:
+// RFC 9000 v1 Initial is 0b00, RFC 9369 v2 Initial is 0b01. Unknown versions
+// keep the v1 mapping so drafts that reuse v1 type bits still sniff.
+func IsLikelyQuicInitialPacket(buf []byte) bool {
+	return isQuicInitialLongHeader(buf)
 }
 
 func (s *Sniffer) SniffQuic() (d string, err error) {
@@ -113,15 +120,11 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	// Check flag.
 	// Long header: 4 bits masked
 	// High 4 bits are not protected, so we can access QuicFlag_HeaderForm and QuicFlag_LongPacketType without decryption.
-	protectedFlag := buf[0]
-	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b11) != QuicFlag_HeaderForm_LongHeader {
-		return cryptos, nil, ErrNotApplicable
-	}
-	if ((protectedFlag >> QuicFlag_LongPacketType) & 0b11) != QuicFlag_LongPacketType_Initial {
+	if !isQuicInitialLongHeader(buf) {
 		return cryptos, nil, ErrNotApplicable
 	}
 
-	// Skip version.
+	// Skip version. DecryptQuic_ reads it for the Initial salt.
 
 	destConnIdLength := int(buf[boundary-1])
 	boundary += destConnIdLength + 1 // +1 because next field has 1B length

@@ -13,6 +13,9 @@ import (
 var (
 	httpHeaderHost = []byte("host")
 	httpHeaderSep  = []byte{':'}
+	httpSchemeSep  = []byte("://")
+	httpConnect    = []byte("CONNECT")
+	httpStar       = []byte("*")
 )
 
 // httpMethods lists valid HTTP request methods as []byte so the method check
@@ -36,37 +39,94 @@ func isValidHttpMethod(method []byte) bool {
 	return false
 }
 
+func isIncompleteHttpMethodPrefix(head []byte) bool {
+	if len(head) == 0 {
+		return false
+	}
+	for _, m := range httpMethods {
+		if bytes.HasPrefix(m, head) {
+			return true
+		}
+	}
+	return false
+}
+
+func hostFromAbsoluteURI(target []byte) string {
+	scheme := bytes.Index(target, httpSchemeSep)
+	if scheme < 0 {
+		return ""
+	}
+	rest := target[scheme+len(httpSchemeSep):]
+	if at := bytes.LastIndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	if slash := bytes.IndexByte(rest, '/'); slash >= 0 {
+		rest = rest[:slash]
+	}
+	if len(rest) == 0 {
+		return ""
+	}
+	return string(rest)
+}
+
+func hostFromRequestLine(requestLine []byte) string {
+	method, rest, found := bytes.Cut(requestLine, []byte(" "))
+	if !found {
+		return ""
+	}
+	target, _, found := bytes.Cut(bytes.TrimLeft(rest, " "), []byte(" "))
+	if !found {
+		target = bytes.TrimSpace(rest)
+	}
+	target = bytes.TrimSpace(target)
+	if len(target) == 0 || bytes.Equal(target, httpStar) {
+		return ""
+	}
+	if bytes.Equal(method, httpConnect) {
+		return string(target)
+	}
+	return hostFromAbsoluteURI(target)
+}
+
 func sniffHTTPHostHeader(data []byte) (string, error) {
 	// The first line is the request line ("METHOD SP target SP version"); it is
 	// never a Host header, so jump past it to avoid a wasted scan per request.
 	start := 0
-	if i := bytes.IndexByte(data, '\n'); i >= 0 {
-		start = i + 1
-	} else {
-		return "", ErrNotFound
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		return "", ErrNeedMore
 	}
+	requestLine := data[:nl]
+	if n := len(requestLine); n > 0 && requestLine[n-1] == '\r' {
+		requestLine = requestLine[:n-1]
+	}
+	start = nl + 1
 	for start < len(data) {
 		// Split on LF. HTTP lines end with CRLF, and a single-byte search for
 		// '\n' is markedly cheaper than a two-byte search for "\r\n"; the
 		// preceding CR (if present) is stripped from the header content.
 		nl := bytes.IndexByte(data[start:], '\n')
-		var line []byte
-		if nl >= 0 {
-			lineEnd := start + nl
-			if lineEnd > start && data[lineEnd-1] == '\r' {
-				line = data[start : lineEnd-1]
-			} else {
-				line = data[start:lineEnd]
-			}
-			start = lineEnd + 1
-		} else {
-			line = data[start:]
-			start = len(data)
+		if nl < 0 {
+			// A later Host line (or the rest of the current one) has not
+			// arrived yet. Wait instead of giving up the way we used to
+			// with ErrNotFound — prefetch often stops after the request line.
+			return "", ErrNeedMore
 		}
+		lineEnd := start + nl
+		var line []byte
+		if lineEnd > start && data[lineEnd-1] == '\r' {
+			line = data[start : lineEnd-1]
+		} else {
+			line = data[start:lineEnd]
+		}
+		start = lineEnd + 1
 
 		// Empty line marks end-of-headers.
 		if len(line) == 0 {
-			break
+			if host := hostFromRequestLine(requestLine); host != "" {
+				return host, nil
+			}
+			return "", ErrNotFound
 		}
 		key, value, found := bytes.Cut(line, httpHeaderSep)
 		if !found {
@@ -81,7 +141,7 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 			return host, nil
 		}
 	}
-	return "", ErrNotFound
+	return "", ErrNeedMore
 }
 
 func (s *Sniffer) SniffHttp() (d string, err error) {
@@ -92,11 +152,15 @@ func (s *Sniffer) SniffHttp() (d string, err error) {
 
 	// Search method.
 	search := s.buf.Bytes()
-	if len(search) > 12 {
-		search = search[:12]
+	head := search
+	if len(head) > 12 {
+		head = head[:12]
 	}
-	method, _, found := bytes.Cut(search, []byte(" "))
+	method, _, found := bytes.Cut(head, []byte(" "))
 	if !found {
+		if isIncompleteHttpMethodPrefix(head) {
+			return "", ErrNeedMore
+		}
 		return "", ErrNotApplicable
 	}
 	if !isValidHttpMethod(method) {

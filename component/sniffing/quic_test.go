@@ -96,9 +96,14 @@ func TestIsLikelyQuicInitialPacket_MultiVersionSupport(t *testing.T) {
 			shouldPass: true,
 		},
 		{
-			name:       "QUIC v2 (0x709a50c4)",
+			name:       "unknown version with v1 Initial type bits",
 			version:    []byte{0x70, 0x9a, 0x50, 0xc4},
 			shouldPass: true,
+		},
+		{
+			name:       "RFC 9369 QUIC v2 version with v1 type bits is Handshake",
+			version:    []byte{0x6b, 0x33, 0x43, 0xcf},
+			shouldPass: false,
 		},
 		{
 			name:       "Draft-29 (0xff00001d)",
@@ -129,6 +134,28 @@ func TestIsLikelyQuicInitialPacket_MultiVersionSupport(t *testing.T) {
 				t.Errorf("IsLikelyQuicInitialPacket() = %v, want %v", result, tt.shouldPass)
 			}
 		})
+	}
+}
+
+func TestIsLikelyQuicInitialPacket_QUICv2InitialType(t *testing.T) {
+	buf := make([]byte, 16)
+	copy(buf[1:5], []byte{0x6b, 0x33, 0x43, 0xcf})
+
+	buf[0] = 0xD0 // Long header + RFC 9369 Initial (0b01) + Fixed bit
+	if !IsLikelyQuicInitialPacket(buf) {
+		t.Fatal("RFC 9369 QUIC v2 Initial should be recognized")
+	}
+
+	buf[0] = 0xC0 // Long header + type 0b00 is Handshake in v2
+	if IsLikelyQuicInitialPacket(buf) {
+		t.Fatal("RFC 9369 QUIC v2 Handshake must not look like Initial")
+	}
+
+	v1 := make([]byte, 16)
+	v1[0] = 0xD0
+	v1[4] = 0x01 // version 1
+	if IsLikelyQuicInitialPacket(v1) {
+		t.Fatal("v1 0-RTT (type 0b01) must not look like Initial")
 	}
 }
 

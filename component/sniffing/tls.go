@@ -21,25 +21,77 @@ const (
 	AssumedTlsClientHelloMaxLength = 4096
 )
 
+func clientHelloComplete(payload []byte) bool {
+	if len(payload) < 4 || payload[0] != HandShakeType_Hello {
+		return false
+	}
+	n := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
+	return n >= 0 && len(payload) >= 4+n
+}
+
+func (s *Sniffer) tlsClientHelloPayload() ([]byte, error) {
+	buf := s.buf.Bytes()
+	if len(buf) == 0 || buf[0] != ContentType_HandShake {
+		return nil, ErrNotApplicable
+	}
+	if len(buf) < 5 {
+		return nil, ErrNeedMore
+	}
+	if buf[1] != 0x03 {
+		return nil, ErrNotApplicable
+	}
+
+	recLen := int(binary.BigEndian.Uint16(buf[3:5]))
+	if len(buf) < 5+recLen {
+		return nil, ErrNeedMore
+	}
+	first := buf[5 : 5+recLen]
+	if len(first) > 0 && first[0] != HandShakeType_Hello {
+		return nil, ErrNotApplicable
+	}
+	if clientHelloComplete(first) {
+		return first, nil
+	}
+
+	// ClientHello can span TLS records. Concatenate handshake payloads until
+	// the 3-byte handshake length is satisfied, instead of parsing only the
+	// first record (which misses SNI that landed in a later record).
+	var payload []byte
+	off := 0
+	for {
+		if len(buf)-off < 5 {
+			return nil, ErrNeedMore
+		}
+		if buf[off] != ContentType_HandShake || buf[off+1] != 0x03 {
+			if clientHelloComplete(payload) {
+				return payload, nil
+			}
+			if len(payload) == 0 {
+				return nil, ErrNotApplicable
+			}
+			return nil, ErrNotApplicable
+		}
+		n := int(binary.BigEndian.Uint16(buf[off+3 : off+5]))
+		if len(buf)-off < 5+n {
+			return nil, ErrNeedMore
+		}
+		payload = append(payload, buf[off+5:off+5+n]...)
+		off += 5 + n
+		if clientHelloComplete(payload) {
+			return payload, nil
+		}
+	}
+}
+
 // SniffTls only supports tls1.2, tls1.3
 func (s *Sniffer) SniffTls() (d string, err error) {
 	// The Transport Layer Security (TLS) Protocol Version 1.3
 	// https://www.rfc-editor.org/rfc/rfc8446#page-27
-	boundary := 5
-	if s.buf.Len() < boundary {
-		return "", ErrNotApplicable
+	payload, err := s.tlsClientHelloPayload()
+	if err != nil {
+		return "", err
 	}
-
-	if s.buf.Bytes()[0] != ContentType_HandShake || s.buf.Bytes()[1] != 0x03 {
-		return "", ErrNotApplicable
-	}
-
-	length := int(binary.BigEndian.Uint16(s.buf.Bytes()[3:5]))
-	search := s.buf.Bytes()[5:]
-	if len(search) < length {
-		return "", ErrNeedMore
-	}
-	return extractSniFromTls(quicutils.BuiltinBytesLocator(search[:length]))
+	return extractSniFromTls(quicutils.BuiltinBytesLocator(payload))
 }
 
 func extractSniFromTls(search quicutils.Locator) (sni string, err error) {
