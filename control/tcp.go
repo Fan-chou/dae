@@ -290,7 +290,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		}
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
-	binding := newTcpFlowBinding(c.PolicyEpoch(), res)
+	binding := newTcpFlowBinding(c.PolicyEpoch(), res, routingResult.Mac)
 	flow, err := c.adoptTCPFlow(ctx, ownership, ingressConn, rConn, binding, src, dst)
 	if err != nil {
 		_ = rConn.Close()

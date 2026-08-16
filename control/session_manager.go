@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cilium/ebpf"
 	commonerrors "github.com/daeuniverse/dae/common/errors"
@@ -73,6 +74,8 @@ type SessionManager struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	nextFlowID atomic.Uint64
 }
 
 // FlowRuntime is the process-owned lifecycle capsule for one established TCP
@@ -80,6 +83,15 @@ type SessionManager struct {
 // immutable route and egress binding.
 type FlowRuntime struct {
 	manager *SessionManager
+
+	id            uint64
+	startUnixNano int64
+	src           netip.AddrPort
+	dst           netip.AddrPort
+	mac           [6]uint8
+	network       string
+	uploadBytes   atomic.Uint64
+	downloadBytes atomic.Uint64
 
 	ingress net.Conn
 	egress  netproxy.Conn
@@ -113,6 +125,15 @@ type UDPFlowRuntime struct {
 	manager  *SessionManager
 	endpoint *UdpEndpoint
 	binding  UdpFlowBinding
+
+	id            uint64
+	startUnixNano int64
+	src           netip.AddrPort
+	dst           netip.AddrPort
+	mac           [6]uint8
+	network       string
+	uploadBytes   atomic.Uint64
+	downloadBytes atomic.Uint64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -305,7 +326,7 @@ func (c *ControlPlane) adoptTCPFlow(
 	if egress != nil {
 		runtime = c.egressRuntime
 	}
-	flow, err := manager.adoptTCP(ingress, egress, binding, runtime, keys)
+	flow, err := manager.adoptTCP(ingress, egress, binding, runtime, keys, src, dst)
 	var drainRelease func()
 	if err == nil && ownership != nil {
 		drainRelease = ownership.releaseLocked()
@@ -350,12 +371,25 @@ func (f *FlowRuntime) Binding() TcpFlowBinding {
 	return f.binding
 }
 
+func flowNetworkName(udp bool, addr netip.Addr) string {
+	proto := "tcp"
+	if udp {
+		proto = "udp"
+	}
+	if addr.Is6() {
+		return proto + "6"
+	}
+	return proto + "4"
+}
+
 func (m *SessionManager) adoptTCP(
 	ingress net.Conn,
 	egress netproxy.Conn,
 	binding TcpFlowBinding,
 	runtime *egressRuntime,
 	pinKeys []bpfTuplesKey,
+	src netip.AddrPort,
+	dst netip.AddrPort,
 ) (*FlowRuntime, error) {
 	if m == nil {
 		return nil, ErrSessionManagerClosed
@@ -370,13 +404,19 @@ func (m *SessionManager) adoptTCP(
 	binding.Egress.Outbound = retainedOutbound
 	ctx, cancel := context.WithCancel(m.ctx)
 	flow := &FlowRuntime{
-		manager:     m,
-		ingress:     ingress,
-		egress:      egress,
-		binding:     binding,
-		ctx:         ctx,
-		cancel:      cancel,
-		egressLease: lease,
+		manager:       m,
+		id:            m.nextFlowID.Add(1),
+		startUnixNano: time.Now().UnixNano(),
+		src:           src,
+		dst:           dst,
+		mac:           binding.Mac,
+		network:       flowNetworkName(false, src.Addr()),
+		ingress:       ingress,
+		egress:        egress,
+		binding:       binding,
+		ctx:           ctx,
+		cancel:        cancel,
+		egressLease:   lease,
 	}
 	if len(pinKeys) > len(flow.pinKeys) {
 		pinKeys = pinKeys[:len(flow.pinKeys)]
@@ -543,13 +583,23 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 	endpoint.setFlowBinding(binding)
 	ctx, cancel := context.WithCancel(m.ctx)
 	flow := &UDPFlowRuntime{
-		manager:     m,
-		endpoint:    endpoint,
-		binding:     binding,
-		ctx:         ctx,
-		cancel:      cancel,
-		egressLease: lease,
+		manager:       m,
+		endpoint:      endpoint,
+		binding:       binding,
+		id:            m.nextFlowID.Add(1),
+		startUnixNano: time.Now().UnixNano(),
+		src:           endpoint.poolKey.Src,
+		dst:           endpoint.poolKey.Dst,
+		network:       flowNetworkName(true, endpoint.poolKey.Src.Addr()),
+		ctx:           ctx,
+		cancel:        cancel,
+		egressLease:   lease,
 	}
+	endpoint.routingMu.RLock()
+	if endpoint.hasRoutingCache {
+		flow.mac = endpoint.routingCache.Mac
+	}
+	endpoint.routingMu.RUnlock()
 
 	m.mu.Lock()
 	if m.closed {

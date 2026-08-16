@@ -80,6 +80,8 @@ func TestConnectionMemoryLayout(t *testing.T) {
 			TcpFlowBinding{},
 			runtime,
 			nil,
+			netip.MustParseAddrPort("192.0.2.1:40000"),
+			netip.MustParseAddrPort("198.51.100.1:443"),
 		)
 		if err != nil {
 			lifecycleErr = err

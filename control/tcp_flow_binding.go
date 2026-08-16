@@ -37,10 +37,11 @@ type TcpEgressBinding struct {
 type TcpFlowBinding struct {
 	Route  TcpRouteBinding
 	Egress TcpEgressBinding
+	Mac    [6]uint8
 }
 
-func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult) TcpFlowBinding {
-	binding := TcpFlowBinding{}
+func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult, mac [6]uint8) TcpFlowBinding {
+	binding := TcpFlowBinding{Mac: mac}
 	binding.Route.PolicyEpoch = policyEpoch
 	if result == nil {
 		return binding

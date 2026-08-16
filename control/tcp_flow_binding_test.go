@@ -45,11 +45,11 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 		SelectionNetworkTypeObj: &networkType,
 	}
 
-	binding := newTcpFlowBinding(identity.Epoch(), result)
+	binding := newTcpFlowBinding(identity.Epoch(), result, [6]uint8{2, 0, 0, 0, 0, 1})
 	if binding.Route.PolicyEpoch != identity.Epoch() || binding.Route.Outbound != result.OutboundIndex || binding.Route.Mark != result.Mark || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
-	if binding.Egress.Dialer != d || binding.Egress.Outbound != outbound || binding.Egress.Target != result.DialTarget || binding.Egress.Network != result.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != result.SniffedDomain || !binding.Egress.IsDialIp {
+	if binding.Egress.Dialer != d || binding.Egress.Outbound != outbound || binding.Egress.Target != result.DialTarget || binding.Egress.Network != result.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != result.SniffedDomain || !binding.Egress.IsDialIp || binding.Mac != [6]uint8{2, 0, 0, 0, 0, 1} {
 		t.Fatalf("egress binding = %+v", binding.Egress)
 	}
 
@@ -59,6 +59,32 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 	if binding.Route.Mark != 42 || binding.Egress.Target != "198.51.100.10:443" || binding.Egress.NetworkType.IpVersion != consts.IpVersionStr_4 {
 		t.Fatalf("binding changed after result mutation: %+v", binding)
 	}
+}
+
+func TestAdoptTCPStoresConnectionIdentity(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+	src := netip.MustParseAddrPort("192.168.124.202:44321")
+	dst := netip.MustParseAddrPort("198.51.100.10:443")
+	mac := [6]uint8{0x3e, 0x0a, 0xa5, 0xde, 0xae, 0xa3}
+	flow, err := manager.adoptTCP(
+		&memoryLayoutConn{id: 1},
+		nil,
+		TcpFlowBinding{Mac: mac},
+		runtime,
+		nil,
+		src,
+		dst,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flow.id == 0 || flow.src != src || flow.dst != dst || flow.mac != mac || flow.network != "tcp4" || flow.startUnixNano == 0 {
+		t.Fatalf("identity = id=%d src=%v dst=%v mac=%x net=%s start=%d", flow.id, flow.src, flow.dst, flow.mac, flow.network, flow.startUnixNano)
+	}
+	flow.finish()
 }
 
 func TestRouteDialReturnsFailedTcpSelection(t *testing.T) {

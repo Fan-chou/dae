@@ -45,7 +45,7 @@ func TestRouteDial_RetriesAlternateFamilyAfterLocalNetworkFailure(t *testing.T) 
 	if got := res.SelectionNetworkTypeObj.IpVersion; got != consts.IpVersionStr_4 {
 		t.Fatalf("selection ip version = %v, want %v", got, consts.IpVersionStr_4)
 	}
-	binding := newTcpFlowBinding(cp.PolicyEpoch(), res)
+	binding := newTcpFlowBinding(cp.PolicyEpoch(), res, [6]uint8{})
 	if binding.Route.Outbound != res.OutboundIndex || binding.Route.Mark != res.Mark || binding.Route.Must != res.Must {
 		t.Fatalf("route binding = %+v, want final result %+v", binding.Route, res)
 	}
