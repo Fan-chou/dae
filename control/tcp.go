@@ -776,12 +776,15 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 	if flowRoutingResult.Mark == 0 {
 		flowRoutingResult.Mark = c.soMarkFromDae
 	}
-	binding := TcpFlowBinding{Route: TcpRouteBinding{
-		PolicyEpoch: c.PolicyEpoch(),
-		Outbound:    consts.OutboundIndex(flowRoutingResult.Outbound),
-		Mark:        flowRoutingResult.Mark,
-		Must:        flowRoutingResult.Must != 0,
-	}}
+	binding := TcpFlowBinding{
+		Mac: flowRoutingResult.Mac,
+		Route: TcpRouteBinding{
+			PolicyEpoch: c.PolicyEpoch(),
+			Outbound:    consts.OutboundIndex(flowRoutingResult.Outbound),
+			Mark:        flowRoutingResult.Mark,
+			Must:        flowRoutingResult.Must != 0,
+		},
+	}
 	flow, err := c.adoptTCPFlow(ctx, ownership, lConn, nil, binding, src, dst)
 	if err != nil {
 		return true, fmt.Errorf("adopt TCP DNS flow runtime: %w", err)

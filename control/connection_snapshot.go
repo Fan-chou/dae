@@ -6,6 +6,7 @@
 package control
 
 import (
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -126,16 +127,16 @@ func adminConnectionFromTCP(flow *FlowRuntime) AdminConnection {
 	item := AdminConnection{
 		ID:       strconv.FormatUint(flow.id, 10),
 		Network:  flow.network,
-		Src:      flow.src.String(),
-		Dst:      flow.dst.String(),
+		Src:      formatAddrPort(flow.src),
+		Dst:      formatAddrPort(flow.dst),
 		Mac:      macString(flow.mac),
 		Upload:   flow.uploadBytes.Load(),
 		Download: flow.downloadBytes.Load(),
 		Start:    formatFlowStart(flow.startUnixNano),
 	}
 	fillAdminConnectionEgress(&item, flow.binding.Egress.Outbound, flow.binding.Egress.Dialer, flow.binding.Egress.SniffedDomain, flow.binding.Egress.Target, flow.binding.Egress.IsDialIp)
-	if item.Dst == "" || item.Dst == "invalid AddrPort" {
-		item.Dst = flow.binding.Egress.Target
+	if item.Dst == "" {
+		item.Dst = displayConnectionTarget(flow.binding.Egress.Target)
 	}
 	return item
 }
@@ -144,18 +145,110 @@ func adminConnectionFromUDP(flow *UDPFlowRuntime) AdminConnection {
 	if flow == nil {
 		return AdminConnection{}
 	}
+	src, dst := udpFlowAddrs(flow)
+	sniffed, target, isDialIP := udpFlowSniff(flow)
 	item := AdminConnection{
 		ID:       strconv.FormatUint(flow.id, 10),
 		Network:  flow.network,
-		Src:      flow.src.String(),
-		Dst:      flow.dst.String(),
-		Mac:      macString(flow.mac),
+		Src:      formatAddrPort(src),
+		Dst:      formatAddrPort(dst),
+		Mac:      macString(udpFlowMac(flow.endpoint, flow.binding)),
 		Upload:   flow.uploadBytes.Load(),
 		Download: flow.downloadBytes.Load(),
 		Start:    formatFlowStart(flow.startUnixNano),
 	}
-	fillAdminConnectionEgress(&item, flow.binding.Egress.Outbound, flow.binding.Egress.Dialer, flow.binding.Egress.SniffedDomain, flow.binding.Egress.Target, flow.binding.Egress.IsDialIp)
+	if item.Mac == "" {
+		item.Mac = macString(flow.mac)
+	}
+	fillAdminConnectionEgress(&item, flow.binding.Egress.Outbound, flow.binding.Egress.Dialer, sniffed, target, isDialIP)
+	if item.Dst == "" {
+		item.Dst = displayConnectionTarget(target)
+	}
 	return item
+}
+
+func formatAddrPort(addr netip.AddrPort) string {
+	if !addr.IsValid() {
+		return ""
+	}
+	return addr.String()
+}
+
+func displayConnectionTarget(target string) string {
+	value := strings.TrimSpace(target)
+	if value == "" || strings.Contains(value, "://") || value == "invalid AddrPort" {
+		return ""
+	}
+	return value
+}
+
+func udpFlowMac(endpoint *UdpEndpoint, binding UdpFlowBinding) [6]uint8 {
+	if binding.Mac != [6]uint8{} {
+		return binding.Mac
+	}
+	if endpoint == nil {
+		return [6]uint8{}
+	}
+	if endpoint.poolKey.RouteScope.Mac != [6]uint8{} {
+		return endpoint.poolKey.RouteScope.Mac
+	}
+	endpoint.routingMu.RLock()
+	defer endpoint.routingMu.RUnlock()
+	if endpoint.hasRoutingCache {
+		return endpoint.routingCache.Mac
+	}
+	return [6]uint8{}
+}
+
+func udpFlowAddrs(flow *UDPFlowRuntime) (src, dst netip.AddrPort) {
+	if flow == nil {
+		return netip.AddrPort{}, netip.AddrPort{}
+	}
+	src = flow.src
+	dst = flow.dst
+	if flow.endpoint == nil {
+		return src, dst
+	}
+	if !src.IsValid() {
+		src = flow.endpoint.poolKey.Src
+	}
+	if !dst.IsValid() {
+		dst = flow.endpoint.poolKey.Dst
+	}
+	if !dst.IsValid() {
+		if pair := flow.endpoint.udpConnStateLastPair.Load(); pair != nil && pair.dst.IsValid() {
+			dst = pair.dst
+		}
+	}
+	if !dst.IsValid() {
+		flow.endpoint.routingMu.RLock()
+		if flow.endpoint.hasRoutingCache && flow.endpoint.routingCacheDst.IsValid() {
+			dst = flow.endpoint.routingCacheDst
+		}
+		flow.endpoint.routingMu.RUnlock()
+	}
+	return src, dst
+}
+
+func udpFlowSniff(flow *UDPFlowRuntime) (sniffed, target string, isDialIP bool) {
+	if flow == nil {
+		return "", "", false
+	}
+	sniffed = flow.binding.Egress.SniffedDomain
+	target = flow.binding.Egress.Target
+	isDialIP = flow.binding.Egress.IsDialIp
+	if flow.endpoint != nil {
+		if flow.endpoint.SniffedDomain != "" {
+			sniffed = flow.endpoint.SniffedDomain
+		}
+		if target == "" {
+			target = flow.endpoint.DialTarget
+		}
+		if flow.endpoint.flowBindingSet {
+			isDialIP = flow.endpoint.flowBindingDialIP
+		}
+	}
+	return sniffed, target, isDialIP
 }
 
 func fillAdminConnectionEgress(item *AdminConnection, group *outbound.DialerGroup, d *dialer.Dialer, sniffed, target string, isDialIP bool) {

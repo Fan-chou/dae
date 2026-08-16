@@ -68,6 +68,50 @@ func TestAdminConnectionsSnapshotFiltersAndOmitsURI(t *testing.T) {
 	flow.finish()
 }
 
+func TestAdminConnectionsSnapshotHidesInvalidAddrPort(t *testing.T) {
+	mac := [6]uint8{0x3e, 0x0a, 0xa5, 0xde, 0xae, 0xa3}
+	group := &outbound.DialerGroup{Name: "proxy"}
+	ue := &UdpEndpoint{
+		DialTarget: "1.2.3.4:443",
+		poolKey: UdpEndpointKey{
+			Src: netip.MustParseAddrPort("192.168.124.202:50000"),
+		},
+	}
+	ue.hasRoutingCache = true
+	ue.routingCache.Mac = mac
+	ue.routingCacheDst = netip.MustParseAddrPort("1.2.3.4:443")
+	ue.udpConnStateLastPair.Store(&udpConnStateTuplePairSnapshot{
+		src: netip.MustParseAddrPort("192.168.124.202:50000"),
+		dst: netip.MustParseAddrPort("1.2.3.4:443"),
+	})
+	item := adminConnectionFromUDP(&UDPFlowRuntime{
+		id:       9,
+		network:  "udp4",
+		src:      ue.poolKey.Src,
+		endpoint: ue,
+		binding: UdpFlowBinding{
+			Mac: mac,
+			Egress: UdpEgressBinding{
+				Outbound: group,
+				Target:   "1.2.3.4:443",
+				IsDialIp: true,
+			},
+		},
+	})
+	if item.Dst != "1.2.3.4:443" {
+		t.Fatalf("dst = %q", item.Dst)
+	}
+	if item.Mac != "3e:0a:a5:de:ae:a3" {
+		t.Fatalf("mac = %q", item.Mac)
+	}
+	if item.Dst == "invalid AddrPort" || item.Src == "invalid AddrPort" {
+		t.Fatalf("leaked zero AddrPort: %+v", item)
+	}
+	if formatAddrPort(netip.AddrPort{}) != "" {
+		t.Fatalf("zero AddrPort should render empty")
+	}
+}
+
 func TestAdminConnectionsSnapshotTruncates(t *testing.T) {
 	manager := NewSessionManager(context.Background())
 	t.Cleanup(func() { _ = manager.Close() })

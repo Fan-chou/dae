@@ -37,6 +37,7 @@ type UdpEgressBinding struct {
 type UdpFlowBinding struct {
 	Route  UdpRouteBinding
 	Egress UdpEgressBinding
+	Mac    [6]uint8
 }
 
 func newUdpFlowBinding(policyEpoch routing.PolicyEpoch, outboundIndex consts.OutboundIndex, mark uint32, must bool, option *DialOption) UdpFlowBinding {

@@ -624,16 +624,12 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		startUnixNano: time.Now().UnixNano(),
 		src:           endpoint.poolKey.Src,
 		dst:           endpoint.poolKey.Dst,
+		mac:           udpFlowMac(endpoint, binding),
 		network:       flowNetworkName(true, endpoint.poolKey.Src.Addr()),
 		ctx:           ctx,
 		cancel:        cancel,
 		egressLease:   lease,
 	}
-	endpoint.routingMu.RLock()
-	if endpoint.hasRoutingCache {
-		flow.mac = endpoint.routingCache.Mac
-	}
-	endpoint.routingMu.RUnlock()
 
 	m.mu.Lock()
 	if m.closed {
