@@ -83,6 +83,7 @@ install -m 0755 "$ROOT/openwrt/kdae/files/dae.init" "$kdae_data/etc/init.d/dae"
 install -m 0644 "$ROOT/openwrt/kdae/files/dae.config" "$kdae_data/etc/config/dae"
 install -m 0644 "$ROOT/example.dae" "$kdae_data/etc/dae/example.dae"
 install -m 0644 "$ROOT/openwrt/kdae/files/dae.keep" "$kdae_data/lib/upgrade/keep.d/dae"
+dae_uci_md5=$(md5sum "$kdae_data/etc/config/dae" | awk '{print $1}')
 pack_ipk kdae "$ARCH" "Package: kdae
 Version: $PKGVER
 Depends: libc, ca-bundle, kmod-sched-core, kmod-sched-bpf, kmod-xdp-sockets-diag, kmod-veth
@@ -93,6 +94,8 @@ Section: net
 Architecture: $ARCH
 Maintainer: kdae local feed
 Description: kdae eBPF transparent proxy (installs as /usr/bin/dae). Sockmap off by default.
+Conffiles:
+ /etc/config/dae $dae_uci_md5
 " "$kdae_data"
 rm -rf "$kdae_data"
 

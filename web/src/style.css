@@ -1,4 +1,80 @@
 @import "tailwindcss";
+
 @plugin "daisyui" {
-  themes: night --default;
+  themes: light --default, dark --prefersdark;
+}
+
+@plugin "daisyui/theme" {
+  name: "light";
+  default: true;
+  --color-primary: #6865c6;
+  --color-primary-content: #ffffff;
+  --color-secondary: #0071e3;
+  --color-secondary-content: #ffffff;
+  --color-accent: #34c759;
+  --color-accent-content: #ffffff;
+  --color-neutral: #3a3a3a;
+  --color-neutral-content: #f5f5f7;
+  --color-base-100: #ffffff;
+  --color-base-200: #f5f5f7;
+  --color-base-300: #d2d2d7;
+  --color-base-content: #1d1d1f;
+  --color-info: #5ac8fa;
+  --color-info-content: #ffffff;
+  --color-success: #34c759;
+  --color-success-content: #ffffff;
+  --color-warning: #ff9500;
+  --color-warning-content: #ffffff;
+  --color-error: #ff3b30;
+  --color-error-content: #ffffff;
+  --radius-selector: 0.625rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "dark";
+  prefersdark: true;
+  color-scheme: dark;
+  --color-primary: #8583e9;
+  --color-primary-content: #ffffff;
+  --color-secondary: #2997ff;
+  --color-secondary-content: #ffffff;
+  --color-accent: #30d158;
+  --color-accent-content: #ffffff;
+  --color-neutral: #5e5e5e;
+  --color-neutral-content: #f5f5f7;
+  --color-base-100: #1d1d1f;
+  --color-base-200: #000000;
+  --color-base-300: #424245;
+  --color-base-content: #f5f5f7;
+  --color-info: #64d2ff;
+  --color-info-content: #ffffff;
+  --color-success: #30d158;
+  --color-success-content: #1c1c1e;
+  --color-warning: #ff9f0a;
+  --color-warning-content: #1c1c1e;
+  --color-error: #ff453a;
+  --color-error-content: #ffffff;
+  --radius-selector: 0.625rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+.kdae-zebra tbody tr:nth-child(even) {
+  background-color: color-mix(in oklab, var(--color-base-content) 8%, var(--color-base-100));
+}
+
+.kdae-log-odd {
+  background-color: var(--color-base-100);
+}
+
+.kdae-log-even {
+  background-color: color-mix(in oklab, var(--color-base-content) 8%, var(--color-base-100));
 }

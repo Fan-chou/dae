@@ -24,6 +24,12 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
   },
+  worker: {
+    format: "es",
+  },
+  optimizeDeps: {
+    include: ["monaco-editor/esm/vs/editor/editor.api"],
+  },
   test: {
     environment: "node",
   },

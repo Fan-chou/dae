@@ -67,25 +67,32 @@ function downloadLogs(): void {
       </button>
       <button class="btn btn-sm" type="button" @click="clearLogs">清空</button>
       <button class="btn btn-sm" type="button" @click="downloadLogs">下载</button>
-      <span class="opacity-60 text-sm">{{ filteredLogs.length }} / {{ ui.logs.length }}</span>
+      <span class="text-sm opacity-60">{{ filteredLogs.length }} / {{ ui.logs.length }}</span>
     </div>
+    <p class="text-sm opacity-70">
+      这里的级别是<strong>前端筛选已采集日志</strong>，不会改 dae 的 <code>log_level</code>。配置写成
+      <code>info</code> 时进程根本不会写出 debug/trace，把筛选改成 debug 只会得到空列表。
+    </p>
     <div v-if="!filteredLogs.length" class="alert">暂无日志</div>
-    <article v-for="entry in filteredLogs" :key="entry.seq" class="card bg-base-200">
-      <div class="card-body p-3 gap-1">
-        <div class="flex flex-wrap gap-2 text-xs opacity-80">
-          <span>{{ entry.seqLabel }}</span>
-          <span v-if="entry.timeShort">{{ entry.timeShort }}</span>
-          <span class="badge badge-outline">{{ entry.level }}</span>
-          <span class="badge">{{ entry.kindLabel }}</span>
-          <span v-if="entry.match" class="badge badge-info">{{ entry.match }}</span>
-        </div>
-        <div v-if="entry.conn" class="font-mono text-sm">{{ entry.conn.from }} ↔ {{ entry.conn.to }}</div>
-        <div v-else class="text-sm">{{ entry.msg }}</div>
-        <div v-if="entry.chips.length" class="flex flex-wrap gap-1">
-          <span v-for="chip in entry.chips" :key="chip.k" class="badge badge-ghost badge-sm">
-            <b class="mr-1">{{ chip.k }}</b>{{ chip.v }}
-          </span>
-        </div>
+    <article
+      v-for="(entry, index) in filteredLogs"
+      :key="entry.seq"
+      class="rounded-box border border-base-300 p-3"
+      :class="index % 2 ? 'kdae-log-even' : 'kdae-log-odd'"
+    >
+      <div class="flex flex-wrap gap-2 text-xs opacity-80">
+        <span>{{ entry.seqLabel }}</span>
+        <span v-if="entry.timeShort">{{ entry.timeShort }}</span>
+        <span class="badge badge-outline">{{ entry.level }}</span>
+        <span class="badge">{{ entry.kindLabel }}</span>
+        <span v-if="entry.match" class="badge badge-info">{{ entry.match }}</span>
+      </div>
+      <div v-if="entry.conn" class="font-mono text-sm">{{ entry.conn.from }} ↔ {{ entry.conn.to }}</div>
+      <div v-else class="text-sm">{{ entry.msg }}</div>
+      <div v-if="entry.chips.length" class="mt-1 flex flex-wrap gap-1">
+        <span v-for="chip in entry.chips" :key="chip.k" class="badge badge-ghost badge-sm">
+          <b class="mr-1">{{ chip.k }}</b>{{ chip.v }}
+        </span>
       </div>
     </article>
   </div>

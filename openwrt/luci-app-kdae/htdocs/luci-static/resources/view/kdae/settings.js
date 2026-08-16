@@ -33,7 +33,7 @@ function renderStatus(isRunning) {
 return view.extend({
 	render() {
 		const m = new form.Map('dae', _('kdae'),
-			_('eBPF 透明代理。选组请打开面板；本页管启停、接口、订阅和热重载。'));
+			_('eBPF 透明代理。选组、连接表、分流编辑请打开面板；本页管启停、接口、订阅和热重载。'));
 
 		let s = m.section(form.TypedSection);
 		s.anonymous = true;

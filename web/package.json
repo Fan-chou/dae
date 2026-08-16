@@ -15,6 +15,7 @@
     "axios": "^1.11.0",
     "dayjs": "^1.11.13",
     "echarts": "^5.6.0",
+    "monaco-editor": "^0.52.2",
     "pretty-bytes": "^7.0.0",
     "vue": "^3.5.18",
     "vue-i18n": "^11.1.11",
@@ -33,6 +34,8 @@
     "vue-tsc": "^3.0.6"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

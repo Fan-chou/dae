@@ -7,7 +7,7 @@
 return view.extend({
 	render() {
 		const m = new form.Map('dae', _('配置'),
-			_('编辑 /etc/dae/config.dae。节点 URI 请放在 nodes.dae（0600），不要贴到这里。保存后请先校验再热重载。'));
+			_('编辑 /etc/dae/config.dae 的 include/global/dns/routing。节点 URI 在 nodes.dae（0600），routing.dae 请用 kdae-ui 配置页。保存后请先校验再热重载。'));
 
 		m.section(form.TypedSection).anonymous = true;
 
