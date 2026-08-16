@@ -20,7 +20,7 @@ export const i18n = createI18n({
         note: "这是 kdae 抓住的流，不是整机 conntrack。页隐藏时暂停轮询。",
       },
       config: {
-        placeholder: "配置编辑在后续步骤开放。此处不打开 nodes.dae。",
+        note: "只编辑 config.dae 的 global+routing 和 routing.dae。不会打开 nodes.dae；保存时 validate 成功才写盘并热重载。admin_secret 显示为占位符，提交时保留磁盘原值。",
       },
     },
   },

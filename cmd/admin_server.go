@@ -28,7 +28,7 @@ import (
 
 const (
 	adminReadTimeout     = 10 * time.Second
-	adminWriteTimeout    = 15 * time.Second
+	adminWriteTimeout    = 30 * time.Second
 	adminShutdownTimeout = 2 * time.Second
 	adminMaxLogLines     = 500
 	adminDefaultLogLines = 200
@@ -134,6 +134,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/groups", s.withAdminAuth(s.handleGroups))
 	mux.HandleFunc("/v1/groups/", s.withAdminAuth(s.handleGroup))
 	mux.HandleFunc("/v1/connections", s.withAdminAuth(s.handleConnections))
+	mux.HandleFunc("/v1/config", s.withAdminAuth(s.handleConfig))
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
 	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
 	server := &http.Server{
@@ -305,6 +306,33 @@ func (s *adminServer) handleConnections(w http.ResponseWriter, r *http.Request) 
 	}
 	snap := plane.AdminConnections(limit, r.URL.Query().Get("outbound"), r.URL.Query().Get("src"), r.URL.Query().Get("mac"))
 	writeAdminJSON(w, http.StatusOK, snap)
+}
+
+func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		body, err := loadAdminConfig(s.configDir)
+		if err != nil {
+			writeAdminError(w, http.StatusInternalServerError, sanitizeAdminError(err))
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, body)
+	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, adminMaxConfigBytes)
+		var body adminConfigBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		queued, err := applyAdminConfig(s.configDir, body, s.reload)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, adminReloadBody{Queued: queued})
+	default:
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {

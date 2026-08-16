@@ -68,6 +68,11 @@ export type ConnectionFilter = {
   limit?: number;
 };
 
+export type AdminConfig = {
+  config: string;
+  routing: string;
+};
+
 export type AdminError = {
   error?: string;
 };

@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance } from "axios";
-import type { AdminConnectionsSnapshot, AdminGroup, AdminLogs, AdminReload, AdminStatus, ConnectionFilter } from "./types";
+import type { AdminConfig, AdminConnectionsSnapshot, AdminGroup, AdminLogs, AdminReload, AdminStatus, ConnectionFilter } from "./types";
 
 export class KdaeApiError extends Error {
   status: number;
@@ -20,12 +20,13 @@ export function createClient(baseUrl: string, secret: string): AxiosInstance {
   });
 }
 
-async function request<T>(client: AxiosInstance, path: string, init?: { method?: string; data?: unknown }): Promise<T> {
+async function request<T>(client: AxiosInstance, path: string, init?: { method?: string; data?: unknown; timeout?: number }): Promise<T> {
   try {
     const response = await client.request<T>({
       url: path,
       method: init?.method || "GET",
       data: init?.data,
+      timeout: init?.timeout,
     });
     return response.data;
   } catch (err) {
@@ -76,4 +77,12 @@ export function connectionsPath(filter: ConnectionFilter = {}): string {
 
 export function fetchConnections(client: AxiosInstance, filter: ConnectionFilter = {}): Promise<AdminConnectionsSnapshot> {
   return request(client, connectionsPath(filter));
+}
+
+export function fetchConfig(client: AxiosInstance): Promise<AdminConfig> {
+  return request(client, "/v1/config");
+}
+
+export function putConfig(client: AxiosInstance, body: AdminConfig): Promise<AdminReload> {
+  return request(client, "/v1/config", { method: "PUT", data: body, timeout: 30000 });
 }

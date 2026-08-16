@@ -43,7 +43,7 @@ trap 'rm -f "$hdr" "$body" "$cfg"' EXIT
 {
 	echo 'silent'
 	echo 'show-error'
-	echo 'max-time = 10'
+	echo 'max-time = 30'
 	echo 'http1.1'
 	printf 'url = "%s"\n' "$target"
 	printf 'request = "%s"\n' "${REQUEST_METHOD:-GET}"

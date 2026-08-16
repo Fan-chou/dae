@@ -41,6 +41,14 @@ describe("connectionsPath", () => {
   });
 });
 
+describe("config payloads", () => {
+  it("never ships a node URI in the editor seed", () => {
+    const seed = { config: "global {\n  log_level: info\n  admin_secret: '***'\n}\n", routing: "routing {\n  fallback: direct\n}\n" };
+    expect(JSON.stringify(seed).includes("://")).toBe(false);
+    expect(seed.config.includes("keep-me")).toBe(false);
+  });
+});
+
 describe("mergeConnectionSnapshots", () => {
   const live = {
     id: "1",

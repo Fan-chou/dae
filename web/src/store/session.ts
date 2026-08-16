@@ -1,7 +1,7 @@
 import { computed, reactive } from "vue";
-import { createClient, fetchConnections, fetchGroups, fetchLogs, fetchStatus, postGroupDelay, postReload, putGroupMember } from "@/api/client";
+import { createClient, fetchConfig, fetchConnections, fetchGroups, fetchLogs, fetchStatus, postGroupDelay, postReload, putConfig, putGroupMember } from "@/api/client";
 import { loadSettings, saveSettings, type UiSettings } from "@/api/settings";
-import type { AdminConnection, AdminGroup, AdminStatus, ConnectionFilter } from "@/api/types";
+import type { AdminConfig, AdminConnection, AdminGroup, AdminStatus, ConnectionFilter } from "@/api/types";
 import { parseLogLineSafe, type ParsedLog } from "@/lib/format";
 
 export const ui = reactive({
@@ -13,6 +13,7 @@ export const ui = reactive({
   connectionsTotal: 0,
   connectionsTruncated: false,
   connectionFilter: { outbound: "AI", src: "", mac: "" } as ConnectionFilter,
+  config: { config: "", routing: "" } as AdminConfig,
   error: "",
   notice: "",
   loading: false,
@@ -46,6 +47,9 @@ export async function refresh(page?: string): Promise<void> {
     if (page === "logs" && !ui.logPaused) {
       const body = await fetchLogs(api);
       ui.logs = (body.lines || []).map((raw, i) => parseLogLineSafe(raw, i + 1)).reverse();
+    }
+    if (page === "config") {
+      ui.config = await fetchConfig(api);
     }
     ui.error = "";
   } catch (err) {
@@ -81,6 +85,20 @@ export async function reloadPlane(): Promise<void> {
   try {
     const body = await postReload(client());
     ui.notice = body.queued ? "已排队热重载" : "重载忙，稍后再试";
+  } catch (err) {
+    ui.error = err instanceof Error ? err.message : String(err);
+  }
+}
+
+export async function saveConfig(): Promise<void> {
+  ui.notice = "";
+  ui.error = "";
+  try {
+    const body = await putConfig(client(), {
+      config: ui.config.config,
+      routing: ui.config.routing,
+    });
+    ui.notice = body.queued ? "已保存并排队热重载" : "已保存，热重载忙或未启用";
   } catch (err) {
     ui.error = err instanceof Error ? err.message : String(err);
   }
