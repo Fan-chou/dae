@@ -138,11 +138,28 @@ Description: LuCI for kdae start/stop, validate, reload, and rule-sync.
 rm -rf "$luci_data"
 
 # --- kdae-ui ---
+echo ">> building kdae-ui"
+PNPM=${PNPM:-pnpm}
+if ! command -v "$PNPM" >/dev/null 2>&1; then
+	echo "pnpm is required to build kdae-ui (set PNPM=... if it is not on PATH)" >&2
+	exit 1
+fi
+(cd "$ROOT/web" && "$PNPM" build)
 ui_data=$(mktemp -d)
-mkdir -p "$ui_data/www/kdae-ui" "$ui_data/www/cgi-bin"
-install -m 0644 "$ROOT/web/index.html" "$ROOT/web/style.css" "$ROOT/web/app.js" \
-	"$ROOT/web/vue.global.prod.js" "$ui_data/www/kdae-ui/"
+mkdir -p "$ui_data/www/kdae-ui/assets" "$ui_data/www/cgi-bin"
+install -m 0644 "$ROOT/web/dist/index.html" "$ui_data/www/kdae-ui/"
+cp -a "$ROOT/web/dist/assets/." "$ui_data/www/kdae-ui/assets/"
 install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-proxy.cgi" "$ui_data/www/cgi-bin/kdae-proxy"
+if [ -e "$ui_data/www/kdae-ui/vue.global.prod.js" ] || [ -e "$ui_data/www/kdae-ui/app.js" ]; then
+	echo "kdae-ui ipk must not ship vue.global.prod.js or app.js" >&2
+	rm -rf "$ui_data"
+	exit 1
+fi
+if ! grep -q '/kdae-ui/assets/' "$ui_data/www/kdae-ui/index.html"; then
+	echo "kdae-ui index.html is missing hashed Vite assets" >&2
+	rm -rf "$ui_data"
+	exit 1
+fi
 pack_ipk kdae-ui all "Package: kdae-ui
 Version: $PKGVER
 Depends: libc
