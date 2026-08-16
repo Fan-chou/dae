@@ -18,13 +18,18 @@ import (
 )
 
 type stubAdminPlane struct {
-	status    control.AdminStatus
-	groups    []control.AdminGroup
-	setErr    error
-	setGroup  string
-	setMember string
-	delayErr  error
-	delayFor  string
+	status       control.AdminStatus
+	groups       []control.AdminGroup
+	setErr       error
+	setGroup     string
+	setMember    string
+	delayErr     error
+	delayFor     string
+	connLimit    int
+	connOutbound string
+	connSrc      string
+	connMac      string
+	connections  control.AdminConnectionsSnapshot
 }
 
 func (s *stubAdminPlane) AdminGroups() []control.AdminGroup { return s.groups }
@@ -44,6 +49,16 @@ func (s *stubAdminPlane) SetGroupSelection(groupName, memberName string) error {
 func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
 	s.delayFor = groupName
 	return s.delayErr
+}
+func (s *stubAdminPlane) AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot {
+	s.connLimit = limit
+	s.connOutbound = outbound
+	s.connSrc = src
+	s.connMac = mac
+	if s.connections.Connections == nil {
+		return control.AdminConnectionsSnapshot{Connections: []control.AdminConnection{}}
+	}
+	return s.connections
 }
 
 func TestAdminBearerAndCORS(t *testing.T) {
@@ -187,5 +202,55 @@ func TestAdminPostGroupDelayDoesNotReload(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "://") {
 		t.Fatalf("delay JSON leaked a URI: %s", rec.Body.String())
+	}
+}
+
+func TestAdminGetConnectionsForwardsFiltersAndOmitsURI(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{
+		connections: control.AdminConnectionsSnapshot{
+			Total: 1,
+			Connections: []control.AdminConnection{{
+				ID:       "1",
+				Network:  "tcp",
+				Src:      "192.168.124.202:44321",
+				Dst:      "api2.cursor.sh:443",
+				Mac:      "3e:0a:a5:de:ae:a3",
+				Outbound: "AI",
+				Dialer:   "US_Dmit_LAX_Hysteria",
+				Policy:   "fixed",
+				Upload:   32,
+			}},
+		},
+	}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.secret = "test-token"
+	req := httptest.NewRequest(http.MethodGet, "/v1/connections?outbound=AI&src=192.168.124.202&mac=3e:0a&limit=64", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleConnections)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET connections status = %d body %s", rec.Code, rec.Body.String())
+	}
+	if plane.connLimit != 64 || plane.connOutbound != "AI" || plane.connSrc != "192.168.124.202" || plane.connMac != "3e:0a" {
+		t.Fatalf("filters limit=%d outbound=%q src=%q mac=%q", plane.connLimit, plane.connOutbound, plane.connSrc, plane.connMac)
+	}
+	if strings.Contains(rec.Body.String(), "://") {
+		t.Fatalf("connections JSON leaked a URI: %s", rec.Body.String())
+	}
+	var snap control.AdminConnectionsSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Total != 1 || len(snap.Connections) != 1 || snap.Connections[0].Outbound != "AI" || snap.Connections[0].Dialer != "US_Dmit_LAX_Hysteria" {
+		t.Fatalf("snap = %+v", snap)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/connections?limit=nope", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec = httptest.NewRecorder()
+	server.withAdminAuth(server.handleConnections)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status = %d", rec.Code)
 	}
 }
