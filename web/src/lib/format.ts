@@ -1,3 +1,5 @@
+import type { AdminConnection } from "@/api/types";
+
 const chipKeys = ["dialer", "network", "sniffed", "ip", "policy", "pname", "mac", "outbound"] as const;
 const sensitiveKey = /password|secret|token|uri|url|auth|key$/i;
 
@@ -211,4 +213,37 @@ export function displayedSelected(group: { selected?: string; policy?: string; m
     return alive[0].name;
   }
   return "—";
+}
+
+export function byteRate(prev: number, next: number, elapsedMs: number): number {
+  if (elapsedMs <= 0) return 0;
+  const delta = next - prev;
+  if (delta <= 0) return 0;
+  return (delta * 1000) / elapsedMs;
+}
+
+export type ConnectionView = AdminConnection & {
+  uploadRate: number;
+  downloadRate: number;
+  closed: boolean;
+};
+
+export function mergeConnectionSnapshots(prev: ConnectionView[], live: AdminConnection[], elapsedMs: number): ConnectionView[] {
+  const prevById = new Map(prev.map((row) => [row.id, row]));
+  const liveIds = new Set(live.map((row) => row.id));
+  const rows: ConnectionView[] = live.map((item) => {
+    const last = prevById.get(item.id);
+    return {
+      ...item,
+      uploadRate: last ? byteRate(last.upload, item.upload, elapsedMs) : 0,
+      downloadRate: last ? byteRate(last.download, item.download, elapsedMs) : 0,
+      closed: false,
+    };
+  });
+  for (const row of prev) {
+    if (!liveIds.has(row.id) && !row.closed) {
+      rows.push({ ...row, uploadRate: 0, downloadRate: 0, closed: true });
+    }
+  }
+  return rows;
 }

@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance } from "axios";
-import type { AdminGroup, AdminLogs, AdminReload, AdminStatus } from "./types";
+import type { AdminConnectionsSnapshot, AdminGroup, AdminLogs, AdminReload, AdminStatus, ConnectionFilter } from "./types";
 
 export class KdaeApiError extends Error {
   status: number;
@@ -62,4 +62,18 @@ export function postGroupDelay(client: AxiosInstance, group: string): Promise<{ 
 
 export function postReload(client: AxiosInstance): Promise<AdminReload> {
   return request(client, "/v1/reload", { method: "POST" });
+}
+
+export function connectionsPath(filter: ConnectionFilter = {}): string {
+  const query = new URLSearchParams();
+  if (filter.limit && filter.limit > 0) query.set("limit", String(filter.limit));
+  if (filter.outbound) query.set("outbound", filter.outbound);
+  if (filter.src) query.set("src", filter.src);
+  if (filter.mac) query.set("mac", filter.mac);
+  const encoded = query.toString();
+  return encoded ? "/v1/connections?" + encoded : "/v1/connections";
+}
+
+export function fetchConnections(client: AxiosInstance, filter: ConnectionFilter = {}): Promise<AdminConnectionsSnapshot> {
+  return request(client, connectionsPath(filter));
 }

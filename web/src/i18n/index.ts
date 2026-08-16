@@ -16,8 +16,8 @@ export const i18n = createI18n({
         reload: "热重载",
       },
       connections: {
-        empty: "连接表将在 API 就绪后显示 kdae 抓住的流，不是整机 conntrack。",
-        note: "must_direct 未劫持、block 静默丢、DNS 不在此表。",
+        empty: "暂无 kdae 抓住的流。must_direct 未劫持、block 静默丢、DNS 不在此表。",
+        note: "这是 kdae 抓住的流，不是整机 conntrack。页隐藏时暂停轮询。",
       },
       config: {
         placeholder: "配置编辑在后续步骤开放。此处不打开 nodes.dae。",

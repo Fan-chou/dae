@@ -40,6 +40,34 @@ export type AdminReload = {
   queued: boolean;
 };
 
+export type AdminConnection = {
+  id: string;
+  network: string;
+  src: string;
+  dst: string;
+  domain?: string;
+  mac?: string;
+  outbound: string;
+  dialer?: string;
+  policy?: string;
+  start?: string;
+  upload: number;
+  download: number;
+};
+
+export type AdminConnectionsSnapshot = {
+  total: number;
+  truncated: boolean;
+  connections: AdminConnection[];
+};
+
+export type ConnectionFilter = {
+  outbound?: string;
+  src?: string;
+  mac?: string;
+  limit?: number;
+};
+
 export type AdminError = {
   error?: string;
 };

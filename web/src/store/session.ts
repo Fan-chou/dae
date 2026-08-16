@@ -1,7 +1,7 @@
 import { computed, reactive } from "vue";
-import { createClient, fetchGroups, fetchLogs, fetchStatus, postGroupDelay, postReload, putGroupMember } from "@/api/client";
+import { createClient, fetchConnections, fetchGroups, fetchLogs, fetchStatus, postGroupDelay, postReload, putGroupMember } from "@/api/client";
 import { loadSettings, saveSettings, type UiSettings } from "@/api/settings";
-import type { AdminGroup, AdminStatus } from "@/api/types";
+import type { AdminConnection, AdminGroup, AdminStatus, ConnectionFilter } from "@/api/types";
 import { parseLogLineSafe, type ParsedLog } from "@/lib/format";
 
 export const ui = reactive({
@@ -9,6 +9,10 @@ export const ui = reactive({
   status: null as AdminStatus | null,
   groups: [] as AdminGroup[],
   logs: [] as ParsedLog[],
+  connections: [] as AdminConnection[],
+  connectionsTotal: 0,
+  connectionsTruncated: false,
+  connectionFilter: { outbound: "AI", src: "", mac: "" } as ConnectionFilter,
   error: "",
   notice: "",
   loading: false,
@@ -79,5 +83,29 @@ export async function reloadPlane(): Promise<void> {
     ui.notice = body.queued ? "已排队热重载" : "重载忙，稍后再试";
   } catch (err) {
     ui.error = err instanceof Error ? err.message : String(err);
+  }
+}
+
+export async function refreshConnections(opts?: { silent?: boolean }): Promise<void> {
+  if (!ui.settings.secret) {
+    ui.error = "请先在设置里填写 admin_secret";
+    return;
+  }
+  if (!opts?.silent) ui.loading = true;
+  try {
+    const body = await fetchConnections(client(), {
+      outbound: ui.connectionFilter.outbound?.trim(),
+      src: ui.connectionFilter.src?.trim(),
+      mac: ui.connectionFilter.mac?.trim(),
+      limit: 256,
+    });
+    ui.connections = body.connections || [];
+    ui.connectionsTotal = body.total || 0;
+    ui.connectionsTruncated = !!body.truncated;
+    ui.error = "";
+  } catch (err) {
+    ui.error = err instanceof Error ? err.message : String(err);
+  } finally {
+    if (!opts?.silent) ui.loading = false;
   }
 }

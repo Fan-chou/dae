@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { connectionsPath } from "../api/client";
 import { defaultBaseUrl } from "../api/settings";
-import { logChips, parseLogLine } from "./format";
+import { byteRate, logChips, mergeConnectionSnapshots, parseLogLine } from "./format";
 
 describe("logChips", () => {
   it("keeps mac and outbound, drops URIs", () => {
@@ -31,5 +32,43 @@ describe("parseLogLine", () => {
 describe("defaultBaseUrl", () => {
   it("falls back to cgi proxy without a browser location", () => {
     expect(defaultBaseUrl()).toBe("/cgi-bin/kdae-proxy");
+  });
+});
+
+describe("connectionsPath", () => {
+  it("puts outbound=AI on the query string", () => {
+    expect(connectionsPath({ outbound: "AI", limit: 256 })).toBe("/v1/connections?limit=256&outbound=AI");
+  });
+});
+
+describe("mergeConnectionSnapshots", () => {
+  const live = {
+    id: "1",
+    network: "tcp",
+    src: "192.168.124.202:44321",
+    dst: "api2.cursor.sh:443",
+    mac: "3e:0a:a5:de:ae:a3",
+    outbound: "AI",
+    dialer: "US_Dmit_LAX_Hysteria",
+    upload: 100,
+    download: 200,
+  };
+
+  it("computes rates from two snapshots and marks closed ids for one cycle", () => {
+    expect(byteRate(100, 200, 2000)).toBe(50);
+    const first = mergeConnectionSnapshots([], [live], 0);
+    expect(first[0].uploadRate).toBe(0);
+    const second = mergeConnectionSnapshots(first, [{ ...live, upload: 200, download: 400 }], 2000);
+    expect(second[0].uploadRate).toBe(50);
+    expect(second[0].downloadRate).toBe(100);
+    const closed = mergeConnectionSnapshots(second, [], 2000);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].closed).toBe(true);
+    expect(mergeConnectionSnapshots(closed, [], 2000)).toHaveLength(0);
+  });
+
+  it("does not keep URIs on view rows", () => {
+    const rows = mergeConnectionSnapshots([], [{ ...live, domain: "api2.cursor.sh" }], 0);
+    expect(JSON.stringify(rows).includes("://")).toBe(false);
   });
 });
