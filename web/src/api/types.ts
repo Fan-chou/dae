@@ -14,6 +14,7 @@ export type AdminStatus = {
   udp_sessions?: number;
   rss_bytes?: number;
   fd_count?: number;
+  traffic_samples?: { ts: number; up: number; down: number }[];
 };
 
 export type AdminGroupMember = {

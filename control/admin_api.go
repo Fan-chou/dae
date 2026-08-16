@@ -13,10 +13,26 @@ import (
 // AdminStatus is the JSON body for GET /v1/status. It never includes node
 // URIs or credentials.
 type AdminStatus struct {
-	Version      string   `json:"version"`
-	Running      bool     `json:"running"`
-	LanInterface []string `json:"lan_interface"`
-	WanInterface []string `json:"wan_interface"`
+	Version           string               `json:"version"`
+	Running           bool                 `json:"running"`
+	LanInterface      []string             `json:"lan_interface"`
+	WanInterface      []string             `json:"wan_interface"`
+	UploadRate        uint64               `json:"upload_rate"`
+	DownloadRate      uint64               `json:"download_rate"`
+	UploadTotal       uint64               `json:"upload_total"`
+	DownloadTotal     uint64               `json:"download_total"`
+	ActiveConnections int                  `json:"active_connections"`
+	UDPSessions       int                  `json:"udp_sessions"`
+	RssBytes          uint64               `json:"rss_bytes"`
+	FdCount           int                  `json:"fd_count"`
+	TrafficSamples    []AdminTrafficSample `json:"traffic_samples,omitempty"`
+}
+
+// AdminTrafficSample is one overview chart point. Rates are bytes/sec.
+type AdminTrafficSample struct {
+	TimestampMs  int64  `json:"ts"`
+	UploadRate   uint64 `json:"up"`
+	DownloadRate uint64 `json:"down"`
 }
 
 // AdminGroupMember is one selectable or observed member. Name is the logical
@@ -98,6 +114,24 @@ func (c *ControlPlane) AdminStatusSnapshot(version string) AdminStatus {
 	}
 	status.LanInterface = append([]string(nil), c.lanInterface...)
 	status.WanInterface = append([]string(nil), c.wanInterface...)
+	stats := c.SnapshotRuntimeStats(defaultRuntimeWindowSec, 48)
+	status.UploadRate = stats.UploadRate
+	status.DownloadRate = stats.DownloadRate
+	status.UploadTotal = stats.UploadTotal
+	status.DownloadTotal = stats.DownloadTotal
+	status.ActiveConnections = stats.ActiveConnections
+	status.UDPSessions = stats.UDPSessions
+	status.RssBytes, status.FdCount = readSelfRSSAndFDs()
+	if len(stats.Samples) > 0 {
+		status.TrafficSamples = make([]AdminTrafficSample, 0, len(stats.Samples))
+		for _, sample := range stats.Samples {
+			status.TrafficSamples = append(status.TrafficSamples, AdminTrafficSample{
+				TimestampMs:  sample.Timestamp.UnixMilli(),
+				UploadRate:   sample.UploadRate,
+				DownloadRate: sample.DownloadRate,
+			})
+		}
+	}
 	return status
 }
 

@@ -65,7 +65,10 @@ func TestAdminStatusSnapshotCopiesInterfaces(t *testing.T) {
 	c := &ControlPlane{
 		lanInterface: []string{"br-lan", "Home"},
 		wanInterface: nil,
+		runtimeStats: newRuntimeStats(),
 	}
+	c.recordUploadTraffic(4096)
+	c.recordDownloadTraffic(2048)
 	status := c.AdminStatusSnapshot("test-version")
 	if status.Version != "test-version" || !status.Running {
 		t.Fatalf("status = %#v", status)
@@ -76,5 +79,18 @@ func TestAdminStatusSnapshotCopiesInterfaces(t *testing.T) {
 	status.LanInterface[0] = "mutated"
 	if c.lanInterface[0] != "br-lan" {
 		t.Fatal("AdminStatusSnapshot must copy lan_interface")
+	}
+	if status.UploadTotal != 4096 || status.DownloadTotal != 2048 {
+		t.Fatalf("totals up=%d down=%d", status.UploadTotal, status.DownloadTotal)
+	}
+	if status.RssBytes == 0 || status.FdCount == 0 {
+		t.Fatalf("process metrics rss=%d fd=%d", status.RssBytes, status.FdCount)
+	}
+	body, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "://") {
+		t.Fatalf("status JSON leaked a URI: %s", body)
 	}
 }
