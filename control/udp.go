@@ -519,6 +519,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 			return nil
 		}
 		recordDownload(int64(len(data)))
+		addUDPFlowDownload(ue, len(data))
 		return nil
 	}
 	if err := send(log, data, from, clientAddr, cacheSlot); err != nil {
@@ -534,6 +535,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 		return nil
 	}
 	recordDownload(int64(len(data)))
+	addUDPFlowDownload(ue, len(data))
 	return nil
 }
 
@@ -573,6 +575,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		return true, nil
 	}
 	RecordUploadTraffic(int64(len(data)))
+	addUDPFlowUpload(ue, len(data))
 	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
 		lifecycle.reportTrafficSuccess()
 	}
@@ -1243,6 +1246,7 @@ getNew:
 			goto getNew
 		}
 		c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+		addUDPFlowUpload(ue, len(payloads[packetIndex]))
 		packetIndex++
 	}
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {

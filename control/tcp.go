@@ -309,7 +309,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// the user-space relay. A registered offload session blocks until both
 	// sockets close; any pre-registration failure falls through silently.
 	var offloadErr error
-	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
+	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, flow.recordDownload, flow.recordUpload)
 	if offloadErr != nil {
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
@@ -348,7 +348,7 @@ func relayEstablishedTCPFlow(
 	src netip.AddrPort,
 	dst netip.AddrPort,
 ) error {
-	if err := RelayTCPContextWithRecords(flow.Context(), ingress, egress, RecordDownloadTraffic, RecordUploadTraffic); err != nil {
+	if err := RelayTCPContextWithRecords(flow.Context(), ingress, egress, flow.recordDownload, flow.recordUpload); err != nil {
 		if daerrors.IsIgnorableTCPRelayError(err) {
 			return nil // ignore normal connection closure errors
 		}

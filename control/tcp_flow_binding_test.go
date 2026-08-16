@@ -87,6 +87,31 @@ func TestAdoptTCPStoresConnectionIdentity(t *testing.T) {
 	flow.finish()
 }
 
+func TestFlowRuntimeRecordsBytesWithoutMapLookup(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+	flow, err := manager.adoptTCP(
+		&memoryLayoutConn{id: 2},
+		nil,
+		TcpFlowBinding{},
+		runtime,
+		nil,
+		netip.MustParseAddrPort("192.0.2.1:1"),
+		netip.MustParseAddrPort("198.51.100.1:443"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow.recordUpload(100)
+	flow.recordDownload(250)
+	if flow.uploadBytes.Load() != 100 || flow.downloadBytes.Load() != 250 {
+		t.Fatalf("bytes up=%d down=%d", flow.uploadBytes.Load(), flow.downloadBytes.Load())
+	}
+	flow.finish()
+}
+
 func TestRouteDialReturnsFailedTcpSelection(t *testing.T) {
 	d, _ := newTestEndpointErrorDialer("hysteria2", "proxy.example:443", io.ErrUnexpectedEOF)
 	cp := newTestDialControlPlane(newTestFixedOutboundGroup(d))

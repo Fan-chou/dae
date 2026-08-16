@@ -371,6 +371,40 @@ func (f *FlowRuntime) Binding() TcpFlowBinding {
 	return f.binding
 }
 
+func (f *FlowRuntime) recordUpload(n int64) {
+	RecordUploadTraffic(n)
+	if f == nil || n <= 0 {
+		return
+	}
+	f.uploadBytes.Add(uint64(n))
+}
+
+func (f *FlowRuntime) recordDownload(n int64) {
+	RecordDownloadTraffic(n)
+	if f == nil || n <= 0 {
+		return
+	}
+	f.downloadBytes.Add(uint64(n))
+}
+
+func addUDPFlowUpload(ue *UdpEndpoint, n int) {
+	if n <= 0 || ue == nil {
+		return
+	}
+	if rt := ue.sessionRuntime; rt != nil {
+		rt.uploadBytes.Add(uint64(n))
+	}
+}
+
+func addUDPFlowDownload(ue *UdpEndpoint, n int) {
+	if n <= 0 || ue == nil {
+		return
+	}
+	if rt := ue.sessionRuntime; rt != nil {
+		rt.downloadBytes.Add(uint64(n))
+	}
+}
+
 func flowNetworkName(udp bool, addr netip.Addr) string {
 	proto := "tcp"
 	if udp {
