@@ -1,14 +1,40 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { useDocumentVisibility, useIntervalFn } from "@vueuse/core";
+import { liveLogCap } from "@/lib/format";
 import { refresh, ui } from "@/store/session";
 
 const logFilter = ref("");
 const logLevel = ref("");
 const logKind = ref("");
 
+const visibility = useDocumentVisibility();
+const { pause, resume } = useIntervalFn(
+  () => {
+    if (!ui.logPaused) void refresh("logs", { silent: true });
+  },
+  2000,
+  { immediate: false },
+);
+
 onMounted(() => {
   void refresh("logs");
+  if (visibility.value !== "hidden" && !ui.logPaused) resume();
 });
+onUnmounted(() => {
+  pause();
+});
+watch(visibility, (state) => {
+  if (state === "hidden" || ui.logPaused) pause();
+  else resume();
+});
+watch(
+  () => ui.logPaused,
+  (paused) => {
+    if (paused || visibility.value === "hidden") pause();
+    else resume();
+  },
+);
 
 const filteredLogs = computed(() => {
   const q = logFilter.value.trim().toLowerCase();
@@ -22,7 +48,7 @@ const filteredLogs = computed(() => {
 
 function togglePause(): void {
   ui.logPaused = !ui.logPaused;
-  if (!ui.logPaused) void refresh("logs");
+  if (!ui.logPaused) void refresh("logs", { silent: true });
 }
 
 function clearLogs(): void {
@@ -61,7 +87,7 @@ function downloadLogs(): void {
         <option value="dns">DNS</option>
         <option value="sys">系统</option>
       </select>
-      <input v-model="logFilter" class="input input-bordered input-sm flex-1 min-w-48" placeholder="搜索 payload / outbound / dialer" />
+      <input v-model="logFilter" class="input input-bordered input-sm min-h-10 min-w-0 w-full sm:flex-1" placeholder="搜索 payload / outbound / dialer" />
       <button class="btn btn-sm" :class="{ 'btn-active': ui.logPaused }" type="button" @click="togglePause">
         {{ ui.logPaused ? "继续" : "暂停" }}
       </button>
@@ -70,13 +96,13 @@ function downloadLogs(): void {
       <span class="text-sm opacity-60">{{ filteredLogs.length }} / {{ ui.logs.length }}</span>
     </div>
     <p class="text-sm opacity-70">
-      这里的级别是<strong>前端筛选已采集日志</strong>，不会改 dae 的 <code>log_level</code>。配置写成
-      <code>info</code> 时进程根本不会写出 debug/trace，把筛选改成 debug 只会得到空列表。
+      接口每次取<strong>最新 300 条</strong>，本页每 2 秒合并进来，最多留 {{ liveLogCap }} 条（满了丢掉最旧的）。级别是<strong>前端筛选</strong>，不会改 dae 的
+      <code>log_level</code>。配置写成 <code>info</code> 时进程不会写出 debug/trace。
     </p>
     <div v-if="!filteredLogs.length" class="alert">暂无日志</div>
     <article
       v-for="(entry, index) in filteredLogs"
-      :key="entry.seq"
+      :key="entry.raw + '-' + entry.seq"
       class="rounded-box border border-base-300 p-3"
       :class="index % 2 ? 'kdae-log-even' : 'kdae-log-odd'"
     >
@@ -87,8 +113,8 @@ function downloadLogs(): void {
         <span class="badge">{{ entry.kindLabel }}</span>
         <span v-if="entry.match" class="badge badge-info">{{ entry.match }}</span>
       </div>
-      <div v-if="entry.conn" class="font-mono text-sm">{{ entry.conn.from }} ↔ {{ entry.conn.to }}</div>
-      <div v-else class="text-sm">{{ entry.msg }}</div>
+      <div v-if="entry.conn" class="break-all font-mono text-sm">{{ entry.conn.from }} ↔ {{ entry.conn.to }}</div>
+      <div v-else class="break-all text-sm">{{ entry.msg }}</div>
       <div v-if="entry.chips.length" class="mt-1 flex flex-wrap gap-1">
         <span v-for="chip in entry.chips" :key="chip.k" class="badge badge-ghost badge-sm">
           <b class="mr-1">{{ chip.k }}</b>{{ chip.v }}

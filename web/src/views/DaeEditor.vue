@@ -105,5 +105,5 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="host" class="h-[min(78vh,56rem)] w-full overflow-hidden rounded-box border border-base-300" />
+  <div ref="host" class="h-[min(70vh,56rem)] w-full overflow-hidden rounded-box border border-base-300" />
 </template>

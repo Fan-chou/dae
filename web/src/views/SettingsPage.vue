@@ -26,7 +26,7 @@ function onTheme(event: Event): void {
 </script>
 
 <template>
-  <div class="mx-auto max-w-xl">
+  <div class="mx-auto max-w-xl pb-[env(safe-area-inset-bottom)]">
     <section class="rounded-box border border-base-300 bg-base-100 p-6 shadow">
       <h1 class="text-lg font-semibold">本地设置</h1>
       <p class="mt-2 text-sm leading-relaxed opacity-70">
@@ -55,9 +55,9 @@ function onTheme(event: Event): void {
         </label>
       </div>
 
-      <div class="mt-6 flex flex-wrap gap-2">
-        <button class="btn btn-primary" type="button" @click="save">保存</button>
-        <button class="btn btn-outline" type="button" @click="testConn">测试连接</button>
+      <div class="mt-6 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+        <button class="btn btn-primary w-full sm:w-auto" type="button" @click="save">保存</button>
+        <button class="btn btn-outline w-full sm:w-auto" type="button" @click="testConn">测试连接</button>
       </div>
     </section>
   </div>

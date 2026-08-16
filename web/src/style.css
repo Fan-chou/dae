@@ -67,6 +67,10 @@
   --noise: 0;
 }
 
+html {
+  touch-action: manipulation;
+}
+
 .kdae-zebra tbody tr:nth-child(even) {
   background-color: color-mix(in oklab, var(--color-base-content) 8%, var(--color-base-100));
 }

@@ -1,6 +1,6 @@
 const storageKey = "kdae-ui-prefs";
 
-export type ConnViewMode = "table" | "card";
+export type ConnViewMode = "auto" | "table" | "card";
 export type ConnTab = "active" | "closed" | "all";
 export type GroupSort = "default" | "latency" | "traffic";
 
@@ -18,7 +18,7 @@ export type UiPrefs = {
 
 export const defaultPrefs: UiPrefs = {
   theme: "system",
-  connView: "table",
+  connView: "auto",
   connInterval: 2000,
   connHiddenCols: ["policy"],
   connExclude: "",
@@ -30,9 +30,11 @@ export function loadPrefs(): UiPrefs {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || "{}") as Partial<UiPrefs>;
     const interval = saved.connInterval === 1000 || saved.connInterval === 5000 ? saved.connInterval : 2000;
+    const connView: ConnViewMode =
+      saved.connView === "card" || saved.connView === "table" || saved.connView === "auto" ? saved.connView : "auto";
     return {
       theme: saved.theme === "light" || saved.theme === "dark" ? saved.theme : "system",
-      connView: saved.connView === "card" ? "card" : "table",
+      connView,
       connInterval: interval,
       connHiddenCols: Array.isArray(saved.connHiddenCols) ? saved.connHiddenCols.map(String) : defaultPrefs.connHiddenCols.slice(),
       connExclude: typeof saved.connExclude === "string" ? saved.connExclude : "",

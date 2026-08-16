@@ -5,7 +5,7 @@ import { loadPrefs, savePrefs, type UiPrefs } from "@/api/prefs";
 import { loadSrcMacHints, saveSrcMacHints } from "@/api/srcMac";
 import { loadSettings, saveSettings, type UiSettings } from "@/api/settings";
 import type { AdminConfig, AdminConnection, AdminGroup, AdminStatus, ConnectionFilter } from "@/api/types";
-import { latencyFingerprint, mergeConnectionSnapshots, mergeSrcMacHints, appendTrafficSample, liveSessionTraffic, parseLogLineSafe, type ConnectionView, type ParsedLog, type SrcMacHint, type TrafficSamplePoint } from "@/lib/format";
+import { latencyFingerprint, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, appendTrafficSample, liveSessionTraffic, type ConnectionView, type ParsedLog, type SrcMacHint, type TrafficSamplePoint } from "@/lib/format";
 
 export const ui = reactive({
   settings: loadSettings(),
@@ -67,7 +67,7 @@ export async function refresh(page?: string, opts?: { silent?: boolean }): Promi
     }
     if (page === "logs" && !ui.logPaused) {
       const body = await fetchLogs(api);
-      ui.logs = (body.lines || []).map((raw, i) => parseLogLineSafe(raw, i + 1)).reverse();
+      ui.logs = mergeLogSnapshots(ui.logs, body.lines || []);
     }
     if (page === "config") {
       ui.config = await fetchConfig(api);

@@ -33,7 +33,10 @@ import {
   uniqueOutbounds,
   type ConnectionView,
 } from "@/lib/format";
+import { effectiveConnView, useCompactLayout } from "@/lib/layout";
+import type { ConnViewMode } from "@/api/prefs";
 
+const compact = useCompactLayout();
 const search = ref("");
 const tab = ref<"active" | "closed" | "all">("active");
 const network = ref("");
@@ -263,16 +266,73 @@ function onIntervalChange(event: Event): void {
 function hostOf(row: ConnectionView): string {
   return row.domain || displayEndpoint(row.dst) || "—";
 }
+
+const showCards = computed(() => effectiveConnView(ui.prefs.connView, compact.value) === "card");
+
+function setConnView(mode: ConnViewMode): void {
+  persistPrefs({ connView: mode });
+}
 </script>
 
 <template>
   <div class="flex flex-col gap-3">
     <div class="flex flex-wrap items-center gap-2">
       <div class="join">
-        <button class="btn btn-sm join-item" :class="{ 'btn-active': tab === 'active' }" type="button" @click="tab = 'active'">活动</button>
-        <button class="btn btn-sm join-item" :class="{ 'btn-active': tab === 'closed' }" type="button" @click="tab = 'closed'">刚断开</button>
-        <button class="btn btn-sm join-item" :class="{ 'btn-active': tab === 'all' }" type="button" @click="tab = 'all'">全部</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'active' }" type="button" @click="tab = 'active'">活动</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'closed' }" type="button" @click="tab = 'closed'">刚断开</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'all' }" type="button" @click="tab = 'all'">全部</button>
       </div>
+      <span class="text-sm opacity-70">{{ filteredRows.length }} / {{ ui.connectionsTotal }}{{ ui.connectionsTruncated ? "（截断）" : "" }}</span>
+    </div>
+
+    <details class="rounded-box border border-base-300 bg-base-100 p-3 md:hidden">
+      <summary class="cursor-pointer text-sm font-medium">筛选 · {{ filteredRows.length }} 条</summary>
+      <div class="mt-3 flex flex-col gap-2">
+        <select v-model="ui.connectionFilter.outbound" class="select select-bordered select-sm w-full" @change="onOutboundChange">
+          <option value="">全部出站</option>
+          <option v-for="name in outboundOptions" :key="'m-ob-' + name" :value="name">{{ name }}</option>
+        </select>
+        <select v-model="ui.connectionFilter.src" class="select select-bordered select-sm w-full">
+          <option value="">全部源</option>
+          <option v-for="opt in srcOptions" :key="'m-src-' + opt.value" :value="opt.value">{{ opt.label }}</option>
+        </select>
+        <select v-model="ui.connectionFilter.mac" class="select select-bordered select-sm w-full">
+          <option value="">全部 MAC</option>
+          <option v-for="opt in macOptions" :key="'m-mac-' + opt.value" :value="opt.value">{{ opt.label }}</option>
+        </select>
+        <select v-model="network" class="select select-bordered select-sm w-full">
+          <option value="">协议</option>
+          <option v-for="name in networkOptions" :key="'m-net-' + name" :value="name">{{ name }}</option>
+        </select>
+        <select v-model="dialer" class="select select-bordered select-sm w-full">
+          <option value="">全部节点</option>
+          <option v-for="name in dialerOptions" :key="'m-d-' + name" :value="name">{{ name }}</option>
+        </select>
+        <input v-model="search" class="input input-bordered input-sm w-full" placeholder="空格分隔，同时匹配主机/源/出站/节点" />
+        <label class="flex items-center gap-2 text-sm">
+          <input type="checkbox" class="checkbox checkbox-sm" :checked="ui.prefs.connExcludeOn" @change="onExcludeToggle" />
+          排除
+        </label>
+        <input
+          class="input input-bordered input-sm w-full"
+          :value="ui.prefs.connExclude"
+          placeholder="正则，匹配则隐藏（如 stun|ntp）"
+          @change="onExcludeChange"
+        />
+        <select class="select select-bordered select-sm w-full" :value="String(ui.prefs.connInterval)" @change="onIntervalChange">
+          <option value="1000">1s</option>
+          <option value="2000">2s</option>
+          <option value="5000">5s</option>
+        </select>
+        <div class="join w-full">
+          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'auto' }" type="button" @click="setConnView('auto')">自动</button>
+          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'table' }" type="button" @click="setConnView('table')">表格</button>
+          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'card' }" type="button" @click="setConnView('card')">卡片</button>
+        </div>
+      </div>
+    </details>
+
+    <div class="hidden flex-wrap items-center gap-2 md:flex">
       <select v-model="ui.connectionFilter.outbound" class="select select-bordered select-sm max-w-56" @change="onOutboundChange">
         <option value="">全部出站</option>
         <option v-for="name in outboundOptions" :key="name" :value="name">{{ name }}</option>
@@ -294,9 +354,8 @@ function hostOf(row: ConnectionView): string {
         <option v-for="name in dialerOptions" :key="name" :value="name">{{ name }}</option>
       </select>
       <input v-model="search" class="input input-bordered input-sm min-w-48 flex-1" placeholder="空格分隔，同时匹配主机/源/出站/节点" />
-      <span class="text-sm opacity-70">{{ filteredRows.length }} / {{ ui.connectionsTotal }}{{ ui.connectionsTruncated ? "（截断）" : "" }}</span>
     </div>
-    <div class="flex flex-wrap items-center gap-2">
+    <div class="hidden flex-wrap items-center gap-2 md:flex">
       <label class="flex items-center gap-1 text-sm">
         <input type="checkbox" class="checkbox checkbox-xs" :checked="ui.prefs.connExcludeOn" @change="onExcludeToggle" />
         排除
@@ -313,11 +372,12 @@ function hostOf(row: ConnectionView): string {
         <option value="5000">5s</option>
       </select>
       <div class="join">
-        <button class="btn btn-sm join-item" :class="{ 'btn-active': ui.prefs.connView === 'table' }" type="button" @click="persistPrefs({ connView: 'table' })">表格</button>
-        <button class="btn btn-sm join-item" :class="{ 'btn-active': ui.prefs.connView === 'card' }" type="button" @click="persistPrefs({ connView: 'card' })">卡片</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'auto' }" type="button" @click="setConnView('auto')">自动</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'table' }" type="button" @click="setConnView('table')">表格</button>
+        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'card' }" type="button" @click="setConnView('card')">卡片</button>
       </div>
       <details class="dropdown">
-        <summary class="btn btn-sm">列</summary>
+        <summary class="btn btn-sm min-h-10">列</summary>
         <div class="menu dropdown-content z-20 rounded-box bg-base-100 p-2 shadow">
           <label v-for="col in columnMeta" :key="col.id" class="flex cursor-pointer items-center gap-2 px-2 py-1 text-sm">
             <input type="checkbox" class="checkbox checkbox-xs" :checked="!ui.prefs.connHiddenCols.includes(col.id)" @change="toggleCol(col.id)" />
@@ -328,27 +388,34 @@ function hostOf(row: ConnectionView): string {
     </div>
     <p class="text-sm opacity-70">开始是 kdae 开始跟踪这条流的时间；时长由开始时间推算。这是 tproxy 抓住的流，不是整机 conntrack。</p>
 
-    <div v-if="ui.prefs.connView === 'card'" class="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+    <div v-if="showCards" class="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
       <button
         v-for="row in filteredRows"
         :key="row.id"
         type="button"
-        class="rounded-box border border-base-300 bg-base-100 p-3 text-left shadow"
+        class="min-h-16 rounded-box border border-base-300 bg-base-100 p-3 text-left shadow"
         :class="{ 'opacity-40': row.closed }"
         @click="detailId = detailId === row.id ? '' : row.id"
       >
-        <div class="truncate font-medium">{{ hostOf(row) }}</div>
-        <div class="mt-1 truncate font-mono text-xs opacity-80">{{ row.src }} → {{ row.outbound }} / {{ row.dialer || "—" }}</div>
-        <div class="mt-1 flex flex-wrap gap-2 text-xs opacity-80">
-          <span>{{ row.network }}</span>
-          <span>{{ connectionAge(row.start || "", nowMs) }}</span>
-          <span>上行 {{ prettyBytes(row.uploadRate) }}/s</span>
-          <span>下行 {{ prettyBytes(row.downloadRate) }}/s</span>
-          <span v-if="row.closed" class="badge badge-ghost badge-xs">断开</span>
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0 break-all text-base font-semibold leading-snug">{{ hostOf(row) }}</div>
+          <span v-if="row.closed" class="badge badge-ghost badge-sm shrink-0">断开</span>
         </div>
-        <div v-if="detailId === row.id" class="mt-2 grid grid-cols-2 gap-1 font-mono text-xs">
-          <div>目标 {{ displayEndpoint(row.dst) || "—" }}</div>
-          <div>MAC {{ macCell(row) }}</div>
+        <div class="mt-1 break-all font-mono text-sm font-medium text-primary">{{ displayEndpoint(row.src) || "—" }}</div>
+        <div class="mt-2 flex flex-wrap items-center gap-1.5">
+          <span class="badge badge-primary badge-sm font-semibold">{{ row.outbound || "—" }}</span>
+          <span class="text-sm font-semibold text-secondary">{{ row.dialer || "—" }}</span>
+        </div>
+        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+          <span class="font-semibold text-success">↓ {{ prettyBytes(row.downloadRate) }}/s</span>
+          <span class="font-medium text-info">↑ {{ prettyBytes(row.uploadRate) }}/s</span>
+          <span class="opacity-70">{{ connectionAge(row.start || "", nowMs) }}</span>
+          <span class="opacity-70">{{ row.network }}</span>
+          <span v-if="macCell(row) !== '—'" class="font-mono opacity-70">{{ macCell(row) }}</span>
+        </div>
+        <div v-if="detailId === row.id" class="mt-2 grid grid-cols-1 gap-1 font-mono text-xs sm:grid-cols-2">
+          <div class="break-all">目标 {{ displayEndpoint(row.dst) || "—" }}</div>
+          <div class="break-all">MAC {{ macCell(row) }}</div>
           <div>开始 {{ formatTimeShort(row.start || "") || "—" }}</div>
           <div>上行 {{ prettyBytes(row.upload) }} · 下行 {{ prettyBytes(row.download) }}</div>
         </div>
@@ -374,7 +441,7 @@ function hostOf(row: ConnectionView): string {
                 <FlexRender :render="header.column.columnDef.header" :props="header.getContext()" />
                 <button
                   v-if="header.column.getCanGroup()"
-                  class="btn btn-ghost btn-xs h-5 min-h-5 px-1"
+                  class="btn btn-ghost btn-sm h-8 min-h-8 px-2"
                   type="button"
                   :title="header.column.getIsGrouped() ? '取消分组' : '按此列分组'"
                   @click.stop="header.column.getToggleGroupingHandler()?.()"
@@ -400,7 +467,7 @@ function hostOf(row: ConnectionView): string {
             <td v-for="cell in row.getVisibleCells()" :key="cell.id" class="font-mono whitespace-nowrap">
               <div class="flex items-center gap-1">
                 <template v-if="cell.getIsGrouped()">
-                  <button class="btn btn-ghost btn-xs h-5 min-h-5 px-1" type="button" @click.stop="row.getToggleExpandedHandler()?.()">
+                  <button class="btn btn-ghost btn-sm h-8 min-h-8 px-2" type="button" @click.stop="row.getToggleExpandedHandler()?.()">
                     {{ row.getIsExpanded() ? "−" : "+" }}
                   </button>
                   <FlexRender :render="cell.column.columnDef.cell" :props="cell.getContext()" />
@@ -419,3 +486,4 @@ function hostOf(row: ConnectionView): string {
     </div>
   </div>
 </template>
+

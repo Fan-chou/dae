@@ -74,8 +74,8 @@ function onGroupSort(event: Event): void {
 
 <template>
   <div class="mb-3 flex flex-wrap items-center gap-2">
-    <input v-model="search" class="input input-bordered input-sm min-w-48 flex-1" placeholder="搜索组或节点" />
-    <select class="select select-bordered select-sm" :value="ui.prefs.groupSort" @change="onGroupSort">
+    <input v-model="search" class="input input-bordered input-sm min-h-10 min-w-0 flex-1" placeholder="搜索组或节点" />
+    <select class="select select-bordered select-sm min-h-10" :value="ui.prefs.groupSort" @change="onGroupSort">
       <option value="default">默认顺序</option>
       <option value="latency">按延迟</option>
       <option value="traffic">按下行速率</option>
@@ -93,7 +93,7 @@ function onGroupSort(event: Event): void {
             · ↓ {{ prettyBytes(groupTraffic(group).downloadRate) }}/s
           </div>
         </div>
-        <button class="btn btn-xs btn-outline shrink-0" type="button" :disabled="!!ui.checkingGroups[group.name]" @click="checkGroupDelay(group.name)">
+        <button class="btn btn-sm btn-outline min-h-10 shrink-0" type="button" :disabled="!!ui.checkingGroups[group.name]" @click="checkGroupDelay(group.name)">
           <span v-if="ui.checkingGroups[group.name]" class="loading loading-spinner loading-xs" />
           {{ ui.checkingGroups[group.name] ? "测速中" : "测延迟" }}
         </button>
@@ -103,7 +103,7 @@ function onGroupSort(event: Event): void {
           v-for="member in membersOf(group)"
           :key="member.name"
           type="button"
-          class="rounded-box border bg-base-200 p-3 text-left transition"
+          class="min-h-16 rounded-box border bg-base-200 p-3 text-left transition"
           :class="isCurrent(group, member) ? 'border-success bg-base-100' : 'border-base-300 hover:border-base-content/40'"
           @click="onSelect(group, member)"
         >

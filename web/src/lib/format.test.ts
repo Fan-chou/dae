@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { connectionsPath } from "../api/client";
 import { defaultBaseUrl } from "../api/settings";
-import { applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeSrcMacHints, parseLogLine, rateScale, srcHost, summarizeConnections, uniqueOutbounds } from "./format";
+import { applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, parseLogLine, rateScale, srcHost, summarizeConnections, uniqueOutbounds } from "./format";
+import { effectiveConnView } from "./layout";
 import { lintDae } from "./dae-lint";
 
 describe("logChips", () => {
@@ -159,6 +160,21 @@ describe("rateScale and connection summaries", () => {
     expect(lookupCachedMac([{ src: "192.168.124.202:1", mac: "3e:0a:a5:de:ae:a3" }], "192.168.124.202:9")).toBe(
       "3e:0a:a5:de:ae:a3",
     );
+  });
+
+  it("picks card view on compact screens when connView is auto", () => {
+    expect(effectiveConnView("auto", true)).toBe("card");
+    expect(effectiveConnView("auto", false)).toBe("table");
+    expect(effectiveConnView("table", true)).toBe("table");
+    expect(effectiveConnView("card", false)).toBe("card");
+  });
+
+  it("merges newer log lines past the 300 fetch window", () => {
+    const first = mergeLogSnapshots([], ["old-a", "old-b", "mid"]);
+    expect(first.map((item) => item.raw)).toEqual(["mid", "old-b", "old-a"]);
+    const next = mergeLogSnapshots(first, ["old-b", "mid", "new-1", "new-2"], 4);
+    expect(next.map((item) => item.raw)).toEqual(["new-2", "new-1", "mid", "old-b"]);
+    expect(next[0].seqLabel).toBe("004");
   });
 
   it("summarizes live rows by outbound and hides closed ones", () => {

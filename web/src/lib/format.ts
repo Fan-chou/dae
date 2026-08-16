@@ -177,6 +177,26 @@ export function parseLogLineSafe(raw: string, seq: number): ParsedLog {
   }
 }
 
+export const liveLogCap = 1000;
+
+function numberLogs(rows: ParsedLog[]): ParsedLog[] {
+  return rows.map((entry, index) => ({
+    ...entry,
+    seq: rows.length - index,
+    seqLabel: String(rows.length - index).padStart(3, "0"),
+  }));
+}
+
+export function mergeLogSnapshots(prev: ParsedLog[], incomingOldestFirst: string[], cap = liveLogCap): ParsedLog[] {
+  const incoming = (incomingOldestFirst || []).map((raw, i) => parseLogLineSafe(raw, i + 1)).reverse();
+  if (!incoming.length) return prev;
+  if (!prev.length) return numberLogs(incoming.slice(0, cap));
+  const anchor = prev[0]?.raw;
+  const overlap = incoming.findIndex((entry) => entry.raw === anchor);
+  const fresh = overlap < 0 ? incoming : incoming.slice(0, overlap);
+  return numberLogs(fresh.concat(prev).slice(0, cap));
+}
+
 export function policyLabel(policy: string): string {
   if (policy === "first_alive") return "first_alive（fallback，自动）";
   if (policy === "fixed") return "fixed（select）";

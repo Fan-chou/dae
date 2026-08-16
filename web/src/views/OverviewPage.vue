@@ -166,7 +166,7 @@ watch(
 </script>
 
 <template>
-  <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+  <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">版本</div>
       <div class="stat-value text-lg">{{ ui.status?.version || "—" }}</div>
@@ -215,7 +215,7 @@ watch(
     <h2 class="mb-2 text-base font-semibold">速率（当前会话）</h2>
     <p class="mb-2 text-sm opacity-70">按连接快照差分，约 2 秒一点，最多保留 5 分钟。第一次刷新速率为 0 是正常的。</p>
     <div v-if="ui.trafficSamples.length < 2" class="py-10 text-center text-sm opacity-60">采集中，请稍候…</div>
-    <div v-show="ui.trafficSamples.length >= 2" ref="chartEl" class="h-56 w-full" />
+    <div v-show="ui.trafficSamples.length >= 2" ref="chartEl" class="h-44 w-full md:h-56" />
   </div>
   <div class="mt-4 grid gap-4 lg:grid-cols-2">
     <section class="rounded-box bg-base-100 p-4 shadow">
@@ -225,7 +225,7 @@ watch(
       <div v-for="item in summary.bySrc" :key="'src-' + item.name" class="border-t border-base-300 py-2 text-sm first:border-t-0">
         <div class="truncate font-mono font-medium">{{ item.name }}</div>
         <div v-if="macsForSrc(item.name)" class="truncate text-xs opacity-70">MAC {{ macsForSrc(item.name) }}</div>
-        <div class="text-xs opacity-80">{{ bucketLine(item) }}</div>
+        <div class="text-xs leading-relaxed break-words opacity-80">{{ bucketLine(item) }}</div>
       </div>
     </section>
     <section class="rounded-box bg-base-100 p-4 shadow">
@@ -234,7 +234,7 @@ watch(
       <div v-for="item in summary.byMac" :key="'mac-' + item.name" class="border-t border-base-300 py-2 text-sm first:border-t-0">
         <div class="truncate font-mono font-medium">{{ item.name }}</div>
         <div v-if="srcsForMac(item.name)" class="truncate text-xs opacity-70">源 {{ srcsForMac(item.name) }}</div>
-        <div class="text-xs opacity-80">{{ bucketLine(item) }}</div>
+        <div class="text-xs leading-relaxed break-words opacity-80">{{ bucketLine(item) }}</div>
       </div>
     </section>
     <section class="rounded-box bg-base-100 p-4 shadow">
@@ -242,7 +242,7 @@ watch(
       <div v-if="!summary.byOutbound.length" class="text-sm opacity-60">暂无连接</div>
       <div v-for="item in summary.byOutbound" :key="'ob-' + item.name" class="border-t border-base-300 py-2 text-sm first:border-t-0">
         <div class="truncate font-medium">{{ item.name }}</div>
-        <div class="text-xs opacity-80">{{ bucketLine(item) }}</div>
+        <div class="text-xs leading-relaxed break-words opacity-80">{{ bucketLine(item) }}</div>
       </div>
     </section>
     <section class="rounded-box bg-base-100 p-4 shadow">
@@ -250,7 +250,7 @@ watch(
       <div v-if="!summary.byDialer.length" class="text-sm opacity-60">暂无连接</div>
       <div v-for="item in summary.byDialer" :key="'d-' + item.name" class="border-t border-base-300 py-2 text-sm first:border-t-0">
         <div class="truncate font-medium">{{ item.name }}</div>
-        <div class="text-xs opacity-80">{{ bucketLine(item) }}</div>
+        <div class="text-xs leading-relaxed break-words opacity-80">{{ bucketLine(item) }}</div>
       </div>
     </section>
     <section class="rounded-box bg-base-100 p-4 shadow lg:col-span-2">
@@ -259,7 +259,7 @@ watch(
       <div class="grid gap-2 md:grid-cols-2">
         <div v-for="item in summary.byDomain" :key="'dom-' + item.name" class="border-t border-base-300 py-2 text-sm first:border-t-0">
           <div class="truncate font-mono font-medium">{{ item.name }}</div>
-          <div class="text-xs opacity-80">{{ bucketLine(item) }}</div>
+          <div class="text-xs leading-relaxed break-words opacity-80">{{ bucketLine(item) }}</div>
         </div>
       </div>
     </section>
