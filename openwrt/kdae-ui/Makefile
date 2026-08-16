@@ -25,10 +25,10 @@ endef
 
 define Package/kdae-ui/install
 	$(INSTALL_DIR) $(1)/www/kdae-ui $(1)/www/cgi-bin
-	$(INSTALL_DATA) $(KDAE_SRC)/web/index.html $(1)/www/kdae-ui/
-	$(INSTALL_DATA) $(KDAE_SRC)/web/style.css $(1)/www/kdae-ui/
-	$(INSTALL_DATA) $(KDAE_SRC)/web/app.js $(1)/www/kdae-ui/
-	$(INSTALL_DATA) $(KDAE_SRC)/web/vue.global.prod.js $(1)/www/kdae-ui/
+	$(INSTALL_DATA) $(KDAE_SRC)/web/legacy/index.html $(1)/www/kdae-ui/
+	$(INSTALL_DATA) $(KDAE_SRC)/web/legacy/style.css $(1)/www/kdae-ui/
+	$(INSTALL_DATA) $(KDAE_SRC)/web/legacy/app.js $(1)/www/kdae-ui/
+	$(INSTALL_DATA) $(KDAE_SRC)/web/legacy/vue.global.prod.js $(1)/www/kdae-ui/
 	$(INSTALL_BIN) ./files/kdae-proxy.cgi $(1)/www/cgi-bin/kdae-proxy
 endef
 
