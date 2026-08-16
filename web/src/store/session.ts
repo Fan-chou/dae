@@ -1,5 +1,5 @@
 import { computed, reactive } from "vue";
-import { createClient, fetchGroups, fetchLogs, fetchStatus, postReload, putGroupMember } from "@/api/client";
+import { createClient, fetchGroups, fetchLogs, fetchStatus, postGroupDelay, postReload, putGroupMember } from "@/api/client";
 import { loadSettings, saveSettings, type UiSettings } from "@/api/settings";
 import type { AdminGroup, AdminStatus } from "@/api/types";
 import { parseLogLineSafe, type ParsedLog } from "@/lib/format";
@@ -57,6 +57,17 @@ export async function selectMember(group: AdminGroup, memberName: string): Promi
     await putGroupMember(client(), group.name, memberName);
     group.selected = memberName;
     ui.notice = "已切换 " + group.name + " → " + memberName + "（未 reload）";
+  } catch (err) {
+    ui.error = err instanceof Error ? err.message : String(err);
+  }
+}
+
+export async function checkGroupDelay(groupName: string): Promise<void> {
+  ui.notice = "";
+  try {
+    await postGroupDelay(client(), groupName);
+    ui.notice = "已触发 " + groupName + " 延迟检测";
+    void refresh("groups");
   } catch (err) {
     ui.error = err instanceof Error ? err.message : String(err);
   }

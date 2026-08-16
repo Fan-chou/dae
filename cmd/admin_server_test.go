@@ -23,6 +23,8 @@ type stubAdminPlane struct {
 	setErr    error
 	setGroup  string
 	setMember string
+	delayErr  error
+	delayFor  string
 }
 
 func (s *stubAdminPlane) AdminGroups() []control.AdminGroup { return s.groups }
@@ -38,6 +40,10 @@ func (s *stubAdminPlane) SetGroupSelection(groupName, memberName string) error {
 	s.setGroup = groupName
 	s.setMember = memberName
 	return s.setErr
+}
+func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
+	s.delayFor = groupName
+	return s.delayErr
 }
 
 func TestAdminBearerAndCORS(t *testing.T) {
@@ -154,5 +160,32 @@ func TestTailLogLinesKeepsLastN(t *testing.T) {
 	}
 	if strings.Join(lines, ",") != "b,c" {
 		t.Fatalf("lines = %#v", lines)
+	}
+}
+
+func TestAdminPostGroupDelayDoesNotReload(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{}
+	reloaded := false
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, func() bool {
+		reloaded = true
+		return true
+	})
+	server.secret = "test-token"
+	req := httptest.NewRequest(http.MethodPost, "/v1/groups/AI/delay", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleGroup)(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST delay status = %d body %s", rec.Code, rec.Body.String())
+	}
+	if reloaded {
+		t.Fatal("POST delay must not trigger a full reload")
+	}
+	if plane.delayFor != "AI" {
+		t.Fatalf("delay group = %q", plane.delayFor)
+	}
+	if strings.Contains(rec.Body.String(), "://") {
+		t.Fatalf("delay JSON leaked a URI: %s", rec.Body.String())
 	}
 }

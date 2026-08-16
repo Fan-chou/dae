@@ -2,7 +2,7 @@
 import { onMounted } from "vue";
 import type { AdminGroup, AdminGroupMember } from "@/api/types";
 import { displayedSelected, latencyClass, latencyText, policyLabel } from "@/lib/format";
-import { refresh, selectMember, ui } from "@/store/session";
+import { checkGroupDelay, refresh, selectMember, ui } from "@/store/session";
 
 onMounted(() => {
   void refresh("groups");
@@ -27,6 +27,9 @@ function onSelect(group: AdminGroup, member: AdminGroupMember): void {
           策略 {{ policyLabel(group.policy) }} · 当前
           <span class="text-success font-semibold">{{ displayedSelected(group) }}</span>
         </p>
+        <div class="card-actions justify-end">
+          <button class="btn btn-xs btn-outline" type="button" @click="checkGroupDelay(group.name)">测延迟</button>
+        </div>
         <button
           v-for="member in group.members"
           :key="member.name"

@@ -56,6 +56,10 @@ export function fetchLogs(client: AxiosInstance, n = 300): Promise<AdminLogs> {
   return request(client, "/v1/logs?n=" + encodeURIComponent(String(n)));
 }
 
+export function postGroupDelay(client: AxiosInstance, group: string): Promise<{ group: string; action: string }> {
+  return request(client, "/v1/groups/" + encodeURIComponent(group) + "/delay", { method: "POST" });
+}
+
 export function postReload(client: AxiosInstance): Promise<AdminReload> {
   return request(client, "/v1/reload", { method: "POST" });
 }

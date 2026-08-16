@@ -94,3 +94,21 @@ func TestAdminStatusSnapshotCopiesInterfaces(t *testing.T) {
 		t.Fatalf("status JSON leaked a URI: %s", body)
 	}
 }
+
+func TestTriggerLatencyChecksForGroupRejectsUnknownAndBuiltin(t *testing.T) {
+	t.Parallel()
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{{Name: "AI"}},
+		},
+	}
+	if err := c.TriggerLatencyChecksForGroup("direct"); err == nil {
+		t.Fatal("builtin group should be rejected")
+	}
+	if err := c.TriggerLatencyChecksForGroup("missing"); err == nil {
+		t.Fatal("unknown group should be rejected")
+	}
+	if err := c.TriggerLatencyChecksForGroup("AI"); err != nil {
+		t.Fatalf("AI group: %v", err)
+	}
+}

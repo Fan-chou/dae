@@ -6,9 +6,12 @@
 package control
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 )
 
@@ -27,15 +30,39 @@ func (c *ControlPlane) TriggerLatencyChecks() {
 		return
 	}
 	for _, group := range c.outbounds {
-		if group == nil {
+		c.notifyGroupLatencyChecks(group)
+	}
+}
+
+// TriggerLatencyChecksForGroup asks one outbound group's dialers to refresh
+// latency samples. Built-in groups are rejected.
+func (c *ControlPlane) TriggerLatencyChecksForGroup(name string) error {
+	if c == nil {
+		return fmt.Errorf("control plane is not ready")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || isBuiltinAdminGroup(name) {
+		return fmt.Errorf("invalid group")
+	}
+	for _, group := range c.outbounds {
+		if group == nil || group.Name != name {
 			continue
 		}
-		for _, d := range group.Dialers {
-			if d == nil {
-				continue
-			}
-			d.NotifyCheck()
+		c.notifyGroupLatencyChecks(group)
+		return nil
+	}
+	return fmt.Errorf("unknown group")
+}
+
+func (c *ControlPlane) notifyGroupLatencyChecks(group *outbound.DialerGroup) {
+	if group == nil {
+		return
+	}
+	for _, d := range group.Dialers {
+		if d == nil {
+			continue
 		}
+		d.NotifyCheck()
 	}
 }
 

@@ -39,6 +39,7 @@ type adminPlane interface {
 	AdminGroups() []control.AdminGroup
 	AdminStatusSnapshot(version string) control.AdminStatus
 	SetGroupSelection(groupName, memberName string) error
+	TriggerLatencyChecksForGroup(groupName string) error
 }
 
 type adminPlaneProvider func() adminPlane
@@ -232,13 +233,30 @@ func (s *adminServer) handleGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	name, err := adminGroupNameFromPath(r.URL.Path)
+	name, action, err := parseAdminGroupPath(r.URL.Path)
 	if err != nil {
 		writeAdminError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if action == "delay" {
+		if r.Method != http.MethodPost {
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		plane := s.currentPlane()
+		if plane == nil {
+			writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+			return
+		}
+		if err := plane.TriggerLatencyChecksForGroup(name); err != nil {
+			writeAdminError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeAdminJSON(w, http.StatusAccepted, map[string]string{"group": name, "action": "delay"})
+		return
+	}
+	if r.Method != http.MethodPut {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
@@ -353,15 +371,34 @@ func adminOriginAllowed(origin string) bool {
 }
 
 func adminGroupNameFromPath(path string) (string, error) {
-	const prefix = "/v1/groups/"
-	if !strings.HasPrefix(path, prefix) {
-		return "", fmt.Errorf("group is required")
-	}
-	name, err := url.PathUnescape(strings.Trim(strings.TrimPrefix(path, prefix), "/"))
-	if err != nil || name == "" || strings.Contains(name, "/") {
+	name, action, err := parseAdminGroupPath(path)
+	if err != nil || action != "" {
 		return "", fmt.Errorf("invalid group")
 	}
 	return name, nil
+}
+
+func parseAdminGroupPath(path string) (name, action string, err error) {
+	const prefix = "/v1/groups/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", fmt.Errorf("group is required")
+	}
+	rest := strings.Trim(strings.TrimPrefix(path, prefix), "/")
+	if rest == "" {
+		return "", "", fmt.Errorf("group is required")
+	}
+	parts := strings.Split(rest, "/")
+	name, err = url.PathUnescape(parts[0])
+	if err != nil || name == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("invalid group")
+	}
+	if len(parts) == 1 {
+		return name, "", nil
+	}
+	if len(parts) == 2 && parts[1] == "delay" {
+		return name, "delay", nil
+	}
+	return "", "", fmt.Errorf("invalid group")
 }
 
 func writeAdminJSON(w http.ResponseWriter, status int, body any) {
