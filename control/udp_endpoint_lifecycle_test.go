@@ -166,14 +166,17 @@ func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
 // means a new round is starting and the remote (e.g. a game server) may have
 // reaped the old session. Retiring now lets the next GetOrCreate dial a fresh
 // hy2 session with a new forwarding source port.
+//
+// Rebuild is gated to the game profile (proxy-backed, not H3/DNS ports, no
+// sniffed domain). A nil Dialer is userspace-direct and must not rebuild.
 func TestUdpEndpointWriteToRebuildsStaleSession(t *testing.T) {
 	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
+	ue := newGameProxyEndpoint(t, mock, "203.0.113.1:27015")
 	ue.hasReply.Store(true)
 	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
 	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
 
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	_, err := ue.WriteTo([]byte("hello world"), "203.0.113.1:27015")
 	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
 		t.Fatalf("expected ErrClosedConnection on stale session, got: %v", err)
 	}
@@ -246,6 +249,174 @@ func TestUdpEndpointWriteToProbingNotRebuilt(t *testing.T) {
 	}
 	if ue.dead.Load() {
 		t.Fatal("probing endpoint must not be retired")
+	}
+}
+
+func newGameProxyEndpoint(t *testing.T, conn netproxy.PacketConn, dialTarget string) *UdpEndpoint {
+	t.Helper()
+	d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", conn)
+	ue := newTestEndpoint(conn)
+	ue.Dialer = d
+	ue.DialTarget = dialTarget
+	if ap, err := netip.ParseAddrPort(dialTarget); err == nil {
+		ue.poolKey.Dst = ap
+	}
+	return ue
+}
+
+func markBothDirectionsStale(ue *UdpEndpoint) {
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+}
+
+func TestStaleRebuildTimeout(t *testing.T) {
+	hy2, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", &mockPacketConn{})
+	ss, _ := newCountingProxyEndpointDialer("shadowsocks", "127.0.0.1:8388", &mockPacketConn{})
+	direct, _ := newCountingProxyEndpointDialer("direct", "", &mockPacketConn{})
+
+	tests := []struct {
+		name  string
+		setup func(*UdpEndpoint)
+		want  time.Duration
+	}{
+		{
+			name: "hy2 full-cone game",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = hy2
+				ue.DialTarget = "203.0.113.1:27015"
+			},
+			want: udpEndpointSendStaleTimeout,
+		},
+		{
+			name: "hy2 quic game on non-443",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = hy2
+				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:27015")
+			},
+			want: udpEndpointSendStaleTimeout,
+		},
+		{
+			name: "hy2 h3 on 443",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = hy2
+				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:443")
+			},
+			want: 0,
+		},
+		{
+			name: "hy2 sniffed domain on game port",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = hy2
+				ue.DialTarget = "203.0.113.1:8443"
+				ue.SniffedDomain = "video.example.com"
+			},
+			want: 0,
+		},
+		{
+			name: "hy2 doq 853",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = hy2
+				ue.poolKey.Dst = netip.MustParseAddrPort("1.1.1.1:853")
+			},
+			want: 0,
+		},
+		{
+			name: "userspace direct",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = direct
+				ue.DialTarget = "203.0.113.1:27015"
+			},
+			want: 0,
+		},
+		{
+			name: "shadowsocks",
+			setup: func(ue *UdpEndpoint) {
+				ue.Dialer = ss
+				ue.DialTarget = "203.0.113.1:27015"
+			},
+			want: 0,
+		},
+		{
+			name:  "nil dialer",
+			setup: func(ue *UdpEndpoint) {},
+			want:  0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ue := newTestEndpoint(&mockPacketConn{})
+			tt.setup(ue)
+			if got := ue.staleRebuildTimeout(); got != tt.want {
+				t.Fatalf("staleRebuildTimeout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUdpEndpointWriteToKeepsStaleDirectAndH3(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*UdpEndpoint)
+	}{
+		{
+			name: "userspace direct",
+			setup: func(ue *UdpEndpoint) {
+				d, _ := newCountingProxyEndpointDialer("direct", "", ue.conn)
+				ue.Dialer = d
+				ue.DialTarget = "203.0.113.1:27015"
+			},
+		},
+		{
+			name: "hy2 h3 443",
+			setup: func(ue *UdpEndpoint) {
+				d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", ue.conn)
+				ue.Dialer = d
+				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:443")
+				ue.DialTarget = "203.0.113.1:443"
+			},
+		},
+		{
+			name: "hy2 sniffed video",
+			setup: func(ue *UdpEndpoint) {
+				d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", ue.conn)
+				ue.Dialer = d
+				ue.DialTarget = "203.0.113.1:8443"
+				ue.SniffedDomain = "video.example.com"
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockPacketConn{}
+			ue := newTestEndpoint(mock)
+			tt.setup(ue)
+			markBothDirectionsStale(ue)
+			n, err := ue.WriteTo([]byte("hello world"), ue.DialTarget)
+			if err != nil {
+				t.Fatalf("expected success, got: %v", err)
+			}
+			if n != len("hello world") {
+				t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+			}
+			if ue.dead.Load() {
+				t.Fatal("non-game profile must not rebuild after bidirectional silence")
+			}
+		})
+	}
+}
+
+func TestUdpEndpointWriteToRebuildsStaleQuicGame(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newGameProxyEndpoint(t, mock, "203.0.113.1:27015")
+	markBothDirectionsStale(ue)
+
+	_, err := ue.WriteTo([]byte("hello world"), "203.0.113.1:27015")
+	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
+		t.Fatalf("expected rebuild for non-443 QUIC game, got: %v", err)
+	}
+	if !ue.dead.Load() {
+		t.Fatal("non-443 QUIC game must still rebuild after bidirectional silence")
 	}
 }
 

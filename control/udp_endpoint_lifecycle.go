@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -412,18 +413,29 @@ const udpEndpointWriteTimeout = 10 * time.Second
 // against lingering on a transport that accepts no writes.
 const writeSoftErrorThreshold = 3
 
-// udpEndpointSendStaleTimeout is how long an established endpoint may go
-// without any client send before the next write rebuilds it. A pause this
-// long means the client is starting a new round after an inter-round silence
-// (e.g. between two game matches). Proxy transports (hy2) multiplex many UDP
-// sessions over one QUIC connection and reuse a single forwarding source port
-// per session: when the remote peer reaped the session during the pause, the
-// old source port is no longer recognized and new-round packets are silently
-// ignored. Rebuilding the endpoint allocates a fresh hy2 session and therefore
-// a fresh forwarding port, which the peer treats as a new client. Active
-// gameplay sends heartbeats every tens of milliseconds, so 5s of client
-// silence is a safe "new round" signal and never fires mid-round.
+// udpEndpointSendStaleTimeout is how long a game-shaped established endpoint
+// may stay silent in both directions before the next write rebuilds it.
+// Proxy transports (hy2) multiplex many UDP sessions over one QUIC connection
+// and reuse a single forwarding source port per session: when a game server
+// reaps the session between rounds, the old source port is no longer
+// recognized and new-round packets are silently ignored. Rebuilding allocates
+// a fresh hy2 session and therefore a fresh forwarding port.
+//
+// The timeout is NOT applied to every UDP endpoint. Video/H3 idle gaps (DASH
+// segment pauses of 6–15s) look identical at the packet-timing layer, so
+// staleRebuildTimeout() gates this to the game profile only. Active gameplay
+// keeps at least one direction alive, so the check never fires mid-round.
 const udpEndpointSendStaleTimeout = 5 * time.Second
+
+// udpStaleRebuildSkipPorts are destinations whose idle gaps are application
+// pauses, not "the peer reaped our session". 443 is HTTP/3; 53/853 are DNS
+// (including DNS-over-QUIC). QUIC games on these ports are indistinguishable
+// from video/DNS without ALPN, which the sniffer does not extract today.
+var udpStaleRebuildSkipPorts = map[uint16]struct{}{
+	443: {},
+	53:  {},
+	853: {},
+}
 
 // udpEndpointWriteToleratedError wraps a transient transport write error that
 // the endpoint absorbed without retiring. Callers must drop the datagram and
@@ -436,6 +448,52 @@ func (e *udpEndpointWriteToleratedError) Unwrap() error { return e.err }
 func isUdpEndpointWriteTolerated(err error) bool {
 	var tolerated *udpEndpointWriteToleratedError
 	return stderrors.As(err, &tolerated)
+}
+
+// staleRebuildTimeout returns how long both directions may stay silent before
+// WriteTo rebuilds the endpoint. Zero means never rebuild on silence: the
+// original 5s timer is a game-server session-reap heuristic and mis-fires on
+// video/H3 DASH gaps, DNS, userspace direct, and stateless proxies.
+//
+// QUIC games vs HTTP/3: the sniffer extracts SNI, not ALPN, so we cannot see
+// "h3" vs a proprietary game QUIC. The practical split is destination port
+// plus sniffed domain — 443/SNI is H3/video; non-443 QUIC without a domain
+// (typical game ports) keeps the 5s rebuild.
+func (ue *UdpEndpoint) staleRebuildTimeout() time.Duration {
+	if ue == nil || !isProxyBackedDialer(ue.Dialer) {
+		return 0
+	}
+	if isStatelessProxyBackedUdpProtocol(ue.Dialer) {
+		return 0
+	}
+	if ue.SniffedDomain != "" {
+		return 0
+	}
+	if _, skip := udpStaleRebuildSkipPorts[ue.udpEndpointDstPort()]; skip {
+		return 0
+	}
+	return udpEndpointSendStaleTimeout
+}
+
+func (ue *UdpEndpoint) udpEndpointDstPort() uint16 {
+	if ue == nil {
+		return 0
+	}
+	if ue.poolKey.Dst.IsValid() {
+		return ue.poolKey.Dst.Port()
+	}
+	if ap, err := netip.ParseAddrPort(ue.DialTarget); err == nil {
+		return ap.Port()
+	}
+	_, portStr, err := net.SplitHostPort(ue.DialTarget)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return 0
+	}
+	return uint16(port)
 }
 
 // armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
@@ -505,32 +563,29 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// lastSendNano reflects the actual send completion.
 	now := time.Now()
 
-	// A session that was established (hasReply) but whose both directions
-	// went silent for udpEndpointSendStaleTimeout is presumed to be starting
-	// a new round after an inter-round pause. The remote (e.g. a game server)
-	// may have reaped the old session, so rebuilding the endpoint yields a
-	// fresh hy2 session with a new forwarding source port that the peer
-	// recognizes as a new client. Without this, dae keeps writing to the same
-	// hy2 session whose source port the peer no longer answers, and the next
-	// round never starts. The check uses the newer of the client-send and
-	// upstream-reply timestamps, so active gameplay — where the server keeps
-	// replying even if the client briefly pauses — never rebuilds mid-round.
+	// Game-shaped sessions that were established (hasReply) but whose both
+	// directions went silent for staleRebuildTimeout() are presumed to be
+	// starting a new round. The remote may have reaped the old session, so
+	// rebuilding yields a fresh forwarding source port. Video/H3, DNS, direct
+	// and stateless proxies skip this (timeout == 0): their idle gaps are not
+	// inter-round reaps. The check uses the newer of lastSend/lastReply, so
+	// a live server reply during a client loading screen never rebuilds.
 	// This runs before the write refreshes lastSendNano, firing only on the
 	// first packet after the silence.
 	if ue.hasReply.Load() {
-		lastSend := ue.lastSendNano.Load()
-		lastReply := ue.lastReplyNano.Load()
-		last := lastSend
-		if lastReply > last {
-			last = lastReply
-		}
-		if last != 0 {
-			if now.UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
+		if timeout := ue.staleRebuildTimeout(); timeout > 0 {
+			lastSend := ue.lastSendNano.Load()
+			lastReply := ue.lastReplyNano.Load()
+			last := lastSend
+			if lastReply > last {
+				last = lastReply
+			}
+			if last != 0 && now.UnixNano()-last >= int64(timeout) {
 				ue.retire()
 				// ErrClosedConnection is classified as a normal UDP endpoint
 				// closure, so the retry removes the stale endpoint and dials a
 				// fresh hy2 session without penalizing the underlying dialer.
-				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, udpEndpointSendStaleTimeout)
+				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, timeout)
 			}
 		}
 	}
