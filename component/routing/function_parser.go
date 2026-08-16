@@ -82,12 +82,17 @@ func L4ProtoParserFactory(callback func(f *config_parser.Function, l4protoType c
 	return func(log *logrus.Logger, f *config_parser.Function, key string, paramValueGroup []string, overrideOutbound *Outbound) (err error) {
 		var l4protoType consts.L4ProtoType
 		for _, v := range paramValueGroup {
-			switch v {
+			switch strings.ToLower(v) {
 			case "tcp":
 				l4protoType |= consts.L4ProtoType_TCP
 			case "udp":
 				l4protoType |= consts.L4ProtoType_UDP
+			default:
+				return fmt.Errorf("unknown l4proto: %q (want tcp or udp)", v)
 			}
+		}
+		if l4protoType == 0 {
+			return fmt.Errorf("l4proto requires tcp and/or udp")
 		}
 		return callback(f, l4protoType, overrideOutbound)
 	}

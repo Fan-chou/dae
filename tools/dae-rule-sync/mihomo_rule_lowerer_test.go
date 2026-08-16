@@ -114,6 +114,9 @@ func TestLowerMihomoRuleEmitsSipMatchMacFromANDActionOption(t *testing.T) {
 	if len(got) != 3 || got[0].Name != "l4proto" || got[1].Name != "dport" {
 		t.Fatalf("functions = %#v, want l4proto && dport && sip(match_mac:)", got)
 	}
+	if len(got[0].Params) != 1 || got[0].Params[0].Val != "udp" {
+		t.Fatalf("l4proto params = %#v, want lowercase udp (dae only matches tcp/udp)", got[0].Params)
+	}
 	sip := got[2]
 	if sip.Name != "sip" || len(sip.Params) != 1 || sip.Params[0].Key != "match_mac" || sip.Params[0].Val != "192.168.124.142/32" {
 		t.Fatalf("sip params = %#v, want match_mac:192.168.124.142/32", sip.Params)
@@ -136,6 +139,9 @@ func TestLowerMihomoRuleEmitsSipMatchMacFromIPCIDRSrcAndAction(t *testing.T) {
 	}
 	if len(lowered) != 1 || len(lowered[0].Rule.AndFunctions) != 2 {
 		t.Fatalf("lowered = %#v, want l4proto && sip(match_mac:)", lowered)
+	}
+	if proto := lowered[0].Rule.AndFunctions[0]; proto.Name != "l4proto" || len(proto.Params) != 1 || proto.Params[0].Val != "tcp" {
+		t.Fatalf("l4proto params = %#v, want lowercase tcp", lowered[0].Rule.AndFunctions[0].Params)
 	}
 	sip := lowered[0].Rule.AndFunctions[1]
 	if sip.Name != "sip" || len(sip.Params) != 1 || sip.Params[0].Key != "match_mac" || sip.Params[0].Val != "192.0.2.1/32" {

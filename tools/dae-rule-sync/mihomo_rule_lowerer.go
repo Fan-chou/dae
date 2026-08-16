@@ -438,6 +438,13 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 		functionName = "sport"
 	case "NETWORK":
 		functionName = "l4proto"
+		for i := range params {
+			normalized := strings.ToLower(params[i].Val)
+			if normalized != "tcp" && normalized != "udp" {
+				return nil, mihomoLoweringError(source, fmt.Sprintf("unsupported NETWORK value %q", params[i].Val))
+			}
+			params[i].Val = normalized
+		}
 	case "PROCESS-NAME":
 		functionName = "pname"
 	case "IN-PORT", "IP-ASN":
