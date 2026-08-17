@@ -70,9 +70,13 @@ var (
 	// cleanup rounds required before leaving pressure mode.
 	connStateJanitorPressureExitRounds = 3
 
-	// TCP ACTIVE state has no age timeout because an idle socket can remain valid
-	// indefinitely. FIN/RST transitions state to CLOSING for prompt cleanup.
-	tcpConnStateTimeoutClosing = 10 * time.Second
+	tcpConnStateClosing uint8 = 1
+
+	// Cilium CT defaults: SYN-only 60s, established 8000s (2h13m20s),
+	// FIN/RST 10s. UDP timeouts are unchanged.
+	tcpConnStateTimeoutSyn         = 60 * time.Second
+	tcpConnStateTimeoutEstablished = 8000 * time.Second
+	tcpConnStateTimeoutClosing     = 10 * time.Second
 )
 
 type mapCleanupStats struct {
@@ -264,6 +268,25 @@ func (c *ControlPlane) stopConnStateJanitor() {
 	})
 }
 
+// tcpConnStateExpireTimeoutNs returns the idle timeout for an unpinned TCP
+// conn_state entry. Matches Cilium CT: SYN-only 60s, established 8000s,
+// CLOSING 10s. Aggressive mode halves each timeout, same as UDP.
+func tcpConnStateExpireTimeoutNs(state, seenNonSyn uint8, aggressive bool) int64 {
+	var timeout time.Duration
+	switch {
+	case state == tcpConnStateClosing:
+		timeout = tcpConnStateTimeoutClosing
+	case seenNonSyn == 0:
+		timeout = tcpConnStateTimeoutSyn
+	default:
+		timeout = tcpConnStateTimeoutEstablished
+	}
+	if aggressive {
+		timeout /= 2
+	}
+	return timeout.Nanoseconds()
+}
+
 // cleanupConnStateMap performs a single-pass scan of ConnStateMap, classifying
 // entries by L4 protocol and applying protocol-specific timeout/expiry logic.
 // This replaces the former separate cleanupUdpConnStateMap + cleanupTcpConnStateMap
@@ -298,9 +321,6 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	normalTimeoutNano := QuicNatTimeout.Nanoseconds()
 	aggressiveTimeout := normalTimeoutNano / 2
 	aggressiveDnsTimeout := dnsTimeoutNano / 2
-
-	closingTimeoutNano := tcpConnStateTimeoutClosing.Nanoseconds()
-	aggressiveClosingTimeout := closingTimeoutNano / 2
 
 	scratch := c.connStateJanitorScratch()
 	udpKeysToDelete := takeJanitorDeleteScratch(scratch.udpDelete)
@@ -356,18 +376,8 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 					if _, pinned := pinnedTCPSnap[key]; pinned {
 						continue
 					}
-					closingTimeout := closingTimeoutNano
-					if aggressiveCleanup {
-						closingTimeout = aggressiveClosingTimeout
-					}
-					shouldDelete := false
-					if value.State == 1 {
-						age := nowNano - int64(value.LastSeenNs)
-						if age > closingTimeout {
-							shouldDelete = true
-						}
-					}
-					if shouldDelete {
+					age := nowNano - int64(value.LastSeenNs)
+					if age > tcpConnStateExpireTimeoutNs(value.State, value.SeenNonSyn, aggressiveCleanup) {
 						tcpKeysToDelete = append(tcpKeysToDelete, key)
 					}
 				}

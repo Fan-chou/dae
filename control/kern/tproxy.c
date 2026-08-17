@@ -511,7 +511,10 @@ struct conn_state {
 	__u32 pid;                 // Process ID (for WAN egress; 0 for LAN)
 	// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
 	__u8 routing_epoch_slot;
-	__u8 padding_after_pid;
+	// Cilium-style CT: 0 = only SYN seen (short idle timeout); 1 = a non-SYN
+	// packet was observed (established). Reuses the former padding_after_pid
+	// byte so the conn_state ABI size and later field offsets stay put.
+	__u8 seen_non_syn;
 	__u16 datapath_generation;
 };
 
@@ -2231,22 +2234,29 @@ mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 // mark_tcp_seen: update/create TCP conn state with optional routing metadata.
 // SYN starts new lifecycle; FIN/RST transitions to CLOSING.
+// Timeouts follow Cilium CT: SYN-only 60s, FIN/RST 10s. Established ACTIVE
+// idle expiry is owned by userspace so pinned tproxy sessions are skipped.
+#define TCP_CONN_STATE_SYN_TIMEOUT_NS 60000000000ULL           // 60 seconds
 #define TCP_CONN_STATE_CLOSING_TIMEOUT_NS 10000000000ULL       // 10 seconds
 #define TCP_CONN_STATE_UPDATE_INTERVAL_NS 1000000000ULL  // 1 second
 
 static __always_inline bool
 tcp_conn_state_expired(const struct conn_state *state, __u64 now)
 {
-	/* ACTIVE entries may belong to process-owned sessions across reloads.
-	 * Userspace owns their idle expiry because it can distinguish a live,
-	 * pinned session from stale kernel state. */
-	if (!state || state->state != TCP_STATE_CLOSING)
+	if (!state)
 		return false;
-	return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
+	if (state->state == TCP_STATE_CLOSING)
+		return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
+	/* SYN-only entries are never pinned; expire them here as a fast path
+	 * when the 4-tuple is reused. Established ACTIVE stays until userspace
+	 * janitor decides (it can distinguish pinned sessions). */
+	if (!state->seen_non_syn)
+		return now - state->last_seen_ns > TCP_CONN_STATE_SYN_TIMEOUT_NS;
+	return false;
 }
 
 // __mark_tcp_seen: noinline core. tcp_flags: bit 0 = SYN && !ACK (new
-// connection), bit 1 = FIN || RST.
+// connection), bit 1 = FIN || RST, bit 2 = !SYN (promotes to established).
 static __noinline struct conn_state *
 __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		__u8 tcp_flags, const struct conntrack_args *args)
@@ -2278,6 +2288,11 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		// Fast path: lazy timestamp update (only if interval > 1 second)
 		if (now - state->last_seen_ns > TCP_CONN_STATE_UPDATE_INTERVAL_NS)
 			state->last_seen_ns = now;
+
+		// Cilium seen_non_syn: any packet without SYN promotes SYN-only
+		// to established (bit 2 of tcp_flags).
+		if (tcp_flags & 4)
+			state->seen_non_syn = 1;
 
 		// Check for connection close signals (FIN or RST)
 		if (is_fin_rst)
@@ -2377,6 +2392,8 @@ mark_tcp_seen(struct tuples_key *key, const struct tcphdr *tcph,
 		tcp_flags |= 1;
 	if (tcph->fin || tcph->rst)
 		tcp_flags |= 2;
+	if (!tcph->syn)
+		tcp_flags |= 4;
 	return __mark_tcp_seen(key, is_wan_ingress_direction, tcp_flags, args);
 }
 

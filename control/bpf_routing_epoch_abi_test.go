@@ -49,6 +49,9 @@ func TestRoutingEpochBPFABI(t *testing.T) {
 	if got, want := unsafe.Offsetof(bpfConnState{}.RoutingEpochSlot), uintptr(52); got != want {
 		t.Fatalf("bpfConnState.RoutingEpochSlot offset = %d, want %d", got, want)
 	}
+	if got, want := unsafe.Offsetof(bpfConnState{}.SeenNonSyn), uintptr(53); got != want {
+		t.Fatalf("bpfConnState.SeenNonSyn offset = %d, want %d", got, want)
+	}
 	if got, want := unsafe.Offsetof(bpfConnState{}.DatapathGeneration), uintptr(54); got != want {
 		t.Fatalf("bpfConnState.DatapathGeneration offset = %d, want %d", got, want)
 	}

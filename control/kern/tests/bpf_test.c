@@ -817,7 +817,22 @@ int testsetup_tcp_active_idle_state_retained(struct __sk_buff *skb)
 
 	state.state = TCP_STATE_ACTIVE;
 	state.last_seen_ns = 1;
+	state.seen_non_syn = 0;
+	if (tcp_conn_state_expired(
+		    &state, state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS))
+		return TC_ACT_SHOT;
+	if (!tcp_conn_state_expired(
+		    &state,
+		    state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS + 1))
+		return TC_ACT_SHOT;
+
+	/* Established ACTIVE is expired only in userspace (pinned sessions). */
+	state.seen_non_syn = 1;
 	if (tcp_conn_state_expired(&state, 120000000002ULL))
+		return TC_ACT_SHOT;
+	if (tcp_conn_state_expired(
+		    &state,
+		    state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS + 1))
 		return TC_ACT_SHOT;
 
 	state.state = TCP_STATE_CLOSING;
@@ -874,6 +889,15 @@ int testsetup_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
 				  NULL, NULL, NULL, NULL,
 				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	if (!new_state || new_state->meta.data.has_routing ||
+	    new_state->state != TCP_STATE_ACTIVE || new_state->seen_non_syn)
+		return TC_ACT_SHOT;
+
+	tcph.syn = 0;
+	tcph.ack = 1;
+	new_state = mark_tcp_seen(&key, &tcph, false,
+				  NULL, NULL, NULL, NULL,
+				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!new_state || !new_state->seen_non_syn ||
 	    new_state->state != TCP_STATE_ACTIVE)
 		return TC_ACT_SHOT;
 
