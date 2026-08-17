@@ -91,3 +91,48 @@ routing {
 		t.Logf("\n%v", section.String(false, false))
 	}
 }
+
+func TestParseTrailingCommaDoesNotPanic(t *testing.T) {
+	srcs := []string{
+		`routing {
+    !sip(
+        match_mac: '192.168.124.129/32',
+        match_mac: '10.1.8.11/32',
+    ) -> must_direct
+}`,
+		`include { local.dae }
+global { log_level: info }
+dns {
+    routing {
+        request { fallback: asis }
+    }
+}
+routing {
+    dip(224.0.0.0/3, 'ff00::/8') -> must_direct
+    !sip(
+        match_mac: '192.168.124.129/32',
+        match_mac: '10.1.8.11/32',
+    ) -> must_direct
+}`,
+	}
+	for i, src := range srcs {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("case %d Parse panicked: %v", i, r)
+				}
+			}()
+			_, err := Parse(src)
+			if err == nil {
+				t.Fatalf("case %d: trailing comma should be a parse error", i)
+			}
+		}()
+	}
+}
+
+func TestParseMatchMacWithoutTrailingComma(t *testing.T) {
+	_, err := Parse(`routing { !sip(match_mac: '192.168.124.129/32') -> must_direct }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}

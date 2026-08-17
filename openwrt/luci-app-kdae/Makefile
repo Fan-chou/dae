@@ -27,8 +27,8 @@ define Package/luci-app-kdae
 endef
 
 define Package/luci-app-kdae/description
-  Start/stop, validate, reload, rule-sync warnings, and a link to /kdae-ui/.
-  Node URI editing is intentionally omitted.
+  Start/stop/restart, crash recover (purge leftover eBPF), validate, reload,
+  rule-sync warnings, and a link to /kdae-ui/. Node URI editing is omitted.
 endef
 
 define Package/luci-app-kdae/conffiles

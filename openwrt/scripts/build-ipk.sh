@@ -77,9 +77,10 @@ pack_ipk() {
 # --- kdae ---
 kdae_data=$(mktemp -d)
 mkdir -p "$kdae_data/usr/bin" "$kdae_data/etc/init.d" "$kdae_data/etc/config" \
-	"$kdae_data/etc/dae" "$kdae_data/lib/upgrade/keep.d"
+	"$kdae_data/etc/dae" "$kdae_data/lib/upgrade/keep.d" "$kdae_data/usr/libexec/dae"
 install -m 0755 "$ROOT/build/dae" "$kdae_data/usr/bin/dae"
 install -m 0755 "$ROOT/openwrt/kdae/files/dae.init" "$kdae_data/etc/init.d/dae"
+install -m 0755 "$ROOT/openwrt/kdae/files/kdae-recover.sh" "$kdae_data/usr/libexec/dae/kdae-recover.sh"
 install -m 0644 "$ROOT/openwrt/kdae/files/dae.config" "$kdae_data/etc/config/dae"
 install -m 0644 "$ROOT/example.dae" "$kdae_data/etc/dae/example.dae"
 install -m 0644 "$ROOT/openwrt/kdae/files/dae.keep" "$kdae_data/lib/upgrade/keep.d/dae"
@@ -136,7 +137,7 @@ Conflicts: luci-app-dae
 Section: luci
 Architecture: all
 Maintainer: kdae local feed
-Description: LuCI for kdae start/stop, validate, reload, and rule-sync.
+Description: LuCI for kdae start/stop/restart, crash recover, validate, reload, and rule-sync.
 " "$luci_data"
 rm -rf "$luci_data"
 

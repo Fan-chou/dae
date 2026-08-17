@@ -30,6 +30,27 @@ function renderStatus(isRunning) {
 	return '<span style="color:%s"><strong>kdae %s</strong></span>'.format(color, text);
 }
 
+function refreshStatus() {
+	return L.resolveDefault(getServiceStatus()).then(function (res) {
+		const view = document.getElementById('service_status');
+		if (view)
+			view.innerHTML = renderStatus(res);
+	});
+}
+
+function execInit(args, okMsg) {
+	return fs.exec('/etc/init.d/dae', args).then(function (res) {
+		const text = [res.stdout, res.stderr].filter(Boolean).join('\n');
+		if (res.code)
+			ui.addNotification(null, E('pre', {}, text || args.join(' ') + ' failed'), 'error');
+		else
+			ui.addNotification(null, E('pre', {}, text || okMsg), 'info');
+		return refreshStatus();
+	}).catch(function (e) {
+		ui.addNotification(null, E('p', {}, e.message), 'error');
+	});
+}
+
 return view.extend({
 	render() {
 		const m = new form.Map('dae', _('kdae'),
@@ -39,11 +60,7 @@ return view.extend({
 		s.anonymous = true;
 		s.render = function () {
 			poll.add(function () {
-				return L.resolveDefault(getServiceStatus()).then(function (res) {
-					const view = document.getElementById('service_status');
-					if (view)
-						view.innerHTML = renderStatus(res);
-				});
+				return L.resolveDefault(refreshStatus());
 			});
 			return E('div', { class: 'cbi-section', id: 'status_bar' }, [
 				E('p', { id: 'service_status' }, _('Collecting data…'))
@@ -87,6 +104,29 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.placeholder = '1';
 
+		o = s.option(form.Button, '_start', _('启动'));
+		o.inputtitle = _('启动');
+		o.inputstyle = 'apply';
+		o.description = _('直接调用 /etc/init.d/dae start。需已勾选「启用」。');
+		o.onclick = function () {
+			return execInit(['start'], _('已发送启动'));
+		};
+
+		o = s.option(form.Button, '_stop', _('关闭'));
+		o.inputtitle = _('关闭');
+		o.inputstyle = 'reset';
+		o.onclick = function () {
+			return execInit(['stop'], _('已关闭'));
+		};
+
+		o = s.option(form.Button, '_restart', _('重启'));
+		o.inputtitle = _('重启');
+		o.inputstyle = 'reload';
+		o.description = _('先停再启。启动前仍会 validate，配置有问题则起不来。');
+		o.onclick = function () {
+			return execInit(['restart'], _('已发送重启'));
+		};
+
 		o = s.option(form.Button, '_validate', _('校验配置'));
 		o.inputtitle = _('dae validate');
 		o.inputstyle = 'apply';
@@ -103,12 +143,28 @@ return view.extend({
 		o.inputtitle = _('dae reload');
 		o.inputstyle = 'reload';
 		o.onclick = function () {
-			return fs.exec('/etc/init.d/dae', ['hot_reload']).then(function (res) {
-				if (res.code)
-					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'reload failed'), 'error');
-				else
-					ui.addNotification(null, E('p', {}, _('已发送热重载')), 'info');
+			return fs.exec('/usr/bin/dae', ['validate', '-c', '/etc/dae/config.dae']).then(function (res) {
+				if (res.code) {
+					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'validate failed'), 'error');
+					return;
+				}
+				return fs.exec('/etc/init.d/dae', ['hot_reload']).then(function (reloadRes) {
+					if (reloadRes.code)
+						ui.addNotification(null, E('pre', {}, reloadRes.stderr || reloadRes.stdout || 'reload failed'), 'error');
+					else
+						ui.addNotification(null, E('p', {}, _('已发送热重载')), 'info');
+				});
 			});
+		};
+
+		o = s.option(form.Button, '_recover', _('清除残留'));
+		o.inputtitle = _('清除残留');
+		o.inputstyle = 'remove';
+		o.description = _('崩溃后网络不通时用：停止 kdae，卸 TC hook、删 dae0/daens、清 /sys/fs/bpf/dae。正常运行时不要点。');
+		o.onclick = function () {
+			if (!window.confirm(_('将停止 kdae 并清除残留 eBPF/TC/dae0/daens。确认继续？')))
+				return Promise.resolve();
+			return execInit(['recover'], _('残留已清除'));
 		};
 
 		o = s.option(form.Button, '_panel', _('打开面板'));
@@ -151,6 +207,13 @@ return view.extend({
 					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'write local.dae failed'), 'warning');
 			}).catch(function (e) {
 				ui.addNotification(null, E('p', {}, e.message));
+			});
+		}).then(function () {
+			return fs.exec('/usr/bin/dae', ['validate', '-c', '/etc/dae/config.dae']).then(function (res) {
+				if (res.code) {
+					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'validate failed'), 'error');
+					return Promise.reject(new Error('validate failed'));
+				}
 			});
 		}).then(function () {
 			return ui.changes.apply(mode == '0');

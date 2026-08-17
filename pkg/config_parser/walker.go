@@ -33,7 +33,8 @@ func NewWalker(parser antlr.Parser) *Walker {
 }
 
 type paramParser struct {
-	list []*Param
+	list   []*Param
+	walker *Walker
 }
 
 func getValueFromLiteral(literal *dae_config.LiteralContext) string {
@@ -42,38 +43,86 @@ func getValueFromLiteral(literal *dae_config.LiteralContext) string {
 		return literal.GetText()
 	}
 	text := quote.GetText()
+	if len(text) < 2 {
+		return text
+	}
 	return text[1 : len(text)-1]
 }
 
+func (p *paramParser) reportBadParam(ctx antlr.Tree, msg string) {
+	if p.walker == nil || ctx == nil {
+		return
+	}
+	p.walker.ReportError(ctx, ErrorType_Unsupported, msg)
+}
+
 func (p *paramParser) parseParam(ctx *dae_config.ParameterContext) *Param {
+	if ctx == nil {
+		return nil
+	}
 	children := ctx.GetChildren()
 	if len(children) == 3 {
-		return &Param{
-			Key: children[0].(*antlr.TerminalNodeImpl).GetText(),
-			Val: getValueFromLiteral(children[2].(*dae_config.LiteralContext)),
+		keyNode, ok := children[0].(*antlr.TerminalNodeImpl)
+		lit, ok2 := children[2].(*dae_config.LiteralContext)
+		if !ok || !ok2 {
+			p.reportBadParam(ctx, "invalid function parameter")
+			return nil
 		}
-	} else if len(children) == 1 {
 		return &Param{
-			Key: "",
-			Val: getValueFromLiteral(children[0].(*dae_config.LiteralContext)),
+			Key: keyNode.GetText(),
+			Val: getValueFromLiteral(lit),
 		}
 	}
-	panic("unexpected")
+	if len(children) == 1 {
+		lit, ok := children[0].(*dae_config.LiteralContext)
+		if !ok {
+			p.reportBadParam(ctx, "invalid function parameter")
+			return nil
+		}
+		return &Param{
+			Key: "",
+			Val: getValueFromLiteral(lit),
+		}
+	}
+	p.reportBadParam(ctx, "invalid function parameter")
+	return nil
 }
+
 func (p *paramParser) parseNonEmptyParamList(ctx *dae_config.NonEmptyParameterListContext) {
+	if ctx == nil {
+		return
+	}
 	children := ctx.GetChildren()
-	if len(children) == 3 {
-		p.parseNonEmptyParamList(children[0].(*dae_config.NonEmptyParameterListContext))
-		p.list = append(p.list, p.parseParam(children[2].(*dae_config.ParameterContext)))
-	} else if len(children) == 1 {
-		p.list = append(p.list, p.parseParam(children[0].(*dae_config.ParameterContext)))
+	switch len(children) {
+	case 3:
+		head, ok := children[0].(*dae_config.NonEmptyParameterListContext)
+		param, ok2 := children[2].(*dae_config.ParameterContext)
+		if !ok || !ok2 {
+			p.reportBadParam(ctx, "invalid function parameter list")
+			return
+		}
+		p.parseNonEmptyParamList(head)
+		if parsed := p.parseParam(param); parsed != nil {
+			p.list = append(p.list, parsed)
+		}
+	case 1:
+		param, ok := children[0].(*dae_config.ParameterContext)
+		if !ok {
+			p.reportBadParam(ctx, "invalid function parameter list")
+			return
+		}
+		if parsed := p.parseParam(param); parsed != nil {
+			p.list = append(p.list, parsed)
+		}
+	default:
+		p.reportBadParam(ctx, "invalid function parameter list")
 	}
 }
 
 func (w *Walker) parseNonEmptyParamList(list *dae_config.NonEmptyParameterListContext) []*Param {
-	paramParser := new(paramParser)
-	paramParser.parseNonEmptyParamList(list)
-	return paramParser.list
+	parser := &paramParser{walker: w}
+	parser.parseNonEmptyParamList(list)
+	return parser.list
 }
 
 type functionVerifier func(function *Function, ctx any) bool
@@ -245,14 +294,19 @@ func (w *Walker) parseRoutingRule(ctx dae_config.IRoutingRuleContext) *RoutingRu
 	andFunctions := w.parseFunctionPrototypeExpression(functionList, nil)
 
 	// Parse outbound.
-	outboundExpr := children[2].(*dae_config.OutboundExprContext)
+	outboundExpr, ok := children[2].(*dae_config.OutboundExprContext)
+	if !ok {
+		w.ReportError(ctx, ErrorType_Unsupported, "bad routing outbound expression")
+		return nil
+	}
 	var outbound *Function
 	if literal := outboundExpr.Bare_literal(); literal != nil {
 		outbound = &Function{Name: literal.GetText()}
 	} else if f := outboundExpr.FunctionPrototype(); f != nil {
 		outbound = w.parseFunctionPrototype(f.(*dae_config.FunctionPrototypeContext), nil)
 	} else {
-		panic("unknown outboundExpr")
+		w.ReportError(ctx, ErrorType_Unsupported, "unknown outbound expression")
+		return nil
 	}
 	return &RoutingRule{
 		AndFunctions: andFunctions,

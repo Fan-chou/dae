@@ -20,7 +20,7 @@ export const i18n = createI18n({
         note: "start 是 kdae 开始跟踪这条流的时间。时长由 start 推算。这是 tproxy 抓住的流，不是整机 conntrack。页隐藏时暂停轮询。",
       },
       config: {
-        note: "只编辑 config.dae 的 global+routing 和 routing.dae。不会打开 nodes.dae；保存时 validate 成功才写盘并热重载。admin_secret 显示为占位符，提交时保留磁盘原值。",
+        note: "只编辑 config.dae 的 global+routing 和 routing.dae。不会打开 nodes.dae。保存和热重载都会先 validate，失败则报错、不写坏盘、不重载。admin_secret 显示为占位符，提交时保留磁盘原值。",
       },
     },
   },

@@ -344,6 +344,10 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusServiceUnavailable, "reload is unavailable")
 		return
 	}
+	if err := validateLoadedAdminConfig(s.configDir); err != nil {
+		writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
+		return
+	}
 	queued := s.reload()
 	status := http.StatusAccepted
 	if !queued {

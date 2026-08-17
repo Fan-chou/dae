@@ -95,6 +95,19 @@ export function lintDae(src: string, kind: DaeLintKind): DaeLintIssue[] {
     if (kind === "routing" && line.includes("://") && !nodeURIScheme.test(line) && !/^\s*(#|\/\/)/.test(line)) {
       push(lineNo, 1, line.length + 1, "routing.dae 不允许出现 URI", "warning");
     }
+    if (!inString) {
+      const code = line.replace(/(#|\/\/).*$/, "").trimEnd();
+      if (code.endsWith(",")) {
+        for (let k = i + 1; k < lines.length; k++) {
+          const next = lines[k].replace(/(#|\/\/).*$/, "").trim();
+          if (!next) continue;
+          if (next.startsWith(")")) {
+            push(lineNo, Math.max(code.length, 1), code.length + 1, "函数参数不能有尾逗号");
+          }
+          break;
+        }
+      }
+    }
   }
   if (depth > 0) {
     push(sectionLine, 1, 2, "有 " + String(depth) + " 个未闭合的 {");

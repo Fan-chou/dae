@@ -35,9 +35,10 @@ define Build/Compile
 endef
 
 define Package/kdae/install
-	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/dae $(1)/lib/upgrade/keep.d
+	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/dae $(1)/lib/upgrade/keep.d $(1)/usr/libexec/dae
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/dae $(1)/usr/bin/dae
 	$(INSTALL_BIN) ./files/dae.init $(1)/etc/init.d/dae
+	$(INSTALL_BIN) ./files/kdae-recover.sh $(1)/usr/libexec/dae/kdae-recover.sh
 	$(INSTALL_CONF) ./files/dae.config $(1)/etc/config/dae
 	$(INSTALL_DATA) $(KDAE_SRC)/example.dae $(1)/etc/dae/example.dae
 	$(INSTALL_DATA) ./files/dae.keep $(1)/lib/upgrade/keep.d/dae

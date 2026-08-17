@@ -13,6 +13,16 @@ import (
 
 func Parse(in string) (sections []*Section, err error) {
 	errorListener := NewConsoleErrorListener()
+	defer func() {
+		if r := recover(); r != nil {
+			sections = nil
+			if errorListener.ErrorBuilder.Len() != 0 {
+				err = fmt.Errorf("%v", errorListener.ErrorBuilder.String())
+				return
+			}
+			err = fmt.Errorf("invalid config: %v", r)
+		}
+	}()
 	lexer := dae_config.Newdae_configLexer(antlr.NewInputStream(in))
 	lexer.RemoveErrorListeners()
 	lexer.AddErrorListener(errorListener)

@@ -71,6 +71,15 @@ func loadAdminConfig(configDir string) (adminConfigResponse, error) {
 	return adminConfigResponse{Config: extracted, Routing: routing}, nil
 }
 
+func validateLoadedAdminConfig(configDir string) error {
+	configPath, _, err := adminConfigPaths(configDir)
+	if err != nil {
+		return err
+	}
+	_, _, err = readConfig(configPath)
+	return err
+}
+
 func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminReloadFunc) (queued bool, err error) {
 	configPath, routingPath, err := adminConfigPaths(configDir)
 	if err != nil {
@@ -142,7 +151,7 @@ func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminRe
 			return false, err
 		}
 	}
-	if _, _, err := readConfig(configPath); err != nil {
+	if err := validateLoadedAdminConfig(configDir); err != nil {
 		restore()
 		return false, fmt.Errorf("%s", sanitizeAdminError(err))
 	}

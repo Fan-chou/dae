@@ -219,3 +219,85 @@ routing { fallback: direct }
 		t.Fatalf("error leaked a URI: %s", rec.Body.String())
 	}
 }
+
+func TestApplyAdminConfigRollsBackTrailingComma(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	original := `global {
+    log_level: info
+}
+routing { fallback: direct }
+`
+	writeRestrictedDae(t, configPath, original)
+	_, err := applyAdminConfig(dir, adminConfigBody{
+		Config: strPtr(`global { log_level: info }
+routing {
+    !sip(
+        match_mac: '192.168.124.129/32',
+    ) -> must_direct
+    fallback: direct
+}
+`),
+	}, func() bool { t.Fatal("reload on trailing comma"); return true })
+	if err == nil {
+		t.Fatal("trailing comma should fail validate")
+	}
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(saved) != original {
+		t.Fatalf("rollback failed: %s", saved)
+	}
+}
+
+func TestHandleReloadRejectsInvalidConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeRestrictedDae(t, filepath.Join(dir, "config.dae"), `global { log_level: info }
+routing {
+    !sip(match_mac: '192.168.124.129/32',) -> must_direct
+}
+`)
+	reloaded := false
+	server := newAdminServer(nil, "", dir, nil, func() bool {
+		reloaded = true
+		return true
+	})
+	server.secret = "test-token"
+	req := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleReload)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reload invalid status = %d body %s", rec.Code, rec.Body.String())
+	}
+	if reloaded {
+		t.Fatal("invalid config must not reload")
+	}
+	if strings.Contains(rec.Body.String(), "panic") {
+		t.Fatalf("error should not mention panic: %s", rec.Body.String())
+	}
+}
+
+func TestHandleReloadAcceptsValidConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeRestrictedDae(t, filepath.Join(dir, "config.dae"), `global { log_level: info }
+routing { fallback: direct }
+`)
+	reloaded := false
+	server := newAdminServer(nil, "", dir, nil, func() bool {
+		reloaded = true
+		return true
+	})
+	server.secret = "test-token"
+	req := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleReload)(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("reload valid status = %d body %s", rec.Code, rec.Body.String())
+	}
+	if !reloaded {
+		t.Fatal("valid config should queue reload")
+	}
+}

@@ -7,7 +7,7 @@
 return view.extend({
 	render() {
 		const m = new form.Map('dae', _('配置'),
-			_('编辑 /etc/dae/config.dae 的 include/global/dns/routing。节点 URI 在 nodes.dae（0600），routing.dae 请用 kdae-ui 配置页。保存后请先校验再热重载。'));
+			_('编辑 /etc/dae/config.dae 的 include/global/dns/routing。节点 URI 在 nodes.dae（0600），routing.dae 请用 kdae-ui 配置页。保存会先校验，失败则还原文件；校验通过后才会热重载。'));
 
 		m.section(form.TypedSection).anonymous = true;
 
@@ -42,14 +42,29 @@ return view.extend({
 		return m.render();
 	},
 
-	handleSaveApply(ev, mode) {
+	handleSave(ev) {
+		const self = this;
+		return fs.read_direct('/etc/dae/config.dae', 'text').catch(function () {
+			return '';
+		}).then(function (backup) {
+			return self.super('handleSave', ev).then(function () {
+				return fs.exec('/usr/bin/dae', ['validate', '-c', '/etc/dae/config.dae']).then(function (res) {
+					if (res.code) {
+						ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'validate failed'), 'error');
+						return fs.write('/etc/dae/config.dae', backup, 384).then(function () {
+							return Promise.reject(new Error('validate failed'));
+						});
+					}
+				});
+			});
+		});
+	},
+
+	handleSaveApply(ev) {
 		return this.handleSave(ev).then(function () {
-			return fs.exec('/usr/bin/dae', ['validate', '-c', '/etc/dae/config.dae']).then(function (res) {
-				if (res.code) {
-					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'validate failed'), 'error');
-					return Promise.reject(new Error('validate failed'));
-				}
-				return L.resolveDefault(fs.exec('/etc/init.d/dae', ['hot_reload']), null);
+			return L.resolveDefault(fs.exec('/etc/init.d/dae', ['hot_reload']), null).then(function (res) {
+				if (res && res.code)
+					ui.addNotification(null, E('pre', {}, res.stderr || res.stdout || 'reload failed'), 'error');
 			});
 		});
 	}

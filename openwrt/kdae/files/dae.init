@@ -7,10 +7,12 @@ USE_PROCD=1
 START=99
 
 extra_command "hot_reload" "Hot-reload service"
+extra_command "recover" "Purge leftover eBPF/TC/netns after a crash"
 
 CONF="dae"
 PROG="/usr/bin/dae"
 LOG_DIR="/var/log/dae"
+RECOVER="/usr/libexec/dae/kdae-recover.sh"
 
 start_service() {
 	config_load "$CONF"
@@ -53,5 +55,15 @@ service_triggers() {
 }
 
 hot_reload() {
+	config_load "$CONF"
+	local config_file
+	config_get config_file "config" "config_file" "/etc/dae/config.dae"
+	"$PROG" validate -c "$config_file" || return 1
 	/etc/init.d/dae running && "$PROG" reload "$(cat /var/run/dae.pid)"
+}
+
+recover() {
+	stop 2>/dev/null || true
+	[ -x "$RECOVER" ] || return 1
+	"$RECOVER"
 }
