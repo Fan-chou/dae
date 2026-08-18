@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 
+	"github.com/daeuniverse/dae/common"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -64,6 +65,34 @@ func extractIPsFromDnsCache(cache *DnsCache) []netip.Addr {
 	return ips
 }
 
+func (c *controlPlaneCore) bindDomainRoutingFingerprinter(matcher *RoutingMatcher) {
+	if c == nil {
+		return
+	}
+	if matcher == nil {
+		c.domainRoutingFingerprinter = nil
+		return
+	}
+	c.domainRoutingFingerprinter = matcher.conflictFingerprint
+}
+
+func (c *controlPlaneCore) attachDomainRoutingFingerprints(cache *DnsCache, snapshot *domainRoutingOwnerSnapshot) {
+	if c == nil || c.domainRoutingFingerprinter == nil || snapshot == nil || len(snapshot.ips) == 0 {
+		return
+	}
+	bitmap := snapshot.bitmap.Bitmap[:]
+	fingerprints := make(map[[4]uint32]domainRoutingFingerprint, len(snapshot.ips))
+	for _, ip := range extractIPsFromDnsCache(cache) {
+		ip6 := ip.As16()
+		key := common.Ipv6ByteSliceToUint32Array(ip6[:])
+		if _, ok := snapshot.ips[key]; !ok {
+			continue
+		}
+		fingerprints[key] = c.domainRoutingFingerprinter(ip, bitmap)
+	}
+	snapshot.fingerprints = fingerprints
+}
+
 // BatchUpdateDomainRouting update bpf map domain_routing. Since one IP may have multiple domains, this function should
 // be invoked every A/AAAA-record lookup.
 func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
@@ -74,6 +103,7 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 	if err != nil {
 		return err
 	}
+	c.attachDomainRoutingFingerprints(cache, &snapshot)
 	bpf := c.PeekBpf()
 	if bpf == nil {
 		return nil

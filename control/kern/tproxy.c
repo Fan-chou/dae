@@ -410,6 +410,8 @@ struct {
 
 struct domain_routing {
 	__u32 bitmap[MAX_MATCH_SET_LEN / 32];
+	__u8 ambiguous;
+	__u8 pad[3];
 };
 
 struct routing_epoch_ip {
@@ -1210,6 +1212,7 @@ struct route_ctx {
 	__u32 domain_word_bits;
 	__u32 routing_epoch_slot;
 	bool domain_word_cached;
+	__u8 domain_ambiguous;
 	__u8 route_state;
 };
 
@@ -1555,6 +1558,23 @@ static __always_inline int route_match_domain_set(struct route_ctx *ctx,
 	return 0;
 }
 
+static __always_inline void route_load_domain_routing(struct route_ctx *ctx)
+{
+	struct routing_epoch_ip daddr = {
+		.slot = ctx->routing_epoch_slot,
+	};
+	struct domain_routing *domain_routing;
+
+	__builtin_memcpy(daddr.addr, ctx->lpm_key_daddr.data, sizeof(daddr.addr));
+	domain_routing = bpf_map_lookup_elem(&domain_routing_map, &daddr);
+	if (!domain_routing)
+		return;
+	ctx->domain_ambiguous = domain_routing->ambiguous;
+	ctx->domain_word_idx = 0;
+	ctx->domain_word_bits = domain_routing->bitmap[0];
+	ctx->domain_word_cached = true;
+}
+
 static __always_inline int
 route_eval_match(struct route_ctx *ctx, const struct match_set *match_set,
 		 __u32 index, __u8 l4proto_type, __u8 ipversion_type,
@@ -1733,9 +1753,17 @@ route_finalize_match(struct route_ctx *ctx, const struct match_set *match_set)
 #endif
 					return 1;
 				}
-				ctx->result = (__s64)match_outbound |
-					      ((__s64)match_set->mark << 8) |
-					      ((__s64)must << 40);
+				{
+					__u8 outbound = match_outbound;
+
+					if (!must && ctx->domain_ambiguous)
+						outbound =
+							OUTBOUND_CONTROL_PLANE_ROUTING;
+					ctx->result =
+						(__s64)outbound |
+						((__s64)match_set->mark << 8) |
+						((__s64)must << 40);
+				}
 #ifdef __DEBUG_ROUTING
 				bpf_printk("outbound %u: %ld",
 					   match_outbound, ctx->result);
@@ -1868,6 +1896,7 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 			return -EFAULT;
 	}
 	ctx->routing_epoch_slot = active_routing_epoch_slot;
+	route_load_domain_routing(ctx);
 	active_rules_len_ptr = bpf_map_lookup_elem(&routing_meta_map, &active_routing_epoch_slot);
 
 	if (active_rules_len_ptr && *active_rules_len_ptr <= MAX_MATCH_SET_LEN)

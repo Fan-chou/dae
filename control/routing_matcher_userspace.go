@@ -58,6 +58,11 @@ type routingMatcherFacts struct {
 	macBin         string
 	macAssocBins   []string
 	domainBitmap   []uint32
+
+	// identityDontCare treats MAC/source/port/process/DSCP/L4 as matching so
+	// DNS-time conflict detection can compare domain()+dip() outcomes without a
+	// connection 5-tuple. Dest IP and domain bits stay real.
+	identityDontCare bool
 }
 
 type compiledRoutingMatch struct {
@@ -167,6 +172,15 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 		return false, fmt.Errorf("nil routing matcher facts")
 	}
 
+	if facts.identityDontCare {
+		switch match.matchType {
+		case consts.MatchType_Mac, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac,
+			consts.MatchType_Port, consts.MatchType_SourcePort, consts.MatchType_ProcessName,
+			consts.MatchType_Dscp, consts.MatchType_L4Proto:
+			return true, nil
+		}
+	}
+
 	switch match.matchType {
 	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 		lpmIndex := int(match.lpmIndex)
@@ -244,7 +258,43 @@ func (m *RoutingMatcher) Match(
 	if err != nil {
 		return 0, 0, false, err
 	}
+	return m.matchFacts(facts)
+}
 
+// conflictFingerprint evaluates routing as if the dest IP and domain bitmap were
+// known but the connection identity (MAC, ports, process, DSCP, L4) always
+// matched. Used to detect same-IP DNS owners that disagree on outbound/must/mark.
+func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uint32) domainRoutingFingerprint {
+	if m == nil || !dest.IsValid() {
+		return domainRoutingFingerprint{}
+	}
+	dest16 := dest.As16()
+	ipVersion := consts.IpVersion_6
+	if dest.Is4() || dest.Is4In6() {
+		ipVersion = consts.IpVersion_4
+	}
+	outbound, mark, must, err := m.matchFacts(routingMatcherFacts{
+		destAddr:         dest16,
+		ipVersion:        ipVersion,
+		ipSetBin:         trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(dest16), 128)),
+		domainBitmap:     domainBitmap,
+		identityDontCare: true,
+	})
+	if err != nil {
+		return domainRoutingFingerprint{}
+	}
+	return domainRoutingFingerprint{
+		outbound: outbound,
+		mark:     mark,
+		must:     must,
+		valid:    true,
+	}
+}
+
+func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	if m == nil {
+		return 0, 0, false, fmt.Errorf("nil routing matcher")
+	}
 	matches := m.compiledMatches
 	if len(matches) == 0 {
 		return 0, 0, false, fmt.Errorf("no compiled routing match set")

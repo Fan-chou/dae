@@ -1094,6 +1094,7 @@ func newControlPlaneWithContextOptions(
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)
+	core.bindDomainRoutingFingerprinter(routingMatcher)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
 	if !buildOpts.delayDatapathCommit {

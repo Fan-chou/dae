@@ -13,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/common/consts"
 )
 
 // ErrBpfMapFull reports that a BPF map rejected an insertion because it is at
@@ -25,13 +26,30 @@ func isBpfMapFullError(err error) bool {
 	return stderrors.Is(err, syscall.E2BIG) || stderrors.Is(err, syscall.ENOSPC)
 }
 
+// domainRoutingFingerprint is the DNS-time routing outcome for one owner on one
+// destination IP, ignoring connection identity (MAC/port/process). Zero value
+// (valid=false) is ignored when detecting conflicts so tests without a matcher
+// keep the historical OR-only merge.
+type domainRoutingFingerprint struct {
+	outbound consts.OutboundIndex
+	mark     uint32
+	must     bool
+	valid    bool
+}
+
 type domainRoutingOwnerSnapshot struct {
-	bitmap bpfDomainRouting
-	ips    map[[4]uint32]struct{}
+	bitmap       bpfDomainRouting
+	ips          map[[4]uint32]struct{}
+	fingerprints map[[4]uint32]domainRoutingFingerprint
+}
+
+type domainRoutingIPOwner struct {
+	bitmap      bpfDomainRouting
+	fingerprint domainRoutingFingerprint
 }
 
 type domainRoutingIPState struct {
-	owners map[string]bpfDomainRouting
+	owners map[string]domainRoutingIPOwner
 	merged bpfDomainRouting
 }
 
@@ -59,6 +77,17 @@ func cloneDomainRoutingIPSet(src map[[4]uint32]struct{}) map[[4]uint32]struct{} 
 	return dst
 }
 
+func cloneDomainRoutingFingerprints(src map[[4]uint32]domainRoutingFingerprint) map[[4]uint32]domainRoutingFingerprint {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[[4]uint32]domainRoutingFingerprint, len(src))
+	for key, fp := range src {
+		dst[key] = fp
+	}
+	return dst
+}
+
 func isZeroDomainRoutingBitmap(bitmap bpfDomainRouting) bool {
 	for _, word := range bitmap.Bitmap {
 		if word != 0 {
@@ -74,10 +103,27 @@ func orDomainRoutingBitmap(dst *bpfDomainRouting, src bpfDomainRouting) {
 	}
 }
 
-func mergeDomainRoutingOwnerBitmaps(owners map[string]bpfDomainRouting) bpfDomainRouting {
+func mergeDomainRoutingIPOwners(owners map[string]domainRoutingIPOwner) bpfDomainRouting {
 	var merged bpfDomainRouting
-	for _, bitmap := range owners {
-		orDomainRoutingBitmap(&merged, bitmap)
+	var seen domainRoutingFingerprint
+	seenValid := false
+	ambiguous := false
+	for _, owner := range owners {
+		orDomainRoutingBitmap(&merged, owner.bitmap)
+		if !owner.fingerprint.valid {
+			continue
+		}
+		if !seenValid {
+			seen = owner.fingerprint
+			seenValid = true
+			continue
+		}
+		if owner.fingerprint != seen {
+			ambiguous = true
+		}
+	}
+	if ambiguous {
+		merged.Ambiguous = 1
 	}
 	return merged
 }
@@ -108,22 +154,29 @@ func (t *domainRoutingTracker) desiredBitmapForKeyLocked(
 	ownerKey string,
 	snapshot domainRoutingOwnerSnapshot,
 ) (bitmap bpfDomainRouting, present bool) {
+	owners := make(map[string]domainRoutingIPOwner)
 	if state := t.ips[key]; state != nil {
-		for existingOwnerKey, existingBitmap := range state.owners {
+		for existingOwnerKey, existing := range state.owners {
 			if existingOwnerKey == ownerKey {
 				continue
 			}
-			orDomainRoutingBitmap(&bitmap, existingBitmap)
+			owners[existingOwnerKey] = existing
 			present = true
 		}
 	}
 	if len(snapshot.ips) > 0 && !isZeroDomainRoutingBitmap(snapshot.bitmap) {
 		if _, ok := snapshot.ips[key]; ok {
-			orDomainRoutingBitmap(&bitmap, snapshot.bitmap)
+			owners[ownerKey] = domainRoutingIPOwner{
+				bitmap:      snapshot.bitmap,
+				fingerprint: snapshot.fingerprints[key],
+			}
 			present = true
 		}
 	}
-	return bitmap, present
+	if !present {
+		return bpfDomainRouting{}, false
+	}
+	return mergeDomainRoutingIPOwners(owners), true
 }
 
 func (t *domainRoutingTracker) applyOwnerSnapshotLocked(ownerKey string, snapshot domainRoutingOwnerSnapshot) {
@@ -141,7 +194,7 @@ func (t *domainRoutingTracker) applyOwnerSnapshotLocked(ownerKey string, snapsho
 				delete(t.ips, key)
 				continue
 			}
-			state.merged = mergeDomainRoutingOwnerBitmaps(state.owners)
+			state.merged = mergeDomainRoutingIPOwners(state.owners)
 		}
 		delete(t.owners, ownerKey)
 	}
@@ -149,20 +202,24 @@ func (t *domainRoutingTracker) applyOwnerSnapshotLocked(ownerKey string, snapsho
 		return
 	}
 	cloned := domainRoutingOwnerSnapshot{
-		bitmap: snapshot.bitmap,
-		ips:    cloneDomainRoutingIPSet(snapshot.ips),
+		bitmap:       snapshot.bitmap,
+		ips:          cloneDomainRoutingIPSet(snapshot.ips),
+		fingerprints: cloneDomainRoutingFingerprints(snapshot.fingerprints),
 	}
 	t.owners[ownerKey] = cloned
 	for key := range cloned.ips {
 		state := t.ips[key]
 		if state == nil {
 			state = &domainRoutingIPState{
-				owners: make(map[string]bpfDomainRouting),
+				owners: make(map[string]domainRoutingIPOwner),
 			}
 			t.ips[key] = state
 		}
-		state.owners[ownerKey] = cloned.bitmap
-		state.merged = mergeDomainRoutingOwnerBitmaps(state.owners)
+		state.owners[ownerKey] = domainRoutingIPOwner{
+			bitmap:      cloned.bitmap,
+			fingerprint: cloned.fingerprints[key],
+		}
+		state.merged = mergeDomainRoutingIPOwners(state.owners)
 	}
 }
 

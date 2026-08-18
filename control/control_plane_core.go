@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -154,6 +155,7 @@ type controlPlaneCore struct {
 	routingEpochActiveSlotCachedValid atomic.Bool
 	lpmTrieIndices                    []uint32
 	bpfOwned                          bool
+	domainRoutingFingerprinter        func(dest netip.Addr, domainBitmap []uint32) domainRoutingFingerprint
 }
 
 func newControlPlaneCore(log *logrus.Logger,

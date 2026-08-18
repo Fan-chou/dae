@@ -166,7 +166,8 @@ setup_routing_epoch_lan_ingress(struct __sk_buff *skb, __u32 active_slot)
 }
 
 static __always_inline int
-set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
+set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap,
+			      __u8 ambiguous, __u8 must)
 {
 	struct match_set domain_rule = {};
 	struct match_set fallback_rule = {};
@@ -182,6 +183,7 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 
 	domain_rule.type = MatchType_DomainSet;
 	domain_rule.outbound = outbound;
+	domain_rule.must = must;
 	if (bpf_map_update_elem(&routing_map, &domain_key, &domain_rule,
 				BPF_ANY))
 		return TC_ACT_SHOT;
@@ -205,6 +207,7 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 		return TC_ACT_SHOT;
 	__builtin_memset(projection, 0, sizeof(*projection));
 	projection->bitmap[0] = bitmap;
+	projection->ambiguous = ambiguous;
 	return bpf_map_update_elem(&domain_routing_map, &ip_key, projection,
 				   BPF_ANY);
 }
@@ -217,9 +220,31 @@ setup_routing_epoch_domain_lan_ingress(struct __sk_buff *skb,
 	int ret;
 
 	// Only slot zero projects this destination into the domain rule.
-	if (set_routing_epoch_domain_rule(0, OUTBOUND_USER_DEFINED_MIN, 1))
+	if (set_routing_epoch_domain_rule(0, OUTBOUND_USER_DEFINED_MIN, 1, 0, 0))
 		return TC_ACT_SHOT;
-	if (set_routing_epoch_domain_rule(1, OUTBOUND_USER_DEFINED_MIN + 1, 0))
+	if (set_routing_epoch_domain_rule(1, OUTBOUND_USER_DEFINED_MIN + 1, 0, 0, 0))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&active_slot, BPF_ANY))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	zero_key = 0;
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&zero_key, BPF_ANY))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+static __always_inline int
+setup_domain_ambiguous_lan_ingress(struct __sk_buff *skb, __u8 outbound,
+				   __u8 must)
+{
+	__u32 zero_key = 0;
+	__u32 active_slot = 0;
+	int ret;
+
+	if (set_routing_epoch_domain_rule(0, outbound, 1, 1, must))
 		return TC_ACT_SHOT;
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&active_slot, BPF_ANY))
@@ -1287,6 +1312,52 @@ int testcheck_routing_epoch_domain_projection_slot_one(struct __sk_buff *skb)
 		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
 		IPV4(198,51,100,20), 19233, 443, OUTBOUND_USER_DEFINED_MIN + 2,
 		routing_epoch_slot_encode(1));
+}
+
+SEC("tc/pktgen/domain_routing_ambiguous_userspace")
+int testpktgen_domain_routing_ambiguous_userspace(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/domain_routing_ambiguous_userspace")
+int testsetup_domain_routing_ambiguous_userspace(struct __sk_buff *skb)
+{
+	return setup_domain_ambiguous_lan_ingress(skb, OUTBOUND_USER_DEFINED_MIN,
+						  0);
+}
+
+SEC("tc/check/domain_routing_ambiguous_userspace")
+int testcheck_domain_routing_ambiguous_userspace(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		IPV4(198,51,100,20), 19233, 443,
+		OUTBOUND_CONTROL_PLANE_ROUTING,
+		routing_epoch_slot_encode(0));
+}
+
+SEC("tc/pktgen/domain_routing_ambiguous_must_direct")
+int testpktgen_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/domain_routing_ambiguous_must_direct")
+int testsetup_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
+{
+	return setup_domain_ambiguous_lan_ingress(skb, OUTBOUND_DIRECT, 1);
+}
+
+SEC("tc/check/domain_routing_ambiguous_must_direct")
+int testcheck_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
+{
+	return check_tcp_conn_state_ipv4_tcp(skb, TC_ACT_OK,
+					     IPV4(192,168,0,1),
+					     IPV4(198,51,100,20), 19233, 443,
+					     OUTBOUND_DIRECT, 0, true);
 }
 
 SEC("tc/pktgen/lan_ingress_tcp_ipv6_dscp_conn_state")
