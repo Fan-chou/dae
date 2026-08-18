@@ -43,6 +43,12 @@ start_service() {
 	procd_set_param respawn
 	procd_set_param stderr 1
 
+	local tcp_sockmap
+	config_get_bool tcp_sockmap "config" "tcp_sockmap" "0"
+	if [ "$tcp_sockmap" = "1" ]; then
+		procd_set_param env DAE_ALLOW_TCP_SOCKMAP=1
+	fi
+
 	procd_close_instance
 }
 

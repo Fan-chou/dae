@@ -133,12 +133,17 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 		}
 	}
 
+	// Sockmap splices tproxy accept <-> dial sockets. LAN-forwarded proxy TCP
+	// uses that path even when wan_interface is empty (gateway / router_proxy=0).
+	if len(c.lanInterface) > 0 || len(c.wanInterface) > 0 {
+		if err := c.core.setupTCPRelayOffload(); err != nil {
+			c.log.WithError(err).Warnln("TCP relay eBPF offload disabled; the accounting hook may already be attached by another eBPF program (check 'bpftool link list')")
+		}
+	}
+
 	if len(c.wanInterface) > 0 {
 		if err := c.core.setupSkPidMonitor(); err != nil {
 			c.log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
-		}
-		if err := c.core.setupTCPRelayOffload(); err != nil {
-			c.log.WithError(err).Warnln("TCP relay eBPF offload disabled; the accounting hook may already be attached by another eBPF program (check 'bpftool link list')")
 		}
 		for _, ifname := range c.wanInterface {
 			if len(c.lanInterface) > 0 && c.autoConfigKernelParameter {
