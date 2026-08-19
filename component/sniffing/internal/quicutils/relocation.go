@@ -86,9 +86,10 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 }
 
 // CollectCryptoFrames walks Initial plaintext frames (RFC 9000 §17.2.2) and
-// inserts CRYPTO payloads into reasm. PADDING, PING, ACK, ACK_ECN and
-// CONNECTION_CLOSE are skipped. An unknown frame stops the walk; fragments
-// already collected are kept (honk collect_crypto_frames).
+// inserts CRYPTO payloads into reasm. PADDING, PING, ACK and ACK_ECN are
+// skipped. CONNECTION_CLOSE is skipped for the walk but marks reasm closed so
+// kdae does not hold the first datagram for more CRYPTO. An unknown frame
+// stops the walk; fragments already collected are kept.
 func CollectCryptoFrames(payload []byte, reasm *CryptoReassembly) error {
 	if reasm == nil {
 		return nil
@@ -104,6 +105,11 @@ func CollectCryptoFrames(payload []byte, reasm *CryptoReassembly) error {
 		if offset != nil {
 			reasm.Insert(offset.UpperAppOffset, offset.Data)
 			ReleaseCryptoFrameOffset(offset)
+		} else {
+			ft, _, ferr := BigEndianUvarint(payload[iNextFrame:])
+			if ferr == nil && (ft == Quic_FrameType_ConnectionClose || ft == Quic_FrameType_ConnectionClose2) {
+				reasm.MarkClosed()
+			}
 		}
 		if frameSize <= 0 {
 			return nil
@@ -182,6 +188,10 @@ func skipAckFrame(body []byte, hasECN bool) (int, error) {
 		return 0, err
 	}
 	pos += n
+	const maxAckRangeCount = 64
+	if rangeCount > maxAckRangeCount {
+		return 0, fmt.Errorf("ack range count %d: %w", rangeCount, ErrOutOfRange)
+	}
 	_, n, err = BigEndianUvarint(body[pos:]) // first ACK range
 	if err != nil {
 		return 0, err

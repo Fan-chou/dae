@@ -14,11 +14,13 @@ type CryptoReassembly struct {
 	pending    map[int][]byte
 	buffered   int
 	overflowed bool
+	closed     bool
 }
 
 // Insert records a CRYPTO fragment at stream offset. Duplicate or fully
-// covered fragments are ignored. Data is copied; callers may recycle the
-// source buffer afterwards.
+// covered fragments are ignored. A later fragment at the same offset keeps
+// the longer slice. Data is copied; callers may recycle the source buffer
+// afterwards.
 func (r *CryptoReassembly) Insert(offset int, data []byte) {
 	if r == nil || r.overflowed || len(data) == 0 {
 		return
@@ -39,17 +41,32 @@ func (r *CryptoReassembly) Insert(offset int, data []byte) {
 		r.markOverflowed()
 		return
 	}
-	owned := make([]byte, len(data))
-	copy(owned, data)
 	if r.pending == nil {
 		r.pending = make(map[int][]byte, 4)
 	}
+	if old, ok := r.pending[offset]; ok && len(data) <= len(old) {
+		return
+	}
+	owned := make([]byte, len(data))
+	copy(owned, data)
 	if old, ok := r.pending[offset]; ok {
 		r.buffered -= len(old)
 	}
 	r.pending[offset] = owned
 	r.buffered += len(owned)
 	r.drainContiguous()
+}
+
+// MarkClosed records that an Initial carried CONNECTION_CLOSE. Incomplete
+// ClientHello must not hold the first datagram waiting for more CRYPTO.
+func (r *CryptoReassembly) MarkClosed() {
+	if r != nil {
+		r.closed = true
+	}
+}
+
+func (r *CryptoReassembly) Closed() bool {
+	return r != nil && r.closed
 }
 
 func (r *CryptoReassembly) drainContiguous() {
@@ -116,6 +133,7 @@ func (r *CryptoReassembly) Reset() {
 	r.pending = nil
 	r.buffered = 0
 	r.overflowed = false
+	r.closed = false
 }
 
 func (r *CryptoReassembly) exportFrames() []*CryptoFrameOffset {

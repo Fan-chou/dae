@@ -100,6 +100,10 @@ func (s *Sniffer) sniffQuicAssembled() (d string, err error) {
 	st, hsEnd := quicutils.ClassifyClientHello(assembled)
 	switch st {
 	case quicutils.ClientHelloIncomplete:
+		if s.quicReasm.Closed() {
+			s.needMore = false
+			return "", ErrNotFound
+		}
 		s.needMore = true
 		return "", ErrNotFound
 	case quicutils.ClientHelloInvalid:
@@ -187,7 +191,8 @@ func sniffQuicBlock(s *Sniffer, buf []byte) (next []byte, err error) {
 	}
 	s.quicPlaintexts = append(s.quicPlaintexts, plaintext)
 	// CRYPTO fragments are owned by s.quicReasm (contiguous prefix from 0).
-	// Unknown frames stop the walk without failing the packet; ACK/CLOSE are skipped.
+	// Unknown frames stop the walk without failing the packet. ACK is skipped;
+	// CONNECTION_CLOSE is skipped but marks the reassembly closed.
 	_ = quicutils.CollectCryptoFrames(plaintext, &s.quicReasm)
 	return buf[blockEnd:], nil
 }

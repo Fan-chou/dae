@@ -107,6 +107,32 @@ func TestDomainRoutingTrackerDropOwnerClearsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestDomainRoutingTrackerIdentityPrefixMarksAmbiguous(t *testing.T) {
+	matcher := identityPrefixConflictMatcher()
+	core := &controlPlaneCore{}
+	core.bindDomainRoutingFingerprinter(matcher)
+	tracker := newDomainRoutingTracker()
+	cacheA := domainRoutingACache("a.example.:1", "203.0.113.77", domainRoutingBitmap(1<<3))
+	cacheB := domainRoutingACache("b.example.:1", "203.0.113.77", domainRoutingBitmap(1<<4))
+	for _, cache := range []*DnsCache{cacheA, cacheB} {
+		snapshot, err := buildDomainRoutingOwnerSnapshot(cache)
+		if err != nil {
+			t.Fatalf("snapshot %q: %v", cache.RouteOwnerKey, err)
+		}
+		core.attachDomainRoutingFingerprints(cache, &snapshot)
+		if err := tracker.syncOwnerForSlot(nil, 0, cache.RouteOwnerKey, snapshot); err != nil {
+			t.Fatalf("project %q: %v", cache.RouteOwnerKey, err)
+		}
+	}
+	merged := requireTrackerMerged(t, tracker, cacheA)
+	if merged.Bitmap[0] != (1<<3)|(1<<4) {
+		t.Fatalf("merged bitmap = %#x, want bits 3 and 4", merged.Bitmap[0])
+	}
+	if merged.Ambiguous != 1 {
+		t.Fatalf("ambiguous = %d, want 1 with sip/dscp prefix in front of domain rules", merged.Ambiguous)
+	}
+}
+
 func projectDomainRoutingWithFingerprint(
 	tracker *domainRoutingTracker,
 	slot uint32,

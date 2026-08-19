@@ -255,6 +255,35 @@ func TestSniffQuic_CompleteHelloWithoutSNIDoesNotNeedMore(t *testing.T) {
 	}
 }
 
+func TestSniffQuic_ConnectionCloseIncompleteDoesNotNeedMore(t *testing.T) {
+	sniffer := NewPacketSniffer(nil, 300*time.Millisecond)
+	defer sniffer.Close()
+	sniffer.quicReasm.Insert(0, []byte{0x01, 0x00, 0x00, 0x20})
+	sniffer.quicReasm.MarkClosed()
+	_, err := sniffer.sniffQuicAssembled()
+	if err == nil {
+		t.Fatal("expected error for incomplete ClientHello after CONNECTION_CLOSE")
+	}
+	if sniffer.NeedMore() {
+		t.Fatal("CONNECTION_CLOSE must not hold the first datagram")
+	}
+}
+
+func TestSniffQuic_ConnectionCloseAfterCompleteStillExtractsSNI(t *testing.T) {
+	hello := minimalClientHello("close.example")
+	sniffer := NewPacketSniffer(nil, 300*time.Millisecond)
+	defer sniffer.Close()
+	sniffer.quicReasm.Insert(0, hello)
+	sniffer.quicReasm.MarkClosed()
+	d, err := sniffer.sniffQuicAssembled()
+	if err != nil {
+		t.Fatalf("complete ClientHello with CLOSE: %v", err)
+	}
+	if d != "close.example" {
+		t.Fatalf("domain = %q, want close.example", d)
+	}
+}
+
 func TestGiveUpIncompleteClearsNeedMore(t *testing.T) {
 	sniffer := NewPacketSniffer(QuicStream2_1, 300*time.Millisecond)
 	defer sniffer.Close()

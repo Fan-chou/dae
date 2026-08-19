@@ -532,6 +532,52 @@ func TestDialerGroup_NestedLazyParentActivatesOnlyParentViewUntilChildSelection(
 	}
 }
 
+func TestDialerGroup_CaptureReloadSelectionFallbackDoesNotActivateCheck(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := newDirectDialer(option, false)
+	child := NewDialerGroupWithRuntimeOptions(
+		option,
+		"lazy-child",
+		[]*dialer.Dialer{leaf},
+		newEmptyAnnotations(1),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		func(bool, *dialer.NetworkType, bool) {},
+		DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true},
+	)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "lazy-parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true, Lazy: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer leaf.Close()
+
+	checkActivated := func(d *dialer.Dialer) bool {
+		return reflect.ValueOf(d).Elem().FieldByName("checkActivated").Bool()
+	}
+	view := parent.parentHealthViews[leaf]
+	fallback := parent.CaptureReloadSelectionFallback()
+	if got := fallback[TestNetworkType.Index()]; got != leaf {
+		t.Fatalf("reload fallback = %p, want concrete leaf %p", got, leaf)
+	}
+	if checkActivated(leaf) {
+		t.Fatal("fallback sampling activated the concrete leaf probe")
+	}
+	if view != nil && checkActivated(view) {
+		t.Fatal("fallback sampling activated the parent health view")
+	}
+}
+
 func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 
 	option := &dialer.GlobalOption{

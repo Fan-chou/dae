@@ -59,9 +59,10 @@ type routingMatcherFacts struct {
 	macAssocBins   []string
 	domainBitmap   []uint32
 
-	// identityDontCare treats MAC/source/port/process/DSCP/L4 as matching so
-	// DNS-time conflict detection can compare domain()+dip() outcomes without a
-	// connection 5-tuple. Dest IP and domain bits stay real.
+	// identityDontCare compares dest-IP + domain (+ fallback / IP version)
+	// without a connection 5-tuple. Identity matches are skipped so AND
+	// `mac && domain` reduces to domain, while standalone sip/dscp/mac
+	// rules miss instead of always hitting.
 	identityDontCare bool
 }
 
@@ -172,15 +173,6 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 		return false, fmt.Errorf("nil routing matcher facts")
 	}
 
-	if facts.identityDontCare {
-		switch match.matchType {
-		case consts.MatchType_Mac, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac,
-			consts.MatchType_Port, consts.MatchType_SourcePort, consts.MatchType_ProcessName,
-			consts.MatchType_Dscp, consts.MatchType_L4Proto:
-			return true, nil
-		}
-	}
-
 	switch match.matchType {
 	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 		lpmIndex := int(match.lpmIndex)
@@ -261,9 +253,34 @@ func (m *RoutingMatcher) Match(
 	return m.matchFacts(facts)
 }
 
-// conflictFingerprint evaluates routing as if the dest IP and domain bitmap were
-// known but the connection identity (MAC, ports, process, DSCP, L4) always
-// matched. Used to detect same-IP DNS owners that disagree on outbound/must/mark.
+// identityRoutingMatch is MAC / source / port / process / DSCP / L4: known only
+// on a real connection, not at DNS time.
+func identityRoutingMatch(matchType consts.MatchType) bool {
+	switch matchType {
+	case consts.MatchType_Mac, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac,
+		consts.MatchType_Port, consts.MatchType_SourcePort, consts.MatchType_ProcessName,
+		consts.MatchType_Dscp, consts.MatchType_L4Proto:
+		return true
+	default:
+		return false
+	}
+}
+
+// destRoutingMatch is dest-IP / domain / IP version / fallback: enough to
+// fingerprint DNS owners on a shared address.
+func destRoutingMatch(matchType consts.MatchType) bool {
+	switch matchType {
+	case consts.MatchType_IpSet, consts.MatchType_DomainSet, consts.MatchType_IpVersion, consts.MatchType_Fallback:
+		return true
+	default:
+		return false
+	}
+}
+
+// conflictFingerprint evaluates routing from dest IP and domain bits only.
+// Identity conjuncts are skipped so `mac && domain` still fingerprints as
+// domain, while standalone sip/dscp rules cannot collapse every owner onto
+// must_direct.
 func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uint32) domainRoutingFingerprint {
 	if m == nil || !dest.IsValid() {
 		return domainRoutingFingerprint{}
@@ -302,8 +319,15 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 
 	goodSubrule := false
 	badRule := false
+	ruleHasDest := false
+	subruleHasDest := false
 	for i, match := range matches {
-		if !badRule && !goodSubrule {
+		if destRoutingMatch(match.matchType) {
+			subruleHasDest = true
+			ruleHasDest = true
+		}
+		identitySkip := facts.identityDontCare && identityRoutingMatch(match.matchType)
+		if !identitySkip && !badRule && !goodSubrule {
 			matched, matchErr := m.matchCompiledMatch(i, match, &facts)
 			if matchErr != nil {
 				return 0, 0, false, matchErr
@@ -318,27 +342,36 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 			// We are now at end of rule, or next match_set belongs to another
 			// subrule.
 
-			if goodSubrule == match.not {
+			// A subrule of only skipped identity matches is vacuous: AND
+			// `mac && domain` reduces to domain, OR `sip || domain` waits
+			// for the dest side.
+			if !(facts.identityDontCare && !subruleHasDest) && goodSubrule == match.not {
 				// This subrule does not hit.
 				badRule = true
 			}
 
 			// Reset goodSubrule.
 			goodSubrule = false
+			subruleHasDest = false
 		}
 
 		if outbound&consts.OutboundLogicalMask !=
 			consts.OutboundLogicalMask {
 			// Tail of a rule (line).
 			// Decide whether to hit.
+			if facts.identityDontCare && !ruleHasDest {
+				badRule = true
+			}
 			if !badRule {
 				if outbound == consts.OutboundMustRules {
 					must = true
+					ruleHasDest = false
 					continue
 				}
 				return outbound, match.mark, match.must || must, nil
 			}
 			badRule = false
+			ruleHasDest = false
 		}
 	}
 	return 0, 0, false, fmt.Errorf("no match set hit")

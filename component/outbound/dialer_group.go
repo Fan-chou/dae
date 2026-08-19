@@ -725,7 +725,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 
 func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, excluded *dialer.Dialer, fixed bool, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
 	d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy, excluded, fixed, activateLazy)
-	if err == nil && d != nil {
+	if err == nil && d != nil && activateLazy {
 		d.ActivateCheck()
 	}
 	// Fixed parent selection keeps the established flat-group contract: the

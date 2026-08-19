@@ -76,6 +76,56 @@ func TestConflictFingerprintDifferentOutbound(t *testing.T) {
 	}
 }
 
+func identityPrefixConflictMatcher() *RoutingMatcher {
+	// 223-shaped prefix: sip / dscp / !sip(match_mac) must_direct, then two
+	// domain rules. DomainSet bits follow compiled match indices 3 and 4.
+	return &RoutingMatcher{
+		compiledMatches: []compiledRoutingMatch{
+			{matchType: consts.MatchType_SourceIpSet, outbound: consts.OutboundDirect, must: true},
+			{matchType: consts.MatchType_Dscp, outbound: consts.OutboundDirect, must: true},
+			{matchType: consts.MatchType_SourceIpSet, outbound: consts.OutboundDirect, must: true, not: true},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundDirect},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundUserDefinedMin},
+			{matchType: consts.MatchType_Fallback, outbound: consts.OutboundBlock},
+		},
+	}
+}
+
+func TestConflictFingerprintSkipsStandaloneIdentityRules(t *testing.T) {
+	matcher := identityPrefixConflictMatcher()
+	dest := netip.MustParseAddr("203.0.113.10")
+	direct := matcher.conflictFingerprint(dest, []uint32{1 << 3})
+	proxy := matcher.conflictFingerprint(dest, []uint32{1 << 4})
+	if !direct.valid || direct.outbound != consts.OutboundDirect || direct.must {
+		t.Fatalf("domain bit 3 = %+v, want valid non-must direct", direct)
+	}
+	if !proxy.valid || proxy.outbound != consts.OutboundUserDefinedMin || proxy.must {
+		t.Fatalf("domain bit 4 = %+v, want valid non-must proxy", proxy)
+	}
+	if direct == proxy {
+		t.Fatal("sip/dscp prefix must not collapse both owners onto must_direct")
+	}
+}
+
+func TestConflictFingerprintOrIdentityReducesToDomain(t *testing.T) {
+	matcher := &RoutingMatcher{
+		compiledMatches: []compiledRoutingMatch{
+			{matchType: consts.MatchType_SourceIpSet, outbound: consts.OutboundLogicalOr},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundUserDefinedMin},
+			{matchType: consts.MatchType_Fallback, outbound: consts.OutboundDirect},
+		},
+	}
+	dest := netip.MustParseAddr("203.0.113.10")
+	hit := matcher.conflictFingerprint(dest, []uint32{0x2})
+	miss := matcher.conflictFingerprint(dest, []uint32{0x1})
+	if !hit.valid || hit.outbound != consts.OutboundUserDefinedMin {
+		t.Fatalf("sip || domain hit = %+v, want proxy", hit)
+	}
+	if !miss.valid || miss.outbound != consts.OutboundDirect {
+		t.Fatalf("sip || domain miss = %+v, want fallback direct", miss)
+	}
+}
+
 func TestAttachDomainRoutingFingerprints(t *testing.T) {
 	matcher := &RoutingMatcher{
 		compiledMatches: []compiledRoutingMatch{

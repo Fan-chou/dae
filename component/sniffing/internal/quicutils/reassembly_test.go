@@ -35,6 +35,17 @@ func TestCryptoReassemblyOutOfOrderAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestCryptoReassemblySameOffsetKeepsLonger(t *testing.T) {
+	var reasm CryptoReassembly
+	reasm.Insert(10, []byte("ab"))
+	reasm.Insert(10, []byte("abcdef"))
+	reasm.Insert(10, []byte("xy"))
+	reasm.Insert(0, []byte("0123456789"))
+	if !bytes.Equal(reasm.Assembled(), []byte("0123456789abcdef")) {
+		t.Fatalf("same-offset must keep the longer fragment: %q", reasm.Assembled())
+	}
+}
+
 func TestCryptoReassemblyHoleStaysPending(t *testing.T) {
 	var reasm CryptoReassembly
 	reasm.Insert(0, []byte("abc"))
@@ -91,6 +102,9 @@ func TestCollectCryptoFramesSkipsAckEcnAndConnectionClose(t *testing.T) {
 	}
 	if !bytes.Equal(reasm.Assembled(), []byte("sni")) {
 		t.Fatalf("got %q", reasm.Assembled())
+	}
+	if !reasm.Closed() {
+		t.Fatal("CONNECTION_CLOSE must mark reassembly closed")
 	}
 }
 
@@ -167,6 +181,15 @@ func TestExtractCryptoFrameOffsetAckIsNotUnknown(t *testing.T) {
 	}
 	if n != len(remainder) {
 		t.Fatalf("consumed %d, want %d", n, len(remainder))
+	}
+}
+
+func TestSkipAckFrameRejectsHugeRangeCount(t *testing.T) {
+	// 2-byte QUIC varint 0x4041 = 65 additional ACK ranges.
+	body := []byte{0x00, 0x00, 0x40, 0x41, 0x00}
+	_, err := skipAckFrame(body, false)
+	if !errors.Is(err, ErrOutOfRange) {
+		t.Fatalf("got %v, want ErrOutOfRange", err)
 	}
 }
 
