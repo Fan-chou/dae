@@ -168,9 +168,11 @@ func (g Group) HasHealthCheckOverride() bool {
 		g.Lazy || g.LazySet
 }
 
-// EnablesHealthCheck reports whether this group needs alive-state sets and
-// health-check activation even when its selection policy is fixed. A fixed
-// Mihomo select choice must not silently discard explicit health settings.
+// EnablesHealthCheck reports whether this group has explicit probe settings
+// that must run even when its selection policy is fixed. Lazy is only a
+// scheduling flag (when to start those probes) and must not invent a health
+// layer of its own: Mihomo select groups emit lazy: false without wanting
+// another clone+probe loop on every leaf.
 func (g Group) EnablesHealthCheck() bool {
 	return g.TcpCheckUrl != nil ||
 		g.TcpCheckHttpMethod != "" ||
@@ -178,8 +180,7 @@ func (g Group) EnablesHealthCheck() bool {
 		g.CheckInterval != 0 ||
 		g.CheckIntervalSet ||
 		g.CheckTolerance != 0 ||
-		g.CheckToleranceSet ||
-		g.Lazy || g.LazySet
+		g.CheckToleranceSet
 }
 
 type DnsRequestRouting struct {

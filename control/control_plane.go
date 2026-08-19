@@ -774,6 +774,10 @@ func newControlPlaneWithContextOptions(
 	baseOutboundCount := len(outbounds)
 	groupSelectionStore := groupSelectionStoreFromContext(ctx)
 	groupSelectionMembers := make(map[string][]string)
+	healthDialers := &outbound.HealthDialerCache{}
+	for _, d := range dialerSet.AllDialers() {
+		healthDialers.Remember(d)
+	}
 	for _, planIndex := range groupBuildOrder {
 		plan := groupPlans[planIndex]
 		group := plan.group
@@ -844,6 +848,7 @@ func newControlPlaneWithContextOptions(
 				outbound.DialerGroupRuntimeOptions{
 					HealthCheckEnabled: group.EnablesHealthCheck(),
 					Lazy:               group.Lazy,
+					HealthDialers:      healthDialers,
 				},
 			)
 			if err != nil {
@@ -881,8 +886,10 @@ func newControlPlaneWithContextOptions(
 		if groupOption != nil {
 			newDialers := make([]*dialer.Dialer, 0)
 			for _, d := range dialers {
-				newDialer := d.CloneWithGlobalOptionContext(context.Background(), groupOption)
-				deferFuncs = append(deferFuncs, newDialer.Close)
+				newDialer, created := healthDialers.ReuseOrClone(d, groupOption)
+				if created {
+					deferFuncs = append(deferFuncs, newDialer.Close)
+				}
 				newDialers = append(newDialers, newDialer)
 			}
 			log.Infof(`Group "%v"'s check option has been override.`, group.Name)
@@ -906,6 +913,7 @@ func newControlPlaneWithContextOptions(
 			outbound.DialerGroupRuntimeOptions{
 				HealthCheckEnabled: group.EnablesHealthCheck(),
 				Lazy:               group.Lazy,
+				HealthDialers:      healthDialers,
 			},
 		)
 		if len(group.SelectionMembers) > 0 {

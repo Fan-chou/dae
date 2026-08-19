@@ -6,7 +6,6 @@
 package outbound
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -85,13 +84,14 @@ type dialerGroupMember struct {
 }
 
 // DialerGroupRuntimeOptions carries group-level health behavior that is not a
-// dialer option. HealthCheckEnabled is needed for fixed Mihomo select groups:
-// fixed selection remains fixed, but explicit health settings must still be
-// observed by the existing connectivity-check machinery. Lazy defers those
-// checks until the group participates in a real selection.
+// dialer option. HealthCheckEnabled is needed for fixed Mihomo select groups
+// that set tcp_check_url / check_interval / similar probe knobs. Lazy only
+// defers those checks until the group participates in a real selection; it
+// must not invent a second probe layer on its own.
 type DialerGroupRuntimeOptions struct {
 	HealthCheckEnabled bool
 	Lazy               bool
+	HealthDialers      *HealthDialerCache
 }
 
 func NewDialerGroup(
@@ -131,7 +131,7 @@ func NewDialerGroupWithRuntimeOptions(
 		dialersAnnotations:  dialersAnnotations,
 		checkTolerance:      option.CheckTolerance,
 		aliveChangeCallback: aliveChangeCallback,
-		healthCheckEnabled:  runtimeOptions.HealthCheckEnabled || runtimeOptions.Lazy,
+		healthCheckEnabled:  runtimeOptions.HealthCheckEnabled,
 		lazyCheck:           runtimeOptions.Lazy,
 	}
 	state := group.buildSelectionState(p, true)
@@ -217,7 +217,7 @@ func NewNestedDialerGroupWithRuntimeOptions(
 	groupDialers := leafDialers
 	groupAnnotations := leafAnnotations
 	var parentHealthViews map[*dialer.Dialer]*dialer.Dialer
-	if runtimeOptions.HealthCheckEnabled || runtimeOptions.Lazy {
+	if runtimeOptions.HealthCheckEnabled {
 		groupDialers = make([]*dialer.Dialer, 0, len(leafDialers))
 		groupAnnotations = make([]*dialer.Annotation, 0, len(leafDialers))
 		parentHealthViews = make(map[*dialer.Dialer]*dialer.Dialer, len(leafDialers))
@@ -228,7 +228,7 @@ func NewNestedDialerGroupWithRuntimeOptions(
 				// remove it from first_alive/url-test fallback.
 				continue
 			}
-			view := leaf.CloneWithGlobalOptionContext(context.Background(), option)
+			view, _ := runtimeOptions.HealthDialers.CloneShared(leaf, option)
 			// A parent health layer is an explicit admission policy. Built-in
 			// DIRECT and other disabled concrete members may skip their own
 			// checks, but that must not suppress the parent's check.
@@ -290,7 +290,11 @@ func (g *DialerGroup) activateChecks() {
 				member.group.ActivateCheck()
 				continue
 			}
-			if member.dialer != nil && len(g.parentHealthViews) == 0 {
+			// Standalone nested leaves (Mihomo select name() members) share the
+			// parent's policy. A fixed select does not need to probe every
+			// alternative; the child url-test group already probes its pool.
+			if member.dialer != nil && len(g.parentHealthViews) == 0 &&
+				g.needsAliveState(g.currentSelectionState().policy.Policy) {
 				member.dialer.ActivateCheck()
 			}
 		}
@@ -721,6 +725,9 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 
 func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, excluded *dialer.Dialer, fixed bool, activateLazy bool) (*dialer.Dialer, time.Duration, *dialer.NetworkType, error) {
 	d, latency, selectedNetworkType, err := member.selectForNestedGroup(networkType, policy, excluded, fixed, activateLazy)
+	if err == nil && d != nil {
+		d.ActivateCheck()
+	}
 	// Fixed parent selection keeps the established flat-group contract: the
 	// explicit user choice is returned even when a health view currently marks
 	// it unavailable. The parent view still runs for observability and reload.
