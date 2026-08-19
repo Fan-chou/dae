@@ -150,10 +150,7 @@ func (c *ControlPlane) ResumeOutboundConnectivityUpdates() {
 			}
 			for _, healthKey := range dialer.StandardHealthKeys() {
 				networkType := healthKey.NetworkType()
-				alive := true
-				if set := group.MustGetAliveDialerSet(networkType); set != nil {
-					alive = set.Len() > 0
-				}
+				alive := group.KernelOutboundAlive(networkType)
 				c.core.writeOutboundConnectivityLocked(uint8(outboundID), alive, networkType)
 			}
 		}

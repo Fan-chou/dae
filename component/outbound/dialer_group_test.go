@@ -1127,10 +1127,15 @@ func TestDialerGroup_Select_FirstAliveNestedHealthKeepsBlockFallback(t *testing.
 				Policy:     consts.DialerSelectionPolicy_Fixed,
 				FixedIndex: 0,
 			}, func(bool, *dialer.NetworkType, bool) {})
+			sawKernelDead := false
 			parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
 				{Group: child},
 				{Group: block},
-			}, policy, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+			}, policy, func(alive bool, _ *dialer.NetworkType, isInit bool) {
+				if !alive && !isInit {
+					sawKernelDead = true
+				}
+			}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
 			if err != nil {
 				t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
 			}
@@ -1159,6 +1164,20 @@ func TestDialerGroup_Select_FirstAliveNestedHealthKeepsBlockFallback(t *testing.
 				parent.parentHealthViews[leaf].RestoreHealthSnapshot(snapshot)
 			}
 
+			set := parent.MustGetAliveDialerSet(TestNetworkType)
+			if set == nil {
+				t.Fatal("parent has no alive set")
+			}
+			if got := set.Len(); got != 0 {
+				t.Fatalf("parent probe set length = %d, want 0 after all health views died", got)
+			}
+			if !parent.KernelOutboundAlive(TestNetworkType) {
+				t.Fatal("kernel outbound alive = false; REJECT fallback would be unreachable from BPF")
+			}
+			if sawKernelDead {
+				t.Fatal("alive callback reported the group dead; BPF would drop new connections before REJECT")
+			}
+
 			selected, _, err := parent.Select(TestNetworkType, true)
 			if err != nil {
 				t.Fatalf("Select() error = %v", err)
@@ -1167,5 +1186,67 @@ func TestDialerGroup_Select_FirstAliveNestedHealthKeepsBlockFallback(t *testing.
 				t.Fatalf("selected dialer = %p, want builtin block fallback %p", selected, blockDialer)
 			}
 		})
+	}
+}
+
+func TestDialerGroup_KernelOutboundAliveWithoutBlockFollowsProbeSet(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	childDialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	sawKernelDead := false
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+		{Group: child},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinAverage10Latencies}, func(alive bool, _ *dialer.NetworkType, isInit bool) {
+		if !alive && !isInit {
+			sawKernelDead = true
+		}
+	}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, d := range childDialers {
+		defer d.Close()
+	}
+
+	for _, leaf := range childDialers {
+		view := parent.parentHealthViews[leaf]
+		if view == nil {
+			t.Fatal("parent omitted a health view for a probeable child leaf")
+		}
+		snapshot := view.HealthSnapshot()
+		for i := range snapshot.Collections {
+			snapshot.Collections[i].Alive = false
+		}
+		view.RestoreHealthSnapshot(snapshot)
+	}
+
+	set := parent.MustGetAliveDialerSet(TestNetworkType)
+	if set == nil {
+		t.Fatal("parent has no alive set")
+	}
+	if got := set.Len(); got != 0 {
+		t.Fatalf("parent probe set length = %d, want 0 after all health views died", got)
+	}
+	if parent.KernelOutboundAlive(TestNetworkType) {
+		t.Fatal("kernel outbound alive = true, want false when every probeable member is dead")
+	}
+	if !sawKernelDead {
+		t.Fatal("alive callback did not report the group dead after every probeable member died")
 	}
 }

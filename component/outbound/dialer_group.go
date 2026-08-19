@@ -42,6 +42,11 @@ type DialerGroup struct {
 	// health-check dialers. The clones let a parent apply its own check option
 	// without changing a child's health state or check lifecycle.
 	parentHealthViews map[*dialer.Dialer]*dialer.Dialer
+	// skipAdmissionFallback is set when a nested health layer omitted
+	// REJECT/block from Dialers so probes cannot mark the fallback dead.
+	// Userspace can still select that member; BPF connectivity must stay
+	// alive so new connections reach it.
+	skipAdmissionFallback bool
 
 	selectionState   atomic.Pointer[dialerGroupSelectionState]
 	selectionStateMu sync.Mutex
@@ -217,6 +222,7 @@ func NewNestedDialerGroupWithRuntimeOptions(
 	groupDialers := leafDialers
 	groupAnnotations := leafAnnotations
 	var parentHealthViews map[*dialer.Dialer]*dialer.Dialer
+	skipAdmissionFallback := false
 	if runtimeOptions.HealthCheckEnabled {
 		groupDialers = make([]*dialer.Dialer, 0, len(leafDialers))
 		groupAnnotations = make([]*dialer.Annotation, 0, len(leafDialers))
@@ -225,7 +231,10 @@ func NewNestedDialerGroupWithRuntimeOptions(
 			if skipsParentHealthAdmission(leaf) {
 				// REJECT/block cannot complete HTTP/DNS probes. Creating a
 				// parent view with DisableCheck=false would mark it dead and
-				// remove it from first_alive/url-test fallback.
+				// remove it from first_alive/url-test fallback. Keep it out
+				// of Dialers, but remember it so an empty probe set does not
+				// tell the kernel the group is unreachable.
+				skipAdmissionFallback = true
 				continue
 			}
 			view, _ := runtimeOptions.HealthDialers.CloneShared(leaf, option)
@@ -238,11 +247,24 @@ func NewNestedDialerGroupWithRuntimeOptions(
 			groupAnnotations = append(groupAnnotations, leafAnnotations[i])
 		}
 	}
-	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, aliveChangeCallback, runtimeOptions)
+	callback := aliveChangeCallback
+	if skipAdmissionFallback && callback != nil {
+		callback = keepSkipAdmissionKernelAlive(callback)
+	}
+	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, callback, runtimeOptions)
 	group.nestedMembers = internalMembers
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
+	group.skipAdmissionFallback = skipAdmissionFallback
 	return group, nil
+}
+
+func keepSkipAdmissionKernelAlive(
+	callback func(alive bool, networkType *dialer.NetworkType, isInit bool),
+) func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+	return func(_ bool, networkType *dialer.NetworkType, isInit bool) {
+		callback(true, networkType, isInit)
+	}
 }
 
 func (g *DialerGroup) nestedConcreteDialers() []*dialer.Dialer {
@@ -427,6 +449,26 @@ func (g *DialerGroup) MinCheckInterval() time.Duration {
 
 func (d *DialerGroup) MustGetAliveDialerSet(typ *dialer.NetworkType) *dialer.AliveDialerSet {
 	return d.currentSelectionState().aliveDialerSets[typ.Index()]
+}
+
+// KernelOutboundAlive reports whether new connections should still reach
+// userspace for this group. REJECT/block is excluded from parent health views,
+// so an empty probe set must not mark the group dead in outbound_connectivity_map.
+func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool {
+	if g == nil {
+		return true
+	}
+	if g.skipAdmissionFallback {
+		return true
+	}
+	if networkType == nil {
+		return true
+	}
+	set := g.MustGetAliveDialerSet(networkType)
+	if set == nil {
+		return true
+	}
+	return set.Len() > 0
 }
 
 // CaptureReloadSelectionFallback captures one fallback candidate per network
