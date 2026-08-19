@@ -7,12 +7,9 @@ package sniffing
 
 import (
 	"encoding/hex"
-	"fmt"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -20,13 +17,10 @@ var QuicStream2_2, _ = hex.DecodeString("cc0000000108e8da6ed9f385c987000044d026f
 var QuicStream2_1, _ = hex.DecodeString("ce0000000108e8da6ed9f385c987000044d0f34f94dcc26b99261ea264742abe4e552a146e16e89e4b7ef0ab3d6f3a34227b59742e4ba83a1e18cea494d2f67e469be4a7ff01334b151e9b7ca63b53735008eecc1f5c618419982292eca5731bb163ba81c1300e0bb99f2536d89ab0faf2dbd37ebfdb3d71f7343296a2190914bda556b8f9ccf5219964eb3cd373966fcfaca8a4735fb59fbaf69bbbdfc3a81b11570bb81fd3f5ef780fb7036e0666b997b0f4ed3305b68eafa1a99b3c8a6a2142ad9fe1e6b0a0eade6ace92b57416d4bf68fa2e9295bfc22757b0542ce91c8af3f547ef0ad385788db230a50158a0009fd95a7e8ee6e0dd11d6f9a906cbe8117e85bd507cdbd8f1a5a6cabf2617de7227d1ae8a8c6086b8ec325df90c0e16b37b4ed0ce617a00c7598a21924a19aec1b08c31b69430b23eefbe555ca2433431d28a4ffec548e463e8e6363b6b4fe9b8477c686c393571273c30b2e1785261faa0fd6f560c12418b27cd0491e013db5a8b3294e01a46a6e4c6b52e32756ab4be6f4ebc886c0c472d63f117ce30115182a97f1308c7f28989ce301cabced825154b0f4fa3bf4a55ce2f384ff11d9cbc0460d69db363664f92dc014bdb771b9b1e1ab6672c6da71c90aa514dcdc3a4ce45298bf9e5a395ebac3dff2a738c4b4690ee06fdab572a277addac7035d94afe794df05da75a56c79c37f42de1d727dc65e3060d9331e2fc82de2d7cef6cb9ae46f648b9930593975c35960b24deb770d5ee4332f8f57a05503399ca7bfdf7207f66a0f73d6b53269a944d5a3043b225adddfdd29d20ea8f500bb09ea3bb724083dd29ea8839e8192c4360ba3c5a6db0d695af5d357d6c4ed94aa28305033629201689764189774bbd4f0ae41b878b8f29a0fe0e124075ea08c5054871506a05be2f90e9ec0c2db48c0780580312e9ff4071054386e4206841f575f7ca06c228f7ee11e2333d08652b9b4f0b97f473a46a3d79c4f9a3416fb20fdbd88cacfa36f06fe1d73618195c6f0bf759a77c6a16b7e271c6cdb672ea53f6edfac860fcaf03313564abde1f66bca441d844d289a9e1025711c284f2c7c805353f2a89e9aeb52e3f452e879f0fafcdc0b48a0676afcf617a85037d991762664f6db64847eff2308447c4e8ea6688838bb7237a5fdfe0f1695afaa0bbb821b0004585adf151b029bd3458e28ba49dfc17eef1d2dd14ccda88d0848d4cd36d33cc5bab173c2448785ec1bdabc8873c904b95d7847d1b89857f2c7e078c6e2eb96029aa91c077e0efcf7b2ed2f30c7abc12189627793c7870dc0e70342cc27402ee1d6dec5ceea0ca06159002ea14a20c63b85689ed1840f404e46cb83d91c5e02f3ed938462364d3349f689310234083f7044e4b338ac54bed94530640d684c9688651b915d8c8895ef0f05f376292871b589751ac5b233e3d85572bb0c11bbbe91cc49a4ef0422f2676a2f3cc62bc88dbb7acf03cb5e847e976bfca6a90b9cee743ea77be5472ef162ff101c6873043df94c53c252840fd6a2662018f0897a06cd215997d6050917876500796fef718957212c773c39d1c7b839931af1e7dfae6e2c1d2251e78896521bb35b20057bad77df85aaed90288c17edb081398815e47239aeb77293a02a61a5125109fc3953593233fa83c17770a815fad7831c1b8647c6089ec621ee774a12a714def498d4335d0bb8a4a6a3dddead8ddb1176f58218477d55317df88cd2ca5a06b72679cf2ff7253ebd76a5ed3")
 var QuicStream3, _ = hex.DecodeString("c00000000110787cb250e5ebaa3070534ac6f568006c14376bb3d77569ef83965513f7ab60499d3d6fe8cd00411e61c97af492e1c220194c2460a093505250315e811506fda1a54b7b6bfc85e18d997db284c578a4c4576258c92176200b5f85d40b28734880c8c01a9e9d5944b17568a24e112e966bf0ee955981635f0dde48e0d176f8492708a4436a53a4794a29dd8b020521824823db71bb6a4266baaf9364a2268cf87ee1dd9a543c9268c3d7ef6726e9bdea6f38d615b9ba08b3a290a22ebc1fcd9093bde5098c3c0d6151ab1e30243d21906a88e8d248a55a2c4d282e309fced134e4d13d9d2ef49325a2741824b14f1a018cfed76d0de5b6cd2881c0c708bbcca59cff5cb60ad7b9a2909b1afb4efe0b358ba098b6b2a598da1f9d23accdab814f524c1e1e0d86d3c1e4199b358a5dad8eacfe6d5d1cf431a44129538177824ed150650d97631d4d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
 
-func dumpCryptos(t *testing.T, cryptos []*quicutils.CryptoFrameOffset) {
-	var b strings.Builder
-	for _, c := range cryptos {
-		fmt.Fprintf(&b, "Offset %v; length: %v:\n", c.UpperAppOffset, len(c.Data))
-		fmt.Fprintf(&b, "Dump:\n%v\n", hex.Dump(c.Data))
-	}
-	t.Log(b.String())
+func dumpAssembled(t *testing.T, s *Sniffer) {
+	t.Helper()
+	assembled := s.quicReasm.Assembled()
+	t.Logf("assembled %d bytes:\n%s", len(assembled), hex.Dump(assembled))
 }
 
 func TestQuicReassemble(t *testing.T) {
@@ -41,7 +35,7 @@ func TestQuicReassemble(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	dumpCryptos(t, sniffer.quicCryptos)
+	dumpAssembled(t, sniffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,14 +49,14 @@ func TestQuic(t *testing.T) {
 	sniffer := NewPacketSniffer(QuicStream3, 300*time.Millisecond)
 	d, err := sniffer.SniffQuic()
 	if err != nil {
-		dumpCryptos(t, sniffer.quicCryptos)
+		dumpAssembled(t, sniffer)
 		if sniffer.NeedMore() {
 			t.Fatal("need more")
 		} else {
 			t.Fatal(err)
 		}
 	}
-	dumpCryptos(t, sniffer.quicCryptos)
+	dumpAssembled(t, sniffer)
 	t.Log(d)
 }
 
@@ -230,4 +224,134 @@ func TestIsLikelyQuicInitialPacket_HeaderValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSniffQuic_IncompleteDoesNotCompleteWithoutSecondPacket(t *testing.T) {
+	sniffer := NewPacketSniffer(QuicStream2_1, 300*time.Millisecond)
+	defer sniffer.Close()
+	_, err := sniffer.SniffQuic()
+	if err == nil {
+		t.Fatal("expected first fragment to be incomplete")
+	}
+	if !sniffer.NeedMore() {
+		t.Fatal("expected NeedMore on incomplete ClientHello")
+	}
+}
+
+func TestSniffQuic_CompleteHelloWithoutSNIDoesNotNeedMore(t *testing.T) {
+	hello := minimalClientHello("")
+	sniffer := NewPacketSniffer(nil, 300*time.Millisecond)
+	defer sniffer.Close()
+	sniffer.quicReasm.Insert(0, hello)
+	d, err := sniffer.sniffQuicAssembled()
+	if d != "" {
+		t.Fatalf("domain = %q, want empty", d)
+	}
+	if err == nil {
+		t.Fatal("expected error for complete ClientHello without SNI")
+	}
+	if sniffer.NeedMore() {
+		t.Fatal("complete ClientHello without SNI must not hold the flow")
+	}
+}
+
+func TestGiveUpIncompleteClearsNeedMore(t *testing.T) {
+	sniffer := NewPacketSniffer(QuicStream2_1, 300*time.Millisecond)
+	defer sniffer.Close()
+	_, _ = sniffer.SniffQuic()
+	if !sniffer.NeedMore() {
+		t.Fatal("expected NeedMore")
+	}
+	sniffer.GiveUpIncomplete()
+	if sniffer.NeedMore() {
+		t.Fatal("GiveUpIncomplete must clear NeedMore")
+	}
+}
+
+func TestSniffQuicLatencyEnvelope(t *testing.T) {
+	const rounds = 200
+	durations := make([]time.Duration, 0, rounds)
+	for i := 0; i < rounds; i++ {
+		start := time.Now()
+		sniffer := NewPacketSniffer(QuicStream3, 300*time.Millisecond)
+		d, err := sniffer.SniffQuic()
+		elapsed := time.Since(start)
+		_ = sniffer.Close()
+		if err != nil || d == "" {
+			t.Fatalf("sniff failed: domain=%q err=%v", d, err)
+		}
+		durations = append(durations, elapsed)
+	}
+	min, max, sum := durations[0], durations[0], time.Duration(0)
+	for _, d := range durations {
+		if d < min {
+			min = d
+		}
+		if d > max {
+			max = d
+		}
+		sum += d
+	}
+	avg := sum / time.Duration(len(durations))
+	t.Logf("single-packet QUIC sniff latency: min=%v avg=%v max=%v n=%d", min, avg, max, rounds)
+	if max > 500*time.Millisecond {
+		t.Fatalf("sniff max latency %v exceeds 500ms envelope (possible regression)", max)
+	}
+}
+
+func TestSniffQuicMultiPacketLatencyEnvelope(t *testing.T) {
+	const rounds = 100
+	var sum time.Duration
+	var max time.Duration
+	for i := 0; i < rounds; i++ {
+		start := time.Now()
+		sniffer := NewPacketSniffer(QuicStream2_1, 300*time.Millisecond)
+		_, err := sniffer.SniffQuic()
+		if err != nil && sniffer.NeedMore() {
+			sniffer.AppendData(QuicStream2_2)
+			_, err = sniffer.SniffQuic()
+		}
+		elapsed := time.Since(start)
+		_ = sniffer.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum += elapsed
+		if elapsed > max {
+			max = elapsed
+		}
+	}
+	t.Logf("two-packet QUIC sniff latency: avg=%v max=%v n=%d", sum/time.Duration(rounds), max, rounds)
+	if max > 500*time.Millisecond {
+		t.Fatalf("two-packet sniff max latency %v exceeds 500ms envelope", max)
+	}
+}
+
+func minimalClientHello(sni string) []byte {
+	var body []byte
+	body = append(body, 0x03, 0x03)
+	body = append(body, make([]byte, 32)...)
+	body = append(body, 0x00)
+	body = append(body, 0x00, 0x00)
+	body = append(body, 0x00)
+	if sni == "" {
+		body = append(body, 0x00, 0x00)
+	} else {
+		name := []byte(sni)
+		listInner := []byte{0x00, byte(len(name) >> 8), byte(len(name))}
+		listInner = append(listInner, name...)
+		list := []byte{byte(len(listInner) >> 8), byte(len(listInner))}
+		list = append(list, listInner...)
+		ext := []byte{0x00, 0x00, byte(len(list) >> 8), byte(len(list))}
+		ext = append(ext, list...)
+		body = append(body, byte(len(ext)>>8), byte(len(ext)))
+		body = append(body, ext...)
+	}
+	hs := make([]byte, 4+len(body))
+	hs[0] = 0x01
+	hs[1] = byte(len(body) >> 16)
+	hs[2] = byte(len(body) >> 8)
+	hs[3] = byte(len(body))
+	copy(hs[4:], body)
+	return hs
 }

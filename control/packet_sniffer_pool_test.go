@@ -172,6 +172,21 @@ func TestPacketSnifferPool_RemoveFlowFamilySessionsRemovesOnlyMatchingFamily(t *
 	}
 }
 
+func TestPacketSnifferInitialPacketBudget(t *testing.T) {
+	ps := &PacketSniffer{}
+	for i := 1; i <= maxInitialSniffPackets; i++ {
+		if !ps.RecordQuicInitialPacket() {
+			t.Fatalf("packet %d should still be sniffed", i)
+		}
+	}
+	if ps.RecordQuicInitialPacket() {
+		t.Fatal("packet after budget must not keep holding")
+	}
+	if ps.quicInitialPackets != maxInitialSniffPackets+1 {
+		t.Fatalf("counted %d, want %d", ps.quicInitialPackets, maxInitialSniffPackets+1)
+	}
+}
+
 func BenchmarkPacketSnifferPool_ObserveFlowFamilyQuicInitial(b *testing.B) {
 	pool := NewPacketSnifferPool()
 	defer pool.Close()

@@ -8,7 +8,6 @@ package sniffing
 import (
 	"encoding/binary"
 	"errors"
-	"io/fs"
 
 	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
 	"github.com/daeuniverse/outbound/pool"
@@ -67,7 +66,7 @@ func (s *Sniffer) SniffQuic() (d string, err error) {
 	nextBlock := s.buf.Bytes()[s.quicNextRead:]
 	isQuic := false
 	for {
-		s.quicCryptos, nextBlock, err = sniffQuicBlock(s, s.quicCryptos, nextBlock)
+		nextBlock, err = sniffQuicBlock(s, nextBlock)
 		if err != nil {
 			// If block is not a quic block, return it.
 			if errors.Is(err, ErrNotApplicable) {
@@ -77,10 +76,6 @@ func (s *Sniffer) SniffQuic() (d string, err error) {
 					break
 				}
 				return "", err
-			}
-			if errors.Is(err, fs.ErrClosed) {
-				// ConnectionClose sniffed.
-				return "", ErrNotFound
 			}
 			// The code should NOT run here.
 			return "", err
@@ -93,35 +88,46 @@ func (s *Sniffer) SniffQuic() (d string, err error) {
 	}
 	// Is quic.
 	s.quicNextRead = s.buf.Len()
-	// Reuse the per-Sniffer LinearLocator across SniffQuic calls instead of
-	// allocating a new one each time (NewLinearLocator was a leading QUIC
-	// allocation). Reset repoints it at the current crypto frame offsets.
-	if s.quicLocator == nil {
-		s.quicLocator = quicutils.NewLinearLocator(s.quicCryptos)
-	} else {
-		s.quicLocator.Reset(s.quicCryptos)
-	}
-	sni, err := extractSniFromTls(s.quicLocator)
-	if err != nil {
-		s.needMore = true
-		return "", ErrNotFound
-	}
-	return sni, nil
+	return s.sniffQuicAssembled()
 }
 
-func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []byte) (new []*quicutils.CryptoFrameOffset, next []byte, err error) {
+func (s *Sniffer) sniffQuicAssembled() (d string, err error) {
+	if s.quicReasm.Overflowed() {
+		s.needMore = false
+		return "", ErrNotFound
+	}
+	assembled := s.quicReasm.Assembled()
+	st, hsEnd := quicutils.ClassifyClientHello(assembled)
+	switch st {
+	case quicutils.ClientHelloIncomplete:
+		s.needMore = true
+		return "", ErrNotFound
+	case quicutils.ClientHelloInvalid:
+		s.needMore = false
+		return "", ErrNotFound
+	default:
+		sni, err := extractSniFromTls(quicutils.BuiltinBytesLocator(assembled[:hsEnd]))
+		if err != nil || sni == "" {
+			s.needMore = false
+			return "", ErrNotFound
+		}
+		return sni, nil
+	}
+}
+
+func sniffQuicBlock(s *Sniffer, buf []byte) (next []byte, err error) {
 	// QUIC: A UDP-Based Multiplexed and Secure Transport
 	// https://datatracker.ietf.org/doc/html/rfc9000#name-initial-packet
 	const dstConnIdPos = 6
 	boundary := dstConnIdPos
 	if len(buf) < boundary {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	// Check flag.
 	// Long header: 4 bits masked
 	// High 4 bits are not protected, so we can access QuicFlag_HeaderForm and QuicFlag_LongPacketType without decryption.
 	if !isQuicInitialLongHeader(buf) {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 
 	// Skip version. DecryptQuic_ reads it for the Initial salt.
@@ -129,37 +135,37 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	destConnIdLength := int(buf[boundary-1])
 	boundary += destConnIdLength + 1 // +1 because next field has 1B length
 	if len(buf) < boundary {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	destConnId := buf[dstConnIdPos : dstConnIdPos+destConnIdLength]
 
 	srcConnIdLength := int(buf[boundary-1])
 	boundary += srcConnIdLength + quicutils.MaxVarintLen64 // The next fields may have quic.MaxVarintLen64 bytes length
 	if len(buf) < boundary {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	tokenLength, n, err := quicutils.BigEndianUvarint(buf[boundary-quicutils.MaxVarintLen64:])
 	if err != nil {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	boundary = boundary - quicutils.MaxVarintLen64 + n      // Correct boundary.
 	boundary += int(tokenLength) + quicutils.MaxVarintLen64 // Next fields may have quic.MaxVarintLen64 bytes length
 	if len(buf) < boundary {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	// https://datatracker.ietf.org/doc/html/rfc9000#name-variable-length-integer-enc
 	length, n, err := quicutils.BigEndianUvarint(buf[boundary-quicutils.MaxVarintLen64:])
 	if err != nil {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	boundary = boundary - quicutils.MaxVarintLen64 + n // Correct boundary.
 	blockEnd := boundary + int(length)
 	if len(buf) < blockEnd {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	boundary += quicutils.MaxPacketNumberLength
 	if len(buf) < boundary {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	header := buf[:boundary]
 	// Decrypt protected Packets.
@@ -177,17 +183,11 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	}()
 	plaintext, err := quicutils.DecryptQuic_(buf, boundary-quicutils.MaxPacketNumberLength, blockEnd, destConnId)
 	if err != nil {
-		return cryptos, nil, ErrNotApplicable
+		return nil, ErrNotApplicable
 	}
 	s.quicPlaintexts = append(s.quicPlaintexts, plaintext)
-	// Now, we confirm it is exact a quic frame.
-	// After here, we should not return NotApplicableError.
-	// And we should return nextFrame.
-	if new, err = quicutils.ReassembleCryptos(cryptos, plaintext); err != nil {
-		if errors.Is(err, fs.ErrClosed) {
-			return cryptos, nil, err
-		}
-		return cryptos, buf[blockEnd:], ErrNotApplicable
-	}
-	return new, buf[blockEnd:], nil
+	// CRYPTO fragments are owned by s.quicReasm (contiguous prefix from 0).
+	// Unknown frames stop the walk without failing the packet; ACK/CLOSE are skipped.
+	_ = quicutils.CollectCryptoFrames(plaintext, &s.quicReasm)
+	return buf[blockEnd:], nil
 }

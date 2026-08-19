@@ -938,8 +938,14 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}()
 
 				_, _ = sniffer.ObserveQuicInitial(data)
+				overBudget := !sniffer.RecordQuicInitialPacket()
 				sniffer.AppendData(data)
-				domain, err = sniffer.SniffUdp()
+				if overBudget {
+					sniffer.GiveUpIncomplete()
+					MarkQuicDcidFailed(key, quicDcidFailureReasonSoftBypass)
+				} else {
+					domain, err = sniffer.SniffUdp()
+				}
 				if err != nil {
 					// Check for decrypt failures (malformed packets).
 					// If decryption repeatedly fails, the packets are not valid QUIC

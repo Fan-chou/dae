@@ -6,9 +6,9 @@
 package quicutils
 
 import (
+	"errors"
 	"fmt"
-	"io/fs"
-	"sort"
+	"io"
 	"sync"
 )
 
@@ -20,10 +20,16 @@ var (
 const (
 	Quic_FrameType_Padding          = 0
 	Quic_FrameType_Ping             = 1
+	Quic_FrameType_Ack              = 0x02
+	Quic_FrameType_AckEcn           = 0x03
 	Quic_FrameType_Crypto           = 6
 	Quic_FrameType_ConnectionClose  = 0x1c
 	Quic_FrameType_ConnectionClose2 = 0x1d
 )
+
+// MaxCryptoStream is the honk-aligned cap on the reassembled CRYPTO stream
+// (ClientHello is well under 4 KiB). Hostile flows cannot grow it further.
+const MaxCryptoStream = 64 * 1024
 
 type CryptoFrameOffset struct {
 	UpperAppOffset int
@@ -35,11 +41,9 @@ type CryptoFrameOffset struct {
 // packets so each crypto frame does not allocate a new struct. Data is cleared
 // on release; the returned struct never carries stale plaintext slices.
 //
-// Lifetime invariant: a pooled struct's Data points into a plaintext PB buffer
-// owned by the sniffer's quicPlaintexts slice. The struct is released (Data set
-// to nil) when the sniffer drops its quicCryptos (CompactPacketState/Close) or
-// when ReassembleCryptos supersedes it during a merge. Releasing the struct does
-// not free the plaintext buffer (managed separately by the PB pool).
+// Lifetime invariant: Insert copies fragment bytes into CryptoReassembly.
+// A pooled CryptoFrameOffset is released after Insert; it must not alias
+// sniffer plaintext after CollectCryptoFrames returns.
 var cryptoFrameOffsetPool = sync.Pool{
 	New: func() any { return &CryptoFrameOffset{} },
 }
@@ -68,62 +72,45 @@ func ReleaseCryptoFrameOffsets(offsets []*CryptoFrameOffset) {
 }
 
 func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffsets []*CryptoFrameOffset, err error) {
-	var frameSize int
-	var offset *CryptoFrameOffset
-	// Extract crypto frames from the new packet.
-	for iNextFrame := 0; iNextFrame < len(newPayload); iNextFrame += frameSize {
-		offset, frameSize, err = ExtractCryptoFrameOffset(newPayload[iNextFrame:], iNextFrame)
-		if err != nil {
-			return nil, err
-		}
-		if offset == nil {
+	var reasm CryptoReassembly
+	for _, o := range offsets {
+		if o == nil {
 			continue
 		}
-		offsets = append(offsets, offset)
+		reasm.Insert(o.UpperAppOffset, o.Data)
 	}
-
-	if len(offsets) <= 1 {
-		// With zero or one frame there is nothing to sort or merge; return as-is
-		// to skip the merged-slice allocation and the reflect-based sort.Slice
-		// swapper. This is the common case for a QUIC Initial whose ClientHello
-		// fits in a single CRYPTO frame.
-		return offsets, nil
+	if err = CollectCryptoFrames(newPayload, &reasm); err != nil {
+		return nil, err
 	}
+	return reasm.exportFrames(), nil
+}
 
-	// Sort by offset to prepare for merge.
-	sort.Slice(offsets, func(i, j int) bool {
-		return offsets[i].UpperAppOffset < offsets[j].UpperAppOffset
-	})
-
-	// Merge overlapping crypto frames.
-	merged := make([]*CryptoFrameOffset, 0, len(offsets))
-	current := offsets[0]
-	for i := 1; i < len(offsets); i++ {
-		next := offsets[i]
-		currentEnd := current.UpperAppOffset + len(current.Data)
-		if next.UpperAppOffset <= currentEnd {
-			// Overlapping or adjacent: merge.
-			if next.UpperAppOffset+len(next.Data) > currentEnd {
-				// Extend current data.
-				newData := make([]byte, next.UpperAppOffset+len(next.Data)-current.UpperAppOffset)
-				copy(newData, current.Data)
-				copy(newData[len(current.Data):], next.Data[currentEnd-next.UpperAppOffset:])
-				mergedOffset := current.UpperAppOffset
-				// current is superseded by the extended view; return it to
-				// the pool and acquire a fresh struct for the merged result.
-				ReleaseCryptoFrameOffset(current)
-				current = AcquireCryptoFrameOffset()
-				current.UpperAppOffset = mergedOffset
-				current.Data = newData
+// CollectCryptoFrames walks Initial plaintext frames (RFC 9000 §17.2.2) and
+// inserts CRYPTO payloads into reasm. PADDING, PING, ACK, ACK_ECN and
+// CONNECTION_CLOSE are skipped. An unknown frame stops the walk; fragments
+// already collected are kept (honk collect_crypto_frames).
+func CollectCryptoFrames(payload []byte, reasm *CryptoReassembly) error {
+	if reasm == nil {
+		return nil
+	}
+	for iNextFrame := 0; iNextFrame < len(payload); {
+		offset, frameSize, err := ExtractCryptoFrameOffset(payload[iNextFrame:], iNextFrame)
+		if err != nil {
+			if errors.Is(err, ErrUnknownFrameType) || errors.Is(err, ErrOutOfRange) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
 			}
-		} else {
-			// Non-overlapping: save current and start new.
-			merged = append(merged, current)
-			current = next
+			return err
 		}
+		if offset != nil {
+			reasm.Insert(offset.UpperAppOffset, offset.Data)
+			ReleaseCryptoFrameOffset(offset)
+		}
+		if frameSize <= 0 {
+			return nil
+		}
+		iNextFrame += frameSize
 	}
-	merged = append(merged, current)
-	return merged, nil
+	return nil
 }
 
 func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset *CryptoFrameOffset, frameSize int, err error) {
@@ -141,6 +128,12 @@ func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset *Cr
 		for ; nextField < len(remainder) && remainder[nextField] == 0; nextField++ {
 		}
 		return nil, nextField, nil
+	case Quic_FrameType_Ack, Quic_FrameType_AckEcn:
+		n, err := skipAckFrame(remainder[nextField:], frameType == Quic_FrameType_AckEcn)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, nextField + n, nil
 	case Quic_FrameType_Crypto:
 		offset, n, err := BigEndianUvarint(remainder[nextField:])
 		if err != nil {
@@ -162,10 +155,86 @@ func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset *Cr
 		o.Data = remainder[nextField : nextField+int(length)]
 		return o, nextField + int(length), nil
 	case Quic_FrameType_ConnectionClose, Quic_FrameType_ConnectionClose2:
-		return nil, 0, fmt.Errorf("connection closed: %w", fs.ErrClosed)
+		n, err := skipConnectionCloseFrame(remainder[nextField:], frameType == Quic_FrameType_ConnectionClose)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, nextField + n, nil
 	default:
 		return nil, 0, fmt.Errorf("%w: %v", ErrUnknownFrameType, frameType)
 	}
+}
+
+func skipAckFrame(body []byte, hasECN bool) (int, error) {
+	pos := 0
+	_, n, err := BigEndianUvarint(body[pos:]) // largest acknowledged
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	_, n, err = BigEndianUvarint(body[pos:]) // ACK delay
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	rangeCount, n, err := BigEndianUvarint(body[pos:])
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	_, n, err = BigEndianUvarint(body[pos:]) // first ACK range
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	for i := uint64(0); i < rangeCount; i++ {
+		_, n, err = BigEndianUvarint(body[pos:]) // gap
+		if err != nil {
+			return 0, err
+		}
+		pos += n
+		_, n, err = BigEndianUvarint(body[pos:]) // ACK range length
+		if err != nil {
+			return 0, err
+		}
+		pos += n
+	}
+	if hasECN {
+		for i := 0; i < 3; i++ {
+			_, n, err = BigEndianUvarint(body[pos:])
+			if err != nil {
+				return 0, err
+			}
+			pos += n
+		}
+	}
+	return pos, nil
+}
+
+func skipConnectionCloseFrame(body []byte, hasFrameType bool) (int, error) {
+	pos := 0
+	_, n, err := BigEndianUvarint(body[pos:]) // error code
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	if hasFrameType {
+		_, n, err = BigEndianUvarint(body[pos:]) // triggering frame type
+		if err != nil {
+			return 0, err
+		}
+		pos += n
+	}
+	reasonLen, n, err := BigEndianUvarint(body[pos:])
+	if err != nil {
+		return 0, err
+	}
+	pos += n
+	end := pos + int(reasonLen)
+	if end > len(body) {
+		return 0, fmt.Errorf("connection close reason out of range: %w", ErrOutOfRange)
+	}
+	return end, nil
 }
 
 var (

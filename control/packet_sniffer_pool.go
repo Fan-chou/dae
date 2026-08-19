@@ -42,6 +42,10 @@ const (
 	// quickly identify non-QUIC traffic that shouldn't be sniffed.
 	consecutiveDecryptFailuresThreshold = 2
 
+	// maxInitialSniffPackets is honk's MAX_INITIAL_SNIFF_PACKETS: give up
+	// waiting for a fragmented ClientHello after this many Initial datagrams.
+	maxInitialSniffPackets = 8
+
 	// failedQuicDcidCacheShardCount spreads writes across independent shards to
 	// keep contention low under bursty QUIC Initial traffic.
 	failedQuicDcidCacheShardCount = 64
@@ -396,6 +400,11 @@ type PacketSniffer struct {
 	// should give up quickly rather than waiting for more packets.
 	consecutiveDecryptFailures int
 
+	// quicInitialPackets counts decrypted-or-attempted Initial datagrams fed
+	// to this session. Honk stops waiting after MAX_INITIAL_SNIFF_PACKETS (8)
+	// so a ClientHello that never completes cannot pin the first packet.
+	quicInitialPackets int
+
 	quicInitialSig    quicInitialFingerprint
 	hasQuicInitialSig bool
 }
@@ -435,6 +444,17 @@ func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 func (ps *PacketSniffer) RecordSniffSuccess() {
 	ps.noSniStreak = 0
 	ps.bypassSniffUntil = time.Time{}
+}
+
+// RecordQuicInitialPacket counts one Initial datagram against the honk
+// packet budget. It returns false once the session should stop holding
+// packets and fall back to IP routing.
+func (ps *PacketSniffer) RecordQuicInitialPacket() bool {
+	if ps == nil {
+		return false
+	}
+	ps.quicInitialPackets++
+	return ps.quicInitialPackets <= maxInitialSniffPackets
 }
 
 func (ps *PacketSniffer) observeParsedQuicInitial(sig quicInitialFingerprint) (observed bool, changed bool) {

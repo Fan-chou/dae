@@ -156,6 +156,23 @@ func BenchmarkIsLikelyQuicInitialPacket(b *testing.B) {
 	}
 }
 
+func BenchmarkSniffer_SniffUdp_QUICOutOfOrderReassembly(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sniffer := NewPacketSniffer(QuicStream2_2, 300*time.Millisecond)
+		_, err := sniffer.SniffQuic()
+		if err != nil && sniffer.NeedMore() {
+			sniffer.AppendData(QuicStream2_1)
+			_, err = sniffer.SniffQuic()
+		}
+		if err != nil {
+			b.Fatalf("out-of-order sniff failed: %v", err)
+		}
+		_ = sniffer.Close()
+	}
+}
+
 func BenchmarkSniffer_SniffTcp_NotApplicable(b *testing.B) {
 	payload := []byte("this is not TLS or HTTP traffic, just random binary data that should fail quickly")
 	// H8: deadlineConn SetReadDeadline routes this through deadline-sync read.

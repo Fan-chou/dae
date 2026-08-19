@@ -64,11 +64,8 @@ type Sniffer struct {
 	data           [][]byte
 	needMore       bool
 	quicNextRead   int
-	quicCryptos    []*quicutils.CryptoFrameOffset
+	quicReasm      quicutils.CryptoReassembly
 	quicPlaintexts []pool.PB
-	// quicLocator is reused across SniffQuic calls to avoid allocating a new
-	// LinearLocator each time. It is Reset (not reallocated) on reuse.
-	quicLocator *quicutils.LinearLocator
 
 	// Async read reuse (stream path). readResultCh is allocated lazily on the
 	// first async read and reused across reads on the normal completion path
@@ -97,9 +94,8 @@ func (s *Sniffer) reset(stream bool, r io.Reader, conn net.Conn, data []byte, ti
 	s.deadline = time.Now().Add(timeout)
 	s.data = nil
 	s.needMore = false
-	quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
+	s.quicReasm.Reset()
 	s.quicNextRead = 0
-	s.quicCryptos = nil
 	s.quicPlaintexts = nil
 	// readResultCh is allocated lazily on the first async read so the common
 	// deadline-sync path (production TCP) pays no channel allocation here.
@@ -318,7 +314,7 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 		return "", ErrNotApplicable
 	}
 
-	if len(s.quicCryptos) == 0 {
+	if s.quicReasm.IsEmpty() {
 		nextBlock := s.buf.Bytes()[s.quicNextRead:]
 		if !IsLikelyQuicInitialPacket(nextBlock) {
 			return "", ErrNotApplicable
@@ -345,6 +341,12 @@ func (s *Sniffer) NeedMore() bool {
 	return s.needMore
 }
 
+// GiveUpIncomplete clears NeedMore so a stalled QUIC ClientHello (packet
+// budget exceeded) can fall through to IP routing instead of holding datagrams.
+func (s *Sniffer) GiveUpIncomplete() {
+	s.needMore = false
+}
+
 // CompactPacketState releases buffered UDP sniffing payloads while keeping the
 // logical sniff result intact. This is used once a packet sniffer session no
 // longer needs historical datagrams for QUIC reassembly, so the session can
@@ -367,8 +369,7 @@ func (s *Sniffer) CompactPacketState() {
 		p.Put()
 	}
 	s.quicPlaintexts = nil
-	quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
-	s.quicCryptos = nil
+	s.quicReasm.Reset()
 	s.quicNextRead = 0
 	s.needMore = false
 
@@ -439,8 +440,7 @@ func (s *Sniffer) Close() (err error) {
 			p.Put()
 		}
 		s.quicPlaintexts = nil
-		quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
-		s.quicCryptos = nil
+		s.quicReasm.Reset()
 		s.readMu.Unlock()
 		// Recycle the struct only when no async reader goroutine is lingering.
 		// A lingering reader (timeout path with no deadline support) holds a
