@@ -2,12 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseMihomoConfigReadsNodeConversionFields(t *testing.T) {
@@ -212,8 +220,12 @@ func TestMihomoNodeNameMappingIsStableAndFailClosed(t *testing.T) {
 		"unsupported option":     {Proxies: []MihomoProxy{{Name: "node", Type: "ss", Server: "127.0.0.1", Port: 8388, Cipher: "aes-256-gcm", Password: "secret", Plugin: "simple-obfs", PluginOpts: map[string]any{"obfs": "http", "exec": "unexpected"}}}},
 		"ss plugin udp":          {Proxies: []MihomoProxy{{Name: "node", Type: "ss", Server: "127.0.0.1", Port: 8388, Cipher: "aes-256-gcm", Password: "secret", UDP: boolPtr(true), Plugin: "obfs", PluginOpts: map[string]any{"mode": "http"}}}},
 		"hy2 missing password":   {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443}}},
-		"hy2 single bandwidth":   {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Up: "50 Mbps"}}},
-		"hy2 port hop":           {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Ports: "443-8443"}}},
+		"hy2 hop-interval":       {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Ports: "443-8443", HopInterval: 10}}},
+		"hy2 alpn":               {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", ALPN: []string{"h3"}}}},
+		"hy2 ca-str":             {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", CAString: "-----BEGIN CERTIFICATE-----"}}},
+		"hy2 cwnd":               {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", CWND: 10}}},
+		"hy2 udp-mtu":            {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", UdpMTU: 1200}}},
+		"hy2 client fingerprint": {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Fingerprint: "chrome"}}},
 		"hy2 salamander no pass": {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Obfs: "salamander"}}},
 	} {
 		if _, _, err := GenerateMihomoNodes(config); err == nil {
@@ -293,6 +305,106 @@ func TestGenerateMihomoNodesSupportsHysteria2(t *testing.T) {
 	}
 	if strings.Contains(string(reportBody), "hy2-secret") || strings.Contains(string(reportBody), "obfs-secret") || strings.Contains(string(reportBody), "p@ss") {
 		t.Fatalf("conversion report contains credentials: %s", reportBody)
+	}
+}
+
+func TestParseMihomoBandwidthAcceptsMihomoUnits(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantBps uint64
+	}{
+		{in: "", wantBps: 0},
+		{in: "50", wantBps: 50 * 1_000_000 / 8},
+		{in: "50 Mbps", wantBps: 50 * 1_000_000 / 8},
+		{in: "1 Gbps", wantBps: 1_000 * 1_000_000 / 8},
+		{in: "100 Kbps", wantBps: 100_000 / 8},
+		{in: "1.5 Mbps", wantBps: 1_500_000 / 8},
+		{in: "8 Bps", wantBps: 8},
+	}
+	for _, tc := range cases {
+		got, err := parseMihomoBandwidth("node", "up", tc.in)
+		if err != nil {
+			t.Fatalf("parseMihomoBandwidth(%q) error = %v", tc.in, err)
+		}
+		if got != tc.wantBps {
+			t.Fatalf("parseMihomoBandwidth(%q) = %d, want %d", tc.in, got, tc.wantBps)
+		}
+	}
+	for _, invalid := range []string{"50 MB", "not-a-rate", "0", "0 Mbps"} {
+		if _, err := parseMihomoBandwidth("node", "up", invalid); err == nil {
+			t.Fatalf("parseMihomoBandwidth(%q) error = nil", invalid)
+		}
+	}
+}
+
+func TestMihomoHysteria2PreservesPasswordSpaces(t *testing.T) {
+	const secret = " secret "
+	link, err := mihomoHysteria2Link(MihomoProxy{
+		Name:     "node",
+		Type:     "hysteria2",
+		Server:   "127.0.0.1",
+		Port:     443,
+		Password: secret,
+	})
+	if err != nil {
+		t.Fatalf("mihomoHysteria2Link() error = %v", err)
+	}
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	if parsed.User.Username() != secret {
+		t.Fatalf("username = %q, want %q", parsed.User.Username(), secret)
+	}
+}
+
+func TestGenerateMihomoNodesMapsHysteria2FieldsKdaeSupports(t *testing.T) {
+	const pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	caPath := writeTempCAPEM(t)
+	config := MihomoConfig{Proxies: []MihomoProxy{
+		{
+			Name:        "hop",
+			Type:        "hysteria2",
+			Server:      "2407:cdc0:d002::1961",
+			Port:        443,
+			Password:    "hop-secret",
+			Ports:       "443-8443",
+			Fingerprint: "01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef",
+			CA:          caPath,
+			Up:          "1 Gbps",
+		},
+		{
+			Name:     "decimal-bw",
+			Type:     "hysteria2",
+			Server:   "127.0.0.1",
+			Port:     443,
+			Password: "bw-secret",
+			Up:       "1.5 Mbps",
+			Down:     "800 Mbps",
+		},
+	}}
+
+	nodes, report, err := GenerateMihomoNodes(config)
+	if err != nil {
+		t.Fatalf("GenerateMihomoNodes() error = %v", err)
+	}
+	if report.Converted != 2 {
+		t.Fatalf("report = %#v, want two converted nodes", report)
+	}
+	if !strings.Contains(nodes, "[2407:cdc0:d002::1961]:443-8443") {
+		t.Fatalf("nodes output = %q, want port hopping in host", nodes)
+	}
+	if !strings.Contains(nodes, "pinSHA256="+pin) {
+		t.Fatalf("nodes output = %q, want certificate pin", nodes)
+	}
+	if !strings.Contains(nodes, "ca=") {
+		t.Fatalf("nodes output = %q, want ca path", nodes)
+	}
+	if !strings.Contains(nodes, "upmbps=1000") {
+		t.Fatalf("nodes output = %q, want 1 Gbps as 1000 Mbps", nodes)
+	}
+	if !strings.Contains(nodes, "maxTx=187500") || !strings.Contains(nodes, "maxRx=100000000") {
+		t.Fatalf("nodes output = %q, want decimal Mbps as maxTx/maxRx", nodes)
 	}
 }
 
@@ -500,4 +612,30 @@ proxy-groups:
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func writeTempCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate() error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
 }

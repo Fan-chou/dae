@@ -13,9 +13,17 @@ import (
 	"unicode/utf8"
 )
 
-const maxMihomoNodeNameLength = 64
+const (
+	maxMihomoNodeNameLength = 64
+	sha256FingerprintBytes  = 32
+)
 
-var mihomoNodeIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+var (
+	mihomoNodeIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+	// Mihomo StringToBps, plus a decimal coefficient. Unit prefix is
+	// case-insensitive; b vs B still distinguishes bits from bytes.
+	mihomoRateRegexp = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([kKmMgGtT]?)([Bb])ps$`)
+)
 
 type NodeConversionReport struct {
 	Converted int
@@ -234,6 +242,9 @@ func validateMihomoEndpoint(proxy MihomoProxy) error {
 	if proxy.Server == "" || strings.TrimSpace(proxy.Server) != proxy.Server || strings.ContainsAny(proxy.Server, "\x00\r\n\t /?#@") {
 		return fmt.Errorf("mihomo proxy %q has an invalid server", proxy.Name)
 	}
+	if proxy.Port == 0 && strings.TrimSpace(proxy.Ports) != "" {
+		return nil
+	}
 	if proxy.Port < 1 || proxy.Port > 65535 {
 		return fmt.Errorf("mihomo proxy %q has an invalid port", proxy.Name)
 	}
@@ -320,27 +331,26 @@ func mihomoSocks5Link(proxy MihomoProxy) (string, error) {
 }
 
 func mihomoHysteria2Link(proxy MihomoProxy) (string, error) {
-	auth := strings.TrimSpace(proxy.Password)
-	if extra := strings.TrimSpace(proxy.Auth); extra != "" {
-		if auth != "" && auth != extra {
-			return "", fmt.Errorf("mihomo proxy %q hysteria2 has conflicting password and auth", proxy.Name)
-		}
-		auth = extra
-	}
-	if auth == "" {
-		return "", fmt.Errorf("mihomo proxy %q hysteria2 password is required", proxy.Name)
+	auth, err := mihomoHysteria2Auth(proxy)
+	if err != nil {
+		return "", err
 	}
 	if proxy.Username != "" || proxy.Cipher != "" || proxy.ClientFingerprint != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 {
 		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported fields", proxy.Name)
 	}
-	if proxy.Ports != "" || proxy.HopInterval != 0 || proxy.Fingerprint != "" || len(proxy.ALPN) != 0 || proxy.CA != "" || proxy.CAString != "" || proxy.CWND != 0 || proxy.UdpMTU != 0 {
-		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported fields", proxy.Name)
+	if proxy.CAString != "" || proxy.CWND != 0 || proxy.UdpMTU != 0 || len(proxy.ALPN) != 0 || proxy.HopInterval != 0 {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 has fields unsupported by kdae", proxy.Name)
 	}
 	if proxy.TLS != nil && !*proxy.TLS {
 		return "", fmt.Errorf("mihomo proxy %q hysteria2 tls=false is unsupported", proxy.Name)
 	}
 	if proxy.UDP != nil && !*proxy.UDP {
 		return "", fmt.Errorf("mihomo proxy %q hysteria2 udp=false is unsupported by dae", proxy.Name)
+	}
+
+	host, err := mihomoHysteria2Host(proxy)
+	if err != nil {
+		return "", err
 	}
 
 	query := url.Values{}
@@ -350,22 +360,24 @@ func mihomoHysteria2Link(proxy MihomoProxy) (string, error) {
 	if proxy.SkipCertVerify != nil && *proxy.SkipCertVerify {
 		query.Set("insecure", "1")
 	}
+	if pin, err := mihomoHysteria2PinSHA256(proxy); err != nil {
+		return "", err
+	} else if pin != "" {
+		query.Set("pinSHA256", pin)
+	}
+	if ca := strings.TrimSpace(proxy.CA); ca != "" {
+		query.Set("ca", ca)
+	}
 
-	up, err := parseMihomoMbps(proxy.Name, "up", proxy.Up)
+	up, err := parseMihomoBandwidth(proxy.Name, "up", proxy.Up)
 	if err != nil {
 		return "", err
 	}
-	down, err := parseMihomoMbps(proxy.Name, "down", proxy.Down)
+	down, err := parseMihomoBandwidth(proxy.Name, "down", proxy.Down)
 	if err != nil {
 		return "", err
 	}
-	if (up == 0) != (down == 0) {
-		return "", fmt.Errorf("mihomo proxy %q hysteria2 up and down must be set together", proxy.Name)
-	}
-	if up != 0 {
-		query.Set("upmbps", strconv.FormatUint(up, 10))
-		query.Set("downmbps", strconv.FormatUint(down, 10))
-	}
+	setHysteria2BandwidthQuery(query, up, down)
 
 	obfs := strings.ToLower(strings.TrimSpace(proxy.Obfs))
 	switch obfs {
@@ -383,7 +395,97 @@ func mihomoHysteria2Link(proxy MihomoProxy) (string, error) {
 		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported obfs", proxy.Name)
 	}
 
-	return buildMihomoLink("hysteria2", url.User(auth), proxy.Server, proxy.Port, query)
+	return buildMihomoLinkWithHost("hysteria2", url.User(auth), host, query)
+}
+
+// mihomoHysteria2Auth keeps the credential bytes unchanged. TrimSpace is only
+// used to decide whether password/auth is present or empty.
+func mihomoHysteria2Auth(proxy MihomoProxy) (string, error) {
+	passwordSet := strings.TrimSpace(proxy.Password) != ""
+	authSet := strings.TrimSpace(proxy.Auth) != ""
+	switch {
+	case passwordSet && authSet:
+		if proxy.Password != proxy.Auth {
+			return "", fmt.Errorf("mihomo proxy %q hysteria2 has conflicting password and auth", proxy.Name)
+		}
+		return proxy.Password, nil
+	case passwordSet:
+		return proxy.Password, nil
+	case authSet:
+		return proxy.Auth, nil
+	default:
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 password is required", proxy.Name)
+	}
+}
+
+func mihomoHysteria2Host(proxy MihomoProxy) (string, error) {
+	ports := strings.TrimSpace(proxy.Ports)
+	if ports == "" {
+		return net.JoinHostPort(proxy.Server, strconv.Itoa(proxy.Port)), nil
+	}
+	normalized, err := normalizeMihomoHysteria2Ports(ports)
+	if err != nil {
+		return "", fmt.Errorf("mihomo proxy %q has an invalid hysteria2 ports", proxy.Name)
+	}
+	return net.JoinHostPort(proxy.Server, normalized), nil
+}
+
+func normalizeMihomoHysteria2Ports(ports string) (string, error) {
+	if ports == "all" || ports == "*" {
+		return "", fmt.Errorf("wildcard ports")
+	}
+	var parts []string
+	for _, part := range strings.Split(ports, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return "", fmt.Errorf("empty port")
+		}
+		if startText, endText, ok := strings.Cut(part, "-"); ok {
+			startText = strings.TrimSpace(startText)
+			endText = strings.TrimSpace(endText)
+			if startText == "" || endText == "" || strings.Contains(endText, "-") {
+				return "", fmt.Errorf("invalid port range")
+			}
+			start, err := strconv.ParseUint(startText, 10, 16)
+			if err != nil || start == 0 {
+				return "", fmt.Errorf("invalid port range")
+			}
+			end, err := strconv.ParseUint(endText, 10, 16)
+			if err != nil || end == 0 {
+				return "", fmt.Errorf("invalid port range")
+			}
+			parts = append(parts, startText+"-"+endText)
+			continue
+		}
+		port, err := strconv.ParseUint(part, 10, 16)
+		if err != nil || port == 0 {
+			return "", fmt.Errorf("invalid port")
+		}
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("empty ports")
+	}
+	return strings.Join(parts, ","), nil
+}
+
+func mihomoHysteria2PinSHA256(proxy MihomoProxy) (string, error) {
+	fingerprint := strings.TrimSpace(proxy.Fingerprint)
+	if fingerprint == "" {
+		return "", nil
+	}
+	switch strings.ToLower(fingerprint) {
+	case "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized":
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 fingerprint is a client impersonation name; kdae has no mapping", proxy.Name)
+	}
+	normalized := strings.ToLower(fingerprint)
+	normalized = strings.ReplaceAll(normalized, ":", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	raw, err := hex.DecodeString(normalized)
+	if err != nil || len(raw) != sha256FingerprintBytes {
+		return "", fmt.Errorf("mihomo proxy %q has an invalid hysteria2 fingerprint", proxy.Name)
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 func mihomoProxyHasHysteria2Fields(proxy MihomoProxy) bool {
@@ -392,22 +494,87 @@ func mihomoProxyHasHysteria2Fields(proxy MihomoProxy) bool {
 		proxy.CA != "" || proxy.CAString != "" || proxy.CWND != 0 || proxy.UdpMTU != 0
 }
 
-func parseMihomoMbps(name, field, value string) (uint64, error) {
-	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), " ", ""))
-	if normalized == "" {
+func parseMihomoBandwidth(name, field, value string) (uint64, error) {
+	s := strings.TrimSpace(value)
+	if s == "" {
 		return 0, nil
 	}
-	for _, suffix := range []string{"mbit/s", "mbps", "mbit", "mb"} {
-		if strings.HasSuffix(normalized, suffix) {
-			normalized = strings.TrimSuffix(normalized, suffix)
-			break
+	if v, err := strconv.Atoi(s); err == nil {
+		if v <= 0 {
+			return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
 		}
+		return uint64(v) * 1_000_000 / 8, nil
 	}
-	mbps, err := strconv.ParseUint(normalized, 10, 64)
-	if err != nil || mbps == 0 {
+	m := mihomoRateRegexp.FindStringSubmatch(s)
+	if m == nil {
 		return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
 	}
-	return mbps, nil
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || n <= 0 || math.IsInf(n, 0) || math.IsNaN(n) {
+		return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
+	}
+	mul := 1.0
+	switch strings.ToUpper(m[2]) {
+	case "T":
+		mul *= 1000
+		fallthrough
+	case "G":
+		mul *= 1000
+		fallthrough
+	case "M":
+		mul *= 1000
+		fallthrough
+	case "K":
+		mul *= 1000
+	}
+	amount := n * mul
+	if m[3] == "b" {
+		amount /= 8
+	}
+	if amount <= 0 || amount > float64(math.MaxUint64) {
+		return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
+	}
+	rounded := math.Round(amount)
+	if math.Abs(amount-rounded) > 1e-6 {
+		return 0, fmt.Errorf("mihomo proxy %q hysteria2 %s is not an integer byte rate", name, field)
+	}
+	bps := uint64(rounded)
+	if bps == 0 {
+		return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
+	}
+	return bps, nil
+}
+
+func setHysteria2BandwidthQuery(query url.Values, upBps, downBps uint64) {
+	upMbps, upOK := bpsToIntegerMbps(upBps)
+	downMbps, downOK := bpsToIntegerMbps(downBps)
+	if upOK && downOK {
+		if upBps > 0 {
+			query.Set("upmbps", strconv.FormatUint(upMbps, 10))
+		}
+		if downBps > 0 {
+			query.Set("downmbps", strconv.FormatUint(downMbps, 10))
+		}
+		return
+	}
+	// Non-integer Mbps uses dae's raw maxTx/maxRx (bytes/s). The URI parser
+	// requires both query keys together; a missing side is encoded as 0.
+	query.Set("maxTx", strconv.FormatUint(upBps, 10))
+	query.Set("maxRx", strconv.FormatUint(downBps, 10))
+}
+
+func bpsToIntegerMbps(bps uint64) (uint64, bool) {
+	if bps == 0 {
+		return 0, true
+	}
+	if bps > math.MaxUint64/8 {
+		return 0, false
+	}
+	bits := bps * 8
+	if bits%1_000_000 != 0 {
+		return 0, false
+	}
+	return bits / 1_000_000, true
 }
 
 func mihomoProxySNI(proxy MihomoProxy) string {
@@ -418,10 +585,14 @@ func mihomoProxySNI(proxy MihomoProxy) string {
 }
 
 func buildMihomoLink(scheme string, user *url.Userinfo, server string, port int, query url.Values) (string, error) {
+	return buildMihomoLinkWithHost(scheme, user, net.JoinHostPort(server, strconv.Itoa(port)), query)
+}
+
+func buildMihomoLinkWithHost(scheme string, user *url.Userinfo, host string, query url.Values) (string, error) {
 	u := url.URL{
 		Scheme: scheme,
 		User:   user,
-		Host:   net.JoinHostPort(server, strconv.Itoa(port)),
+		Host:   host,
 	}
 	if len(query) > 0 {
 		u.RawQuery = query.Encode()
