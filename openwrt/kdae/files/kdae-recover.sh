@@ -40,9 +40,22 @@ line_handle() {
 	}'
 }
 
+line_chain() {
+	echo "$1" | awk '{
+		for (i = 1; i <= NF; i++)
+			if ($i == "chain") { print $(i + 1); exit }
+	}'
+}
+
 is_dae_filter() {
 	case "$1" in
-	*dae_*|*0x2022*|*0x2023*) return 0 ;;
+	*dae_*) ;;
+	*) return 1 ;;
+	esac
+	h=$(line_handle "$1")
+	[ -n "$h" ] || return 1
+	case "$h" in
+	0x2022*|0x2023*) return 0 ;;
 	esac
 	return 1
 }
@@ -58,17 +71,31 @@ purge_tc_dir() {
 			[ -n "$p" ] && pref=$p
 			;;
 		esac
-		h=$(line_handle "$line")
 		is_dae_filter "$line" || continue
 		[ -n "$pref" ] || continue
-		if [ -n "$h" ]; then
-			if tc filter del dev "$dev" "$dir" pref "$pref" handle "$h" bpf 2>/dev/null ||
-				tc filter del dev "$dev" "$dir" pref "$pref" handle "$h" 2>/dev/null ||
-				tc filter del dev "$dev" "$dir" pref "$pref" 2>/dev/null; then
-				log "removed tc $dev $dir pref=$pref handle=$h"
+		h=$(line_handle "$line")
+		if [ -z "$h" ]; then
+			log "skip tc $dev $dir pref=$pref: missing handle"
+			continue
+		fi
+		chain=$(line_chain "$line")
+		deleted=0
+		if [ -n "$chain" ]; then
+			if tc filter del dev "$dev" "$dir" pref "$pref" chain "$chain" handle "$h" bpf 2>/dev/null ||
+				tc filter del dev "$dev" "$dir" pref "$pref" chain "$chain" handle "$h" 2>/dev/null; then
+				deleted=1
 			fi
-		elif tc filter del dev "$dev" "$dir" pref "$pref" 2>/dev/null; then
-			log "removed tc $dev $dir pref=$pref"
+		fi
+		if [ "$deleted" -eq 0 ]; then
+			if tc filter del dev "$dev" "$dir" pref "$pref" handle "$h" bpf 2>/dev/null ||
+				tc filter del dev "$dev" "$dir" pref "$pref" handle "$h" 2>/dev/null; then
+				deleted=1
+			fi
+		fi
+		if [ "$deleted" -eq 1 ]; then
+			log "removed tc $dev $dir pref=$pref handle=$h"
+		else
+			log "skip tc $dev $dir pref=$pref handle=$h: could not delete exactly"
 		fi
 	done
 }

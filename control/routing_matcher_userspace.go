@@ -250,7 +250,8 @@ func (m *RoutingMatcher) Match(
 	if err != nil {
 		return 0, 0, false, err
 	}
-	return m.matchFacts(facts)
+	outbound, mark, must, _, err := m.matchFacts(facts)
+	return outbound, mark, must, err
 }
 
 // identityRoutingMatch is MAC / source / port / process / DSCP / L4: known only
@@ -280,7 +281,9 @@ func destRoutingMatch(matchType consts.MatchType) bool {
 // conflictFingerprint evaluates routing from dest IP and domain bits only.
 // Identity conjuncts are skipped so `mac && domain` still fingerprints as
 // domain, while standalone sip/dscp rules cannot collapse every owner onto
-// must_direct.
+// must_direct. A hitting rule that skipped identity is marked
+// identitySensitive so shared-IP owners that only agree dest-only still
+// conflict.
 func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uint32) domainRoutingFingerprint {
 	if m == nil || !dest.IsValid() {
 		return domainRoutingFingerprint{}
@@ -290,7 +293,7 @@ func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uin
 	if dest.Is4() || dest.Is4In6() {
 		ipVersion = consts.IpVersion_4
 	}
-	outbound, mark, must, err := m.matchFacts(routingMatcherFacts{
+	outbound, mark, must, identitySensitive, err := m.matchFacts(routingMatcherFacts{
 		destAddr:         dest16,
 		ipVersion:        ipVersion,
 		ipSetBin:         trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(dest16), 128)),
@@ -301,36 +304,41 @@ func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uin
 		return domainRoutingFingerprint{}
 	}
 	return domainRoutingFingerprint{
-		outbound: outbound,
-		mark:     mark,
-		must:     must,
-		valid:    true,
+		outbound:          outbound,
+		mark:              mark,
+		must:              must,
+		identitySensitive: identitySensitive,
+		valid:             true,
 	}
 }
 
-func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, identitySensitive bool, err error) {
 	if m == nil {
-		return 0, 0, false, fmt.Errorf("nil routing matcher")
+		return 0, 0, false, false, fmt.Errorf("nil routing matcher")
 	}
 	matches := m.compiledMatches
 	if len(matches) == 0 {
-		return 0, 0, false, fmt.Errorf("no compiled routing match set")
+		return 0, 0, false, false, fmt.Errorf("no compiled routing match set")
 	}
 
 	goodSubrule := false
 	badRule := false
 	ruleHasDest := false
 	subruleHasDest := false
+	ruleHasIdentitySkip := false
 	for i, match := range matches {
 		if destRoutingMatch(match.matchType) {
 			subruleHasDest = true
 			ruleHasDest = true
 		}
 		identitySkip := facts.identityDontCare && identityRoutingMatch(match.matchType)
+		if identitySkip {
+			ruleHasIdentitySkip = true
+		}
 		if !identitySkip && !badRule && !goodSubrule {
 			matched, matchErr := m.matchCompiledMatch(i, match, &facts)
 			if matchErr != nil {
-				return 0, 0, false, matchErr
+				return 0, 0, false, false, matchErr
 			}
 			if matched {
 				goodSubrule = true
@@ -366,13 +374,15 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 				if outbound == consts.OutboundMustRules {
 					must = true
 					ruleHasDest = false
+					ruleHasIdentitySkip = false
 					continue
 				}
-				return outbound, match.mark, match.must || must, nil
+				return outbound, match.mark, match.must || must, ruleHasIdentitySkip, nil
 			}
 			badRule = false
 			ruleHasDest = false
+			ruleHasIdentitySkip = false
 		}
 	}
-	return 0, 0, false, fmt.Errorf("no match set hit")
+	return 0, 0, false, false, fmt.Errorf("no match set hit")
 }

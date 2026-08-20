@@ -34,7 +34,12 @@ type domainRoutingFingerprint struct {
 	outbound consts.OutboundIndex
 	mark     uint32
 	must     bool
-	valid    bool
+	// identitySensitive is set when the dest-only fingerprint skipped an
+	// identity conjunct (L4/source/MAC/port/process/DSCP) on the hitting
+	// rule. Two owners that agree on dest-only outbound can still split
+	// once those facts are known.
+	identitySensitive bool
+	valid             bool
 }
 
 type domainRoutingOwnerSnapshot struct {
@@ -118,7 +123,8 @@ func mergeDomainRoutingIPOwners(owners map[string]domainRoutingIPOwner) bpfDomai
 			seenValid = true
 			continue
 		}
-		if owner.fingerprint != seen {
+		if owner.fingerprint != seen ||
+			seen.identitySensitive || owner.fingerprint.identitySensitive {
 			ambiguous = true
 		}
 	}

@@ -843,6 +843,7 @@ int testsetup_tcp_active_idle_state_retained(struct __sk_buff *skb)
 	state.state = TCP_STATE_ACTIVE;
 	state.last_seen_ns = 1;
 	state.seen_non_syn = 0;
+	state.datapath_generation = PARAM.datapath_generation;
 	if (tcp_conn_state_expired(
 		    &state, state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS))
 		return TC_ACT_SHOT;
@@ -850,6 +851,14 @@ int testsetup_tcp_active_idle_state_retained(struct __sk_buff *skb)
 		    &state,
 		    state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS + 1))
 		return TC_ACT_SHOT;
+
+	/* Old generation with seen_non_syn=0 is treated as established. */
+	state.datapath_generation = PARAM.datapath_generation + 1;
+	if (tcp_conn_state_expired(
+		    &state,
+		    state.last_seen_ns + TCP_CONN_STATE_SYN_TIMEOUT_NS + 1))
+		return TC_ACT_SHOT;
+	state.datapath_generation = PARAM.datapath_generation;
 
 	/* Established ACTIVE is expired only in userspace (pinned sessions). */
 	state.seen_non_syn = 1;
@@ -1354,10 +1363,11 @@ int testsetup_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
 SEC("tc/check/domain_routing_ambiguous_must_direct")
 int testcheck_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
 {
-	return check_tcp_conn_state_ipv4_tcp(skb, TC_ACT_OK,
-					     IPV4(192,168,0,1),
-					     IPV4(198,51,100,20), 19233, 443,
-					     OUTBOUND_DIRECT, 0, true);
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		IPV4(198,51,100,20), 19233, 443,
+		OUTBOUND_CONTROL_PLANE_ROUTING,
+		routing_epoch_slot_encode(0));
 }
 
 SEC("tc/pktgen/lan_ingress_tcp_ipv6_dscp_conn_state")

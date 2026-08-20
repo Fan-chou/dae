@@ -1250,3 +1250,183 @@ func TestDialerGroup_KernelOutboundAliveWithoutBlockFollowsProbeSet(t *testing.T
 		t.Fatal("alive callback did not report the group dead after every probeable member died")
 	}
 }
+
+func TestDialerGroup_FixedDeadProxyDoesNotKeepKernelAliveWithReject(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	childDialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	blockDialer := newBuiltinBlockDialer(option)
+	block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: block},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer block.Close()
+	defer blockDialer.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, d := range childDialers {
+		defer d.Close()
+	}
+
+	for _, leaf := range childDialers {
+		view := parent.parentHealthViews[leaf]
+		if view == nil {
+			t.Fatal("parent omitted a health view for a probeable child leaf")
+		}
+		snapshot := view.HealthSnapshot()
+		for i := range snapshot.Collections {
+			snapshot.Collections[i].Alive = false
+		}
+		view.RestoreHealthSnapshot(snapshot)
+	}
+
+	if parent.KernelOutboundAlive(TestNetworkType) {
+		t.Fatal("kernel outbound alive = true; fixed(0) cannot reach REJECT and should follow the empty probe set")
+	}
+}
+
+func TestDialerGroup_FixedRejectMemberKeepsKernelAlive(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	childDialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	blockDialer := newBuiltinBlockDialer(option)
+	block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	sawKernelDead := false
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: block},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 1}, func(alive bool, _ *dialer.NetworkType, isInit bool) {
+		if !alive && !isInit {
+			sawKernelDead = true
+		}
+	}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer block.Close()
+	defer blockDialer.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, d := range childDialers {
+		defer d.Close()
+	}
+
+	for _, leaf := range childDialers {
+		view := parent.parentHealthViews[leaf]
+		snapshot := view.HealthSnapshot()
+		for i := range snapshot.Collections {
+			snapshot.Collections[i].Alive = false
+		}
+		view.RestoreHealthSnapshot(snapshot)
+	}
+
+	if !parent.KernelOutboundAlive(TestNetworkType) {
+		t.Fatal("kernel outbound alive = false; fixed REJECT member must stay reachable from BPF")
+	}
+	if sawKernelDead {
+		t.Fatal("alive callback reported the group dead while fixed on REJECT")
+	}
+}
+
+func TestDialerGroup_SetSelectionPolicyFixedStopsRejectKernelAlive(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	childDialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	blockDialer := newBuiltinBlockDialer(option)
+	block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	sawKernelDead := false
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: block},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(alive bool, _ *dialer.NetworkType, isInit bool) {
+		if !alive && !isInit {
+			sawKernelDead = true
+		}
+	}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer block.Close()
+	defer blockDialer.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, d := range childDialers {
+		defer d.Close()
+	}
+
+	for _, leaf := range childDialers {
+		view := parent.parentHealthViews[leaf]
+		snapshot := view.HealthSnapshot()
+		for i := range snapshot.Collections {
+			snapshot.Collections[i].Alive = false
+		}
+		view.RestoreHealthSnapshot(snapshot)
+	}
+	if !parent.KernelOutboundAlive(TestNetworkType) {
+		t.Fatal("first_alive should keep kernel alive via REJECT")
+	}
+
+	sawKernelDead = false
+	parent.SetSelectionPolicy(DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0})
+	if parent.KernelOutboundAlive(TestNetworkType) {
+		t.Fatal("kernel outbound alive = true after switching to fixed(0) on a dead proxy")
+	}
+	if !sawKernelDead {
+		t.Fatal("policy switch did not republish kernel dead")
+	}
+}

@@ -1756,7 +1756,11 @@ route_finalize_match(struct route_ctx *ctx, const struct match_set *match_set)
 				{
 					__u8 outbound = match_outbound;
 
-					if (!must && ctx->domain_ambiguous)
+					// Shared-IP domain conflicts cannot trust a
+					// domain-derived must_direct: the merged bitmap
+					// may hit another owner's must rule. Userspace
+					// recomputes must after sniffing the real name.
+					if (ctx->domain_ambiguous)
 						outbound =
 							OUTBOUND_CONTROL_PLANE_ROUTING;
 					ctx->result =
@@ -2277,10 +2281,14 @@ tcp_conn_state_expired(const struct conn_state *state, __u64 now)
 	if (state->state == TCP_STATE_CLOSING)
 		return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
 	/* SYN-only entries are never pinned; expire them here as a fast path
-	 * when the 4-tuple is reused. Established ACTIVE stays until userspace
-	 * janitor decides (it can distinguish pinned sessions). */
-	if (!state->seen_non_syn)
+	 * when the 4-tuple is reused. Entries from a previous datapath
+	 * generation reused seen_non_syn=0 padding, so treat those as
+	 * established until userspace janitor decides. */
+	if (!state->seen_non_syn) {
+		if (state->datapath_generation != PARAM.datapath_generation)
+			return false;
 		return now - state->last_seen_ns > TCP_CONN_STATE_SYN_TIMEOUT_NS;
+	}
 	return false;
 }
 

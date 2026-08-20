@@ -99,6 +99,9 @@ func TestConflictFingerprintSkipsStandaloneIdentityRules(t *testing.T) {
 	if !direct.valid || direct.outbound != consts.OutboundDirect || direct.must {
 		t.Fatalf("domain bit 3 = %+v, want valid non-must direct", direct)
 	}
+	if direct.identitySensitive {
+		t.Fatal("sip/dscp prefix must not mark the dest-only domain hit identity-sensitive")
+	}
 	if !proxy.valid || proxy.outbound != consts.OutboundUserDefinedMin || proxy.must {
 		t.Fatalf("domain bit 4 = %+v, want valid non-must proxy", proxy)
 	}
@@ -148,5 +151,37 @@ func TestAttachDomainRoutingFingerprints(t *testing.T) {
 		if !fp.valid || fp.outbound != consts.OutboundDirect {
 			t.Fatalf("fingerprint = %+v, want valid direct", fp)
 		}
+	}
+}
+
+func l4SplitConflictMatcher() *RoutingMatcher {
+	// domain(a) && tcp -> common; domain(a) && udp -> proxy_a;
+	// domain(b) && tcp -> common; domain(b) && udp -> proxy_b.
+	// Dest-only evaluation skips l4proto, so both owners hit common.
+	return &RoutingMatcher{
+		compiledMatches: []compiledRoutingMatch{
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundLogicalAnd},
+			{matchType: consts.MatchType_L4Proto, outbound: consts.OutboundDirect},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundLogicalAnd},
+			{matchType: consts.MatchType_L4Proto, outbound: consts.OutboundUserDefinedMin},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundLogicalAnd},
+			{matchType: consts.MatchType_L4Proto, outbound: consts.OutboundDirect},
+			{matchType: consts.MatchType_DomainSet, outbound: consts.OutboundLogicalAnd},
+			{matchType: consts.MatchType_L4Proto, outbound: consts.OutboundUserDefinedMin + 1},
+			{matchType: consts.MatchType_Fallback, outbound: consts.OutboundBlock},
+		},
+	}
+}
+
+func TestConflictFingerprintDomainAndL4IsIdentitySensitive(t *testing.T) {
+	matcher := l4SplitConflictMatcher()
+	dest := netip.MustParseAddr("203.0.113.10")
+	first := matcher.conflictFingerprint(dest, []uint32{1<<0 | 1<<2})
+	second := matcher.conflictFingerprint(dest, []uint32{1<<4 | 1<<6})
+	if !first.valid || first.outbound != consts.OutboundDirect || !first.identitySensitive {
+		t.Fatalf("owner a = %+v, want valid identity-sensitive common/direct", first)
+	}
+	if !second.valid || second.outbound != consts.OutboundDirect || !second.identitySensitive {
+		t.Fatalf("owner b = %+v, want valid identity-sensitive common/direct", second)
 	}
 }

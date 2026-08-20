@@ -271,12 +271,12 @@ func (c *ControlPlane) stopConnStateJanitor() {
 // tcpConnStateExpireTimeoutNs returns the idle timeout for an unpinned TCP
 // conn_state entry. Matches Cilium CT: SYN-only 60s, established 8000s,
 // CLOSING 10s. Aggressive mode halves each timeout, same as UDP.
-func tcpConnStateExpireTimeoutNs(state, seenNonSyn uint8, aggressive bool) int64 {
+func tcpConnStateExpireTimeoutNs(state, seenNonSyn uint8, entryGeneration, currentGeneration uint16, aggressive bool) int64 {
 	var timeout time.Duration
 	switch {
 	case state == tcpConnStateClosing:
 		timeout = tcpConnStateTimeoutClosing
-	case seenNonSyn == 0:
+	case seenNonSyn == 0 && (currentGeneration == 0 || entryGeneration == currentGeneration):
 		timeout = tcpConnStateTimeoutSyn
 	default:
 		timeout = tcpConnStateTimeoutEstablished
@@ -377,7 +377,11 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						continue
 					}
 					age := nowNano - int64(value.LastSeenNs)
-					if age > tcpConnStateExpireTimeoutNs(value.State, value.SeenNonSyn, aggressiveCleanup) {
+					currentGen := uint16(0)
+					if c.core != nil {
+						currentGen = uint16(c.core.datapathGeneration.Load())
+					}
+					if age > tcpConnStateExpireTimeoutNs(value.State, value.SeenNonSyn, value.DatapathGeneration, currentGen, aggressiveCleanup) {
 						tcpKeysToDelete = append(tcpKeysToDelete, key)
 					}
 				}

@@ -11,20 +11,34 @@ func TestTcpConnStateExpireTimeoutNs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		state      uint8
-		seenNonSyn uint8
-		aggressive bool
-		want       int64
+		name              string
+		state             uint8
+		seenNonSyn        uint8
+		entryGeneration   uint16
+		currentGeneration uint16
+		aggressive        bool
+		want              int64
 	}{
 		{
-			name:  "syn-only",
-			want:  tcpConnStateTimeoutSyn.Nanoseconds(),
+			name: "syn-only",
+			want: tcpConnStateTimeoutSyn.Nanoseconds(),
 		},
 		{
 			name:       "syn-only aggressive",
 			aggressive: true,
 			want:       tcpConnStateTimeoutSyn.Nanoseconds() / 2,
+		},
+		{
+			name:              "old generation syn-only padding",
+			entryGeneration:   1,
+			currentGeneration: 2,
+			want:              tcpConnStateTimeoutEstablished.Nanoseconds(),
+		},
+		{
+			name:              "current generation syn-only",
+			entryGeneration:   7,
+			currentGeneration: 7,
+			want:              tcpConnStateTimeoutSyn.Nanoseconds(),
 		},
 		{
 			name:       "established",
@@ -52,7 +66,7 @@ func TestTcpConnStateExpireTimeoutNs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tcpConnStateExpireTimeoutNs(tt.state, tt.seenNonSyn, tt.aggressive)
+			got := tcpConnStateExpireTimeoutNs(tt.state, tt.seenNonSyn, tt.entryGeneration, tt.currentGeneration, tt.aggressive)
 			if got != tt.want {
 				t.Fatalf("timeout = %d, want %d", got, tt.want)
 			}

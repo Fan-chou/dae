@@ -233,7 +233,8 @@ func NewNestedDialerGroupWithRuntimeOptions(
 				// parent view with DisableCheck=false would mark it dead and
 				// remove it from first_alive/url-test fallback. Keep it out
 				// of Dialers, but remember it so an empty probe set does not
-				// tell the kernel the group is unreachable.
+				// tell the kernel the group is unreachable when the current
+				// policy can still select it.
 				skipAdmissionFallback = true
 				continue
 			}
@@ -247,24 +248,21 @@ func NewNestedDialerGroupWithRuntimeOptions(
 			groupAnnotations = append(groupAnnotations, leafAnnotations[i])
 		}
 	}
-	callback := aliveChangeCallback
-	if skipAdmissionFallback && callback != nil {
-		callback = keepSkipAdmissionKernelAlive(callback)
-	}
-	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, callback, runtimeOptions)
+	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, aliveChangeCallback, runtimeOptions)
 	group.nestedMembers = internalMembers
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
 	group.skipAdmissionFallback = skipAdmissionFallback
-	return group, nil
-}
-
-func keepSkipAdmissionKernelAlive(
-	callback func(alive bool, networkType *dialer.NetworkType, isInit bool),
-) func(alive bool, networkType *dialer.NetworkType, isInit bool) {
-	return func(_ bool, networkType *dialer.NetworkType, isInit bool) {
-		callback(true, networkType, isInit)
+	if skipAdmissionFallback && aliveChangeCallback != nil {
+		group.aliveChangeCallback = func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+			if group.rejectReachable() {
+				aliveChangeCallback(true, networkType, isInit)
+				return
+			}
+			aliveChangeCallback(alive, networkType, isInit)
+		}
 	}
+	return group, nil
 }
 
 func (g *DialerGroup) nestedConcreteDialers() []*dialer.Dialer {
@@ -381,7 +379,10 @@ func (g *DialerGroup) SnapshotForEstablishedFlow(selected *dialer.Dialer) *Diale
 
 func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	g.selectionStateMu.Lock()
-	defer g.selectionStateMu.Unlock()
+	defer func() {
+		g.selectionStateMu.Unlock()
+		g.republishKernelAlive()
+	}()
 
 	current := g.currentSelectionState()
 	currentNeedsAliveState := g.needsAliveState(current.policy.Policy)
@@ -453,12 +454,13 @@ func (d *DialerGroup) MustGetAliveDialerSet(typ *dialer.NetworkType) *dialer.Ali
 
 // KernelOutboundAlive reports whether new connections should still reach
 // userspace for this group. REJECT/block is excluded from parent health views,
-// so an empty probe set must not mark the group dead in outbound_connectivity_map.
+// so an empty probe set must not mark the group dead when the current policy
+// can still select that fallback.
 func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool {
 	if g == nil {
 		return true
 	}
-	if g.skipAdmissionFallback {
+	if g.rejectReachable() {
 		return true
 	}
 	if networkType == nil {
@@ -469,6 +471,71 @@ func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool 
 		return true
 	}
 	return set.Len() > 0
+}
+
+func (g *DialerGroup) republishKernelAlive() {
+	if g == nil || g.aliveChangeCallback == nil {
+		return
+	}
+	for _, nt := range standardSelectionNetworkTypes() {
+		g.aliveChangeCallback(g.KernelOutboundAlive(nt), nt, false)
+	}
+}
+
+// rejectReachable reports whether the current selection policy can still land
+// on a REJECT/block member that parent health probes omitted.
+func (g *DialerGroup) rejectReachable() bool {
+	if g == nil {
+		return false
+	}
+	return g.policyRejectReachable(g.CurrentSelectionPolicy())
+}
+
+func (g *DialerGroup) policyRejectReachable(policy DialerSelectionPolicy) bool {
+	if len(g.nestedMembers) > 0 {
+		switch policy.Policy {
+		case consts.DialerSelectionPolicy_Fixed:
+			if policy.FixedIndex < 0 || policy.FixedIndex >= len(g.nestedMembers) {
+				return false
+			}
+			return memberRejectReachable(g.nestedMembers[policy.FixedIndex])
+		default:
+			for _, member := range g.nestedMembers {
+				if memberRejectReachable(member) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	dialers := g.concreteDialers
+	if len(dialers) == 0 {
+		dialers = g.Dialers
+	}
+	switch policy.Policy {
+	case consts.DialerSelectionPolicy_Fixed:
+		if policy.FixedIndex < 0 || policy.FixedIndex >= len(dialers) {
+			return false
+		}
+		return skipsParentHealthAdmission(dialers[policy.FixedIndex])
+	default:
+		for _, d := range dialers {
+			if skipsParentHealthAdmission(d) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func memberRejectReachable(member dialerGroupMember) bool {
+	if member.dialer != nil {
+		return skipsParentHealthAdmission(member.dialer)
+	}
+	if member.group == nil {
+		return false
+	}
+	return member.group.rejectReachable()
 }
 
 // CaptureReloadSelectionFallback captures one fallback candidate per network

@@ -133,6 +133,54 @@ func TestDomainRoutingTrackerIdentityPrefixMarksAmbiguous(t *testing.T) {
 	}
 }
 
+func TestDomainRoutingTrackerIdentitySensitiveMarksAmbiguous(t *testing.T) {
+	tracker := newDomainRoutingTracker()
+	cacheA := domainRoutingACache("a.example.:1", "203.0.113.77", domainRoutingBitmap(0x1))
+	cacheB := domainRoutingACache("b.example.:1", "203.0.113.77", domainRoutingBitmap(0x2))
+	sameSensitive := domainRoutingFingerprint{
+		outbound:          consts.OutboundDirect,
+		identitySensitive: true,
+		valid:             true,
+	}
+
+	if err := projectDomainRoutingWithFingerprint(tracker, 0, cacheA, sameSensitive); err != nil {
+		t.Fatalf("project A: %v", err)
+	}
+	if err := projectDomainRoutingWithFingerprint(tracker, 0, cacheB, sameSensitive); err != nil {
+		t.Fatalf("project B: %v", err)
+	}
+	merged := requireTrackerMerged(t, tracker, cacheA)
+	if merged.Bitmap[0] != 0x3 {
+		t.Fatalf("merged bitmap = %#x, want 0x3", merged.Bitmap[0])
+	}
+	if merged.Ambiguous != 1 {
+		t.Fatalf("ambiguous = %d, want 1 when dest-only fingerprints match but identity can split", merged.Ambiguous)
+	}
+}
+
+func TestDomainRoutingTrackerIdentitySensitiveAttachedFromMatcher(t *testing.T) {
+	matcher := l4SplitConflictMatcher()
+	core := &controlPlaneCore{}
+	core.bindDomainRoutingFingerprinter(matcher)
+	tracker := newDomainRoutingTracker()
+	cacheA := domainRoutingACache("a.example.:1", "203.0.113.77", domainRoutingBitmap(1<<0|1<<2))
+	cacheB := domainRoutingACache("b.example.:1", "203.0.113.77", domainRoutingBitmap(1<<4|1<<6))
+	for _, cache := range []*DnsCache{cacheA, cacheB} {
+		snapshot, err := buildDomainRoutingOwnerSnapshot(cache)
+		if err != nil {
+			t.Fatalf("snapshot %q: %v", cache.RouteOwnerKey, err)
+		}
+		core.attachDomainRoutingFingerprints(cache, &snapshot)
+		if err := tracker.syncOwnerForSlot(nil, 0, cache.RouteOwnerKey, snapshot); err != nil {
+			t.Fatalf("project %q: %v", cache.RouteOwnerKey, err)
+		}
+	}
+	merged := requireTrackerMerged(t, tracker, cacheA)
+	if merged.Ambiguous != 1 {
+		t.Fatalf("ambiguous = %d, want 1 for shared-IP domain+l4proto split", merged.Ambiguous)
+	}
+}
+
 func projectDomainRoutingWithFingerprint(
 	tracker *domainRoutingTracker,
 	slot uint32,
