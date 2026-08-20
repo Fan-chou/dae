@@ -118,9 +118,7 @@ func validateGenerationMihomoMetadata(metadata *generationMihomoMetadata) error 
 		}
 		seenSafeNames[safeName] = original
 		protocol := strings.ToLower(metadata.NodeTypes[safeName])
-		switch protocol {
-		case "anytls", "ss", "socks5":
-		default:
+		if !mihomoSupportedNodeProtocol(protocol) {
 			return fmt.Errorf("generation Mihomo node protocol is unsupported")
 		}
 	}
@@ -166,8 +164,20 @@ func mihomoProxyLink(proxy MihomoProxy) (string, string, error) {
 	case "socks5":
 		link, err := mihomoSocks5Link(proxy)
 		return link, protocol, err
+	case "hysteria2", "hy2":
+		link, err := mihomoHysteria2Link(proxy)
+		return link, "hysteria2", err
 	default:
 		return "", protocol, fmt.Errorf("mihomo proxy %q uses unsupported type %q", proxy.Name, protocol)
+	}
+}
+
+func mihomoSupportedNodeProtocol(protocol string) bool {
+	switch protocol {
+	case "anytls", "ss", "socks5", "hysteria2":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -181,14 +191,28 @@ func validateMihomoProxyFields(proxy MihomoProxy) error {
 	}{
 		{name: "username", value: proxy.Username},
 		{name: "password", value: proxy.Password},
+		{name: "auth", value: proxy.Auth},
 		{name: "cipher", value: proxy.Cipher},
 		{name: "sni", value: proxy.SNI},
 		{name: "servername", value: proxy.ServerName},
 		{name: "client-fingerprint", value: proxy.ClientFingerprint},
 		{name: "plugin", value: proxy.Plugin},
+		{name: "up", value: proxy.Up},
+		{name: "down", value: proxy.Down},
+		{name: "obfs", value: proxy.Obfs},
+		{name: "obfs-password", value: proxy.ObfsPassword},
+		{name: "ports", value: proxy.Ports},
+		{name: "fingerprint", value: proxy.Fingerprint},
+		{name: "ca", value: proxy.CA},
+		{name: "ca-str", value: proxy.CAString},
 	} {
 		if strings.ContainsAny(field.value, "\x00\r\n") {
 			return fmt.Errorf("mihomo proxy %q has a control character in %s", proxy.Name, field.name)
+		}
+	}
+	for _, value := range proxy.ALPN {
+		if strings.ContainsAny(value, "\x00\r\n") {
+			return fmt.Errorf("mihomo proxy %q has a control character in alpn", proxy.Name)
 		}
 	}
 	if proxy.SNI != "" && proxy.ServerName != "" && proxy.SNI != proxy.ServerName {
@@ -220,7 +244,7 @@ func mihomoAnyTLSLink(proxy MihomoProxy) (string, error) {
 	if proxy.Password == "" {
 		return "", fmt.Errorf("mihomo proxy %q anytls password is required", proxy.Name)
 	}
-	if proxy.Username != "" || proxy.Cipher != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 {
+	if proxy.Username != "" || proxy.Cipher != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 || mihomoProxyHasHysteria2Fields(proxy) {
 		return "", fmt.Errorf("mihomo proxy %q anytls has unsupported fields", proxy.Name)
 	}
 	if proxy.TLS != nil && !*proxy.TLS {
@@ -243,7 +267,7 @@ func mihomoShadowsocksLink(proxy MihomoProxy) (string, error) {
 	if proxy.Cipher == "" || proxy.Password == "" {
 		return "", fmt.Errorf("mihomo proxy %q ss cipher and password are required", proxy.Name)
 	}
-	if proxy.Username != "" || proxy.SNI != "" || proxy.ServerName != "" || proxy.ClientFingerprint != "" {
+	if proxy.Username != "" || proxy.SNI != "" || proxy.ServerName != "" || proxy.ClientFingerprint != "" || mihomoProxyHasHysteria2Fields(proxy) {
 		return "", fmt.Errorf("mihomo proxy %q ss has unsupported fields", proxy.Name)
 	}
 	if proxy.TLS != nil && *proxy.TLS {
@@ -271,7 +295,7 @@ func mihomoShadowsocksLink(proxy MihomoProxy) (string, error) {
 }
 
 func mihomoSocks5Link(proxy MihomoProxy) (string, error) {
-	if proxy.Cipher != "" || proxy.SNI != "" || proxy.ServerName != "" || proxy.ClientFingerprint != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 {
+	if proxy.Cipher != "" || proxy.SNI != "" || proxy.ServerName != "" || proxy.ClientFingerprint != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 || mihomoProxyHasHysteria2Fields(proxy) {
 		return "", fmt.Errorf("mihomo proxy %q socks5 has unsupported fields", proxy.Name)
 	}
 	if proxy.TLS != nil && *proxy.TLS {
@@ -293,6 +317,97 @@ func mihomoSocks5Link(proxy MihomoProxy) (string, error) {
 		user = url.UserPassword(proxy.Username, proxy.Password)
 	}
 	return buildMihomoLink("socks5", user, proxy.Server, proxy.Port, nil)
+}
+
+func mihomoHysteria2Link(proxy MihomoProxy) (string, error) {
+	auth := strings.TrimSpace(proxy.Password)
+	if extra := strings.TrimSpace(proxy.Auth); extra != "" {
+		if auth != "" && auth != extra {
+			return "", fmt.Errorf("mihomo proxy %q hysteria2 has conflicting password and auth", proxy.Name)
+		}
+		auth = extra
+	}
+	if auth == "" {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 password is required", proxy.Name)
+	}
+	if proxy.Username != "" || proxy.Cipher != "" || proxy.ClientFingerprint != "" || proxy.Plugin != "" || len(proxy.PluginOpts) != 0 {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported fields", proxy.Name)
+	}
+	if proxy.Ports != "" || proxy.HopInterval != 0 || proxy.Fingerprint != "" || len(proxy.ALPN) != 0 || proxy.CA != "" || proxy.CAString != "" || proxy.CWND != 0 || proxy.UdpMTU != 0 {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported fields", proxy.Name)
+	}
+	if proxy.TLS != nil && !*proxy.TLS {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 tls=false is unsupported", proxy.Name)
+	}
+	if proxy.UDP != nil && !*proxy.UDP {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 udp=false is unsupported by dae", proxy.Name)
+	}
+
+	query := url.Values{}
+	if sni := mihomoProxySNI(proxy); sni != "" {
+		query.Set("sni", sni)
+	}
+	if proxy.SkipCertVerify != nil && *proxy.SkipCertVerify {
+		query.Set("insecure", "1")
+	}
+
+	up, err := parseMihomoMbps(proxy.Name, "up", proxy.Up)
+	if err != nil {
+		return "", err
+	}
+	down, err := parseMihomoMbps(proxy.Name, "down", proxy.Down)
+	if err != nil {
+		return "", err
+	}
+	if (up == 0) != (down == 0) {
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 up and down must be set together", proxy.Name)
+	}
+	if up != 0 {
+		query.Set("upmbps", strconv.FormatUint(up, 10))
+		query.Set("downmbps", strconv.FormatUint(down, 10))
+	}
+
+	obfs := strings.ToLower(strings.TrimSpace(proxy.Obfs))
+	switch obfs {
+	case "":
+		if strings.TrimSpace(proxy.ObfsPassword) != "" {
+			return "", fmt.Errorf("mihomo proxy %q hysteria2 obfs-password requires obfs", proxy.Name)
+		}
+	case "salamander":
+		if strings.TrimSpace(proxy.ObfsPassword) == "" {
+			return "", fmt.Errorf("mihomo proxy %q hysteria2 obfs=salamander requires obfs-password", proxy.Name)
+		}
+		query.Set("obfs", "salamander")
+		query.Set("obfs-password", proxy.ObfsPassword)
+	default:
+		return "", fmt.Errorf("mihomo proxy %q hysteria2 has unsupported obfs", proxy.Name)
+	}
+
+	return buildMihomoLink("hysteria2", url.User(auth), proxy.Server, proxy.Port, query)
+}
+
+func mihomoProxyHasHysteria2Fields(proxy MihomoProxy) bool {
+	return proxy.Auth != "" || proxy.Up != "" || proxy.Down != "" || proxy.Obfs != "" || proxy.ObfsPassword != "" ||
+		proxy.Ports != "" || proxy.HopInterval != 0 || proxy.Fingerprint != "" || len(proxy.ALPN) != 0 ||
+		proxy.CA != "" || proxy.CAString != "" || proxy.CWND != 0 || proxy.UdpMTU != 0
+}
+
+func parseMihomoMbps(name, field, value string) (uint64, error) {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), " ", ""))
+	if normalized == "" {
+		return 0, nil
+	}
+	for _, suffix := range []string{"mbit/s", "mbps", "mbit", "mb"} {
+		if strings.HasSuffix(normalized, suffix) {
+			normalized = strings.TrimSuffix(normalized, suffix)
+			break
+		}
+	}
+	mbps, err := strconv.ParseUint(normalized, 10, 64)
+	if err != nil || mbps == 0 {
+		return 0, fmt.Errorf("mihomo proxy %q has an invalid hysteria2 %s", name, field)
+	}
+	return mbps, nil
 }
 
 func mihomoProxySNI(proxy MihomoProxy) string {

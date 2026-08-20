@@ -5,10 +5,12 @@ package main
 import (
 	D "github.com/daeuniverse/outbound/dialer"
 	_ "github.com/daeuniverse/outbound/dialer/anytls"
+	_ "github.com/daeuniverse/outbound/dialer/hysteria2"
 	_ "github.com/daeuniverse/outbound/dialer/shadowsocks"
 	_ "github.com/daeuniverse/outbound/dialer/socks"
 	_ "github.com/daeuniverse/outbound/protocol/anytls"
 	"github.com/daeuniverse/outbound/protocol/direct"
+	_ "github.com/daeuniverse/outbound/protocol/hysteria2"
 	_ "github.com/daeuniverse/outbound/protocol/shadowsocks"
 	_ "github.com/daeuniverse/outbound/protocol/shadowsocks_2022"
 	_ "github.com/daeuniverse/outbound/protocol/socks5"

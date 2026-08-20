@@ -25,6 +25,7 @@ type MihomoProxy struct {
 	Port              int            `yaml:"port"`
 	Username          string         `yaml:"username"`
 	Password          string         `yaml:"password"`
+	Auth              string         `yaml:"auth"`
 	Cipher            string         `yaml:"cipher"`
 	SNI               string         `yaml:"sni"`
 	ServerName        string         `yaml:"servername"`
@@ -34,6 +35,18 @@ type MihomoProxy struct {
 	UDP               *bool          `yaml:"udp"`
 	Plugin            string         `yaml:"plugin"`
 	PluginOpts        map[string]any `yaml:"plugin-opts"`
+	Up                string         `yaml:"up"`
+	Down              string         `yaml:"down"`
+	Obfs              string         `yaml:"obfs"`
+	ObfsPassword      string         `yaml:"obfs-password"`
+	Ports             string         `yaml:"ports"`
+	HopInterval       int            `yaml:"hop-interval"`
+	Fingerprint       string         `yaml:"fingerprint"`
+	ALPN              []string       `yaml:"alpn"`
+	CA                string         `yaml:"ca"`
+	CAString          string         `yaml:"ca-str"`
+	CWND              int            `yaml:"cwnd"`
+	UdpMTU            int            `yaml:"udp-mtu"`
 }
 
 type MihomoGroup struct {

@@ -39,12 +39,22 @@ func TestParseMihomoConfigReadsNodeConversionFields(t *testing.T) {
     port: 1080
     username: user
     password: socks-secret
+  - name: hy2-node
+    type: hysteria2
+    server: 2407:cdc0:d002::1961
+    port: 58526
+    password: hy2-secret
+    sni: edge.example
+    up: "50 Mbps"
+    down: "800 Mbps"
+    obfs: salamander
+    obfs-password: obfs-secret
 `))
 	if err != nil {
 		t.Fatalf("ParseMihomoConfig() error = %v", err)
 	}
-	if len(config.Proxies) != 3 {
-		t.Fatalf("proxies = %#v, want three proxies", config.Proxies)
+	if len(config.Proxies) != 4 {
+		t.Fatalf("proxies = %#v, want four proxies", config.Proxies)
 	}
 	anytls := config.Proxies[0]
 	if anytls.Server != "anytls.example" || anytls.Port != 443 || anytls.Password != "anytls-secret" || anytls.SNI != "edge.example" || anytls.ServerName != "edge.example" || anytls.ClientFingerprint != "chrome" || anytls.TLS == nil || !*anytls.TLS || anytls.SkipCertVerify == nil || !*anytls.SkipCertVerify || anytls.UDP == nil || !*anytls.UDP {
@@ -55,6 +65,10 @@ func TestParseMihomoConfigReadsNodeConversionFields(t *testing.T) {
 	}
 	if config.Proxies[2].Username != "user" || config.Proxies[2].Password != "socks-secret" {
 		t.Fatalf("socks5 auth fields = %#v", config.Proxies[2])
+	}
+	hy2 := config.Proxies[3]
+	if hy2.Type != "hysteria2" || hy2.Server != "2407:cdc0:d002::1961" || hy2.Port != 58526 || hy2.Password != "hy2-secret" || hy2.SNI != "edge.example" || hy2.Up != "50 Mbps" || hy2.Down != "800 Mbps" || hy2.Obfs != "salamander" || hy2.ObfsPassword != "obfs-secret" {
+		t.Fatalf("hysteria2 fields = %#v", hy2)
 	}
 }
 
@@ -197,6 +211,10 @@ func TestMihomoNodeNameMappingIsStableAndFailClosed(t *testing.T) {
 		"unsupported plugin":     {Proxies: []MihomoProxy{{Name: "node", Type: "ss", Server: "127.0.0.1", Port: 8388, Cipher: "aes-256-gcm", Password: "secret", Plugin: "not-supported"}}},
 		"unsupported option":     {Proxies: []MihomoProxy{{Name: "node", Type: "ss", Server: "127.0.0.1", Port: 8388, Cipher: "aes-256-gcm", Password: "secret", Plugin: "simple-obfs", PluginOpts: map[string]any{"obfs": "http", "exec": "unexpected"}}}},
 		"ss plugin udp":          {Proxies: []MihomoProxy{{Name: "node", Type: "ss", Server: "127.0.0.1", Port: 8388, Cipher: "aes-256-gcm", Password: "secret", UDP: boolPtr(true), Plugin: "obfs", PluginOpts: map[string]any{"mode": "http"}}}},
+		"hy2 missing password":   {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443}}},
+		"hy2 single bandwidth":   {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Up: "50 Mbps"}}},
+		"hy2 port hop":           {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Ports: "443-8443"}}},
+		"hy2 salamander no pass": {Proxies: []MihomoProxy{{Name: "node", Type: "hysteria2", Server: "127.0.0.1", Port: 443, Password: "secret", Obfs: "salamander"}}},
 	} {
 		if _, _, err := GenerateMihomoNodes(config); err == nil {
 			t.Errorf("%s: GenerateMihomoNodes() error = nil", name)
@@ -227,6 +245,54 @@ func TestMihomoLinkURIEncodesCredentials(t *testing.T) {
 	}
 	if strings.Contains(link, proxy.Password) {
 		t.Fatalf("link contains an unescaped credential: %q", link)
+	}
+}
+
+func TestGenerateMihomoNodesSupportsHysteria2(t *testing.T) {
+	config := MihomoConfig{Proxies: []MihomoProxy{
+		{
+			Name:     "🇸🇬 NNC.SG | Hysteria",
+			Type:     "hysteria2",
+			Server:   "2407:cdc0:d002::1961",
+			Port:     58526,
+			Password: "p@ss:/?#",
+			SNI:      "sg.example",
+		},
+		{
+			Name:         "us-hy2",
+			Type:         "hy2",
+			Server:       "127.0.0.1",
+			Port:         443,
+			Password:     "hy2-secret",
+			Up:           "50 Mbps",
+			Down:         "800 Mbps",
+			Obfs:         "salamander",
+			ObfsPassword: "obfs-secret",
+		},
+	}}
+
+	nodes, report, err := GenerateMihomoNodes(config)
+	if err != nil {
+		t.Fatalf("GenerateMihomoNodes() error = %v", err)
+	}
+	if report.Converted != 2 || report.Types[report.NameMap["🇸🇬 NNC.SG | Hysteria"]] != "hysteria2" || report.Types["us-hy2"] != "hysteria2" {
+		t.Fatalf("report = %#v", report)
+	}
+	if !strings.Contains(nodes, "hysteria2://") || !strings.Contains(nodes, "[2407:cdc0:d002::1961]:58526") || !strings.Contains(nodes, "sni=sg.example") {
+		t.Fatalf("nodes output = %q, want hysteria2 IPv6 link", nodes)
+	}
+	if !strings.Contains(nodes, "upmbps=50") || !strings.Contains(nodes, "downmbps=800") || !strings.Contains(nodes, "obfs=salamander") {
+		t.Fatalf("nodes output = %q, want bandwidth and obfs query", nodes)
+	}
+	if strings.Contains(nodes, "p@ss:/?#") {
+		t.Fatalf("nodes output contains an unencoded credential: %q", nodes)
+	}
+	reportBody, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal(report) error = %v", err)
+	}
+	if strings.Contains(string(reportBody), "hy2-secret") || strings.Contains(string(reportBody), "obfs-secret") || strings.Contains(string(reportBody), "p@ss") {
+		t.Fatalf("conversion report contains credentials: %s", reportBody)
 	}
 }
 
