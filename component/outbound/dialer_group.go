@@ -50,12 +50,20 @@ type DialerGroup struct {
 
 	selectionState   atomic.Pointer[dialerGroupSelectionState]
 	selectionStateMu sync.Mutex
+	// kernelAliveMu serializes BPF connectivity publishes so a stale
+	// SetSelectionPolicy republish or health callback cannot overwrite a
+	// newer policy's live KernelOutboundAlive result.
+	kernelAliveMu sync.Mutex
+	// kernelAliveEpoch increments with each policy store. Publishers that
+	// observed an older epoch drop their write after waiting for the mutex.
+	kernelAliveEpoch atomic.Uint64
 	lazyCheckOnce    sync.Once
 	closeOnce        sync.Once
 
 	dialersAnnotations  []*dialer.Annotation
 	checkTolerance      time.Duration
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool)
+	userAliveCallback   func(alive bool, networkType *dialer.NetworkType, isInit bool)
 	healthCheckEnabled  bool
 	lazyCheck           bool
 
@@ -130,25 +138,42 @@ func NewDialerGroupWithRuntimeOptions(
 	log := option.Log
 
 	group := &DialerGroup{
-		log:                 log,
-		Name:                name,
-		Dialers:             dialers,
-		dialersAnnotations:  dialersAnnotations,
-		checkTolerance:      option.CheckTolerance,
-		aliveChangeCallback: aliveChangeCallback,
-		healthCheckEnabled:  runtimeOptions.HealthCheckEnabled,
-		lazyCheck:           runtimeOptions.Lazy,
+		log:                log,
+		Name:               name,
+		Dialers:            dialers,
+		dialersAnnotations: dialersAnnotations,
+		checkTolerance:     option.CheckTolerance,
+		healthCheckEnabled: runtimeOptions.HealthCheckEnabled,
+		lazyCheck:          runtimeOptions.Lazy,
 	}
+	group.installAlivePublisher(aliveChangeCallback)
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
 	group.selectionState.Store(state)
 	group.cachedMinCheckInterval = group.MinCheckInterval()
 
-	for _, nt := range standardSelectionNetworkTypes() {
-		aliveChangeCallback(true, nt, true)
+	if aliveChangeCallback != nil {
+		for _, nt := range standardSelectionNetworkTypes() {
+			aliveChangeCallback(true, nt, true)
+		}
 	}
 
 	return group
+}
+
+func (g *DialerGroup) installAlivePublisher(cb func(alive bool, networkType *dialer.NetworkType, isInit bool)) {
+	g.userAliveCallback = cb
+	if cb == nil {
+		g.aliveChangeCallback = nil
+		return
+	}
+	g.aliveChangeCallback = func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+		if isInit {
+			cb(alive, networkType, isInit)
+			return
+		}
+		g.publishLiveKernelAlive(networkType)
+	}
 }
 
 // NewNestedDialerGroup builds an ordered recursive selection tree. Dialers is
@@ -253,15 +278,6 @@ func NewNestedDialerGroupWithRuntimeOptions(
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
 	group.skipAdmissionFallback = skipAdmissionFallback
-	if skipAdmissionFallback && aliveChangeCallback != nil {
-		group.aliveChangeCallback = func(alive bool, networkType *dialer.NetworkType, isInit bool) {
-			if group.rejectReachable() {
-				aliveChangeCallback(true, networkType, isInit)
-				return
-			}
-			aliveChangeCallback(alive, networkType, isInit)
-		}
-	}
 	return group, nil
 }
 
@@ -380,6 +396,7 @@ func (g *DialerGroup) SnapshotForEstablishedFlow(selected *dialer.Dialer) *Diale
 func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	g.selectionStateMu.Lock()
 	defer func() {
+		g.kernelAliveEpoch.Add(1)
 		g.selectionStateMu.Unlock()
 		g.republishKernelAlive()
 	}()
@@ -474,12 +491,34 @@ func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool 
 }
 
 func (g *DialerGroup) republishKernelAlive() {
-	if g == nil || g.aliveChangeCallback == nil {
+	if g == nil || g.userAliveCallback == nil {
+		return
+	}
+	epoch := g.kernelAliveEpoch.Load()
+	g.kernelAliveMu.Lock()
+	defer g.kernelAliveMu.Unlock()
+	if g.kernelAliveEpoch.Load() != epoch {
 		return
 	}
 	for _, nt := range standardSelectionNetworkTypes() {
-		g.aliveChangeCallback(g.KernelOutboundAlive(nt), nt, false)
+		if g.kernelAliveEpoch.Load() != epoch {
+			return
+		}
+		g.userAliveCallback(g.KernelOutboundAlive(nt), nt, false)
 	}
+}
+
+func (g *DialerGroup) publishLiveKernelAlive(networkType *dialer.NetworkType) {
+	if g == nil || g.userAliveCallback == nil || networkType == nil {
+		return
+	}
+	epoch := g.kernelAliveEpoch.Load()
+	g.kernelAliveMu.Lock()
+	defer g.kernelAliveMu.Unlock()
+	if g.kernelAliveEpoch.Load() != epoch {
+		return
+	}
+	g.userAliveCallback(g.KernelOutboundAlive(networkType), networkType, false)
 }
 
 // rejectReachable reports whether the current selection policy can still land

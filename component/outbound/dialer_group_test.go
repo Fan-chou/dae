@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -1428,5 +1429,101 @@ func TestDialerGroup_SetSelectionPolicyFixedStopsRejectKernelAlive(t *testing.T)
 	}
 	if !sawKernelDead {
 		t.Fatal("policy switch did not republish kernel dead")
+	}
+}
+
+func TestDialerGroup_SetSelectionPolicyConcurrentKernelAliveMatchesLive(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	childDialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+		newDirectDialer(option, false),
+	}
+	child := NewDialerGroup(option, "failed-child", childDialers, newEmptyAnnotations(len(childDialers)), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	blockDialer := newBuiltinBlockDialer(option)
+	block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+
+	var pubMu sync.Mutex
+	lastAlive := make(map[string]bool)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "parent", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: block},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(alive bool, nt *dialer.NetworkType, isInit bool) {
+		if isInit || nt == nil {
+			return
+		}
+		pubMu.Lock()
+		lastAlive[nt.String()] = alive
+		pubMu.Unlock()
+	}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer block.Close()
+	defer blockDialer.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, d := range childDialers {
+		defer d.Close()
+	}
+
+	for _, leaf := range childDialers {
+		view := parent.parentHealthViews[leaf]
+		snapshot := view.HealthSnapshot()
+		for i := range snapshot.Collections {
+			snapshot.Collections[i].Alive = false
+		}
+		view.RestoreHealthSnapshot(snapshot)
+	}
+
+	policies := []DialerSelectionPolicy{
+		{Policy: consts.DialerSelectionPolicy_FirstAlive},
+		{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 1},
+		{Policy: consts.DialerSelectionPolicy_Random},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(2)
+		policy := policies[i%len(policies)]
+		staleAlive := i%2 == 0
+		go func(policy DialerSelectionPolicy) {
+			defer wg.Done()
+			parent.SetSelectionPolicy(policy)
+		}(policy)
+		go func(staleAlive bool) {
+			defer wg.Done()
+			// Stale health callbacks must not pin an old alive bit; the
+			// publisher always writes the live KernelOutboundAlive value.
+			parent.aliveChangeCallback(staleAlive, TestNetworkType, false)
+		}(staleAlive)
+	}
+	wg.Wait()
+
+	for _, nt := range standardSelectionNetworkTypes() {
+		want := parent.KernelOutboundAlive(nt)
+		pubMu.Lock()
+		got, ok := lastAlive[nt.String()]
+		pubMu.Unlock()
+		if !ok {
+			t.Fatalf("missing kernel alive publish for %s", nt.String())
+		}
+		if got != want {
+			t.Fatalf("published kernel alive[%s]=%v, live KernelOutboundAlive=%v policy=%v",
+				nt.String(), got, want, parent.CurrentSelectionPolicy())
+		}
 	}
 }
