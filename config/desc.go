@@ -10,7 +10,7 @@ type Desc map[string]string
 var SectionSummaryDesc = Desc{
 	"subscription":  "Subscriptions defined here will be resolved as nodes and merged as a part of the global node pool.\nSupport to give the subscription a tag, and filter nodes from a given subscription in the group section.",
 	"rule_provider": "Remote or local rule sources are fetched, validated, and lowered into the existing routing matcher. Provider content is data only and never executed.",
-	"node":          "Nodes defined here will be merged as a part of the global node pool.",
+	"node":          "Nodes defined here will be merged as a part of the global node pool.\nOptional link query resolve_dns=8.8.8.8 (IP, optional :port) pins UDP dest IP via DNS through this node. Default is to pass the domain.",
 	"dns":           "See more at https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md.",
 	"group":         "Node group. Groups defined here can be used as outbounds in section \"routing\".",
 	"routing": `Traffic follows this routing. See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.

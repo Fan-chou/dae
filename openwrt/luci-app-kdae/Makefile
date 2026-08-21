@@ -48,6 +48,7 @@ define Package/luci-app-kdae/install
 	$(INSTALL_DIR) $(1)/usr/libexec/dae
 	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-sync.sh $(1)/usr/libexec/dae/kdae-sync.sh
 	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-write-local.sh $(1)/usr/libexec/dae/kdae-write-local.sh
+	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-list-nodes.sh $(1)/usr/libexec/dae/kdae-list-nodes.sh
 endef
 
 $(eval $(call BuildPackage,luci-app-kdae))

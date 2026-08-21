@@ -148,7 +148,11 @@ func runMihomoRoutingSync(ctx context.Context, options SyncOptions) (SyncReport,
 	}
 
 	mihomoConfig := MihomoConfig{Proxies: document.Proxies, Groups: document.Groups}
-	nodesText, nodeReport, err := GenerateMihomoNodes(mihomoConfig)
+	overlay, err := loadNodeResolveDNSOverlay(options.NodeResolveDNSFile)
+	if err != nil {
+		return SyncReport{}, err
+	}
+	nodesText, nodeReport, err := GenerateMihomoNodesWithResolveDNS(mihomoConfig, overlay)
 	if err != nil {
 		return SyncReport{}, err
 	}

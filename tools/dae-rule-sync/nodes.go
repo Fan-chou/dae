@@ -36,6 +36,10 @@ type NodeConversionReport struct {
 // invalid must not be silently hidden merely because a group does not refer to
 // it today.
 func GenerateMihomoNodes(config MihomoConfig) (string, NodeConversionReport, error) {
+	return GenerateMihomoNodesWithResolveDNS(config, nil)
+}
+
+func GenerateMihomoNodesWithResolveDNS(config MihomoConfig, overlay map[string]string) (string, NodeConversionReport, error) {
 	report := NodeConversionReport{
 		NameMap: make(map[string]string, len(config.Proxies)),
 		Types:   make(map[string]string, len(config.Proxies)),
@@ -75,6 +79,10 @@ func GenerateMihomoNodes(config MihomoConfig) (string, NodeConversionReport, err
 		link, protocol, err := mihomoProxyLink(proxy)
 		if err != nil {
 			return "", NodeConversionReport{}, err
+		}
+		link, err = applyResolveDNSOverlay(link, proxy.Name, overlay)
+		if err != nil {
+			return "", NodeConversionReport{}, fmt.Errorf("mihomo proxy %q: %w", proxy.Name, err)
 		}
 		if err := validateDaeLiteral(link); err != nil {
 			return "", NodeConversionReport{}, fmt.Errorf("mihomo proxy %q generated an invalid dae link", proxy.Name)

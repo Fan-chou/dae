@@ -1055,7 +1055,7 @@ afterSniffing:
 		IsDns:           false,
 		UdpHealthDomain: dialer.UdpHealthDomainData,
 	}
-	// Keep UDP target pinned to original destination IP to avoid QUIC session issues.
+	// Reuse the endpoint's stored WriteTo target when the pool key is symmetric.
 	dialTarget := ue.dialTargetForWrite(realDst)
 getNew:
 	if retry > MaxRetry {
@@ -1170,10 +1170,9 @@ getNew:
 				}
 
 				option = &DialOption{
-					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
-					// FakeIP destinations are the exception: DialTarget must be the real IP,
-					// while the UDP endpoint key stays on the FakeIP.
-					Target:        udpDialTarget(c, realDst, dialTarget, res.DialTarget),
+					// Pass the domain (or resolve_dns-pinned IP) from chooseProxyDialer.
+					// Endpoint key stays on the client destination (including FakeIP).
+					Target:        udpDialTarget(res.DialTarget, realDst.String()),
 					Dialer:        res.Dialer,
 					Outbound:      res.Outbound,
 					Network:       res.Network,

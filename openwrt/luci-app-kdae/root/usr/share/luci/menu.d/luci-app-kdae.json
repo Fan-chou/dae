@@ -17,7 +17,7 @@
 		"order": 10,
 		"action": {
 			"type": "view",
-			"path": "kdae/setup"
+			"path": "kdae/setup2"
 		}
 	},
 	"admin/services/kdae/config": {

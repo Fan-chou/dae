@@ -7,12 +7,14 @@
 				"/etc/dae/example.dae": [ "read" ],
 				"/etc/dae/local.dae": [ "read" ],
 				"/etc/dae/metadata.json": [ "read" ],
+				"/etc/dae/current/metadata.json": [ "read" ],
 				"/var/log/dae/dae.log": [ "read" ],
 				"/var/run/kdae-last-sync.json": [ "read" ],
 				"/etc/init.d/dae": [ "exec" ],
 				"/usr/bin/dae": [ "exec" ],
 				"/usr/libexec/dae/kdae-sync.sh": [ "exec" ],
-				"/usr/libexec/dae/kdae-write-local.sh": [ "exec" ]
+				"/usr/libexec/dae/kdae-write-local.sh": [ "exec" ],
+				"/usr/libexec/dae/kdae-list-nodes.sh": [ "exec" ]
 			},
 			"ubus": {
 				"service": [ "list" ]

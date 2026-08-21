@@ -33,6 +33,10 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	}
 
 	normalizedLink := normalizeShadowTLSPluginOptions(link)
+	normalizedLink, resolveDNS, err := extractLinkResolveDNS(normalizedLink)
+	if err != nil {
+		return nil, err
+	}
 	baseDialer := newDefaultNetworkDialer(direct.SymmetricDirect, gOption.SoMarkFromDae, gOption.Mptcp)
 	scopedBaseDialer := scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
 
@@ -109,6 +113,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 
 	daeDialer := NewDialerContext(ctx, d, gOption, iOption, &p)
 	daeDialer.metadataRetirer = metadataRetirer
+	daeDialer.resolveDNS = resolveDNS
 
 	// Store reference to sticky wrapper for health check cycle management
 	if stickyWrapper != nil {

@@ -15,3 +15,8 @@ config dae 'config'
 #	option url 'https://example.com/clash'
 #	option role 'routing'
 #	option persist '1'
+
+# 混入配置：每个节点单独一条。同步时写进节点链接 ?resolve_dns=
+# config mixin
+#	option name '🇺🇸 US | Hysteria2'
+#	option resolve_dns '8.8.8.8'

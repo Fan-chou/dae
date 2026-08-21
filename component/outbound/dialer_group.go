@@ -307,6 +307,43 @@ func (g *DialerGroup) ParentHealthViewDialers() []*dialer.Dialer {
 	return views
 }
 
+// AnnotationOf returns the group-membership annotation for d. Nested health
+// clones map back to the concrete leaf.
+func (g *DialerGroup) AnnotationOf(d *dialer.Dialer) *dialer.Annotation {
+	if g == nil || d == nil {
+		return nil
+	}
+	if anno := g.annotationOfExact(d); anno != nil {
+		return anno
+	}
+	for _, member := range g.nestedMembers {
+		if member.dialer == d && member.annotation != nil {
+			return member.annotation
+		}
+	}
+	for orig, view := range g.parentHealthViews {
+		if orig == d {
+			if anno := g.annotationOfExact(view); anno != nil {
+				return anno
+			}
+			return g.annotationOfExact(orig)
+		}
+	}
+	return nil
+}
+
+func (g *DialerGroup) annotationOfExact(d *dialer.Dialer) *dialer.Annotation {
+	if d == nil {
+		return nil
+	}
+	for i, x := range g.Dialers {
+		if x == d && i < len(g.dialersAnnotations) {
+			return g.dialersAnnotations[i]
+		}
+	}
+	return nil
+}
+
 // IsLazyCheck reports whether ControlPlane should defer this group's health
 // checks until the group is selected.
 func (g *DialerGroup) IsLazyCheck() bool {

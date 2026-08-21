@@ -44,6 +44,35 @@ json_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
 }
 
+write_node_resolve_dns() {
+	dest=$1
+	umask 077
+	tmp="${dest}.tmp.$$"
+	{
+		printf '{\n'
+		first=1
+		for type in mixin node_dns; do
+			index=0
+			while uci -q get "dae.@${type}[$index]" >/dev/null 2>&1; do
+				name=$(uci -q get "dae.@${type}[$index].name" || true)
+				dns=$(uci -q get "dae.@${type}[$index].resolve_dns" || true)
+				index=$((index + 1))
+				[ -n "$name" ] || continue
+				[ -n "$dns" ] || continue
+				if [ "$first" -eq 1 ]; then
+					first=0
+				else
+					printf ',\n'
+				fi
+				printf '  "%s": "%s"' "$(json_escape "$name")" "$(json_escape "$dns")"
+			done
+		done
+		printf '\n}\n'
+	} > "$tmp"
+	chmod 600 "$tmp"
+	mv "$tmp" "$dest"
+}
+
 write_state() {
 	ok=$1
 	generation=$2
@@ -95,6 +124,14 @@ else
 	exit 1
 fi
 
+cache_dir="${gendir}/cache"
+umask 077
+mkdir -p "$cache_dir"
+chmod 700 "$cache_dir"
+overlay="${cache_dir}/node-resolve-dns.json"
+write_node_resolve_dns "$overlay"
+set -- "$@" -node-resolve-dns "$overlay"
+
 if [ ! -x "$SYNC" ]; then
 	write_state false "" "" "dae-rule-sync is not installed"
 	echo "dae-rule-sync is not installed" >&2
@@ -117,7 +154,9 @@ ${warning}"
 	fi
 fi
 generation=""
-if [ -f "$gendir/metadata.json" ]; then
+if [ -f "$gendir/current/metadata.json" ]; then
+	generation=$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$gendir/current/metadata.json" | head -n1)
+elif [ -f "$gendir/metadata.json" ]; then
 	generation=$(sed -n 's/.*"generation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$gendir/metadata.json" | head -n1)
 fi
 

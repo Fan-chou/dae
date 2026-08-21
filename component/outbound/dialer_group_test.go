@@ -1527,3 +1527,24 @@ func TestDialerGroup_SetSelectionPolicyConcurrentKernelAliveMatchesLive(t *testi
 		}
 	}
 }
+
+func TestAnnotationOfMapsParentHealthView(t *testing.T) {
+	option := &dialer.GlobalOption{Log: log, CheckInterval: time.Second}
+	leaf := newNoopDialer(option)
+	view := newNoopDialer(option)
+	anno := &dialer.Annotation{AddLatency: -500 * time.Millisecond}
+	g := NewDialerGroup(option, "annotated", []*dialer.Dialer{view}, []*dialer.Annotation{anno},
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed},
+		func(bool, *dialer.NetworkType, bool) {})
+	g.parentHealthViews = map[*dialer.Dialer]*dialer.Dialer{leaf: view}
+
+	if got := g.AnnotationOf(view); got == nil || got.AddLatency != anno.AddLatency {
+		t.Fatalf("view annotation = %+v, want add_latency %v", got, anno.AddLatency)
+	}
+	if got := g.AnnotationOf(leaf); got == nil || got.AddLatency != anno.AddLatency {
+		t.Fatalf("leaf annotation = %+v, want add_latency %v via parentHealthViews", got, anno.AddLatency)
+	}
+	if got := g.AnnotationOf(newNoopDialer(option)); got != nil {
+		t.Fatalf("unknown dialer annotation = %+v, want nil", got)
+	}
+}

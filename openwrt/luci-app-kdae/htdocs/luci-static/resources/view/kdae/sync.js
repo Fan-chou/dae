@@ -42,10 +42,11 @@ return view.extend({
 		function refreshState() {
 			return Promise.all([
 				loadJSON('/var/run/kdae-last-sync.json'),
+				loadJSON('/etc/dae/current/metadata.json'),
 				loadJSON('/etc/dae/metadata.json')
 			]).then(function (pair) {
 				const sync = pair[0] || {};
-				const meta = pair[1] || {};
+				const meta = pair[1] || pair[2] || {};
 				const lines = [];
 				lines.push('generation: ' + (sync.generation || meta.generation || '—'));
 				if (meta.previous_generation)

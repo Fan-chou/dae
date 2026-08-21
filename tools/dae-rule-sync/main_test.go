@@ -34,6 +34,20 @@ func TestParseCLIArgsReadsOutputsAndStrictMode(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsReadsNodeResolveDNS(t *testing.T) {
+	options, err := ParseCLIArgs([]string{
+		"-mihomo-routing-config", "mihomo.yaml",
+		"-generation-dir", "/tmp/gen",
+		"-node-resolve-dns", "/tmp/overlay.json",
+	})
+	if err != nil {
+		t.Fatalf("ParseCLIArgs() error = %v", err)
+	}
+	if options.NodeResolveDNSFile != "/tmp/overlay.json" {
+		t.Fatalf("NodeResolveDNSFile = %q", options.NodeResolveDNSFile)
+	}
+}
+
 func TestCLIHelpDocumentsPublicationSemantics(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {

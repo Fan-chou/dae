@@ -38,6 +38,7 @@ type SyncOptions struct {
 	GroupsOutput         string
 	NodesOutput          string
 	GenerationDir        string
+	NodeResolveDNSFile   string
 	Client               *http.Client
 	Strict               bool
 	AllowPrivate         bool
@@ -276,7 +277,11 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		var groupsText string
 		var groupReport GroupConversionReport
 		if fullMihomoOutput {
-			nodesText, nodeReport, err := GenerateMihomoNodes(mihomoConfig)
+			overlay, err := loadNodeResolveDNSOverlay(options.NodeResolveDNSFile)
+			if err != nil {
+				return SyncReport{}, err
+			}
+			nodesText, nodeReport, err := GenerateMihomoNodesWithResolveDNS(mihomoConfig, overlay)
 			if err != nil {
 				return SyncReport{}, err
 			}

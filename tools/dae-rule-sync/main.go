@@ -27,6 +27,7 @@ func parseCLIArgs(args []string, output io.Writer) (SyncOptions, error) {
 	flags.StringVar(&options.GroupsOutput, "groups-output", "", "direct groups output path (compatibility-only; non-atomic complete-state publication)")
 	flags.StringVar(&options.NodesOutput, "nodes-output", "", "direct Mihomo node output path (compatibility-only; use generation-dir with routes)")
 	flags.StringVar(&options.GenerationDir, "generation-dir", "", "generation output directory; atomically publishes nodes, routes, groups, DATs, and provider snapshots together")
+	flags.StringVar(&options.NodeResolveDNSFile, "node-resolve-dns", "", "JSON overlay mapping original Mihomo node names to resolve_dns IPs")
 	flags.BoolVar(&options.Strict, "strict", false, "fail when a rule cannot be converted")
 	if err := flags.Parse(args); err != nil {
 		return SyncOptions{}, err

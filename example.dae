@@ -191,6 +191,8 @@ node {
     node2: 'vless://LINK'
     chains: 'tuic://LINK -> vmess://LINK'
     hysteria2: 'hysteria2://password@server-ip:port/?sni=domain'
+    # Optional: pin UDP/QUIC dest IP via DNS through this node (default is pass domain).
+    # hysteria2_pinned: 'hysteria2://password@server-ip:port/?sni=domain&resolve_dns=8.8.8.8'
 }
 
 # See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md for full examples.

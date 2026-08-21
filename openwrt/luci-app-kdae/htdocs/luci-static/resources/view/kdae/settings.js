@@ -1,4 +1,4 @@
 'use strict';
-'require view.kdae.setup as view';
+'require view.kdae.setup2 as view';
 
 return view;

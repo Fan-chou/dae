@@ -155,7 +155,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	if err := c.guardFakeIPOutbound(outboundIndex, dst.Addr()); err != nil {
 		return nil, err
 	}
-	dialTarget, dialIp, err = c.rewriteFakeIPDialTarget(ctx, domain, dst, p.Network, dialTarget, dialIp)
+	dialTarget, dialIp, err = c.rewriteFakeIPDialTarget(domain, dst, dialTarget, dialIp)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +227,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 
 	selectionNetworkType = endpointNetworkTypeForSelection(selectionNetworkType, admissionNetworkType)
 
-	return &proxyDialResult{
+	res := &proxyDialResult{
 		OutboundIndex: outboundIndex,
 		Outbound:      outbound,
 		Dialer:        d,
@@ -247,7 +247,11 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		OrigNetworkTypeObj:      networkType,
 		SelectionNetworkTypeObj: selectionNetworkType,
 		AdmissionNetworkTypeObj: admissionNetworkType,
-	}, nil
+	}
+	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
+		return res, err
+	}
+	return res, nil
 }
 
 func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netproxy.Conn, *proxyDialResult, error) {

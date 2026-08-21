@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -47,5 +48,32 @@ func TestHysteria2ClonePreservesSalamanderObfs(t *testing.T) {
 	defer other.Close()
 	if healthDialerIdentity(src) == healthDialerIdentity(other) {
 		t.Fatalf("nodes that differ only in obfs-password share cache identity %q", healthDialerIdentity(src))
+	}
+}
+
+func TestNewFromLinkResolveDNSAndClone(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	src, err := dialer.NewFromLink(option, dialer.InstanceOption{DisableCheck: true},
+		"hysteria2://pass@127.0.0.1:443?sni=example.com&resolve_dns=8.8.8.8#n", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	want := netip.MustParseAddrPort("8.8.8.8:53")
+	if src.ResolveDNS() != want {
+		t.Fatalf("ResolveDNS = %v, want %v", src.ResolveDNS(), want)
+	}
+	if src.Property() != nil && strings.Contains(src.Property().Link, "resolve_dns") {
+		t.Fatalf("protocol link still has resolve_dns: %s", src.Property().Link)
+	}
+	clone := src.Clone()
+	defer clone.Close()
+	if clone.ResolveDNS() != want {
+		t.Fatalf("clone ResolveDNS = %v, want %v", clone.ResolveDNS(), want)
 	}
 }

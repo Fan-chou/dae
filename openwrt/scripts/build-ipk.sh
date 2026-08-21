@@ -130,6 +130,8 @@ install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-sync.sh" 
 	"$luci_data/usr/libexec/dae/kdae-sync.sh"
 install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-write-local.sh" \
 	"$luci_data/usr/libexec/dae/kdae-write-local.sh"
+install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-list-nodes.sh" \
+	"$luci_data/usr/libexec/dae/kdae-list-nodes.sh"
 pack_ipk luci-app-kdae all "Package: luci-app-kdae
 Version: $PKGVER
 Depends: libc, kdae

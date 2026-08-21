@@ -14,8 +14,13 @@ import (
 	"strings"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/common/netutils"
 	dnsmessage "github.com/miekg/dns"
 )
+
+// resolveIPViaDialer is the UDP DNS lookup used by resolve_dns pinning.
+// Tests replace it to avoid a real network round-trip.
+var resolveIPViaDialer = netutils.ResolveNetip
 
 func (c *ControlPlane) resolveFakeIPDomain(domain string, dst netip.Addr) (string, error) {
 	store := c.fakeIPStore()
@@ -48,44 +53,28 @@ func (c *ControlPlane) guardFakeIPOutbound(outbound consts.OutboundIndex, dst ne
 	return nil
 }
 
-func (c *ControlPlane) rewriteFakeIPDialTarget(ctx context.Context, domain string, dst netip.AddrPort, network, dialTarget string, dialIp bool) (string, bool, error) {
+func (c *ControlPlane) rewriteFakeIPDialTarget(domain string, dst netip.AddrPort, dialTarget string, dialIp bool) (string, bool, error) {
 	store := c.fakeIPStore()
 	if store == nil {
 		return dialTarget, dialIp, nil
 	}
+	fakeDest := store.Contains(dst.Addr())
+	fakeTarget := false
 	if addr, err := parseDialTargetIP(dialTarget); err == nil && store.Contains(addr) {
-		wantV6 := dst.Addr().Is6() && !dst.Addr().Is4In6()
-		if network != "udp" && domain != "" {
-			return net.JoinHostPort(domain, strconv.Itoa(int(dst.Port()))), false, nil
-		}
-		realIP, err := c.lookupRealIPForFakeIP(ctx, domain, wantV6)
-		if err != nil {
-			return "", false, err
-		}
-		if store.Contains(realIP) {
-			return "", false, fmt.Errorf("refusing to dial FakeIP %s", realIP)
-		}
-		return netip.AddrPortFrom(realIP, dst.Port()).String(), true, nil
+		fakeTarget = true
 	}
-	if store.Contains(dst.Addr()) && network == "udp" {
-		wantV6 := dst.Addr().Is6() && !dst.Addr().Is4In6()
-		realIP, err := c.lookupRealIPForFakeIP(ctx, domain, wantV6)
-		if err != nil {
-			return "", false, err
-		}
-		if store.Contains(realIP) {
-			return "", false, fmt.Errorf("refusing to dial FakeIP %s", realIP)
-		}
-		return netip.AddrPortFrom(realIP, dst.Port()).String(), true, nil
+	if !fakeDest && !fakeTarget {
+		return dialTarget, dialIp, nil
 	}
-	return dialTarget, dialIp, nil
+	if domain == "" {
+		return "", false, fmt.Errorf("unnamed FakeIP %s", dst.Addr())
+	}
+	return net.JoinHostPort(domain, strconv.Itoa(int(dst.Port()))), false, nil
 }
 
-func udpDialTarget(c *ControlPlane, realDst netip.AddrPort, pinned, selected string) string {
-	if c != nil {
-		if store := c.fakeIPStore(); store != nil && store.Contains(realDst.Addr()) && selected != "" {
-			return selected
-		}
+func udpDialTarget(selected, pinned string) string {
+	if selected != "" {
+		return selected
 	}
 	return pinned
 }
@@ -101,28 +90,61 @@ func parseDialTargetIP(target string) (netip.Addr, error) {
 	return netip.ParseAddr(host)
 }
 
-func (c *ControlPlane) lookupRealIPForFakeIP(ctx context.Context, domain string, ipv6 bool) (netip.Addr, error) {
-	if c == nil || domain == "" {
-		return netip.Addr{}, fmt.Errorf("empty FakeIP name")
+func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialParam, res *proxyDialResult) error {
+	if res == nil || p == nil || p.Network != "udp" {
+		return nil
 	}
-	dns := c.ActiveDnsController()
-	if dns == nil {
-		return netip.Addr{}, fmt.Errorf("dns controller is not ready")
+	domain := strings.TrimSuffix(res.SniffedDomain, ".")
+	if domain == "" || isIPLikeDomain(domain) {
+		return nil
 	}
+	if res.Dialer == nil {
+		return nil
+	}
+	dns := res.Dialer.ResolveDNS()
+	if !dns.IsValid() {
+		return nil
+	}
+	wantV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
 	qtype := uint16(dnsmessage.TypeA)
-	if ipv6 {
-		qtype = dnsmessage.TypeAAAA
+	if wantV6 {
+		qtype = uint16(dnsmessage.TypeAAAA)
 	}
-	if ip := realIPFromAnswers(dns.LookupCacheAnswers(domain, qtype), ipv6); ip.IsValid() {
-		return ip, nil
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if err := dns.EnsureRealAnswers(ctx, domain, qtype); err != nil {
-		return netip.Addr{}, fmt.Errorf("resolve real IP for FakeIP name %s: %w", domain, err)
+	dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+	defer cancel()
+	network := res.Network
+	if network == "" {
+		network = "udp"
 	}
-	if ip := realIPFromAnswers(dns.LookupCacheAnswers(domain, qtype), ipv6); ip.IsValid() {
-		return ip, nil
+	addrs, err := resolveIPViaDialer(dialCtx, res.Dialer, dns, domain, qtype, network)
+	if err != nil {
+		return fmt.Errorf("resolve %s via %s: %w", domain, dns, err)
 	}
-	return netip.Addr{}, fmt.Errorf("no real IP for FakeIP name %s", domain)
+	ip, err := pickResolvedDialIP(addrs, wantV6, c.fakeIPStore())
+	if err != nil {
+		return fmt.Errorf("no real IP for %s via %s: %w", domain, dns, err)
+	}
+	res.DialTarget = netip.AddrPortFrom(ip, p.Dest.Port()).String()
+	res.IsDialIp = true
+	return nil
+}
+
+func pickResolvedDialIP(addrs []netip.Addr, wantV6 bool, store *FakeIPStore) (netip.Addr, error) {
+	for _, ip := range addrs {
+		if store != nil && store.Contains(ip) {
+			continue
+		}
+		if wantV6 && ip.Is6() && !ip.Is4In6() {
+			return ip, nil
+		}
+		if !wantV6 && (ip.Is4() || ip.Is4In6()) {
+			return ip, nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("no matching address family")
 }
 
 func realIPFromAnswers(answers []dnsmessage.RR, ipv6 bool) netip.Addr {

@@ -123,6 +123,10 @@ type Dialer struct {
 	stickyIpDialer *stickyip.StickyIpDialer
 	proxyIpCache   *ProxyIpCache
 
+	// resolveDNS, when set, pins UDP/QUIC DialTarget to an IP looked up
+	// through this node at that DNS. Empty means pass the domain.
+	resolveDNS netip.AddrPort
+
 	// recoveryState manages exponential backoff for recovery detection.
 	// It is intentionally scoped to a single dialer instance so cloned or
 	// recreated dialers start clean under their own health-check semantics.
@@ -312,6 +316,7 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 		clone, err := NewFromLinkWithProxyCacheContext(ctx, option, d.InstanceOption, d.property.Link, d.property.SubscriptionTag, NewProxyIpCache())
 		if err == nil {
 			clone.property = cloneProperty(d.property)
+			clone.resolveDNS = d.resolveDNS
 			return clone
 		}
 		if option != nil && option.Log != nil {
@@ -324,6 +329,7 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 	clone := NewDialerContext(ctx, d.Dialer, option, d.InstanceOption, cloneProperty(d.property))
 	clone.stickyIpDialer = d.stickyIpDialer
 	clone.proxyIpCache = d.proxyIpCache
+	clone.resolveDNS = d.resolveDNS
 	return clone
 }
 
@@ -401,6 +407,20 @@ func (d *Dialer) Close() error {
 
 func (d *Dialer) Property() *Property {
 	return d.property
+}
+
+func (d *Dialer) ResolveDNS() netip.AddrPort {
+	if d == nil {
+		return netip.AddrPort{}
+	}
+	return d.resolveDNS
+}
+
+func (d *Dialer) SetResolveDNS(dns netip.AddrPort) {
+	if d == nil {
+		return
+	}
+	d.resolveDNS = dns
 }
 
 func cloneProperty(property *Property) *Property {
