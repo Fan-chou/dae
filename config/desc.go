@@ -80,6 +80,11 @@ Internal selectors only affect dae's own requests, must point to names defined i
 	"response": `DNS responses will follow this routing.
 Built-in outbound: accept, reject.
 Available functions: qname, qtype, ip, upstream`,
+	"bind":                 "DNS bind address",
+	"optimistic_cache":     "RFC 8767 stale-while-revalidate for DNS cache",
+	"optimistic_cache_ttl": "Stale window in seconds",
+	"max_cache_size":       "Maximum DNS cache entries",
+	"fakeip":               "Selective FakeIP for proxy-group domain() names. Off by default.",
 }
 
 var GroupDesc = Desc{

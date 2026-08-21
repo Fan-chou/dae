@@ -8,6 +8,8 @@ package control
 import (
 	"context"
 	"fmt"
+	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/daeuniverse/dae/component/dns"
@@ -27,6 +29,7 @@ type dnsControllerRuntimeState struct {
 	bestDialerChooser     func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 	fixedDomainTtl        map[string]int
+	fakeIPPolicy          *FakeIPPolicy
 }
 
 func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint16, optimisticCacheEnabled bool, optimisticCacheTtl int, maxCacheSize int, err error) {
@@ -141,6 +144,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 		fixedDomainTtl:        option.FixedDomainTtl,
+		fakeIPPolicy:          option.FakeIPPolicy,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)
@@ -151,6 +155,98 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		c.cacheProjectionMu.Unlock()
 	}
 	return nil
+}
+
+func (c *DnsController) fakeIPPolicy() *FakeIPPolicy {
+	rt := c.runtime()
+	if rt == nil {
+		return nil
+	}
+	return rt.fakeIPPolicy
+}
+
+func fakeIPClientFromReq(req *udpRequest) (netip.Addr, [6]byte) {
+	var mac [6]byte
+	if req == nil {
+		return netip.Addr{}, mac
+	}
+	if req.routingResult != nil {
+		mac = req.routingResult.Mac
+	}
+	if req.realSrc.IsValid() {
+		return req.realSrc.Addr(), mac
+	}
+	return netip.Addr{}, mac
+}
+
+func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed []byte, req *udpRequest) []byte {
+	policy := c.fakeIPPolicy()
+	if policy == nil {
+		return packed
+	}
+	src, mac := fakeIPClientFromReq(req)
+	out, err := policy.PackedOrReal(qname, qtype, packed, src, mac)
+	if err != nil {
+		if c.log != nil {
+			c.log.WithError(err).Warn("fakeip packed rewrite failed; sending real response")
+		}
+		return packed
+	}
+	return out
+}
+
+func (c *DnsController) rewriteClientMsg(msg *dnsmessage.Msg, req *udpRequest) {
+	policy := c.fakeIPPolicy()
+	if policy == nil || msg == nil {
+		return
+	}
+	src, mac := fakeIPClientFromReq(req)
+	if err := policy.RewriteMsg(msg, src, mac); err != nil && c.log != nil {
+		c.log.WithError(err).Warn("fakeip message rewrite failed; sending real response")
+	}
+}
+
+func (c *DnsController) LookupCacheAnswers(qname string, qtype uint16) []dnsmessage.RR {
+	if c == nil {
+		return nil
+	}
+	key := c.cacheKey(qname, qtype)
+	if v, ok := c.dnsCache.Load(key); ok {
+		if cache, _ := v.(*DnsCache); cache != nil {
+			return cache.Answer
+		}
+	}
+	prefix := key + "|"
+	var answers []dnsmessage.RR
+	c.dnsCache.Range(func(k, value any) bool {
+		ks, ok := k.(string)
+		if !ok || (ks != key && !strings.HasPrefix(ks, prefix)) {
+			return true
+		}
+		cache, _ := value.(*DnsCache)
+		if cache == nil || len(cache.Answer) == 0 {
+			return true
+		}
+		answers = cache.Answer
+		return false
+	})
+	return answers
+}
+
+func (c *DnsController) EnsureRealAnswers(ctx context.Context, qname string, qtype uint16) error {
+	if c == nil || qname == "" {
+		return fmt.Errorf("dns controller is not ready")
+	}
+	if len(c.LookupCacheAnswers(qname, qtype)) > 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = c.baseContext()
+	}
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion(dnsmessage.CanonicalName(qname), qtype)
+	msg.RecursionDesired = true
+	return c.handleWithResponseWriter_(ctx, msg, nil, false, nil, 0, nil, "", "")
 }
 
 func (c *DnsController) runtime() *dnsControllerRuntimeState {

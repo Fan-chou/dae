@@ -61,6 +61,10 @@ func truncateDNSResponse(packed []byte, limit int) []byte {
 // it is truncated with the TC bit set (rare path: only large answers pay the
 // Unpack/Truncate cost).
 func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpRequest, responseWriter dnsmessage.ResponseWriter, reqMsg *dnsmessage.Msg) error {
+	if reqMsg != nil && len(reqMsg.Question) > 0 {
+		q := reqMsg.Question[0]
+		resp = c.rewriteClientPacked(q.Name, q.Qtype, resp, req)
+	}
 	// Optimization: Patch ID directly in the packed buffer if possible.
 	// For UDP, we can use Write() directly. For TCP, we might need WriteMsg or manual length.
 	// However, most responseWriters here are either UDP or wrappers that handle message framing.

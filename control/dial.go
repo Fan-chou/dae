@@ -111,6 +111,11 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	mark := p.Mark
 	must := p.Must
 
+	domain, err := c.resolveFakeIPDomain(domain, dst.Addr())
+	if err != nil {
+		return nil, err
+	}
+
 	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
 	if shouldReroute {
 		outboundIndex = consts.OutboundControlPlaneRouting
@@ -125,7 +130,6 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			Dscp:     p.Dscp,
 		}
 		var newMark uint32
-		var err error
 		proto := consts.L4ProtoType_TCP
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
@@ -146,6 +150,14 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			consts.OutboundControlPlaneRouting.String(),
 			outboundIndex.String(),
 		)
+	}
+
+	if err := c.guardFakeIPOutbound(outboundIndex, dst.Addr()); err != nil {
+		return nil, err
+	}
+	dialTarget, dialIp, err = c.rewriteFakeIPDialTarget(ctx, domain, dst, p.Network, dialTarget, dialIp)
+	if err != nil {
+		return nil, err
 	}
 
 	if mark == 0 {

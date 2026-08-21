@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -33,6 +34,28 @@ import (
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
 )
+
+var (
+	processFakeIPOnce  sync.Once
+	processFakeIPValue *control.FakeIPStore
+)
+
+func processFakeIPStore(conf *config.Config) *control.FakeIPStore {
+	if conf == nil {
+		return nil
+	}
+	processFakeIPOnce.Do(func() {
+		dir := "."
+		if cfgFile != "" {
+			dir = filepath.Dir(cfgFile)
+		}
+		processFakeIPValue = control.NewFakeIPStore(
+			control.FakeIPStorePath(dir, conf.Dns.FakeIP.Path),
+			conf.Dns.FakeIP.ResolvedMaxEntries(),
+		)
+	})
+	return processFakeIPValue
+}
 
 func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*control.Listener, error) {
 	var listener *control.Listener
@@ -208,6 +231,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			log.WithError(loadErr).Warn("Ignoring invalid Mihomo group selection state")
 		}
 		ctx = control.WithGroupSelectionStore(ctx, selectionStore)
+	}
+	if fakeStore := processFakeIPStore(conf); fakeStore != nil {
+		ctx = control.WithFakeIPStore(ctx, fakeStore)
 	}
 	if conf.Global.SoMarkFromDae == 0 {
 		var autoSelected bool

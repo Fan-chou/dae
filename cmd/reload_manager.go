@@ -654,5 +654,50 @@ func dnsConfigFingerprint(dns config.Dns) string {
 	b.WriteString("bind=")
 	b.WriteString(strconv.Quote(dns.Bind))
 	b.WriteByte(';')
+	b.WriteString("fakeip=")
+	b.WriteString(fakeIPFingerprint(dns.FakeIP))
+	b.WriteByte(';')
+	return b.String()
+}
+
+func fakeIPFingerprint(fake config.FakeIP) string {
+	var b strings.Builder
+	b.WriteString("enable=")
+	b.WriteString(strconv.FormatBool(fake.Enable))
+	b.WriteByte(';')
+	b.WriteString("inet4_range=")
+	b.WriteString(strconv.Quote(fake.Inet4Range))
+	b.WriteByte(';')
+	b.WriteString("inet6_range=")
+	b.WriteString(strconv.Quote(fake.Inet6Range))
+	b.WriteByte(';')
+	b.WriteString("match=")
+	b.WriteString(strconv.Quote(fake.Match))
+	b.WriteByte(';')
+	b.WriteString("ttl=")
+	b.WriteString(strconv.Itoa(fake.Ttl))
+	b.WriteByte(';')
+	b.WriteString("max_entries=")
+	b.WriteString(strconv.Itoa(fake.MaxEntries))
+	b.WriteByte(';')
+	b.WriteString("path=")
+	b.WriteString(strconv.Quote(fake.Path))
+	b.WriteByte(';')
+	b.WriteString("filter_mode=")
+	b.WriteString(strconv.Quote(fake.FilterMode))
+	b.WriteByte(';')
+	b.WriteString("filter_builtin=")
+	b.WriteString(strconv.FormatBool(fake.FilterBuiltin))
+	b.WriteByte(';')
+	b.WriteString("filter=")
+	b.WriteString(strconv.Itoa(len(fake.Filter)))
+	for _, fn := range fake.Filter {
+		b.WriteByte(':')
+		if fn == nil {
+			b.WriteString("<nil>")
+			continue
+		}
+		b.WriteString(fn.String(true, true, false))
+	}
 	return b.String()
 }

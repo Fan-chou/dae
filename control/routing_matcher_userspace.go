@@ -23,6 +23,9 @@ type RoutingMatcher struct {
 	compiledMatches []compiledRoutingMatch
 	predicateGroups []routingMatcherPredicateGroupSpan
 	lookupMacAssoc  macAssocLookup
+	// fakeIPLeafIsProxy reports whether a user-defined outbound currently
+	// selects a proxy node. Nil treats every user group as PROXY (unit tests).
+	fakeIPLeafIsProxy func(consts.OutboundIndex) bool
 }
 
 // routingMatcherPredicateGroupSpan maps one immutable policy predicate group

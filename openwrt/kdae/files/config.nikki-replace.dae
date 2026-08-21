@@ -1,0 +1,124 @@
+# kdae 主配置：尽量对齐 223 上的 Nikki（Mihomo TUN + LAN 透明代理）。
+#
+# 网卡 / admin_listen / 仅节点订阅由 LuCI 写入 local.dae，不要在这里重复。
+# 节点、组和分流来自 dae-rule-sync 的当前 generation。
+# DAT 通过 /etc/dae/generated -> current/generated。
+#
+# 切流前：先停 Nikki，再启用 kdae。不要两套同时做透明代理。
+# 192.168.124.222 上的 Clash 要留着（部分节点是指向它的 socks5）。
+# kdae 没有 mixed/socks/redir/tproxy 入站，也没有 Clash API 9090。
+
+include {
+    local.dae
+    current/nodes.dae
+    current/groups.dae
+    routing.dae
+}
+
+global {
+    log_level: info
+    tproxy_port: 12345
+    tproxy_port_protect: true
+    auto_config_kernel_parameter: true
+
+    # 对齐 Nikki fake-ip + sniffer（parse-pure-ip / override-destination）：
+    # 先按嗅探到的域名重新匹配分流，再用该域名拨号。domain 只改拨号不重路由。
+    # domain++ 对 already-direct 的流量不会再改道，CPU 也更重。
+    dial_mode: domain++
+    sniffing_timeout: 100ms
+    tls_implementation: utls
+    utls_imitate: chrome_auto
+
+    tcp_check_url: 'http://cp.cloudflare.com/generate_204'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'one.one.one.one:53,1.1.1.1,2606:4700:4700::1111'
+    check_interval: 120s
+    check_tolerance: 50ms
+
+    # Nikki mixin default-nameserver。解析订阅和节点域名用。
+    bootstrap_resolver: '223.5.5.5:53'
+    fallback_resolver: '223.5.5.5:53'
+
+    allow_insecure: false
+    disable_waiting_network: false
+    mptcp: false
+}
+
+# kdae 选择性 FakeIP：inet4 28.0.0.0/15（子集，不是 Clash 的 28.0.0.0/8 全局池）。
+# 上游仍是 222:5354 真解析；只有 traffic routing 已能确定走代理组的名字才回假地址。
+# wan_interface 为空时，kdae 自己查 222:5354 不会被拦回来。
+dns {
+    upstream {
+        homedns: 'udp://192.168.124.222:5354'
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            # 局域网名、Mihomo hosts 里的 *.local / *.routing 交给路由器 dnsmasq。
+            qname(suffix: lan, suffix: local, suffix: routing) -> asis
+            fallback: homedns
+        }
+    }
+    fakeip {
+        enable: true
+        inet4_range: '28.0.0.0/15'
+        filter_mode: skip
+        filter {
+            qname(suffix: chowtaiseng.com, suffix: tailscale.com, suffix: routing)
+            qname(suffix: forzamotorsport.net, suffix: elb.us-west-2.amazonaws.com)
+            qname(full: lancache.steamcontent.com, full: speedtest.cros.wr.pvp.net)
+            qname(full: time1.apple.com, full: time.asia.apple.com)
+            qname(full: cn.ntp.org.cn, full: ntp.ntsc.ac.cn, full: time.nist.gov)
+            qname(full: time1.cloud.tencent.com, full: trtc.time.tencent-cloud.com, full: time1.aliyun.com)
+            qname(regex: '^[^.]+\.[^.]+\.[^.]+\.srv\.nintendo\.net$')
+            qname(regex: '^xbox\.[^.]+\.[^.]+\.microsoft\.com$')
+        }
+    }
+}
+
+# 下面这些规则排在 generation 分流之前（include 会把 routing.dae 接到后面）。
+routing {
+    # 组播 / 链路本地，避免被代理。
+    dip(224.0.0.0/3, 'ff00::/8') -> must_direct
+
+    # 222 在 br-lan 上，不能被 223 的 LAN 透明代理抓走。
+    sip(192.168.124.222) -> must_direct
+
+    # 对齐 Nikki bypass_dscp=4（BT 等）。
+    dscp(0x4) -> must_direct
+
+    # 对齐 Nikki lan_access_control：名单 IP 进代理；同 MAC 学到的其它地址也会进。
+    # 其余直出且不劫持 DNS。每个 CIDR 必须带 match_mac:，不能写成 sip(match_mac: a, b)。
+    !sip(
+        match_mac: '192.168.124.129/32',
+        match_mac: '192.168.124.130/32',
+        match_mac: '192.168.124.131/32',
+        match_mac: '192.168.124.132/32',
+        match_mac: '192.168.124.133/32',
+        match_mac: '192.168.124.134/32',
+        match_mac: '192.168.124.135/32',
+        match_mac: '192.168.124.136/32',
+        match_mac: '192.168.124.137/32',
+        match_mac: '192.168.124.138/32',
+        match_mac: '192.168.124.139/32',
+        match_mac: '192.168.124.140/32',
+        match_mac: '192.168.124.141/32',
+        match_mac: '192.168.124.142/32',
+        match_mac: '192.168.124.143/32',
+        match_mac: '192.168.124.144/32',
+        match_mac: '192.168.124.145/32',
+        match_mac: '192.168.124.146/32',
+        match_mac: '192.168.124.147/32',
+        match_mac: '192.168.124.148/32',
+        match_mac: '192.168.124.149/32',
+        match_mac: '192.168.124.150/32',
+        match_mac: '192.168.124.201/32',
+        match_mac: '192.168.124.202/32',
+        match_mac: '192.168.124.203/32',
+        match_mac: '192.168.124.205/32',
+        match_mac: '192.168.124.220/32',
+        match_mac: '192.168.124.221/32',
+        match_mac: '192.168.124.224/32',
+        match_mac: '10.1.10.2/32'
+    ) -> must_direct
+}

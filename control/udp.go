@@ -1171,7 +1171,9 @@ getNew:
 
 				option = &DialOption{
 					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
-					Target:        dialTarget,
+					// FakeIP destinations are the exception: DialTarget must be the real IP,
+					// while the UDP endpoint key stays on the FakeIP.
+					Target:        udpDialTarget(c, realDst, dialTarget, res.DialTarget),
 					Dialer:        res.Dialer,
 					Outbound:      res.Outbound,
 					Network:       res.Network,

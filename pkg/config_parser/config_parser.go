@@ -12,6 +12,7 @@ import (
 )
 
 func Parse(in string) (sections []*Section, err error) {
+	in = rewriteBareQnameInFilterBlocks(in)
 	errorListener := NewConsoleErrorListener()
 	defer func() {
 		if r := recover(); r != nil {

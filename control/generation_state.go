@@ -22,4 +22,5 @@ type controlPlaneGenerationState struct {
 	policyIdentity        routing.PolicyIdentity
 	routingMatcher        *RoutingMatcher
 	bootstrapResolvers    []netip.AddrPort
+	fakeIPPolicy          *FakeIPPolicy
 }

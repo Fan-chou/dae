@@ -99,5 +99,33 @@ func decodeRoutingSection(conf *Config, section *config_parser.Section) error {
 }
 
 func decodeDnsSection(conf *Config, section *config_parser.Section) error {
-	return SectionParser(reflect.ValueOf(&conf.Dns), section)
+	if section == nil {
+		return fmt.Errorf("nil section: dns")
+	}
+	var rest []*config_parser.Item
+	var fakeipSection *config_parser.Section
+	for _, item := range section.Items {
+		if nested, ok := item.Value.(*config_parser.Section); ok && nested.Name == "fakeip" {
+			if fakeipSection != nil {
+				return fmt.Errorf("duplicate dns.fakeip section")
+			}
+			fakeipSection = nested
+			continue
+		}
+		rest = append(rest, item)
+	}
+	stripped := *section
+	stripped.Items = rest
+	if err := SectionParser(reflect.ValueOf(&conf.Dns), &stripped); err != nil {
+		return err
+	}
+	if fakeipSection == nil {
+		return nil
+	}
+	fake, err := parseFakeIPSection(fakeipSection)
+	if err != nil {
+		return fmt.Errorf("failed to parse fakeip: %w", err)
+	}
+	conf.Dns.FakeIP = fake
+	return nil
 }

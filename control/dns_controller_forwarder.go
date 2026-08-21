@@ -474,7 +474,7 @@ func (c *DnsController) dialSend(
 	}
 	respMsg := resolution.response
 
-	if resolution.upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) {
+	if resolution.upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) && req != nil && req.routingResult != nil {
 		var (
 			qname string
 			qtype string
@@ -522,12 +522,28 @@ func (c *DnsController) dialSend(
 		// Keep the id the same with request.
 		respMsg.Id = id
 		respMsg.Compress = true
+		fakeNow := false
+		if len(respMsg.Question) > 0 {
+			q := respMsg.Question[0]
+			src, mac := fakeIPClientFromReq(req)
+			if policy := c.fakeIPPolicy(); policy != nil && policy.ShouldFake(q.Name, q.Qtype, src, mac) {
+				fakeNow = true
+			}
+		}
+		if fakeNow {
+			if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+				c.log.Warnf("failed to cache DNS response: %v", err)
+			}
+			c.rewriteClientMsg(respMsg, req)
+		}
 		// If responseWriter is provided, use it to write the response.
 		if responseWriter != nil {
 			// For responseWriter path, cache synchronously because
 			// responseWriter may need the message after we return.
-			if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-				c.log.Warnf("failed to cache DNS response: %v", err)
+			if !fakeNow {
+				if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+					c.log.Warnf("failed to cache DNS response: %v", err)
+				}
 			}
 			return responseWriter.WriteMsg(respMsg)
 		}
@@ -565,6 +581,10 @@ func (c *DnsController) dialSend(
 
 		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 			return err
+		}
+
+		if fakeNow {
+			return nil
 		}
 
 		// Cache asynchronously after sending response (UDP path only).

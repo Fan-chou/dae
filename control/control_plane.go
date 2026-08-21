@@ -1103,6 +1103,10 @@ func newControlPlaneWithContextOptions(
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	core.bindDomainRoutingFingerprinter(routingMatcher)
+	plane.bindFakeIPLeafResolver()
+	if err := plane.initFakeIP(ctx, log, dnsConfig, tagToNodeList, locationFinder); err != nil {
+		return nil, err
+	}
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
 	if !buildOpts.delayDatapathCommit {
@@ -1550,6 +1554,7 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 		OptimisticCacheTtl: c.dnsOptimisticCacheTtl,
 		MaxCacheSize:       c.dnsMaxCacheSize,
 		IpVersionPrefer:    c.dnsIpVersionPrefer,
+		FakeIPPolicy:       c.fakeIPPolicy,
 	}
 }
 

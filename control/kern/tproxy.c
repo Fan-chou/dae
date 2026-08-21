@@ -343,6 +343,187 @@ struct {
 	__array(values, struct map_lpm_type);
 } lpm_array_map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 64);
+	__uint(key_size, sizeof(struct lpm_key));
+	__uint(value_size, sizeof(__u32));
+} fakeip_lpm_map SEC(".maps");
+
+static __always_inline bool fakeip_hit_v4(__be32 daddr)
+{
+	struct lpm_key key = {};
+	__u32 *val;
+
+	/* Userspace programs IPv4 prefixes as IPv4-mapped IPv6
+	 * (prefixlen = 96 + v4 bits). Lookup must use the same layout as
+	 * route()'s lpm_key_daddr: prefixlen 128 + ::ffff:addr. prefixlen 32
+	 * with the v4 address in data[0] never matches, so 28.x leaked to WAN.
+	 */
+	key.prefixlen = 128;
+	key.data[2] = bpf_htonl(0x0000ffff);
+	key.data[3] = daddr;
+	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
+	return val != NULL;
+}
+
+static __always_inline bool fakeip_hit_v6(const union ip6 *daddr)
+{
+	struct lpm_key key = {};
+	__u32 *val;
+
+	key.prefixlen = 128;
+	__builtin_memcpy(key.data, daddr, 16);
+	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
+	return val != NULL;
+}
+
+static __always_inline bool fakeip_hit_dest(const struct tuples *t, __u16 eth_proto)
+{
+	struct lpm_key key = {};
+	__u32 *val;
+
+	key.prefixlen = 128;
+	__builtin_memcpy(key.data, &t->five.dip, 16);
+	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
+	(void)eth_proto;
+	return val != NULL;
+}
+
+struct fakeip_icmphdr {
+	__u8 type;
+	__u8 code;
+	__be16 checksum;
+	__be16 id;
+	__be16 seq;
+};
+
+#ifndef IPPROTO_ICMP
+#define IPPROTO_ICMP 1
+#endif
+#ifndef ICMP_ECHO
+#define ICMP_ECHO 8
+#endif
+#ifndef ICMP_ECHOREPLY
+#define ICMP_ECHOREPLY 0
+#endif
+#ifndef ICMPV6_ECHO_REQUEST
+#define ICMPV6_ECHO_REQUEST 128
+#endif
+#ifndef ICMPV6_ECHO_REPLY
+#define ICMPV6_ECHO_REPLY 129
+#endif
+
+static __noinline int fakeip_swap_eth(struct __sk_buff *skb, __u32 link_h_len)
+{
+	__u8 smac[6];
+	__u8 dmac[6];
+
+	if (link_h_len < ETH_HLEN)
+		return 0;
+	if (bpf_skb_load_bytes(skb, 0, dmac, 6))
+		return -1;
+	if (bpf_skb_load_bytes(skb, 6, smac, 6))
+		return -1;
+	if (bpf_skb_store_bytes(skb, 0, smac, 6, 0))
+		return -1;
+	if (bpf_skb_store_bytes(skb, 6, dmac, 6, 0))
+		return -1;
+	return 0;
+}
+
+static __noinline int fakeip_icmp4_echo_reply(struct __sk_buff *skb,
+					      __u32 link_h_len)
+{
+	struct iphdr iph;
+	struct fakeip_icmphdr icmph;
+	__u32 ip_off = link_h_len;
+	__u32 icmp_off;
+	__be32 tmp;
+
+	if (bpf_skb_load_bytes(skb, ip_off, &iph, sizeof(iph)))
+		return TC_ACT_SHOT;
+	if (iph.ihl < 5)
+		return TC_ACT_SHOT;
+	icmp_off = ip_off + (iph.ihl << 2);
+	if (bpf_skb_load_bytes(skb, icmp_off, &icmph, sizeof(icmph)))
+		return TC_ACT_SHOT;
+	if (icmph.type != ICMP_ECHO || icmph.code != 0)
+		return TC_ACT_SHOT;
+	if (fakeip_swap_eth(skb, link_h_len))
+		return TC_ACT_SHOT;
+	tmp = iph.saddr;
+	if (bpf_skb_store_bytes(skb, ip_off + offsetof(struct iphdr, saddr),
+				&iph.daddr, 4, 0))
+		return TC_ACT_SHOT;
+	if (bpf_skb_store_bytes(skb, ip_off + offsetof(struct iphdr, daddr),
+				&tmp, 4, 0))
+		return TC_ACT_SHOT;
+	if (bpf_l4_csum_replace(skb, icmp_off + offsetof(struct fakeip_icmphdr, checksum),
+				bpf_htons((ICMP_ECHO << 8)), 0, 2))
+		return TC_ACT_SHOT;
+	{
+		__u8 type = ICMP_ECHOREPLY;
+
+		if (bpf_skb_store_bytes(skb, icmp_off, &type, 1, 0))
+			return TC_ACT_SHOT;
+	}
+	return bpf_redirect(skb->ifindex, 0);
+}
+
+static __noinline int fakeip_icmp6_echo_reply(struct __sk_buff *skb,
+					      __u32 link_h_len)
+{
+	struct ipv6hdr ip6h;
+	struct fakeip_icmphdr icmph;
+	__u32 ip_off = link_h_len;
+	__u32 icmp_off = ip_off + sizeof(struct ipv6hdr);
+	union {
+		struct in6_addr a;
+		__u8 b[16];
+	} tmp;
+
+	if (bpf_skb_load_bytes(skb, ip_off, &ip6h, sizeof(ip6h)))
+		return TC_ACT_SHOT;
+	if (bpf_skb_load_bytes(skb, icmp_off, &icmph, sizeof(icmph)))
+		return TC_ACT_SHOT;
+	if (icmph.type != ICMPV6_ECHO_REQUEST || icmph.code != 0)
+		return TC_ACT_SHOT;
+	if (fakeip_swap_eth(skb, link_h_len))
+		return TC_ACT_SHOT;
+	__builtin_memcpy(&tmp.a, &ip6h.saddr, 16);
+	if (bpf_skb_store_bytes(skb, ip_off + offsetof(struct ipv6hdr, saddr),
+				&ip6h.daddr, 16, 0))
+		return TC_ACT_SHOT;
+	if (bpf_skb_store_bytes(skb, ip_off + offsetof(struct ipv6hdr, daddr),
+				&tmp.a, 16, 0))
+		return TC_ACT_SHOT;
+	if (bpf_l4_csum_replace(skb,
+				icmp_off + offsetof(struct fakeip_icmphdr, checksum),
+				bpf_htons((ICMPV6_ECHO_REQUEST << 8)),
+				bpf_htons((ICMPV6_ECHO_REPLY << 8)), 2))
+		return TC_ACT_SHOT;
+	{
+		__u8 type = ICMPV6_ECHO_REPLY;
+
+		if (bpf_skb_store_bytes(skb, icmp_off, &type, 1, 0))
+			return TC_ACT_SHOT;
+	}
+	return bpf_redirect(skb->ifindex, 0);
+}
+
+static __noinline int fakeip_lan_non_tcpudp(struct __sk_buff *skb,
+					    __u32 link_h_len, __u16 eth_proto,
+					    __u8 ip_proto, __u8 l4proto)
+{
+	if (eth_proto == bpf_htons(ETH_P_IP) && ip_proto == IPPROTO_ICMP)
+		return fakeip_icmp4_echo_reply(skb, link_h_len);
+	if (eth_proto == bpf_htons(ETH_P_IPV6) && l4proto == IPPROTO_ICMPV6)
+		return fakeip_icmp6_echo_reply(skb, link_h_len);
+	return TC_ACT_SHOT;
+}
+
 struct port_range {
 	__u16 port_start;
 	__u16 port_end;
@@ -2567,8 +2748,28 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
+		{
+			__u32 k = 0;
+			struct parse_transport_ctx *tctx =
+				bpf_map_lookup_elem(&parse_ctx_scratch_map, &k);
+
+			if (tctx) {
+				bool hit = false;
+
+				if (tctx->ethh.h_proto == bpf_htons(ETH_P_IP))
+					hit = fakeip_hit_v4(tctx->iph.daddr);
+				else if (tctx->ethh.h_proto == bpf_htons(ETH_P_IPV6))
+					hit = fakeip_hit_v6((const union ip6 *)&tctx->ipv6h.daddr);
+				if (hit)
+					return fakeip_lan_non_tcpudp(
+						skb, link_h_len, tctx->ethh.h_proto,
+						tctx->iph.protocol, tctx->l4proto);
+			}
+		}
 		return TC_ACT_OK;
 	}
+
+	bool dest_is_fakeip = fakeip_hit_dest(&pkt->tuples, pkt->ethh.h_proto);
 
 	if (link_h_len == ETH_HLEN)
 		mac_assoc_learn(pkt->ethh.h_source,
@@ -2616,10 +2817,12 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		outbound = tcp_state->meta.data.outbound;
 		mark = tcp_state->meta.data.mark;
 
-		if (outbound == OUTBOUND_DIRECT) {
+		if (outbound == OUTBOUND_DIRECT && !dest_is_fakeip) {
 			skb->mark = mark;
 			return TC_ACT_OK;
 		}
+		if (dest_is_fakeip)
+			outbound = OUTBOUND_CONTROL_PLANE_ROUTING;
 		if (unlikely(outbound == OUTBOUND_BLOCK))
 			return TC_ACT_SHOT;
 		pkt->datapath_generation = tcp_state->datapath_generation;
@@ -2655,7 +2858,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			}
 
 			// Fast path: Use cached routing if available
-			if (udp_state && udp_state->meta.data.has_routing) {
+			if (udp_state && udp_state->meta.data.has_routing &&
+			    !dest_is_fakeip) {
 				// Load routing from conn state - skip expensive route() call!
 				__u8 outbound = udp_state->meta.data.outbound;
 				__u32 mark = udp_state->meta.data.mark;
@@ -2741,12 +2945,16 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 
 	__s64 s64_ret;
 
-	s64_ret = route(route_flag,
-			pkt->l4proto == IPPROTO_TCP ? (const void *)&pkt->tcph :
-						      (const void *)&pkt->udph,
-			pkt->tuples.five.sip.u6_addr32,
-			pkt->tuples.five.dip.u6_addr32,
-			mac_be);
+	if (dest_is_fakeip) {
+		s64_ret = OUTBOUND_CONTROL_PLANE_ROUTING;
+	} else {
+		s64_ret = route(route_flag,
+				pkt->l4proto == IPPROTO_TCP ? (const void *)&pkt->tcph :
+							      (const void *)&pkt->udph,
+				pkt->tuples.five.sip.u6_addr32,
+				pkt->tuples.five.dip.u6_addr32,
+				mac_be);
+	}
 	if (s64_ret < 0) {
 		bpf_printk("shot routing: %d", s64_ret);
 		return TC_ACT_SHOT;
@@ -2912,7 +3120,26 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
+		{
+			bool hit = false;
+
+			if (ctx->ethh.h_proto == bpf_htons(ETH_P_IP))
+				hit = fakeip_hit_v4(ctx->iph.daddr);
+			else if (ctx->ethh.h_proto == bpf_htons(ETH_P_IPV6))
+				hit = fakeip_hit_v6((const union ip6 *)&ctx->ipv6h.daddr);
+			if (hit)
+				return TC_ACT_SHOT;
+		}
 		return TC_ACT_OK;
+	}
+
+	{
+		struct tuples tuples;
+
+		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h,
+			   &ctx->tcph, &ctx->udph, ctx->l4proto);
+		if (fakeip_hit_dest(&tuples, ctx->ethh.h_proto))
+			return TC_ACT_SHOT;
 	}
 
 	// Reverse-direction conntrack refresh.
@@ -2964,6 +3191,11 @@ wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 {
 	/* DNS must always reach control plane; userspace handles fallback. */
 	if (dport == bpf_htons(53))
+		return true;
+	/* FakeIP / kernel handoff uses outbound 0xFD. That slot is never
+	 * written in outbound_connectivity_map (only real group ids are),
+	 * so the ARRAY default 0 would SHOT every FakeIP SYN. */
+	if (outbound == OUTBOUND_CONTROL_PLANE_ROUTING)
 		return true;
 
 	// ARRAY map key: outbound_id * 6 + domain * 2 + ipversion

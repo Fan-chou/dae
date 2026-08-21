@@ -252,6 +252,22 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 				for _, r := range rules {
 					m.writeLine(depth, r.String(false, true, true))
 				}
+			case "Filter":
+				fns, ok := field.Interface().([]*config_parser.Function)
+				if !ok {
+					return fmt.Errorf("unexpected Filter type: %v", field.Type())
+				}
+				if len(fns) == 0 {
+					continue
+				}
+				m.writeLine(depth, "filter {")
+				for _, fn := range fns {
+					if fn == nil {
+						return fmt.Errorf("nil function in filter")
+					}
+					m.writeLine(depth+1, fn.String(true, true, false)+" -> skip")
+				}
+				m.writeLine(depth, "}")
 			default:
 				return fmt.Errorf("unknown reserved field: %v", structField.Name)
 			}
@@ -261,6 +277,11 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 		// Section(s) field.
 		if field.Kind() == reflect.Struct || (field.Kind() == reflect.Slice &&
 			field.Type().Elem().Kind() == reflect.Struct) {
+			if key == "fakeip" {
+				if fake, ok := field.Interface().(FakeIP); ok && !fake.Enable && len(fake.Filter) == 0 {
+					continue
+				}
+			}
 			if err = m.MarshalSection(key, field, depth); err != nil {
 				return err
 			}

@@ -230,6 +230,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		if responseWriter != nil {
 			respMsgUnique := respMsg.Copy()
 			respMsgUnique.Id = dnsMessage.Id
+			c.rewriteClientMsg(respMsgUnique, req)
 			return responseWriter.WriteMsg(respMsgUnique)
 		}
 
@@ -240,6 +241,10 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		data, err := respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
 			return fmt.Errorf("pack DNS packet: %w", err)
+		}
+		if len(respMsg.Question) > 0 {
+			q := respMsg.Question[0]
+			data = c.rewriteClientPacked(q.Name, q.Qtype, data, req)
 		}
 		if len(data) >= 2 {
 			binary.BigEndian.PutUint16(data[:2], dnsMessage.Id)
@@ -453,6 +458,9 @@ func (c *DnsController) resolveDNSUpstream(
 
 	upstreamName := "asis"
 	if upstream == nil {
+		if req == nil || !req.realDst.IsValid() {
+			return nil, fmt.Errorf("asis DNS lookup requires a destination")
+		}
 		// As-is.
 
 		// As-is should not be valid in response routing, thus using connection realDest is reasonable.

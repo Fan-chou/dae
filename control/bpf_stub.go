@@ -247,6 +247,7 @@ type bpfMapSpecs struct {
 	TcpOffloadSent           *ebpf.MapSpec `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.MapSpec `ebpf:"listen_socket_map"`
 	LpmArrayMap              *ebpf.MapSpec `ebpf:"lpm_array_map"`
+	FakeipLpmMap             *ebpf.MapSpec `ebpf:"fakeip_lpm_map"`
 	OutboundConnectivityMap  *ebpf.MapSpec `ebpf:"outbound_connectivity_map"`
 	ParseCtxScratchMap       *ebpf.MapSpec `ebpf:"parse_ctx_scratch_map"`
 	RedirectTrack            *ebpf.MapSpec `ebpf:"redirect_track"`
@@ -295,6 +296,7 @@ type bpfMaps struct {
 	TcpOffloadSent           *ebpf.Map `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
 	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
+	FakeipLpmMap             *ebpf.Map `ebpf:"fakeip_lpm_map"`
 	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
 	ParseCtxScratchMap       *ebpf.Map `ebpf:"parse_ctx_scratch_map"`
 	RedirectTrack            *ebpf.Map `ebpf:"redirect_track"`
@@ -326,6 +328,7 @@ func (m *bpfMaps) Close() error {
 		m.TcpOffloadSent,
 		m.ListenSocketMap,
 		m.LpmArrayMap,
+		m.FakeipLpmMap,
 		m.OutboundConnectivityMap,
 		m.ParseCtxScratchMap,
 		m.RedirectTrack,
