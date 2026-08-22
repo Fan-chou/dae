@@ -605,8 +605,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			}
 			// Oversized datagram: fall through to the direct path.
 		} else {
-			ue.hasSent.Store(true)
-			ue.lastSendNano.Store(time.Now().UnixNano())
+			// Do not refresh hasSent/lastSendNano here. Append only
+			// queues the datagram; flush() is the sole writer of
+			// those fields after WriteBatch actually succeeds. A
+			// premature stamp would hide a later failed flush from
+			// the bidirectional-silence rebuild check.
 			return len(b), nil
 		}
 	}
