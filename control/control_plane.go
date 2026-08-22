@@ -1102,6 +1102,19 @@ func newControlPlaneWithContextOptions(
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)
+	core.setKernelDirectLookup(func(id uint8, nt *dialer.NetworkType) bool {
+		if plane == nil || int(id) >= len(plane.outbounds) {
+			return false
+		}
+		group := plane.outbounds[id]
+		return group != nil && group.KernelFastPathDirect(nt)
+	})
+	// First start never calls Resume from cmd/run.go; rewrite the map now
+	// that the lookup can see builtin-direct leaves. A paused shared-BPF
+	// reload candidate must wait for the supervisor's publish-time Resume.
+	if !(buildOpts.delayDatapathCommit && sharedBpfReload) {
+		plane.ResumeOutboundConnectivityUpdates()
+	}
 	core.bindDomainRoutingFingerprinter(routingMatcher)
 	plane.bindFakeIPLeafResolver()
 	if err := plane.initFakeIP(ctx, log, dnsConfig, tagToNodeList, locationFinder); err != nil {

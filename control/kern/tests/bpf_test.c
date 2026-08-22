@@ -1163,6 +1163,150 @@ int testcheck_wan_udp_new_outbound_obeys_connectivity_change(
 	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
 }
 
+SEC("tc/pktgen/lan_udp_kernel_direct_group_skips_userspace")
+int testpktgen_lan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,9), IPV4(10,20,0,9), 41008, 8443, 0);
+}
+
+SEC("tc/setup/lan_udp_kernel_direct_group_skips_userspace")
+int testsetup_lan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP,
+					   1u | 2u))
+		return TC_ACT_SHOT;
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/lan_udp_kernel_direct_group_skips_userspace")
+int testcheck_lan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
+SEC("tc/pktgen/lan_udp_kernel_direct_group_keeps_dns_userspace")
+int testpktgen_lan_udp_kernel_direct_group_keeps_dns_userspace(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,10), IPV4(10,20,0,10), 41009, 53, 0);
+}
+
+SEC("tc/setup/lan_udp_kernel_direct_group_keeps_dns_userspace")
+int testsetup_lan_udp_kernel_direct_group_keeps_dns_userspace(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP,
+					   1u | 2u))
+		return TC_ACT_SHOT;
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/lan_udp_kernel_direct_group_keeps_dns_userspace")
+int testcheck_lan_udp_kernel_direct_group_keeps_dns_userspace(
+	struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto(skb, IPPROTO_UDP);
+}
+
+SEC("tc/pktgen/lan_udp_cached_group_ignores_kernel_direct_flag")
+int testpktgen_lan_udp_cached_group_ignores_kernel_direct_flag(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,11), IPV4(10,20,0,11), 41010, 8443, 0);
+}
+
+SEC("tc/setup/lan_udp_cached_group_ignores_kernel_direct_flag")
+int testsetup_lan_udp_cached_group_ignores_kernel_direct_flag(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	ret = setup_cached_routing_result_for_proto(
+		IPV4(192,168,20,11), IPV4(10,20,0,11), 41010, 8443,
+		IPPROTO_UDP, outbound, TPROXY_MARK);
+	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP,
+						  1u | 2u))
+		return TC_ACT_SHOT;
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/lan_udp_cached_group_ignores_kernel_direct_flag")
+int testcheck_lan_udp_cached_group_ignores_kernel_direct_flag(
+	struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto(skb, IPPROTO_UDP);
+}
+
+SEC("tc/pktgen/wan_udp_kernel_direct_group_skips_userspace")
+int testpktgen_wan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,12), IPV4(10,20,0,12), 41011, 8443, 0);
+}
+
+SEC("tc/setup/wan_udp_kernel_direct_group_skips_userspace")
+int testsetup_wan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP,
+					   1u | 2u))
+		return TC_ACT_SHOT;
+	return do_tproxy_wan_egress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/wan_udp_kernel_direct_group_skips_userspace")
+int testcheck_wan_udp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
+SEC("tc/pktgen/wan_tcp_kernel_direct_group_skips_userspace")
+int testpktgen_wan_tcp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,20,13), IPV4(10,20,0,13),
+			    41012, 443);
+}
+
+SEC("tc/setup/wan_tcp_kernel_direct_group_skips_userspace")
+int testsetup_wan_tcp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP,
+					   1u | 2u))
+		return TC_ACT_SHOT;
+	return do_tproxy_wan_egress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/wan_tcp_kernel_direct_group_skips_userspace")
+int testcheck_wan_tcp_kernel_direct_group_skips_userspace(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
 SEC("tc/pktgen/lan_ingress_udp_first_fragment_listener")
 int testpktgen_lan_ingress_udp_first_fragment_listener(struct __sk_buff *skb)
 {

@@ -1528,6 +1528,77 @@ func TestDialerGroup_SetSelectionPolicyConcurrentKernelAliveMatchesLive(t *testi
 	}
 }
 
+func TestDialerGroup_KernelFastPathDirectFollowsFixedSelection(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	directDialer := newDirectDialer(option, false)
+	direct := NewDialerGroup(option, consts.OutboundDirect.String(), []*dialer.Dialer{directDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	proxyDialer := newNoopDialer(option)
+	proxy := NewDialerGroup(option, "Apple_Proxy", []*dialer.Dialer{proxyDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	blockDialer := newBuiltinBlockDialer(option)
+	block := NewDialerGroup(option, consts.OutboundBlock.String(), []*dialer.Dialer{blockDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroup(option, "CN_CN", []NestedDialerGroupMember{
+		{Group: direct},
+		{Group: block},
+		{Group: proxy},
+	}, DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+	defer direct.Close()
+	defer block.Close()
+	defer proxy.Close()
+	defer directDialer.Close()
+	defer blockDialer.Close()
+	defer proxyDialer.Close()
+
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fixed(direct) should advertise kernel-direct")
+	}
+
+	parent.SetSelectionPolicy(DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 1,
+	})
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fixed(block) must not advertise kernel-direct; REJECT still needs userspace")
+	}
+
+	parent.SetSelectionPolicy(DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 2,
+	})
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fixed(proxy) must not advertise kernel-direct")
+	}
+
+	parent.SetSelectionPolicy(DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	})
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("switching back to direct should advertise kernel-direct again")
+	}
+}
+
 func TestAnnotationOfMapsParentHealthView(t *testing.T) {
 	option := &dialer.GlobalOption{Log: log, CheckInterval: time.Second}
 	leaf := newNoopDialer(option)

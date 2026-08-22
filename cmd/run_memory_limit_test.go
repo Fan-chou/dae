@@ -81,3 +81,40 @@ func TestMinPositive(t *testing.T) {
 		t.Fatalf("minPositive() = %d, want 0", got)
 	}
 }
+
+func TestParseMemTotalBytes(t *testing.T) {
+	got := parseMemTotalBytes([]byte("MemTotal:       1024000 kB\nMemFree:         1234 kB\n"))
+	if want := int64(1024000 * 1024); got != want {
+		t.Fatalf("parseMemTotalBytes() = %d, want %d", got, want)
+	}
+	if got := parseMemTotalBytes([]byte("MemFree: 1 kB\n")); got != 0 {
+		t.Fatalf("parseMemTotalBytes() missing MemTotal = %d, want 0", got)
+	}
+}
+
+func TestHostGcMemoryCeiling(t *testing.T) {
+	if got := hostGcMemoryCeiling(400 << 20); got != 0 {
+		t.Fatalf("hostGcMemoryCeiling(400MiB) = %d, want 0", got)
+	}
+	if got, want := hostGcMemoryCeiling(1<<30), int64(256<<20); got != want {
+		t.Fatalf("hostGcMemoryCeiling(1GiB) = %d, want %d", got, want)
+	}
+	if got, want := hostGcMemoryCeiling(512<<20), int64(512<<20)*30/100; got != want {
+		t.Fatalf("hostGcMemoryCeiling(512MiB) = %d, want %d", got, want)
+	}
+}
+
+func TestGcMemoryCeilingPrefersCgroupThenHost(t *testing.T) {
+	limit, source := gcMemoryCeiling(64<<20, 1<<30)
+	if limit != 64<<20 || source != "cgroup" {
+		t.Fatalf("gcMemoryCeiling(cgroup) = %d %q, want cgroup 64MiB", limit, source)
+	}
+	limit, source = gcMemoryCeiling(0, 1<<30)
+	if limit != 256<<20 || source != "host" {
+		t.Fatalf("gcMemoryCeiling(host) = %d %q, want host 256MiB", limit, source)
+	}
+	limit, source = gcMemoryCeiling(0, 256<<20)
+	if limit != 0 || source != "" {
+		t.Fatalf("gcMemoryCeiling(small host) = %d %q, want empty", limit, source)
+	}
+}

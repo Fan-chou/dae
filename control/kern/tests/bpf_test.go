@@ -483,3 +483,23 @@ func TestLanFakeipNonsynStatelessTproxy(t *testing.T) {
 func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
 }
+
+func TestLanUdpKernelDirectGroupSkipsUserspace(t *testing.T) {
+	runProgramSetByID(t, "LanUdpKernelDirectGroupSkipsUserspace")
+}
+
+func TestLanUdpKernelDirectGroupKeepsDnsUserspace(t *testing.T) {
+	runProgramSetByID(t, "LanUdpKernelDirectGroupKeepsDnsUserspace")
+}
+
+func TestLanUdpCachedGroupIgnoresKernelDirectFlag(t *testing.T) {
+	runProgramSetByID(t, "LanUdpCachedGroupIgnoresKernelDirectFlag")
+}
+
+func TestWanUdpKernelDirectGroupSkipsUserspace(t *testing.T) {
+	runProgramSetByID(t, "WanUdpKernelDirectGroupSkipsUserspace")
+}
+
+func TestWanTcpKernelDirectGroupSkipsUserspace(t *testing.T) {
+	runProgramSetByID(t, "WanTcpKernelDirectGroupSkipsUserspace")
+}

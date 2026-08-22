@@ -527,6 +527,25 @@ func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool 
 	return set.Len() > 0
 }
 
+// KernelFastPathDirect reports whether new non-DNS connections for this group
+// can skip userspace: the currently selected leaf is the builtin direct
+// dialer. Selection is observed without activating lazy health checks.
+func (g *DialerGroup) KernelFastPathDirect(networkType *dialer.NetworkType) bool {
+	if g == nil || networkType == nil {
+		return false
+	}
+	d, _, _, err := g.selectWithExclusionResult(networkType, false, nil, false)
+	return err == nil && isBuiltinDirectDialer(d)
+}
+
+func isBuiltinDirectDialer(d *dialer.Dialer) bool {
+	if d == nil {
+		return false
+	}
+	property := d.Property()
+	return property != nil && property.Name == consts.OutboundDirect.String() && property.Link == ""
+}
+
 func (g *DialerGroup) republishKernelAlive() {
 	if g == nil || g.userAliveCallback == nil {
 		return

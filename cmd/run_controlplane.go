@@ -193,10 +193,11 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 // (100% heap growth) can overshoot the cgroup limit and trigger OOM kills.
 //
 // An explicit GOMEMLIMIT always wins. Only memory.max participates in the
-// detected ceiling: memory.high is a reclaim throttle the kernel lets the
-// process exceed, so deriving a soft heap limit from it makes the Go GC run
-// back-to-back against a threshold that was never meant to be a hard bound.
-// The function is a no-op when no finite cgroup ceiling is configured.
+// detected cgroup ceiling: memory.high is a reclaim throttle the kernel lets
+// the process exceed, so deriving a soft heap limit from it makes the Go GC
+// run back-to-back against a threshold that was never meant to be a hard bound.
+// When no finite cgroup ceiling exists, a fraction of /proc/meminfo MemTotal
+// is used so OpenWrt-style hosts still get a heap cap.
 func configureGcMemoryLimit(log *logrus.Logger) {
 	if value, ok := os.LookupEnv("GOMEMLIMIT"); ok {
 		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
@@ -204,10 +205,10 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 		}
 		return
 	}
-	limit := detectCgroupMemLimit()
+	limit, source := gcMemoryCeiling(detectCgroupMemLimit(), readMemTotalBytes())
 	if limit <= 0 {
 		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
-			log.Debug("GOMEMLIMIT: no finite cgroup memory ceiling detected, skipping")
+			log.Debug("GOMEMLIMIT: no finite memory ceiling detected, skipping")
 		}
 		return
 	}
@@ -215,8 +216,8 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	softLimit := limit * 9 / 10
 	debug.SetMemoryLimit(softLimit)
 	if log != nil {
-		log.Infof("Configured GOMEMLIMIT=%d MiB (cgroup memory ceiling=%d MiB)",
-			softLimit/1024/1024, limit/1024/1024)
+		log.Infof("Configured GOMEMLIMIT=%d MiB (%s memory ceiling=%d MiB)",
+			softLimit/1024/1024, source, limit/1024/1024)
 	}
 }
 

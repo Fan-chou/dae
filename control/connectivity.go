@@ -20,6 +20,10 @@ const (
 	outboundConnectivityDomainDnsUDP     = uint32(1)
 	outboundConnectivityDomainDataUDP    = uint32(2)
 	outboundConnectivitySlotsPerOutbound = outboundConnectivitySlotsPerDomain * 3
+
+	// Must match control/kern/tproxy.c OUTBOUND_CONN_* bits.
+	outboundConnAliveBit    = uint32(1)
+	outboundKernelDirectBit = uint32(2)
 )
 
 func FormatL4Proto(l4proto uint8) string {
@@ -49,6 +53,26 @@ func outboundConnectivityMapKey(outbound uint8, networkType *dialer.NetworkType)
 		ipVersionIdx = 1
 	}
 	return uint32(outbound)*outboundConnectivitySlotsPerOutbound + domainIdx*outboundConnectivitySlotsPerDomain + ipVersionIdx
+}
+
+func encodeOutboundConnectivityValue(alive, kernelDirect bool) uint32 {
+	var value uint32
+	if alive {
+		value |= outboundConnAliveBit
+	}
+	if kernelDirect {
+		value |= outboundKernelDirectBit
+	}
+	return value
+}
+
+func (c *controlPlaneCore) setKernelDirectLookup(fn func(outbound uint8, networkType *dialer.NetworkType) bool) {
+	if c == nil {
+		return
+	}
+	c.outboundConnectivityMu.Lock()
+	c.kernelDirectLookup = fn
+	c.outboundConnectivityMu.Unlock()
 }
 
 // pauseOutboundConnectivityUpdates waits for an in-flight health callback to
@@ -112,18 +136,17 @@ func (c *controlPlaneCore) writeOutboundConnectivityLocked(outbound uint8, alive
 		}).Tracef("Outbound <%v> %v -> %v, notify the kernel program.", c.outboundId2Name[outbound], networkType.StringWithoutDns(), strAlive)
 	}
 
-	value := uint32(0)
-	if alive {
-		value = 1
-	}
+	kernelDirect := c.kernelDirectLookup != nil && c.kernelDirectLookup(outbound, networkType)
+	value := encodeOutboundConnectivityValue(alive, kernelDirect)
 	// ARRAY map key: outbound_id * 6 + domain * 2 + ipversion
 	// domain: 0=TCP, 1=DNS UDP, 2=data UDP; ipversion: 0=IPv4, 1=IPv6
 	key := outboundConnectivityMapKey(outbound, networkType)
 	if err := bpf.OutboundConnectivityMap.Update(key, value, ebpf.UpdateAny); err != nil {
 		c.log.WithFields(logrus.Fields{
-			"alive":    alive,
-			"network":  networkType.StringWithoutDns(),
-			"outbound": c.outboundId2Name[outbound],
+			"alive":        alive,
+			"kernelDirect": kernelDirect,
+			"network":      networkType.StringWithoutDns(),
+			"outbound":     c.outboundId2Name[outbound],
 		}).Warnf("Failed to notify the kernel program: %v", err)
 	}
 }

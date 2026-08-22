@@ -106,6 +106,62 @@ func minPositive(values ...int64) int64 {
 	return minimum
 }
 
+func readMemTotalBytes() int64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	return parseMemTotalBytes(b)
+}
+
+func parseMemTotalBytes(meminfo []byte) int64 {
+	for _, line := range strings.Split(string(meminfo), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kib, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || kib <= 0 {
+			return 0
+		}
+		return kib * 1024
+	}
+	return 0
+}
+
+// hostGcMemoryCeiling derives a heap ceiling from physical RAM when the
+// process is not in a finite cgroup. OpenWrt routers typically have no
+// memory.max; without this fallback GOMEMLIMIT stays unset.
+func hostGcMemoryCeiling(memTotalBytes int64) int64 {
+	const minHostRAM = 512 << 20
+	if memTotalBytes < minHostRAM {
+		return 0
+	}
+	ceiling := memTotalBytes * 30 / 100
+	const maxCeiling = 256 << 20
+	const minCeiling = 128 << 20
+	if ceiling > maxCeiling {
+		ceiling = maxCeiling
+	}
+	if ceiling < minCeiling {
+		ceiling = minCeiling
+	}
+	return ceiling
+}
+
+func gcMemoryCeiling(cgroupLimit, memTotalBytes int64) (limit int64, source string) {
+	if cgroupLimit > 0 {
+		return cgroupLimit, "cgroup"
+	}
+	if host := hostGcMemoryCeiling(memTotalBytes); host > 0 {
+		return host, "host"
+	}
+	return 0, ""
+}
+
 func newHTTPClientForDialer(d netproxy.Dialer, timeout time.Duration, soMark uint32, mptcp bool) http.Client {
 	soMark = common.EffectiveSoMarkFromDae(soMark)
 	return http.Client{

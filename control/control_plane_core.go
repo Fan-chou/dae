@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
 	"github.com/daeuniverse/dae/component"
+	"github.com/daeuniverse/dae/component/outbound/dialer"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -125,6 +126,7 @@ type controlPlaneCore struct {
 	// with health callbacks while a prepared generation is cut over or rolled back.
 	outboundConnectivityMu     sync.Mutex
 	outboundConnectivityPaused bool
+	kernelDirectLookup         func(outbound uint8, networkType *dialer.NetworkType) bool
 
 	closed                context.Context
 	close                 context.CancelFunc

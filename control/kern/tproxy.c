@@ -89,11 +89,20 @@ static const __u32 two_key = 2;
 
 // Key format: outbound_id * 6 + domain * 2 + ipversion
 // domain: 0=TCP, 1=DNS UDP, 2=data UDP; ipversion: 0=IPv4, 1=IPv6
+//
+// Value bits:
+//   bit0 OUTBOUND_CONN_ALIVE_BIT: new connections may reach userspace
+//   bit1 OUTBOUND_KERNEL_DIRECT_BIT: the group's current leaf is builtin
+//        direct, so new non-DNS flows can skip tproxy (collapse to
+//        OUTBOUND_DIRECT before conn_state is cached).
+
+#define OUTBOUND_CONN_ALIVE_BIT 1u
+#define OUTBOUND_KERNEL_DIRECT_BIT 2u
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
-	__type(value, __u32); // true, false
+	__type(value, __u32);
 	__uint(max_entries, 1536); // 256 outbounds * 3 domains * 2 ipversions
 } outbound_connectivity_map SEC(".maps");
 
@@ -2200,6 +2209,41 @@ wan_egress_needs_control_plane(__u8 outbound, __u32 mark)
 	return !(outbound == OUTBOUND_DIRECT && mark == 0);
 }
 
+static __always_inline __u32
+outbound_connectivity_map_key(const struct __sk_buff *skb, __u8 outbound,
+			      __u8 l4proto, __be16 dport)
+{
+	return ((__u32)outbound * 6) +
+	       ((l4proto == IPPROTO_UDP) ?
+			((dport == bpf_htons(53)) ? 1 : 2) : 0) * 2 +
+	       (skb->protocol == bpf_htons(ETH_P_IP) ? 0 : 1);
+}
+
+// noinline: always_inline lookup locals would grow do_tproxy_wan_egress_tcp
+// past the verifier's 512-byte combined-stack limit with route().
+static __noinline __u8
+collapse_kernel_direct_outbound(struct __sk_buff *skb, __u8 outbound,
+				__u8 l4proto, __be16 dport)
+{
+	__u32 key;
+	__u32 *flags;
+
+	if (outbound == OUTBOUND_DIRECT)
+		return OUTBOUND_DIRECT;
+	if (outbound == OUTBOUND_BLOCK ||
+	    outbound == OUTBOUND_CONTROL_PLANE_ROUTING)
+		return outbound;
+	/* DNS must stay in userspace so the DNS controller can rewrite. */
+	if (dport == bpf_htons(53))
+		return outbound;
+
+	key = outbound_connectivity_map_key(skb, outbound, l4proto, dport);
+	flags = bpf_map_lookup_elem(&outbound_connectivity_map, &key);
+	if (flags && (*flags & OUTBOUND_KERNEL_DIRECT_BIT))
+		return OUTBOUND_DIRECT;
+	return outbound;
+}
+
 static __always_inline void
 fill_routing_result(struct routing_result *dst,
 		    __u32 mark, __u8 must, __u8 outbound,
@@ -3002,6 +3046,9 @@ lan_new_flow_route:;
 	__u8 routing_epoch_slot =
 		routing_epoch_slot_from_route_result(s64_ret);
 
+	outbound = collapse_kernel_direct_outbound(skb, outbound, pkt->l4proto,
+						   pkt->tuples.five.dport);
+
 	// Cache routing in conn state (skip DNS to avoid map churn).
 	if (pkt->l4proto == IPPROTO_UDP &&
 	    is_short_lived_udp_traffic(&pkt->tuples.five)) {
@@ -3237,22 +3284,10 @@ wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 	if (outbound == OUTBOUND_CONTROL_PLANE_ROUTING)
 		return true;
 
-	// ARRAY map key: outbound_id * 6 + domain * 2 + ipversion
-	// domain: 0=TCP, 1=DNS UDP, 2=data UDP; ipversion: 0=IPv4, 1=IPv6
-	__u32 domain_idx = 0;
-	__u32 ip_idx = skb->protocol == bpf_htons(ETH_P_IP) ? 0 : 1;
-	__u32 key;
-	__u32 *alive;
+	__u32 key = outbound_connectivity_map_key(skb, outbound, l4proto, dport);
+	__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &key);
 
-	if (l4proto == IPPROTO_UDP) {
-		if (dport == bpf_htons(53))
-			domain_idx = 1;
-		else
-			domain_idx = 2;
-	}
-	key = ((__u32)outbound * 6) + (domain_idx * 2) + ip_idx;
-	alive = bpf_map_lookup_elem(&outbound_connectivity_map, &key);
-	if (alive && *alive == 0)
+	if (alive && (*alive & OUTBOUND_CONN_ALIVE_BIT) == 0)
 		return false;
 	return true;
 }
@@ -3269,12 +3304,10 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	struct pid_pname *pid_pname = NULL;
 	const char *handoff_pname = NULL;
 	__u32 handoff_pid = 0;
-	__u8 handoff_mac[6] = {};
 	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
 	__u16 datapath_generation = PARAM.datapath_generation;
-	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
-		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &scratch_key);
+		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &zero_key);
 
 	if (!scratch)
 		return TC_ACT_SHOT;
@@ -3317,6 +3350,9 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		mark = s64_ret >> 8;
 		must = (s64_ret >> 40) & 1;
 		routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
+		outbound = collapse_kernel_direct_outbound(skb, outbound,
+							   IPPROTO_TCP,
+							   tuples->five.dport);
 		scratch->must_val = must;
 
 		__u8 dscp = tuples->dscp;
@@ -3329,7 +3365,6 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			handoff_pname = pid_pname->pname;
 			handoff_pid = pid_pname->pid;
 		}
-		__builtin_memcpy(handoff_mac, scratch->mac, 6);
 
 		__u8 *outbound_ptr = &outbound;
 		__u32 *mark_ptr = &mark;
@@ -3375,7 +3410,6 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		outbound = tcp_conn->meta.data.outbound;
 		mark = tcp_conn->meta.data.mark;
 		must = tcp_conn->meta.data.must;
-		__builtin_memcpy(handoff_mac, tcp_conn->mac, 6);
 		__builtin_memcpy(scratch->mac, tcp_conn->mac, 6);
 		handoff_pname = (const char *)tcp_conn->pname;
 		handoff_pid = tcp_conn->pid;
@@ -3404,7 +3438,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 	struct routing_result routing_result = {};
 
-	fill_routing_result(&routing_result, mark, must, outbound, handoff_mac,
+	fill_routing_result(&routing_result, mark, must, outbound, scratch->mac,
 			    tuples->dscp, handoff_pname, handoff_pid,
 			    routing_epoch_slot, datapath_generation);
 	/* TCP has embedded conn-state routing metadata; handoff is best-effort. */
@@ -3509,6 +3543,8 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	mark = s64_ret >> 8;
 	must = (s64_ret >> 40) & 1;
 	routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
+	outbound = collapse_kernel_direct_outbound(skb, outbound, IPPROTO_UDP,
+						   tuples->five.dport);
 
 fast_path_skip_routing:
 		if (udp_conn_state && tuples->five.dport != bpf_htons(53)) {
