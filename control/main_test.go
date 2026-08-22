@@ -49,5 +49,8 @@ func TestMain(m *testing.M) {
 		goleak.IgnoreAnyFunction("github.com/panjf2000/ants/v2.(*poolCommon).ticktock"),
 		// outbound package init background goroutine.
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/component/outbound/dialer.init.0.func1"),
+		// netns tests subscribe to link updates; netlink's callback goroutine
+		// can outlive the test after unsubscribe.
+		goleak.IgnoreAnyFunction("github.com/vishvananda/netlink.linkSubscribeAt.func2"),
 	)
 }
