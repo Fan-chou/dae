@@ -6,6 +6,7 @@
 package control
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -15,53 +16,137 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// startTransportReceiver registers the endpoint's reply handler with a
+// transport-owned packet receiver ("push mode"). The transport then delivers
+// upstream packets through handleReceivedPacket on its existing reader (QUIC
+// family) or a shared epoll loop (direct), instead of this endpoint owning a
+// blocking ReadFrom goroutine. Returns false when the conn does not support
+// registration, leaving the caller to start a ReadFrom loop.
 func (ue *UdpEndpoint) startTransportReceiver() bool {
-	if ue != nil && ue.replyRuntime != nil {
-		runtime := ue.replyRuntime
-		if receiver, ok := ue.conn.(netproxy.PacketReceiver); ok {
-			if stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket); registered {
-				runtime.receiverMu.Lock()
-				runtime.receiverStop = stop
-				runtime.receiverMu.Unlock()
-				if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
-					ue.log.Debug("[UdpEndpoint] Using transport-owned packet receiver")
-				}
-				return true
-			}
-		}
+	if ue == nil || ue.conn == nil {
+		return false
 	}
-	return false
+	receiver, ok := ue.conn.(netproxy.PacketReceiver)
+	if !ok {
+		return false
+	}
+	// Create the reply queue before registering. Some transports (hysteria2)
+	// drain datagrams queued between session creation and registration
+	// synchronously inside RegisterPacketReceiver; those deliveries must
+	// already see a live queue.
+	ue.replyQueueMu.Lock()
+	ue.replyQueueCh = make(chan *udpEndpointReply, udpEndpointReplyQueueSize)
+	ue.replyQueueDone = make(chan struct{})
+	ue.replyQueueStop = make(chan struct{})
+	ch, done, stopSignal := ue.replyQueueCh, ue.replyQueueDone, ue.replyQueueStop
+	ue.replyQueueMu.Unlock()
+	go ue.replySender(ch, stopSignal, done)
+
+	stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket)
+	if !registered {
+		ue.stopTransportReceiver()
+		return false
+	}
+	ue.receiverMu.Lock()
+	ue.receiverStop = stop
+	ue.receiverMu.Unlock()
+	// hysteria2 drains queued datagrams inside RegisterPacketReceiver. A
+	// hard error there calls markRetiredFromReceiver and stopPacketReceiver
+	// before this assignment, so the first unregister is a no-op. Re-run
+	// now that stop is visible; Close is idempotent via closeOnce.
+	if ue.dead.Load() {
+		ue.stopPacketReceiver()
+	}
+
+	if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
+		ue.log.Debug("[UdpEndpoint] Using transport-owned packet receiver")
+	}
+	return true
 }
 
+// stopPacketReceiver unregisters the transport receiver. Safe to call from
+// inside handleReceivedPacket and any number of times.
 func (ue *UdpEndpoint) stopPacketReceiver() {
-	if ue == nil || ue.replyRuntime == nil {
+	if ue == nil {
 		return
 	}
-	runtime := ue.replyRuntime
-	runtime.receiverMu.Lock()
-	stop := runtime.receiverStop
-	runtime.receiverStop = nil
-	runtime.receiverMu.Unlock()
+	ue.receiverMu.Lock()
+	stop := ue.receiverStop
+	ue.receiverStop = nil
+	ue.receiverMu.Unlock()
 	if stop != nil {
 		stop()
 	}
 }
 
+// stopTransportReceiver tears down push mode: unregister first so no further
+// deliveries race the queue close, then close the bounded queue and wait for
+// the replySender goroutine to drain what it already accepted. ReadFrom-loop
+// endpoints have no shared queue; their loop closes its own locals.
+func (ue *UdpEndpoint) stopTransportReceiver() {
+	ue.stopPacketReceiver()
+	ue.replyQueueMu.Lock()
+	ch := ue.replyQueueCh
+	done := ue.replyQueueDone
+	if ch != nil && !ue.replyQueueClosed {
+		ue.replyQueueClosed = true
+		ue.replyQueueCh = nil
+	} else {
+		ch = nil
+	}
+	ue.replyQueueMu.Unlock()
+	if ch == nil {
+		return
+	}
+	close(ch)
+	if done != nil {
+		<-done
+	}
+}
+
+// enqueueReceivedReply hands one transport-owned packet to the reply sender.
+// A full queue drops only this packet (after releasing it) and keeps the
+// receiver registered; a closed queue rejects the packet so the caller can
+// unregister.
+func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, release func()) bool {
+	ue.replyQueueMu.Lock()
+	ch := ue.replyQueueCh
+	if ch == nil || ue.replyQueueClosed {
+		ue.replyQueueMu.Unlock()
+		if release != nil {
+			release()
+		}
+		return false
+	}
+	queued := takeUdpEndpointReply(pool.PB(data), from)
+	queued.release = release
+	select {
+	case ch <- queued:
+		ue.replyQueueMu.Unlock()
+		return true
+	default:
+		ue.replyQueueMu.Unlock()
+		recycleUdpEndpointReply(queued, false)
+		return true
+	}
+}
+
+// handleReceivedPacket is the push-mode delivery callback. Some transports
+// deliver concurrently from multiple stream readers, so endpoint probing and
+// error counters stay serialized exactly as in ReadFrom mode.
 func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) bool {
 	if packet == nil {
 		return false
 	}
 
-	// Some transport implementations can deliver packets concurrently from
-	// multiple stream readers. Keep the endpoint's probing/error counters and
-	// initial-peer admission serialized exactly as they are in ReadFrom mode.
-	runtime := ue.replyRuntime
-	if runtime == nil {
+	ue.receiveMu.Lock()
+	defer ue.receiveMu.Unlock()
+
+	if ue.dead.Load() {
 		packet.Release()
+		ue.stopPacketReceiver()
 		return false
 	}
-	runtime.receiveMu.Lock()
-	defer runtime.receiveMu.Unlock()
 
 	if packet.Err != nil {
 		if errors.IsReplayAttackError(packet.Err) || errors.IsAuthError(packet.Err) {
@@ -76,7 +161,7 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 			}
 		}
 		if ue.shouldRetireOnReadError(packet.Err) {
-			ue.retire()
+			ue.markRetiredFromReceiver()
 			if ue.isConnectionRefused(packet.Err) {
 				ue.handleProxyServerFailure()
 			}
@@ -99,21 +184,24 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		ue.markReplied(time.Now().UnixNano())
 	}
 
-	reply := udpEndpointReply{data: pool.PB(packet.Data), from: from}
-	accepted, keepReceiver := ue.submitReplyFromReceiver(reply, packet.Release)
-	if accepted || keepReceiver {
-		return true
+	if !ue.enqueueReceivedReply(packet.Data, from, packet.Release) {
+		ue.stopPacketReceiver()
+		return false
 	}
-	packet.Release()
-	ue.stopPacketReceiver()
-	return false
+	return true
 }
 
 func (ue *UdpEndpoint) startReadLoop() {
+	dialerName := ""
+	if ue.Dialer != nil {
+		if prop := ue.Dialer.Property(); prop != nil {
+			dialerName = prop.Name
+		}
+	}
 	if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
 		ue.log.WithFields(logrus.Fields{
 			"lAddr":      ue.lAddr.String(),
-			"dialer":     ue.Dialer.Property().Name,
+			"dialer":     dialerName,
 			"proxy_addr": ue.DialTarget,
 		}).Debug("[UdpEndpoint] Read loop started")
 	}

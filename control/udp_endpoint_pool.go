@@ -169,6 +169,16 @@ type UdpEndpoint struct {
 	transportDone  atomic.Value
 	replyRuntime   *udpEndpointReplyRuntime
 	sessionRuntime *UDPFlowRuntime
+
+	receiverMu   sync.Mutex // guards receiverStop
+	receiverStop func()
+	receiveMu    sync.Mutex // serializes concurrent receiver deliveries
+
+	replyQueueMu     sync.Mutex // guards replyQueueCh vs teardown
+	replyQueueCh     chan *udpEndpointReply
+	replyQueueDone   chan struct{}
+	replyQueueStop   chan struct{} // sender error signal; nobody listens in this mode
+	replyQueueClosed bool
 }
 
 type UdpEndpointKey struct {

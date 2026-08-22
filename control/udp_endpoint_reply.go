@@ -15,10 +15,6 @@ import (
 )
 
 type udpEndpointReplyRuntime struct {
-	receiverMu   sync.Mutex
-	receiverStop func()
-	receiveMu    sync.Mutex
-
 	dispatcher        *udpReplyDispatcher
 	slots             chan struct{}
 	stop              chan struct{}
@@ -345,6 +341,10 @@ const udpEndpointReplyQueueSize = 256
 type udpEndpointReply struct {
 	data pool.PB
 	from netip.AddrPort
+	// release, when set, owns the reply payload instead of the package pool:
+	// transport-owned packet receivers hand their buffers in with a release
+	// callback (ReceivedPacket.Release).
+	release func()
 }
 
 var udpEndpointReplyObjects = sync.Pool{
@@ -368,7 +368,9 @@ func recycleUdpEndpointReply(reply *udpEndpointReply, releaseData bool) {
 	if reply == nil {
 		return
 	}
-	if releaseData {
+	if reply.release != nil {
+		reply.release()
+	} else if releaseData {
 		putUdpEndpointReplyData(reply.data)
 	}
 	*reply = udpEndpointReply{}
@@ -514,7 +516,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retire()
+				ue.retireFromReplySender()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.
