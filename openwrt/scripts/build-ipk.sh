@@ -17,7 +17,7 @@ fi
 RELEASE=1
 PKGVER="${VERSION}-${RELEASE}"
 
-export GOROOT=${GOROOT:-/root/sdk/go1.26.0}
+export GOROOT=${GOROOT:-/root/sdk/go1.27.0}
 export PATH="$GOROOT/bin:$PATH"
 export GOTOOLCHAIN=${GOTOOLCHAIN:-local}
 export GOMODCACHE=${GOMODCACHE:-/root/go-mod}

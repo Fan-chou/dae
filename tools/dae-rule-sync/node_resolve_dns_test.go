@@ -62,7 +62,7 @@ func TestGenerateMihomoNodesWithResolveDNSOverlay(t *testing.T) {
 	}}
 	overlay := map[string]string{
 		"🇺🇸 US | Hysteria2": "8.8.8.8",
-		"gone-node":          "1.1.1.1",
+		"gone-node":         "1.1.1.1",
 	}
 	nodes, report, err := GenerateMihomoNodesWithResolveDNS(config, overlay)
 	if err != nil {

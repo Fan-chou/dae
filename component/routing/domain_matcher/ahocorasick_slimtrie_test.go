@@ -12,7 +12,6 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 )
 
 func TestAhocorasickSlimtrie(t *testing.T) {
@@ -57,8 +56,20 @@ func TestAhocorasickSlimtrie(t *testing.T) {
 		}
 		bitmap := bf.MatchDomainBitmap(sample)
 		bitmap2 := actrie.MatchDomainBitmap(sample)
-		if !slices.Equal(bitmap, bitmap2) {
+		if !uint32SliceEqual(bitmap, bitmap2) {
 			t.Fatal(i, sample, bitmap, bitmap2)
 		}
 	}
+}
+
+func uint32SliceEqual(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

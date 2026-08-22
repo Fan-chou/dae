@@ -326,7 +326,7 @@ func durationPercentiles(samples []time.Duration) (p50, p99, max time.Duration) 
 	sorted := append([]time.Duration(nil), samples...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	p50 = sorted[len(sorted)*50/100]
-	p99idx := len(sorted)*99/100
+	p99idx := len(sorted) * 99 / 100
 	if p99idx >= len(sorted) {
 		p99idx = len(sorted) - 1
 	}

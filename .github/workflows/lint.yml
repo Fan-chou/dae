@@ -27,15 +27,15 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    - name: Set up Go 1.26
+    - name: Set up Go 1.27
       uses: actions/setup-go@v6
       with:
-        go-version: "1.26.0"
+        go-version: "1.27.0"
 
     - name: Run golangci-lint
       uses: golangci/golangci-lint-action@v9
       with:
-        version: v2.11.0
+        version: v2.13.1
         args: --timeout=10m --build-tags=dae_stub_ebpf
 
   ebpf-lint:
