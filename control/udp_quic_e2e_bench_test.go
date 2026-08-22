@@ -16,10 +16,8 @@ import (
 )
 
 // udpQuicE2EBenchmarkCases parameterizes the QUIC end-to-end benchmark across
-// the cardinalities that matter for ordered-ingress roll-out: a single
-// producer pinning one flow at a time, and multiple producers each driving
-// their own flows. The fan-out mirrors the production ingress pattern where one
-// eBPF callback may submit several QUIC Initials concurrently.
+// the cardinalities that matter for ordered-ingress: a single producer pinning
+// one flow at a time, and multiple producers each driving their own flows.
 var udpQuicE2EBenchmarkCases = []struct {
 	producers int
 }{
@@ -28,19 +26,9 @@ var udpQuicE2EBenchmarkCases = []struct {
 }
 
 // udpQuicE2EBenchmarkMaxInFlight bounds concurrent QUIC Initial lifecycles so
-// neither dispatcher hits its maxPending ceiling; overload policy stays out of
-// the comparison, matching the philosophy of udpDispatcherBenchmarkMaxInFlight.
-//
-// Note: the ordered dispatcher's endpoint-create admission gate
-// (defaultUDPOrderedDispatcherMaxCompensatingWorkers = 64) can still saturate
-// under high cold-flow concurrency because the simulation's instant dial lets
-// producers outrun the compensating-worker retirement. That is an artifact of
-// in-memory transport, not a production regression (real dials are
-// network-bound and far slower). handlePkt silently drops a packet whose dial
-// is rejected (returns nil on errUdpEndpointCreateAdmissionFull), so the
-// sanity checks below only assert the path executed at least once rather than
-// once per op.
-const udpQuicE2EBenchmarkMaxInFlight = udpDispatcherBenchmarkMaxInFlight
+// the convoy queue stays below UdpTaskQueueLength and overload policy stays
+// out of the comparison.
+const udpQuicE2EBenchmarkMaxInFlight = UdpTaskQueueLength / 2
 
 // BenchmarkQuicInitialEndToEnd measures the full QUIC Initial lifecycle under
 // the production dispatch path:
@@ -48,54 +36,19 @@ const udpQuicE2EBenchmarkMaxInFlight = udpDispatcherBenchmarkMaxInFlight
 //	submitOrderedUDPIngress -> convoy -> handlePkt -> proxy DialContext ->
 //	first-packet WriteTo -> endpoint creation.
 //
-// It compares the legacy fallback (DefaultUdpTaskPool + per-endpoint reply
-// goroutine) against the ordered ingress dispatcher backed by the shared
-// udpReplyDispatcher. This is the end-to-end coverage the SLO gate in
-// cmd/semantic_refactor_features.go was waiting on: the existing
-// BenchmarkUDPOrderedDispatcherSubmitDrain deliberately excludes endpoint
-// admission and transport writes, so it could not justify flipping the default.
-//
 // Each iteration targets a fresh flow (unique source port) so the pool takes
-// the cache-miss slow path and actually performs a proxy dial. This mirrors
-// the cold-start cost that dominates QUIC Initial handling in production.
-//
-// In-flight work is bounded by a permit semaphore (mirroring
-// runBoundedUDPDispatcherBenchmark) so neither dispatcher hits its
-// maxPending ceiling and overload policy stays out of the comparison.
+// the cache-miss slow path and actually performs a proxy dial.
 func BenchmarkQuicInitialEndToEnd(b *testing.B) {
 	for _, tc := range udpQuicE2EBenchmarkCases {
-		for _, impl := range []struct {
-			name    string
-			ordered bool
-		}{
-			{name: "legacy_pool", ordered: false},
-			{name: "ordered_ingress", ordered: true},
-		} {
-			b.Run(impl.name, func(b *testing.B) {
-				b.Run("p="+strconv.Itoa(tc.producers), func(b *testing.B) {
-					runQuicInitialEndToEndBenchmark(b, tc.producers, impl.ordered)
-				})
-			})
-		}
+		b.Run("p="+strconv.Itoa(tc.producers), func(b *testing.B) {
+			runQuicInitialEndToEndBenchmark(b, tc.producers)
+		})
 	}
 }
 
-func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) {
+func runQuicInitialEndToEndBenchmark(b *testing.B, producers int) {
 	restore := setupQuicInitialRegressionTestState(b)
 	b.Cleanup(restore)
-
-	var dispatcher *udpOrderedDispatcher
-	var reply *udpReplyDispatcher
-	if ordered {
-		dispatcher = newDefaultUDPOrderedDispatcher()
-		reply = newDefaultUDPReplyDispatcher()
-		b.Cleanup(func() {
-			dispatcher.close()
-			dispatcher.wait()
-			reply.close()
-			reply.wait()
-		})
-	}
 
 	// A factory dialer mints a fresh simulation conn per dial so each cache-miss
 	// flow gets its own transport. Close on one conn must not tear down a
@@ -109,8 +62,6 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 		}
 	})
 	cp := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(dialer))
-	cp.udpOrderedDispatcher = dispatcher
-	cp.udpReplyDispatcher = reply
 
 	payload := makeLikelyQuicInitialPayload(0x33)
 	// newQuicInitialRegressionFlow asserts the payload classifies as QUIC
@@ -130,8 +81,7 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 
 	// Endpoints created during the timed region are collected and torn down
 	// once measurement stops. The read loop blocks on an empty reads channel
-	// until Close signals EOF, so the reply dispatcher's task WaitGroup stays
-	// at zero and teardown only needs to wait for read-loop exit.
+	// until Close signals EOF.
 	var createdMu sync.Mutex
 	created := make([]*UdpEndpoint, 0, 1024)
 	collectEndpoint := func(decision UdpFlowDecision) {
@@ -161,12 +111,7 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 	flowAddr := src.Addr()
 	// claimFlow re-derives the decision per iteration via ClassifyUdpFlow +
 	// EnsureSnifferSession, exactly as control_plane.go's processPacket does for
-	// every packet. Reusing a single decision (as an earlier revision did) made
-	// every flow share one PacketSnifferKey/session, skipping the per-packet
-	// sniffer-classification cost (NewPacketSnifferKey DCID parse, failed-DCID
-	// shard probe, EnsureSnifferSession GetOrCreate) that production pays — which
-	// understated the measured ns/op by ~16% (legacy) / ~46% (ordered) and
-	// inflated the ordered-vs-legacy advantage from ~9% to ~28%.
+	// every packet.
 	claimFlow := func() (netip.AddrPort, UdpFlowDecision) {
 		port := atomic.AddUint32(&flowPort, 1)
 		flowSrc := netip.AddrPortFrom(flowAddr, uint16(port))
@@ -177,10 +122,6 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 		return flowSrc, decision
 	}
 
-	// Permit semaphore bounds in-flight work so neither dispatcher hits its
-	// maxPending ceiling nor the ordered dispatcher's endpoint-create admission
-	// gate; overload policy stays out of the comparison. Each accepted task
-	// returns its permit on completion.
 	permits := make(chan struct{}, udpQuicE2EBenchmarkMaxInFlight)
 	for range udpQuicE2EBenchmarkMaxInFlight {
 		permits <- struct{}{}
@@ -209,17 +150,14 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 			collectEndpoint(decision)
 			settle()
 		}
-		discard := settle
-		if !cp.submitOrderedUDPIngress(decision.Key, udpTaskFunc(run), nil, nil) {
-			discard()
+		if !cp.submitOrderedUDPIngress(decision.Key, udpTaskFunc(run)) {
+			settle()
 			b.Errorf("submitOrderedUDPIngress rejected QUIC Initial under bounded load")
 		}
 	})
 	completed.Wait()
 	b.StopTimer()
 
-	// Sanity: every task settled, at least one dial+write landed (proving the
-	// full path executed), and no handlePkt reported an error.
 	if errs := handleErrs.Load(); errs > 0 {
 		b.Fatalf("QUIC e2e handlePkt reported %d errors", errs)
 	}
@@ -244,22 +182,32 @@ func closeQuicBenchmarkEndpoint(tb testing.TB, ue *UdpEndpoint) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		tb.Errorf("UdpEndpoint.Close hung during benchmark teardown")
+	}
+}
+
+// runProducers distributes b.N operations across `producers` goroutines.
+func runProducers(b *testing.B, producers int, emit func(workerID int, op int)) {
+	if producers <= 1 {
+		for op := range b.N {
+			emit(0, op)
+		}
 		return
 	}
-	// Drain the reply runtime's task WaitGroup so its convoy goroutines stop
-	// touching global pools before the benchmark swaps them back. Mirrors the
-	// regression test's teardown contract.
-	if ue.replyRuntime == nil {
-		return
+	opsPerProducer := b.N / producers
+	remainder := b.N % producers
+	var wg sync.WaitGroup
+	wg.Add(producers)
+	for worker := range producers {
+		count := opsPerProducer
+		if worker < remainder {
+			count++
+		}
+		go func(workerID, count int) {
+			defer wg.Done()
+			for op := range count {
+				emit(workerID, op)
+			}
+		}(worker, count)
 	}
-	waitDone := make(chan struct{})
-	go func() {
-		ue.replyRuntime.tasks.Wait()
-		close(waitDone)
-	}()
-	select {
-	case <-waitDone:
-	case <-time.After(3 * time.Second):
-		tb.Errorf("replyRuntime.tasks.Wait hung during benchmark teardown")
-	}
+	wg.Wait()
 }

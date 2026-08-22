@@ -28,12 +28,6 @@ const (
 	// test (curl through the datapath got a mid-relay reset), so the slot-0
 	// overwrite path remains the default until that is understood.
 	SemanticRefactorFeatureRoutingEpoch SemanticRefactorFeature = "routing-epoch"
-	// SemanticRefactorFeatureUDPOrderedDispatcher lets ordered UDP ingress use
-	// the bounded generation-owned dispatcher instead of one convoy per flow.
-	SemanticRefactorFeatureUDPOrderedDispatcher SemanticRefactorFeature = "udp-ordered-dispatcher"
-	// SemanticRefactorFeatureUDPReplyDispatcher lets UDP endpoint replies use
-	// bounded generation-owned workers while preserving per-endpoint ordering.
-	SemanticRefactorFeatureUDPReplyDispatcher SemanticRefactorFeature = "udp-reply-dispatcher"
 )
 
 var (
@@ -48,9 +42,7 @@ var (
 // SemanticRefactorFeatureSet is an immutable copy of the process-wide
 // migration gate state used by each control-plane generation.
 type SemanticRefactorFeatureSet struct {
-	RoutingEpoch         bool
-	UDPOrderedDispatcher bool
-	UDPReplyDispatcher   bool
+	RoutingEpoch bool
 }
 
 type semanticRefactorFeatureGateSetting struct {
@@ -75,10 +67,6 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 	switch feature {
 	case SemanticRefactorFeatureRoutingEpoch:
 		return h.setting.features.RoutingEpoch
-	case SemanticRefactorFeatureUDPOrderedDispatcher:
-		return h.setting.features.UDPOrderedDispatcher
-	case SemanticRefactorFeatureUDPReplyDispatcher:
-		return h.setting.features.UDPReplyDispatcher
 	default:
 		return false
 	}
@@ -88,10 +76,10 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 func ParseSemanticRefactorFeature(value string) (SemanticRefactorFeature, error) {
 	feature := SemanticRefactorFeature(value)
 	switch feature {
-	case SemanticRefactorFeatureRoutingEpoch,
-		SemanticRefactorFeatureUDPOrderedDispatcher,
-		SemanticRefactorFeatureUDPReplyDispatcher:
+	case SemanticRefactorFeatureRoutingEpoch:
 		return feature, nil
+	case "compiled-policy", "dns-resolver", "udp-ordered-dispatcher", "udp-reply-dispatcher":
+		return "", fmt.Errorf("retired semantic refactor feature %q", value)
 	default:
 		return "", fmt.Errorf("unknown semantic refactor feature %q", value)
 	}
@@ -105,10 +93,6 @@ func EnableSemanticRefactorFeatures(features ...SemanticRefactorFeature) (*Seman
 		switch feature {
 		case SemanticRefactorFeatureRoutingEpoch:
 			setting.features.RoutingEpoch = true
-		case SemanticRefactorFeatureUDPOrderedDispatcher:
-			setting.features.UDPOrderedDispatcher = true
-		case SemanticRefactorFeatureUDPReplyDispatcher:
-			setting.features.UDPReplyDispatcher = true
 		default:
 			return nil, fmt.Errorf("unknown semantic refactor feature %q", feature)
 		}

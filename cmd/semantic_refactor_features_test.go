@@ -33,17 +33,16 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		{name: "unset", want: defaults, enabled: true},
 		{name: "empty", present: true, want: defaults, enabled: true},
 		{name: "disable none", value: "none", present: true},
-		{name: "udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},
-		{name: "udp reply dispatcher", value: "udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},
-		{name: "multiple", value: "udp-ordered-dispatcher,udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher, control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},
 		{name: "unknown", value: "unknown", present: true, wantErr: true},
 		// Paths that have been collapsed into the single production path must
 		// fail loudly rather than being accepted and silently doing nothing.
 		{name: "routing epoch", value: "routing-epoch", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureRoutingEpoch}, enabled: true},
 		{name: "retired compiled-policy", value: "compiled-policy", present: true, wantErr: true},
 		{name: "retired dns-resolver", value: "dns-resolver", present: true, wantErr: true},
-		{name: "duplicate", value: "udp-reply-dispatcher,udp-reply-dispatcher", present: true, wantErr: true},
-		{name: "whitespace", value: "udp-ordered-dispatcher, udp-reply-dispatcher", present: true, wantErr: true},
+		{name: "retired udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, wantErr: true},
+		{name: "retired udp reply dispatcher", value: "udp-reply-dispatcher", present: true, wantErr: true},
+		{name: "duplicate", value: "routing-epoch,routing-epoch", present: true, wantErr: true},
+		{name: "whitespace", value: "routing-epoch, routing-epoch", present: true, wantErr: true},
 	}
 	for _, tc := range tests {
 		tc := tc

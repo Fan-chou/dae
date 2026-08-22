@@ -24,13 +24,7 @@ import (
 //   - cache=hit:  the same flow key is reused so GetOrCreate resolves through
 //     the shard lookup and skips dialing entirely.
 //
-// Endpoint-create admission gating is intentionally not measured here. That
-// gate is owned by the ordered dispatcher and is only meaningful when a task
-// is submitted through submitOrderedUDPIngress (it borrows a compensating
-// worker for the duration of the dial). Its cost is therefore covered by
-// BenchmarkQuicInitialEndToEnd/ordered_ingress, which runs the full dispatch
-// path. Calling acquireEndpointCreateAdmission outside the dispatcher would
-// spawn workers with no task to run, so it cannot be isolated correctly.
+// The full ingress-to-dial path is covered by BenchmarkQuicInitialEndToEnd.
 func BenchmarkUdpProxyDial(b *testing.B) {
 	for _, cache := range []struct {
 		name string

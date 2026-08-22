@@ -7,6 +7,7 @@ package control
 
 import (
 	stderrors "errors"
+	"strings"
 	"testing"
 )
 
@@ -17,24 +18,22 @@ func TestSemanticRefactorFeatureGateDefaultsDisabled(t *testing.T) {
 }
 
 func TestSemanticRefactorFeatureGateOwnership(t *testing.T) {
-	handle, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureUDPOrderedDispatcher)
+	handle, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureRoutingEpoch)
 	if err != nil {
 		t.Fatalf("EnableSemanticRefactorFeatures() error = %v", err)
 	}
 	t.Cleanup(handle.Disable)
-	if got := semanticRefactorFeatureGateSnapshot(); !got.UDPOrderedDispatcher || got.UDPReplyDispatcher {
-		t.Fatalf("semanticRefactorFeatureGateSnapshot() = %+v, want only the ordered dispatcher", got)
+	if got := semanticRefactorFeatureGateSnapshot(); !got.RoutingEpoch {
+		t.Fatalf("semanticRefactorFeatureGateSnapshot() = %+v, want routing epoch", got)
 	}
-	if !handle.Enabled(SemanticRefactorFeatureUDPOrderedDispatcher) ||
-		handle.Enabled(SemanticRefactorFeatureUDPReplyDispatcher) ||
-		handle.Enabled("unknown") {
+	if !handle.Enabled(SemanticRefactorFeatureRoutingEpoch) || handle.Enabled("unknown") {
 		t.Fatal("SemanticRefactorFeatureGateHandle.Enabled() did not report its owned features")
 	}
-	if _, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureUDPReplyDispatcher); !stderrors.Is(err, ErrSemanticRefactorFeatureAlreadyEnabled) {
+	if _, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureRoutingEpoch); !stderrors.Is(err, ErrSemanticRefactorFeatureAlreadyEnabled) {
 		t.Fatalf("second EnableSemanticRefactorFeatures() error = %v, want ownership error", err)
 	}
 	handle.Disable()
-	if handle.Enabled(SemanticRefactorFeatureUDPOrderedDispatcher) {
+	if handle.Enabled(SemanticRefactorFeatureRoutingEpoch) {
 		t.Fatal("SemanticRefactorFeatureGateHandle.Enabled() = true after Disable()")
 	}
 	if got := semanticRefactorFeatureGateSnapshot(); got != (SemanticRefactorFeatureSet{}) {
@@ -43,10 +42,7 @@ func TestSemanticRefactorFeatureGateOwnership(t *testing.T) {
 }
 
 func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *testing.T) {
-	handle, err := EnableSemanticRefactorFeatures(
-		SemanticRefactorFeatureUDPOrderedDispatcher,
-		SemanticRefactorFeatureUDPReplyDispatcher,
-	)
+	handle, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureRoutingEpoch)
 	if err != nil {
 		t.Fatalf("EnableSemanticRefactorFeatures() error = %v", err)
 	}
@@ -56,81 +52,38 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 	if got := semanticRefactorFeatureGateSnapshot(); got != (SemanticRefactorFeatureSet{}) {
 		t.Fatalf("global feature snapshot after owner disable = %+v, want all disabled", got)
 	}
-	want := SemanticRefactorFeatureSet{
-		UDPOrderedDispatcher: true,
-		UDPReplyDispatcher:   true,
-	}
+	want := SemanticRefactorFeatureSet{RoutingEpoch: true}
 	if features != want {
 		t.Fatalf("captured generation features = %+v, want %+v", features, want)
 	}
 
-	// A generation owns a value copy, so its enabled paths remain available
-	// while a subsequent process owner is free to install a different gate.
-	ordered := newUDPOrderedDispatcherForFeatures(features)
-	reply := newUDPReplyDispatcherForFeatures(features)
-	if ordered == nil || reply == nil {
-		t.Fatalf("captured generation dispatchers = (%p, %p), want both enabled", ordered, reply)
-	}
-	plane := &ControlPlane{
-		semanticRefactorFeatures: features,
-		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
-			udpOrderedDispatcher: ordered,
-			udpReplyDispatcher:   reply,
-		},
-	}
+	plane := &ControlPlane{semanticRefactorFeatures: features}
 	if err := plane.Close(); err != nil {
 		t.Fatalf("captured generation ControlPlane.Close() error = %v", err)
 	}
 }
 
 func TestParseSemanticRefactorFeature(t *testing.T) {
-	for _, feature := range []SemanticRefactorFeature{
-		SemanticRefactorFeatureRoutingEpoch,
-		SemanticRefactorFeatureUDPOrderedDispatcher,
-		SemanticRefactorFeatureUDPReplyDispatcher,
-	} {
-		got, err := ParseSemanticRefactorFeature(string(feature))
-		if err != nil || got != feature {
-			t.Fatalf("ParseSemanticRefactorFeature(%q) = (%q, %v), want (%q, nil)", feature, got, err, feature)
-		}
+	got, err := ParseSemanticRefactorFeature(string(SemanticRefactorFeatureRoutingEpoch))
+	if err != nil || got != SemanticRefactorFeatureRoutingEpoch {
+		t.Fatalf("ParseSemanticRefactorFeature(%q) = (%q, %v), want (%q, nil)",
+			SemanticRefactorFeatureRoutingEpoch, got, err, SemanticRefactorFeatureRoutingEpoch)
 	}
 	// Names of migration paths that have since been collapsed into the single
 	// production path must not silently parse into a no-op gate.
-	for _, retired := range []string{"compiled-policy", "dns-resolver", "unknown"} {
+	for _, retired := range []string{
+		"compiled-policy",
+		"dns-resolver",
+		"udp-ordered-dispatcher",
+		"udp-reply-dispatcher",
+	} {
 		if _, err := ParseSemanticRefactorFeature(retired); err == nil {
 			t.Fatalf("ParseSemanticRefactorFeature(%q) error = nil, want rejection", retired)
+		} else if !strings.Contains(err.Error(), "retired") {
+			t.Fatalf("ParseSemanticRefactorFeature(%q) error = %v, want retired", retired, err)
 		}
 	}
-}
-
-func TestUDPOrderedDispatcherUsesGenerationFeatureGate(t *testing.T) {
-	legacy := newUDPOrderedDispatcherForFeatures(SemanticRefactorFeatureSet{})
-	if legacy != nil {
-		t.Fatal("legacy feature set created a UDP ordered dispatcher")
+	if _, err := ParseSemanticRefactorFeature("unknown"); err == nil {
+		t.Fatal("ParseSemanticRefactorFeature(\"unknown\") error = nil, want rejection")
 	}
-
-	refactored := newUDPOrderedDispatcherForFeatures(SemanticRefactorFeatureSet{UDPOrderedDispatcher: true})
-	if refactored == nil {
-		t.Fatal("UDP ordered dispatcher feature did not create a dispatcher")
-	}
-	t.Cleanup(func() {
-		refactored.close()
-		refactored.wait()
-	})
-}
-
-func TestUDPReplyDispatcherUsesGenerationFeatureGate(t *testing.T) {
-	legacy := newUDPReplyDispatcherForFeatures(SemanticRefactorFeatureSet{})
-	if legacy != nil {
-		t.Fatal("legacy feature set created a UDP reply dispatcher")
-	}
-
-	refactored := newUDPReplyDispatcherForFeatures(SemanticRefactorFeatureSet{UDPReplyDispatcher: true})
-	if refactored == nil {
-		t.Fatal("UDP reply dispatcher feature did not create a dispatcher")
-	}
-	t.Cleanup(func() {
-		refactored.close()
-		refactored.wait()
-	})
 }

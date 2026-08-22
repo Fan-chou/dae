@@ -207,12 +207,11 @@ func (ue *UdpEndpoint) startReadLoop() {
 	}
 
 	// Async reply dispatch keeps slow sendPkt operations off the blocking read
-	// loop. The gated dispatcher preserves the legacy bounded backlog and
-	// endpoint FIFO while sharing workers across endpoint generations.
+	// loop: the bounded replyCh channel decouples the sender goroutine from
+	// the read loop while preserving per-endpoint FIFO.
 	var replyCh chan *udpEndpointReply
 	var senderStop chan struct{}
 	var senderDone chan struct{}
-	runtime := ue.replyRuntime
 
 	buf := pool.GetFullCap(consts.EthernetMtu)
 	defer func() {
@@ -220,15 +219,10 @@ func (ue *UdpEndpoint) startReadLoop() {
 		// after its ownership has been transferred to a reply consumer, so this
 		// is the single release point for whichever buffer is still held.
 		putUdpEndpointReplyData(buf)
-		if runtime == nil {
-			if replyCh != nil {
-				close(replyCh)
-				<-senderDone
-			}
-			return
+		if replyCh != nil {
+			close(replyCh)
+			<-senderDone
 		}
-		runtime.dispatcher.closeInputAndWait(ue)
-		runtime.tasks.Wait()
 	}()
 	for {
 		n, from, err := ue.conn.ReadFrom(buf[:])
@@ -292,19 +286,6 @@ func (ue *UdpEndpoint) startReadLoop() {
 		// read buffer to the sender goroutine. This removes one per-packet copy
 		// from the hot reply path while keeping the same backpressure semantics.
 		reply := udpEndpointReply{data: buf[:n], from: from}
-		if runtime != nil {
-			if !ue.submitReply(reply) {
-				// submitReply returns false before transferring ownership when
-				// the dispatcher rejects the task, so the read loop still owns
-				// the buffer. reply.data aliases buf, so returning here lets the
-				// deferred pool.Put(buf) release it exactly once. Releasing it
-				// again through reply.data would put the same backing array into
-				// the pool twice and alias it across unrelated flows.
-				return
-			}
-			buf = pool.GetFullCap(consts.EthernetMtu)
-			continue
-		}
 		if replyCh == nil {
 			replyCh = make(chan *udpEndpointReply, udpEndpointReplyQueueSize)
 			senderStop = make(chan struct{})

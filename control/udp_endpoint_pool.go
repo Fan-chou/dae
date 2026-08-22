@@ -22,10 +22,9 @@ import (
 )
 
 var (
-	UdpRoutingResultCacheTtl          = 300 * time.Millisecond
-	ErrEndpointFailed                 = fmt.Errorf("endpoint creation recently failed (negative cache)")
-	errUdpEndpointAdmissionClosed     = stderrors.New("udp endpoint admission closed")
-	errUdpEndpointCreateAdmissionFull = stderrors.New("udp endpoint create admission full")
+	UdpRoutingResultCacheTtl      = 300 * time.Millisecond
+	ErrEndpointFailed             = fmt.Errorf("endpoint creation recently failed (negative cache)")
+	errUdpEndpointAdmissionClosed = stderrors.New("udp endpoint admission closed")
 )
 
 // udpEndpointCreateShardCount is the number of sharded mutexes that guard
@@ -167,7 +166,6 @@ type UdpEndpoint struct {
 	// transportDone stores a <-chan struct{} once the transport lifecycle is
 	// indexed. atomic.Value avoids carrying a mutex in every endpoint.
 	transportDone  atomic.Value
-	replyRuntime   *udpEndpointReplyRuntime
 	sessionRuntime *UDPFlowRuntime
 
 	receiverMu   sync.Mutex // guards receiverStop
@@ -265,8 +263,6 @@ func (g *udpEndpointAdmissionGate) closeAndWait() {
 	g.mu.Unlock()
 }
 
-type udpEndpointCreateAdmission func() (release func(), ok bool)
-
 type UdpEndpointOptions struct {
 	Ctx        context.Context
 	Handler    UdpHandler
@@ -279,9 +275,6 @@ type UdpEndpointOptions struct {
 	// admissionGate prevents endpoint creation after its control plane begins
 	// forced retirement and keeps in-flight creation visible to retirement.
 	admissionGate *udpEndpointAdmissionGate
-	// createAdmission reserves cold-path capacity before waiting for a creation
-	// shard or dialing. It is never invoked when an existing endpoint is reused.
-	createAdmission udpEndpointCreateAdmission
 	// GetTarget is useful only if the underlay does not support Full-cone.
 	GetDialOption func(ctx context.Context) (option *DialOption, err error)
 	// Log is the logger to use for endpoint lifecycle events.
@@ -290,9 +283,6 @@ type UdpEndpointOptions struct {
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
-	// replyDispatcher is an optional generation-owned dispatcher for replies.
-	// It is private so the legacy endpoint pool API remains unchanged.
-	replyDispatcher *udpReplyDispatcher
 	// sessionManager promotes a successfully dialed endpoint into the
 	// process-owned session lifecycle before it is published in the pool.
 	sessionManager *SessionManager
@@ -711,11 +701,6 @@ dialSuccess:
 				UdpHealthDomain: dialer.UdpHealthDomainData,
 			}
 		}(),
-		replyRuntime: newUdpEndpointReplyRuntime(
-			createOption.replyDispatcher,
-			createOption.DrainTracker,
-			udpEndpointReplyQueueSize,
-		),
 	}
 	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 		ue.writeBatch = newUDPWriteBatchAggregator(ue)
@@ -793,9 +778,6 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	if stderrors.Is(err, outbound.ErrNoAliveDialer) {
 		return false
 	}
-	if stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
-		return false
-	}
 	if isTransientLocalUdpDialCreateError(err) {
 		return false
 	}
@@ -861,19 +843,6 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 		}
 	}
 	shard.mu.RUnlock()
-
-	// Reserve cold-path capacity before waiting for this creation shard. The
-	// creation mutex is held through proxy dialing, so admitting after Lock
-	// would still let one slow dial block unrelated keys in the same shard.
-	if createOption != nil && createOption.createAdmission != nil {
-		release, admitted := createOption.createAdmission()
-		if !admitted {
-			return nil, false, errUdpEndpointCreateAdmissionFull
-		}
-		if release != nil {
-			defer release()
-		}
-	}
 
 	// Slow path: serialize creation for the same key using a creation shard lock.
 	shard.createMu.Lock()

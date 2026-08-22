@@ -1222,10 +1222,6 @@ func newControlPlaneWithContextOptions(
 		plane.releaseCommittedDNSReloadState()
 		plane.markReady()
 	}
-	// Standalone callers retain generation-owned dispatchers. AttachSessionManager
-	// replaces them with process-owned instances before Serve starts.
-	plane.udpOrderedDispatcher = newUDPOrderedDispatcherForFeatures(plane.semanticRefactorFeatures)
-	plane.udpReplyDispatcher = newUDPReplyDispatcherForFeatures(plane.semanticRefactorFeatures)
 	return plane, nil
 }
 
@@ -2608,6 +2604,12 @@ func shouldSkipDNSFastPathForLocalListenerTraffic(listenAddr string, src, dst ne
 	return false
 }
 
+// submitOrderedUDPIngress runs same-flow UDP ingress through the per-flow
+// convoy task pool so packets stay FIFO without a generation-owned dispatcher.
+func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run UdpTask) bool {
+	return DefaultUdpTaskPool.EmitTask(key, run)
+}
+
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
 	sentReady := false
 	defer func() {
@@ -2698,12 +2700,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 			go func(lconn net.Conn) {
 				// Direct-dispatch goroutines get the same panic isolation as
-				// dispatcher tasks: one bad packet or connection must not take
+				// convoy tasks: one bad packet or connection must not take
 				// down the whole dae process.
 				defer func() {
 					if recovered := recover(); recovered != nil {
 						_ = lconn.Close()
-						reportUDPDispatcherPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
+						reportPacketPathPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
 					}
 				}()
 				ownership, ok := c.acquireIncomingConnectionLease(lconn)
@@ -2763,8 +2765,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
 				go task.Run()
-			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, pktBuf, &c.udpIngressAdmission) {
-				// Rejected: the dispatcher does not own the buffer or the
+			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task) {
+				// Rejected: the pool does not own the buffer or the
 				// admission, so release both inline and return the task to the
 				// pool (it was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
@@ -3078,9 +3080,7 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			}
 		}
 	}
-	c.closeUDPOrderedDispatcher()
 	c.udpIngressAdmission.closeAndWait()
-	c.waitUDPOrderedDispatcher()
 	// Wait for endpoint creation already admitted by this generation before
 	// scanning the shared pool. New creation attempts are rejected once closed.
 	c.udpEndpointAdmission.closeAndWait()
@@ -3103,9 +3103,6 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			errs = append(errs, udpErr)
 		}
 	}
-	c.closeUDPReplyDispatcher()
-	c.waitUDPReplyDispatcher()
-
 	return stderrors.Join(errs...)
 }
 
@@ -3253,11 +3250,7 @@ func (c *ControlPlane) Close() (err error) {
 		if manager, owned := c.controlPlaneSessionManager(); owned && manager != nil {
 			c.closeErr = stderrors.Join(c.closeErr, manager.Close())
 		}
-		c.closeUDPOrderedDispatcher()
 		c.udpIngressAdmission.closeAndWait()
-		c.waitUDPOrderedDispatcher()
-		c.closeUDPReplyDispatcher()
-		c.waitUDPReplyDispatcher()
 
 		var stopWg sync.WaitGroup
 		stopWg.Add(2)
