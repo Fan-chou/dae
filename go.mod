@@ -8,14 +8,14 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.20.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260814220143-942b5a4c04c9
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260822155507-4e6215966a8b
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260814025545-9d6cbf7ccd49
+	github.com/olicesx/quic-go v0.0.0-20260822152321-9a83b6d89e2b
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -114,14 +114,14 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Latest perf/datagram-pool: GC-stable bounded channel pools for STREAM and
-// DATAGRAM frames (sync.Pool was cleared on every GC cycle, causing an
-// allocation spiral that showed up as 80% GC CPU in production), plus bounded
-// Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260816030133-2ae9729e70e9
+// Pinned to perf/client-skipaddr-and-gro (9a83b6d8): GC-stable bounded channel
+// pools, datagram queue timeout, StreamFrame double-put fix, GSO/datagram/stream
+// lifecycle leaks, dial-only skipAddr, and optional UDP GRO receive.
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260822152321-9a83b6d89e2b
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
-// Fan-chou/outbound fix/pool-gc-stability
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260821172846-aaddc9e26317
+// Fan-chou/outbound fix/pool-gc-stability: hy2 demux/reassembly plus
+// olicesx UDP session lifecycle (256bb281) and quic-go 9a83b6d8.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260822155507-4e6215966a8b
