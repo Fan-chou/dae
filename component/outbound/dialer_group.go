@@ -57,8 +57,12 @@ type DialerGroup struct {
 	// kernelAliveEpoch increments with each policy store. Publishers that
 	// observed an older epoch drop their write after waiting for the mutex.
 	kernelAliveEpoch atomic.Uint64
-	lazyCheckOnce    sync.Once
-	closeOnce        sync.Once
+	// kernelAliveDependents are nested parents that must republish their
+	// outbound_connectivity_map slot when this group's selected leaf changes.
+	kernelAliveDependentsMu sync.Mutex
+	kernelAliveDependents   []*DialerGroup
+	lazyCheckOnce           sync.Once
+	closeOnce               sync.Once
 
 	dialersAnnotations  []*dialer.Annotation
 	checkTolerance      time.Duration
@@ -278,6 +282,11 @@ func NewNestedDialerGroupWithRuntimeOptions(
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
 	group.skipAdmissionFallback = skipAdmissionFallback
+	for _, member := range internalMembers {
+		if member.group != nil {
+			member.group.addKernelAliveDependent(group)
+		}
+	}
 	return group, nil
 }
 
@@ -403,6 +412,11 @@ func (g *DialerGroup) Close() error {
 	}
 	g.closeOnce.Do(func() {
 		g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
+		for _, member := range g.nestedMembers {
+			if member.group != nil {
+				member.group.removeKernelAliveDependent(g)
+			}
+		}
 	})
 	return nil
 }
@@ -528,14 +542,68 @@ func (g *DialerGroup) KernelOutboundAlive(networkType *dialer.NetworkType) bool 
 }
 
 // KernelFastPathDirect reports whether new non-DNS connections for this group
-// can skip userspace: the currently selected leaf is the builtin direct
-// dialer. Selection is observed without activating lazy health checks.
+// can skip userspace because the selected leaf is the builtin direct dialer
+// and that selection is published into outbound_connectivity_map.
+//
+// random never qualifies: it has no current leaf, so a DIRECT sample would
+// pin every later new flow. fixed(i) is stable via SetSelectionPolicy.
+// first_alive / min republish when the alive set or latency winner changes.
 func (g *DialerGroup) KernelFastPathDirect(networkType *dialer.NetworkType) bool {
 	if g == nil || networkType == nil {
 		return false
 	}
-	d, _, _, err := g.selectWithExclusionResult(networkType, false, nil, false)
-	return err == nil && isBuiltinDirectDialer(d)
+	switch g.CurrentSelectionPolicy().Policy {
+	case consts.DialerSelectionPolicy_Random:
+		return false
+	case consts.DialerSelectionPolicy_Fixed:
+		return g.stableKernelDirectLeaf(nil)
+	case consts.DialerSelectionPolicy_FirstAlive,
+		consts.DialerSelectionPolicy_MinLastLatency,
+		consts.DialerSelectionPolicy_MinAverage10Latencies,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		d, _, _, err := g.selectWithExclusionResult(networkType, false, nil, false)
+		return err == nil && isBuiltinDirectDialer(d)
+	default:
+		return false
+	}
+}
+
+func (g *DialerGroup) stableKernelDirectLeaf(seen map[*DialerGroup]struct{}) bool {
+	if g == nil {
+		return false
+	}
+	if _, dup := seen[g]; dup {
+		return false
+	}
+	next := make(map[*DialerGroup]struct{}, len(seen)+1)
+	for group := range seen {
+		next[group] = struct{}{}
+	}
+	next[g] = struct{}{}
+
+	policy := g.CurrentSelectionPolicy()
+	if policy.Policy != consts.DialerSelectionPolicy_Fixed {
+		return false
+	}
+	if len(g.nestedMembers) > 0 {
+		i := policy.FixedIndex
+		if i < 0 || i >= len(g.nestedMembers) {
+			return false
+		}
+		return g.nestedMembers[i].stableKernelDirectLeaf(next)
+	}
+	i := policy.FixedIndex
+	if i < 0 || i >= len(g.Dialers) {
+		return false
+	}
+	return isBuiltinDirectDialer(g.Dialers[i])
+}
+
+func (m dialerGroupMember) stableKernelDirectLeaf(seen map[*DialerGroup]struct{}) bool {
+	if m.group != nil {
+		return m.group.stableKernelDirectLeaf(seen)
+	}
+	return isBuiltinDirectDialer(m.dialer)
 }
 
 func isBuiltinDirectDialer(d *dialer.Dialer) bool {
@@ -552,16 +620,19 @@ func (g *DialerGroup) republishKernelAlive() {
 	}
 	epoch := g.kernelAliveEpoch.Load()
 	g.kernelAliveMu.Lock()
-	defer g.kernelAliveMu.Unlock()
 	if g.kernelAliveEpoch.Load() != epoch {
+		g.kernelAliveMu.Unlock()
 		return
 	}
 	for _, nt := range standardSelectionNetworkTypes() {
 		if g.kernelAliveEpoch.Load() != epoch {
+			g.kernelAliveMu.Unlock()
 			return
 		}
 		g.userAliveCallback(g.KernelOutboundAlive(nt), nt, false)
 	}
+	g.kernelAliveMu.Unlock()
+	g.notifyKernelAliveDependentsAll()
 }
 
 func (g *DialerGroup) publishLiveKernelAlive(networkType *dialer.NetworkType) {
@@ -570,11 +641,68 @@ func (g *DialerGroup) publishLiveKernelAlive(networkType *dialer.NetworkType) {
 	}
 	epoch := g.kernelAliveEpoch.Load()
 	g.kernelAliveMu.Lock()
-	defer g.kernelAliveMu.Unlock()
 	if g.kernelAliveEpoch.Load() != epoch {
+		g.kernelAliveMu.Unlock()
 		return
 	}
 	g.userAliveCallback(g.KernelOutboundAlive(networkType), networkType, false)
+	g.kernelAliveMu.Unlock()
+	g.notifyKernelAliveDependents(networkType)
+}
+
+func (g *DialerGroup) addKernelAliveDependent(parent *DialerGroup) {
+	if g == nil || parent == nil || g == parent {
+		return
+	}
+	g.kernelAliveDependentsMu.Lock()
+	defer g.kernelAliveDependentsMu.Unlock()
+	for _, existing := range g.kernelAliveDependents {
+		if existing == parent {
+			return
+		}
+	}
+	g.kernelAliveDependents = append(g.kernelAliveDependents, parent)
+}
+
+func (g *DialerGroup) removeKernelAliveDependent(parent *DialerGroup) {
+	if g == nil || parent == nil {
+		return
+	}
+	g.kernelAliveDependentsMu.Lock()
+	defer g.kernelAliveDependentsMu.Unlock()
+	out := g.kernelAliveDependents[:0]
+	for _, existing := range g.kernelAliveDependents {
+		if existing != parent {
+			out = append(out, existing)
+		}
+	}
+	g.kernelAliveDependents = out
+}
+
+func (g *DialerGroup) kernelAliveDependentSnapshot() []*DialerGroup {
+	if g == nil {
+		return nil
+	}
+	g.kernelAliveDependentsMu.Lock()
+	defer g.kernelAliveDependentsMu.Unlock()
+	if len(g.kernelAliveDependents) == 0 {
+		return nil
+	}
+	out := make([]*DialerGroup, len(g.kernelAliveDependents))
+	copy(out, g.kernelAliveDependents)
+	return out
+}
+
+func (g *DialerGroup) notifyKernelAliveDependents(networkType *dialer.NetworkType) {
+	for _, parent := range g.kernelAliveDependentSnapshot() {
+		parent.publishLiveKernelAlive(networkType)
+	}
+}
+
+func (g *DialerGroup) notifyKernelAliveDependentsAll() {
+	for _, parent := range g.kernelAliveDependentSnapshot() {
+		parent.republishKernelAlive()
+	}
 }
 
 // rejectReachable reports whether the current selection policy can still land

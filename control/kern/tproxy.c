@@ -92,9 +92,10 @@ static const __u32 two_key = 2;
 //
 // Value bits:
 //   bit0 OUTBOUND_CONN_ALIVE_BIT: new connections may reach userspace
-//   bit1 OUTBOUND_KERNEL_DIRECT_BIT: the group's current leaf is builtin
+//   bit1 OUTBOUND_KERNEL_DIRECT_BIT: the group's published leaf is builtin
 //        direct, so new non-DNS flows can skip tproxy (collapse to
-//        OUTBOUND_DIRECT before conn_state is cached).
+//        OUTBOUND_DIRECT before conn_state is cached). Set for fixed(i) and
+//        for first_alive/min after their leaf is republished; never for random.
 
 #define OUTBOUND_CONN_ALIVE_BIT 1u
 #define OUTBOUND_KERNEL_DIRECT_BIT 2u

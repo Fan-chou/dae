@@ -228,6 +228,9 @@ func (a *AliveDialerSet) printLatencies() {
 func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	fromInit := a.dialerToIndex[dialer] == -Init
+	oldBest := a.minLatency.dialer
+	oldLen := len(a.aliveEntries)
 	var (
 		rawLatency     time.Duration
 		sortingLatency time.Duration
@@ -301,16 +304,11 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 				a.minLatency.dialer = nil
 				a.minLatency.sortingLatency = time.Hour
 				a.calcMinLatency()
-				if a.minLatency.dialer == nil {
-					a.mu.Unlock()
-					a.aliveChangeCallback(false)
-					a.mu.Lock()
-					if a.log.IsLevelEnabled(logrus.InfoLevel) {
-						a.log.WithFields(logrus.Fields{
-							"group":   a.dialerGroupName,
-							"network": a.CheckTyp.String(),
-						}).Infof("Group has no dialer alive")
-					}
+				if a.minLatency.dialer == nil && a.log.IsLevelEnabled(logrus.InfoLevel) {
+					a.log.WithFields(logrus.Fields{
+						"group":   a.dialerGroupName,
+						"network": a.CheckTyp.String(),
+					}).Infof("Group has no dialer alive")
 				}
 			}
 		}
@@ -353,10 +351,6 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 				re := "re-"
 				var oldDialerName string
 				if bakOldBestDialer == nil {
-					// Not alive -> alive
-					a.mu.Unlock()
-					a.aliveChangeCallback(true)
-					a.mu.Lock()
 					re = ""
 					oldDialerName = "<nil>"
 				} else {
@@ -373,17 +367,11 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 				}
 
 				a.printLatencies()
-			} else {
-				// Alive -> not alive
-				a.mu.Unlock()
-				a.aliveChangeCallback(false)
-				a.mu.Lock()
-				if a.log.IsLevelEnabled(logrus.InfoLevel) {
-					a.log.WithFields(logrus.Fields{
-						"group":   a.dialerGroupName,
-						"network": a.CheckTyp.String(),
-					}).Infof("Group has no dialer alive")
-				}
+			} else if a.log.IsLevelEnabled(logrus.InfoLevel) {
+				a.log.WithFields(logrus.Fields{
+					"group":   a.dialerGroupName,
+					"network": a.CheckTyp.String(),
+				}).Infof("Group has no dialer alive")
 			}
 		}
 	} else if alive && minPolicy {
@@ -406,6 +394,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			}).Infof("Group selects dialer")
 		}
 	}
+	a.notifySelectionChangeLocked(fromInit, oldBest, oldLen)
 }
 
 func (a *AliveDialerSet) calcMinLatency() {
@@ -426,6 +415,38 @@ func (a *AliveDialerSet) calcMinLatency() {
 		a.minLatency.sortingLatency = minLatency
 		a.minLatency.dialer = minDialer
 	}
+}
+
+func (a *AliveDialerSet) notifySelectionChangeLocked(fromInit bool, oldBest *Dialer, oldLen int) {
+	if fromInit || a.aliveChangeCallback == nil {
+		return
+	}
+	newBest := a.minLatency.dialer
+	newLen := len(a.aliveEntries)
+	shouldNotify := false
+	alive := false
+	switch a.selectionPolicy {
+	case consts.DialerSelectionPolicy_FirstAlive:
+		if oldLen != newLen {
+			shouldNotify = true
+			alive = newLen > 0
+		}
+	case consts.DialerSelectionPolicy_MinLastLatency,
+		consts.DialerSelectionPolicy_MinAverage10Latencies,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		if oldBest != newBest {
+			shouldNotify = true
+			alive = newBest != nil
+		}
+	default:
+		return
+	}
+	if !shouldNotify {
+		return
+	}
+	a.mu.Unlock()
+	a.aliveChangeCallback(alive)
+	a.mu.Lock()
 }
 
 func (a *AliveDialerSet) SetSelectionPolicy(policy consts.DialerSelectionPolicy) {
