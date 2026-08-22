@@ -295,6 +295,51 @@ func TestFakeIPStoreSyncFailureDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestFakeIPStoreWalWriteFailureDoesNotCommit(t *testing.T) {
+	dir := t.TempDir()
+	v4 := netip.MustParsePrefix("198.18.0.0/15")
+	v6 := netip.MustParsePrefix("fd00:daee::/96")
+	s := NewFakeIPStore(dir, 8)
+	if err := s.Open(v4, v6); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	fakeIPWalWriteHook = func([]byte) error { return errors.New("injected wal write failure") }
+	defer func() { fakeIPWalWriteHook = nil }()
+	_, _, _, err := s.Assign("chatgpt.com")
+	if err == nil {
+		t.Fatal("Assign must fail when wal write fails")
+	}
+	if _, _, ok := s.Lookup("chatgpt.com"); ok {
+		t.Fatal("wal-failed mapping must not be visible to Lookup")
+	}
+	s.mu.Lock()
+	_, hit := s.active.forward["chatgpt.com."]
+	s.mu.Unlock()
+	if hit {
+		t.Fatal("wal-failed mapping must not stay in the live table")
+	}
+
+	fakeIPWalWriteHook = nil
+	a4, _, _, err := s.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := NewFakeIPStore(dir, 8)
+	if err := s2.Open(v4, v6); err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, _, ok := s2.Lookup("chatgpt.com")
+	if !ok || got != a4 {
+		t.Fatalf("after restart lookup = %v %v, want %v", got, ok, a4)
+	}
+}
+
 func TestFakeIPStoreDisableReenableReusesAddress(t *testing.T) {
 	dir := t.TempDir()
 	v4 := netip.MustParsePrefix("198.18.0.0/15")
@@ -537,4 +582,169 @@ func durationP99(samples []time.Duration) time.Duration {
 		idx = len(cp) - 1
 	}
 	return cp[idx]
+}
+
+func TestFakeIPStoreInet6OffKeepsIPv4(t *testing.T) {
+	dir := t.TempDir()
+	v4 := netip.MustParsePrefix("198.18.0.0/15")
+	v6 := netip.MustParsePrefix("fd00:daee::/96")
+	s := NewFakeIPStore(dir, 8)
+	if err := s.Open(v4, v6); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a4, a6, _, err := s.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a4.IsValid() || !a6.IsValid() {
+		t.Fatalf("assign = %v %v, want dual-stack", a4, a6)
+	}
+
+	s.ApplyRanges(v4, netip.Prefix{})
+	got4, got6, ok := s.Lookup("chatgpt.com")
+	if !ok || got4 != a4 {
+		t.Fatalf("after inet6 off lookup = %v %v %v, want live %v", got4, got6, ok, a4)
+	}
+	if got6.IsValid() {
+		t.Fatalf("after inet6 off still advertising AAAA %v", got6)
+	}
+	name, ok := s.LookBack(a4)
+	if !ok || name != "chatgpt.com." {
+		t.Fatalf("ipv4 lookback = %q %v", name, ok)
+	}
+	name, ok = s.LookBack(a6)
+	if !ok || name != "chatgpt.com." {
+		t.Fatalf("old ipv6 lookback = %q %v", name, ok)
+	}
+	if !s.Contains(a6) {
+		t.Fatal("old fake IPv6 must still trap after inet6 off")
+	}
+	again4, again6, _, err := s.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again4 != a4 {
+		t.Fatalf("inet6 off reassigned IPv4 %v, want %v", again4, a4)
+	}
+	if again6.IsValid() {
+		t.Fatalf("inet6 off assign advertised AAAA %v", again6)
+	}
+
+	s.ApplyRanges(v4, v6)
+	got4, got6, ok = s.Lookup("chatgpt.com")
+	if !ok || got4 != a4 || got6 != a6 {
+		t.Fatalf("re-enable lookup = %v %v %v, want %v %v", got4, got6, ok, a4, a6)
+	}
+}
+
+func TestFakeIPStoreInet6OffKeepsIPv4AcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	v4 := netip.MustParsePrefix("198.18.0.0/15")
+	v6 := netip.MustParsePrefix("fd00:daee::/96")
+	s1 := NewFakeIPStore(dir, 8)
+	if err := s1.Open(v4, v6); err != nil {
+		t.Fatal(err)
+	}
+	a4, a6, _, err := s1.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.ApplyRanges(v4, netip.Prefix{})
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := NewFakeIPStore(dir, 8)
+	if err := s2.Open(v4, netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got4, got6, ok := s2.Lookup("chatgpt.com")
+	if !ok || got4 != a4 || got6.IsValid() {
+		t.Fatalf("restart lookup = %v %v %v, want live %v invalid-v6", got4, got6, ok, a4)
+	}
+	name, ok := s2.LookBack(a6)
+	if !ok || name != "chatgpt.com." {
+		t.Fatalf("restart old ipv6 lookback = %q %v", name, ok)
+	}
+	again4, _, _, err := s2.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again4 != a4 {
+		t.Fatalf("restart reassigned IPv4 %v, want %v", again4, a4)
+	}
+}
+
+func TestFakeIPStoreIPv4OnlyAssignAndReload(t *testing.T) {
+	dir := t.TempDir()
+	v4 := netip.MustParsePrefix("198.18.0.0/24")
+	s1 := NewFakeIPStore(dir, 8)
+	if err := s1.Open(v4, netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	a4, a6, _, err := s1.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a4.IsValid() || a6.IsValid() {
+		t.Fatalf("assign = %v %v, want IPv4-only", a4, a6)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := NewFakeIPStore(dir, 8)
+	if err := s2.Open(v4, netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got4, got6, ok := s2.Lookup("chatgpt.com")
+	if !ok || got4 != a4 || got6.IsValid() {
+		t.Fatalf("reload lookup = %v %v %v, want %v invalid-v6", got4, got6, ok, a4)
+	}
+}
+
+func TestFakeIPStoreInet6PoolSwitchAllocatesAAAA(t *testing.T) {
+	dir := t.TempDir()
+	v4 := netip.MustParsePrefix("198.18.0.0/15")
+	v6a := netip.MustParsePrefix("fd00:daee::/96")
+	v6b := netip.MustParsePrefix("fd00:daef::/96")
+	s := NewFakeIPStore(dir, 8)
+	if err := s.Open(v4, v6a); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a4, a6, _, err := s.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v6a.Contains(a6) {
+		t.Fatalf("assign AAAA = %v, want %s", a6, v6a)
+	}
+
+	s.ApplyRanges(v4, v6b)
+	got4, got6, ok := s.Lookup("chatgpt.com")
+	if !ok || got4 != a4 {
+		t.Fatalf("after switch lookup = %v %v %v, want live %v", got4, got6, ok, a4)
+	}
+	if got6.IsValid() {
+		t.Fatalf("Lookup advertised parked AAAA %v", got6)
+	}
+
+	again4, again6, _, err := s.Assign("chatgpt.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again4 != a4 {
+		t.Fatalf("switch reassigned IPv4 %v, want %v", again4, a4)
+	}
+	if !again6.IsValid() || !v6b.Contains(again6) || again6 == a6 {
+		t.Fatalf("switch Assign AAAA = %v, want new address in %s", again6, v6b)
+	}
+	name, ok := s.LookBack(a6)
+	if !ok || name != "chatgpt.com." {
+		t.Fatalf("parked ipv6 lookback = %q %v", name, ok)
+	}
 }

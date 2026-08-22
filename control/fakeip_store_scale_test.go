@@ -206,7 +206,7 @@ func TestFakeIPStoreEvictLatency32768(t *testing.T) {
 	evictOnly := make([]time.Duration, samples)
 	for i := 0; i < samples; i++ {
 		start := time.Now()
-		if err := store.evictIfNeededLocked(); err != nil {
+		if _, err := store.evictIfNeededLocked(); err != nil {
 			store.mu.Unlock()
 			t.Fatal(err)
 		}

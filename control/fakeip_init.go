@@ -66,7 +66,11 @@ func (c *ControlPlane) initFakeIP(
 	}
 	c.fakeIPPolicy = NewFakeIPPolicy(fake, store, c.routingMatcher, filter, uint64(c.policyIdentity.Epoch()))
 	if log != nil && fake.Enable {
-		log.Infof("selective FakeIP enabled: inet4=%s inet6=%s filter_mode=%s", inet4, inet6, fake.ResolvedFilterMode())
+		inet6Text := "off"
+		if inet6.IsValid() {
+			inet6Text = inet6.String()
+		}
+		log.Infof("selective FakeIP enabled: inet4=%s inet6=%s filter_mode=%s", inet4, inet6Text, fake.ResolvedFilterMode())
 	}
 	c.syncFakeIPKernelPrefixes()
 	return nil

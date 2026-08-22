@@ -10,6 +10,10 @@ bpf*_*_bpfel*.go
 /build/
 outline.json
 go-mod/
+.gocache/
+.gomodcache/
+.gotmp/
+.gopath/
 node_modules/
 web/dist/
 *.log

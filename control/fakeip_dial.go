@@ -105,10 +105,10 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 	if !dns.IsValid() {
 		return nil
 	}
-	wantV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-	qtype := uint16(dnsmessage.TypeA)
-	if wantV6 {
-		qtype = uint16(dnsmessage.TypeAAAA)
+	preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
+	qtypes := [2]uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA}
+	if preferV6 {
+		qtypes[0], qtypes[1] = dnsmessage.TypeAAAA, dnsmessage.TypeA
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -119,32 +119,47 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 	if network == "" {
 		network = "udp"
 	}
-	addrs, err := resolveIPViaDialer(dialCtx, res.Dialer, dns, domain, qtype, network)
-	if err != nil {
-		return fmt.Errorf("resolve %s via %s: %w", domain, dns, err)
+	store := c.fakeIPStore()
+	var lastErr error
+	for _, qtype := range qtypes {
+		addrs, err := resolveIPViaDialer(dialCtx, res.Dialer, dns, domain, qtype, network)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ip, err := pickResolvedDialIP(addrs, preferV6, store)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		res.DialTarget = netip.AddrPortFrom(ip, p.Dest.Port()).String()
+		res.IsDialIp = true
+		return nil
 	}
-	ip, err := pickResolvedDialIP(addrs, wantV6, c.fakeIPStore())
-	if err != nil {
-		return fmt.Errorf("no real IP for %s via %s: %w", domain, dns, err)
+	if lastErr != nil {
+		return fmt.Errorf("resolve %s via %s: %w", domain, dns, lastErr)
 	}
-	res.DialTarget = netip.AddrPortFrom(ip, p.Dest.Port()).String()
-	res.IsDialIp = true
-	return nil
+	return fmt.Errorf("no real IP for %s via %s", domain, dns)
 }
 
-func pickResolvedDialIP(addrs []netip.Addr, wantV6 bool, store *FakeIPStore) (netip.Addr, error) {
+func pickResolvedDialIP(addrs []netip.Addr, preferV6 bool, store *FakeIPStore) (netip.Addr, error) {
+	var fallback netip.Addr
 	for _, ip := range addrs {
 		if store != nil && store.Contains(ip) {
 			continue
 		}
-		if wantV6 && ip.Is6() && !ip.Is4In6() {
+		isV6 := ip.Is6() && !ip.Is4In6()
+		if preferV6 == isV6 {
 			return ip, nil
 		}
-		if !wantV6 && (ip.Is4() || ip.Is4In6()) {
-			return ip, nil
+		if !fallback.IsValid() {
+			fallback = ip
 		}
 	}
-	return netip.Addr{}, fmt.Errorf("no matching address family")
+	if fallback.IsValid() {
+		return fallback, nil
+	}
+	return netip.Addr{}, fmt.Errorf("no real IP")
 }
 
 func realIPFromAnswers(answers []dnsmessage.RR, ipv6 bool) netip.Addr {

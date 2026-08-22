@@ -232,4 +232,89 @@ func TestPickResolvedDialIPSkipsFakeIPPool(t *testing.T) {
 	if got.String() != "203.0.113.9" {
 		t.Fatalf("got %v", got)
 	}
+	v6 := netip.MustParseAddr("2001:db8::1")
+	got, err = pickResolvedDialIP([]netip.Addr{fake, v6}, false, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != v6 {
+		t.Fatalf("prefer v4 with only AAAA = %v, want %v", got, v6)
+	}
+	got, err = pickResolvedDialIP([]netip.Addr{v6, netip.MustParseAddr("203.0.113.9")}, false, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != "203.0.113.9" {
+		t.Fatalf("prefer v4 = %v, want 203.0.113.9", got)
+	}
+}
+
+func TestApplyProxyResolveDNSFallsBackToOtherFamily(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.dialMode = consts.DialMode_DomainPlus
+
+	var types []uint16
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+		types = append(types, typ)
+		if typ == dnsmessage.TypeA {
+			return nil, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("2001:db8::9")}, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "ipv6only.example",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(types) != 2 || types[0] != dnsmessage.TypeA || types[1] != dnsmessage.TypeAAAA {
+		t.Fatalf("qtypes = %v, want A then AAAA", types)
+	}
+	if res.DialTarget != "[2001:db8::9]:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want pinned AAAA", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.dialMode = consts.DialMode_DomainPlus
+
+	var types []uint16
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+		types = append(types, typ)
+		if typ == dnsmessage.TypeAAAA {
+			return nil, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "v4only.example",
+		Src:      netip.MustParseAddrPort("[2001:db8::2]:40000"),
+		Dest:     netip.MustParseAddrPort("[2001:db8::1]:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(types) != 2 || types[0] != dnsmessage.TypeAAAA || types[1] != dnsmessage.TypeA {
+		t.Fatalf("qtypes = %v, want AAAA then A", types)
+	}
+	if res.DialTarget != "203.0.113.9:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want pinned A", res.DialTarget, res.IsDialIp)
+	}
 }

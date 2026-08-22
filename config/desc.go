@@ -84,7 +84,7 @@ Available functions: qname, qtype, ip, upstream`,
 	"optimistic_cache":     "RFC 8767 stale-while-revalidate for DNS cache",
 	"optimistic_cache_ttl": "Stale window in seconds",
 	"max_cache_size":       "Maximum DNS cache entries",
-	"fakeip":               "Selective FakeIP for proxy-group domain() names. Off by default.",
+	"fakeip":               "Selective FakeIP for proxy-group domain() names. Off by default.\nOmit inet6_range to skip IPv6: eligible AAAA queries get NODATA. Set inet6_range (e.g. fd00:daee::/96) to also fake AAAA.",
 }
 
 var GroupDesc = Desc{

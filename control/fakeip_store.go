@@ -37,11 +37,12 @@ const (
 )
 
 var (
-	fakeIPDefaultInet4       = netip.MustParsePrefix("198.18.0.0/15")
-	fakeIPDefaultInet6       = netip.MustParsePrefix("fd00:daee::/96")
-	fakeIPTombstoneGrace     = 24 * time.Hour
-	fakeIPFdatasync          = unix.Fdatasync
-	errFakeIPNotDurable      = errors.New("fakeip wal sync failed")
+	fakeIPDefaultInet4   = netip.MustParsePrefix("198.18.0.0/15")
+	fakeIPDefaultInet6   = netip.MustParsePrefix("fd00:daee::/96")
+	fakeIPTombstoneGrace = 24 * time.Hour
+	fakeIPFdatasync      = unix.Fdatasync
+	fakeIPWalWriteHook   func([]byte) error
+	errFakeIPNotDurable  = errors.New("fakeip wal sync failed")
 )
 
 var (
@@ -52,15 +53,15 @@ var (
 type fakeIPInternID uint32
 
 type fakeIPRecord struct {
-	qname        string
-	ipv4         netip.Addr
-	ipv6         netip.Addr
-	origin4      netip.Prefix
-	origin6      netip.Prefix
-	updatedUnix  int64
-	retiredUnix  int64
-	seq          uint64
-	retired      bool
+	qname       string
+	ipv4        netip.Addr
+	ipv6        netip.Addr
+	origin4     netip.Prefix
+	origin6     netip.Prefix
+	updatedUnix int64
+	retiredUnix int64
+	seq         uint64
+	retired     bool
 }
 
 type fakeIPGeneration struct {
@@ -333,8 +334,8 @@ func (s *FakeIPStore) Lookup(qname string) (v4, v6 netip.Addr, ok bool) {
 		s.mu.RUnlock()
 		return netip.Addr{}, netip.Addr{}, false
 	}
-	v4, v6 = rec.ipv4, rec.ipv6
-	ok = rec.ipv4.IsValid() || rec.ipv6.IsValid()
+	v4, v6 = s.liveAddrsLocked(rec)
+	ok = v4.IsValid() || v6.IsValid()
 	s.mu.RUnlock()
 	if ok {
 		s.Touch(qname)
@@ -358,35 +359,49 @@ func (s *FakeIPStore) Assign(qname string) (v4, v6 netip.Addr, seq uint64, err e
 	s.expireTombstonesLocked(time.Now())
 	now := time.Now().Unix()
 	if id, hit := s.active.forward[qname]; hit && int(id) < len(s.records) && !s.records[id].retired {
+		if err := s.ensureActiveV6Locked(id); err != nil {
+			s.mu.Unlock()
+			return netip.Addr{}, netip.Addr{}, 0, err
+		}
 		s.touchLocked(qname, now)
 		return s.waitPublishedLocked(s.records[id])
 	}
 	if rec, _, ok := s.reviveSamePoolLocked(qname); ok {
 		return s.waitPublishedLocked(rec)
 	}
-	if err := s.evictIfNeededLocked(); err != nil {
+	restoreEvict, err := s.evictIfNeededLocked()
+	if err != nil {
 		s.mu.Unlock()
 		return netip.Addr{}, netip.Addr{}, 0, err
 	}
 	v4, err = s.allocateLocked(qname, true)
 	if err != nil {
+		restoreEvict()
 		s.mu.Unlock()
 		return netip.Addr{}, netip.Addr{}, 0, err
 	}
-	v6, err = s.allocateLocked(qname, false)
-	if err != nil {
+	if s.active.inet6.IsValid() {
+		v6, err = s.allocateLocked(qname, false)
+		if err != nil {
+			restoreEvict()
+			s.mu.Unlock()
+			return netip.Addr{}, netip.Addr{}, 0, err
+		}
+	}
+	seq = s.seq + 1
+	rec := fakeIPRecord{qname: qname, ipv4: v4, ipv6: v6, origin4: s.active.inet4, origin6: s.active.inet6, updatedUnix: now, seq: seq}
+	if err := s.appendWalLocked(rec); err != nil {
+		restoreEvict()
 		s.mu.Unlock()
 		return netip.Addr{}, netip.Addr{}, 0, err
 	}
+	s.seq = seq
 	id := s.internLocked(qname)
 	if int(id) < len(s.records) && s.records[id].qname == qname &&
 		(s.records[id].retired || s.records[id].ipv4 != v4 || s.records[id].ipv6 != v6) &&
 		(s.records[id].ipv4.IsValid() || s.records[id].ipv6.IsValid()) {
 		id = s.internNewLocked(qname)
 	}
-	s.seq++
-	seq = s.seq
-	rec := fakeIPRecord{qname: qname, ipv4: v4, ipv6: v6, origin4: s.active.inet4, origin6: s.active.inet6, updatedUnix: now, seq: seq}
 	if int(id) < len(s.records) {
 		s.records[id] = rec
 	} else {
@@ -402,10 +417,6 @@ func (s *FakeIPStore) Assign(qname string) (v4, v6 netip.Addr, seq uint64, err e
 		s.active.v6[off] = id
 		s.active.usedV6[off] = struct{}{}
 	}
-	if err := s.appendWalLocked(rec); err != nil {
-		s.mu.Unlock()
-		return netip.Addr{}, netip.Addr{}, 0, err
-	}
 	ch := s.waiterLocked(seq)
 	s.mu.Unlock()
 	<-ch
@@ -418,10 +429,10 @@ func (s *FakeIPStore) reviveSamePoolLocked(qname string) (fakeIPRecord, fakeIPIn
 		return fakeIPRecord{}, 0, false
 	}
 	rec := s.records[id]
-	if rec.qname != qname || !rec.ipv4.IsValid() || !rec.ipv6.IsValid() {
+	if rec.qname != qname || !rec.ipv4.IsValid() {
 		return fakeIPRecord{}, 0, false
 	}
-	if rec.origin4 != s.active.inet4 || rec.origin6 != s.active.inet6 {
+	if rec.origin4 != s.active.inet4 || !s.active.inet4.Contains(rec.ipv4) {
 		return fakeIPRecord{}, 0, false
 	}
 	rec.retired = false
@@ -433,15 +444,26 @@ func (s *FakeIPStore) reviveSamePoolLocked(qname string) (fakeIPRecord, fakeIPIn
 	return rec, id, true
 }
 
+func (s *FakeIPStore) liveAddrsLocked(rec fakeIPRecord) (v4, v6 netip.Addr) {
+	if s.active != nil && s.active.inet4.Contains(rec.ipv4) {
+		v4 = rec.ipv4
+	}
+	if s.active != nil && s.active.inet6.IsValid() && s.active.inet6.Contains(rec.ipv6) {
+		v6 = rec.ipv6
+	}
+	return v4, v6
+}
+
 func (s *FakeIPStore) waitPublishedLocked(rec fakeIPRecord) (netip.Addr, netip.Addr, uint64, error) {
+	v4, v6 := s.liveAddrsLocked(rec)
 	if rec.seq == 0 || rec.seq <= s.durable {
 		s.mu.Unlock()
-		return rec.ipv4, rec.ipv6, 0, nil
+		return v4, v6, 0, nil
 	}
 	ch := s.waiterLocked(rec.seq)
 	s.mu.Unlock()
 	<-ch
-	return s.publishedAfterWait(rec.ipv4, rec.ipv6, rec.seq)
+	return s.publishedAfterWait(v4, v6, rec.seq)
 }
 
 func (s *FakeIPStore) publishedAfterWait(v4, v6 netip.Addr, seq uint64) (netip.Addr, netip.Addr, uint64, error) {
@@ -496,10 +518,31 @@ func (s *FakeIPStore) applyRangesLocked(inet4, inet6 netip.Prefix, force bool) {
 		s.restoreMatchingRetiredLocked(inet4, inet6)
 		return
 	}
-	if !force && s.active.inet4 == inet4 && s.active.inet6 == inet6 {
+	if force {
+		s.retireActiveGenerationLocked()
+		s.active = newFakeIPGeneration(inet4, inet6)
+		return
+	}
+	if s.active.inet4 == inet4 && s.active.inet6 == inet6 {
 		if len(s.active.forward) == 0 {
 			s.restoreMatchingRetiredLocked(inet4, inet6)
 		}
+		return
+	}
+	if s.active.inet4 == inet4 {
+		// IPv4 pool did not move: keep live A mappings. Only the IPv6 pool
+		// is parked so old fake AAAA still LookBack, and new AAAA is not
+		// advertised until inet6 matches again.
+		s.replaceActiveInet6Locked(inet6)
+		return
+	}
+	s.retireActiveGenerationLocked()
+	s.active = newFakeIPGeneration(inet4, inet6)
+	s.restoreMatchingRetiredLocked(inet4, inet6)
+}
+
+func (s *FakeIPStore) retireActiveGenerationLocked() {
+	if s.active == nil {
 		return
 	}
 	now := time.Now().Unix()
@@ -510,10 +553,121 @@ func (s *FakeIPStore) applyRangesLocked(inet4, inet6 netip.Prefix, force bool) {
 			s.records[i].retiredUnix = now
 		}
 	}
-	s.active = newFakeIPGeneration(inet4, inet6)
-	if !force {
-		s.restoreMatchingRetiredLocked(inet4, inet6)
+}
+
+func (s *FakeIPStore) replaceActiveInet6Locked(inet6 netip.Prefix) {
+	old6 := s.active.inet6
+	if old6 == inet6 {
+		return
 	}
+	if old6.IsValid() {
+		s.parkInet6Locked(old6)
+	}
+	s.active.inet6 = inet6
+	if inet6.IsValid() {
+		s.adoptParkedInet6Locked(inet6)
+	}
+}
+
+func (s *FakeIPStore) parkInet6Locked(old6 netip.Prefix) {
+	if s.active == nil || !old6.IsValid() {
+		return
+	}
+	parked := newFakeIPGeneration(netip.Prefix{}, old6)
+	parked.usedV6 = s.active.usedV6
+	parked.v6 = s.active.v6
+	s.retired = append(s.retired, parked)
+	s.active.usedV6 = make(map[uint32]struct{})
+	s.active.v6 = make(map[uint32]fakeIPInternID)
+}
+
+func (s *FakeIPStore) adoptParkedInet6Locked(inet6 netip.Prefix) {
+	if s.active == nil || !inet6.IsValid() {
+		return
+	}
+	for i := len(s.retired) - 1; i >= 0; i-- {
+		gen := s.retired[i]
+		if gen == nil || gen.inet6 != inet6 || gen.inet4.IsValid() {
+			continue
+		}
+		s.active.usedV6 = gen.usedV6
+		s.active.v6 = gen.v6
+		s.retired = append(s.retired[:i], s.retired[i+1:]...)
+		break
+	}
+	if s.active.usedV6 == nil {
+		s.active.usedV6 = make(map[uint32]struct{})
+	}
+	if s.active.v6 == nil {
+		s.active.v6 = make(map[uint32]fakeIPInternID)
+	}
+	for id, rec := range s.records {
+		if rec.qname == "" || rec.retired {
+			continue
+		}
+		if _, ok := s.active.forward[rec.qname]; !ok {
+			continue
+		}
+		if off, ok := fakeIPOffset(s.active.inet6, rec.ipv6); ok {
+			s.active.v6[off] = fakeIPInternID(id)
+			s.active.usedV6[off] = struct{}{}
+		}
+	}
+}
+
+func (s *FakeIPStore) ensureParkedInet6Locked(origin6 netip.Prefix, id fakeIPInternID, rec fakeIPRecord) {
+	if !rec.ipv6.IsValid() {
+		return
+	}
+	p6 := origin6
+	if !p6.IsValid() || !p6.Contains(rec.ipv6) {
+		if fakeIPDefaultInet6.Contains(rec.ipv6) {
+			p6 = fakeIPDefaultInet6
+		} else {
+			p6, _ = rec.ipv6.Prefix(96)
+		}
+	}
+	if !p6.IsValid() {
+		return
+	}
+	var parked *fakeIPGeneration
+	for _, gen := range s.retired {
+		if gen != nil && gen.inet6 == p6 && !gen.inet4.IsValid() {
+			parked = gen
+			break
+		}
+	}
+	if parked == nil {
+		parked = newFakeIPGeneration(netip.Prefix{}, p6)
+		s.retired = append(s.retired, parked)
+	}
+	s.markUsedLocked(parked, id, rec)
+}
+
+func (s *FakeIPStore) ensureActiveV6Locked(id fakeIPInternID) error {
+	if s.active == nil || !s.active.inet6.IsValid() || int(id) >= len(s.records) {
+		return nil
+	}
+	rec := s.records[id]
+	if s.active.inet6.Contains(rec.ipv6) {
+		return nil
+	}
+	v6, err := s.allocateLocked(rec.qname, false)
+	if err != nil {
+		return err
+	}
+	next := rec
+	next.ipv6 = v6
+	next.origin6 = s.active.inet6
+	next.seq = s.seq + 1
+	if err := s.appendWalLocked(next); err != nil {
+		return err
+	}
+	s.seq = next.seq
+	s.records[id] = next
+	s.indexReverseLocked(id, next)
+	s.markUsedLocked(s.active, id, next)
+	return nil
 }
 
 func (s *FakeIPStore) restoreMatchingRetiredLocked(inet4, inet6 netip.Prefix) {
@@ -624,7 +778,8 @@ func unionUsed(active map[uint32]struct{}, retired []*fakeIPGeneration, ipv4 boo
 	return out
 }
 
-func (s *FakeIPStore) evictIfNeededLocked() error {
+func (s *FakeIPStore) evictIfNeededLocked() (restore func(), err error) {
+	restore = func() {}
 	live := 0
 	oldestIdx := -1
 	oldestUnix := int64(1<<63 - 1)
@@ -642,19 +797,25 @@ func (s *FakeIPStore) evictIfNeededLocked() error {
 		}
 	}
 	if live < s.maxLive {
-		return nil
+		return restore, nil
 	}
 	if oldestIdx < 0 {
-		return fmt.Errorf("fakeip table full")
+		return restore, fmt.Errorf("fakeip table full")
 	}
 	// Evict the idle ACTIVE (smallest updatedUnix = last DNS assign/lookup),
 	// not the first-allocated name. Popular names stay if they keep resolving.
 	rec := s.records[oldestIdx]
-	rec.retired = true
-	rec.retiredUnix = time.Now().Unix()
-	s.records[oldestIdx] = rec
+	id := fakeIPInternID(oldestIdx)
+	s.records[oldestIdx].retired = true
+	s.records[oldestIdx].retiredUnix = time.Now().Unix()
 	delete(s.active.forward, rec.qname)
-	return nil
+	restore = func() {
+		s.records[oldestIdx] = rec
+		if s.active != nil {
+			s.active.forward[rec.qname] = id
+		}
+	}
+	return restore, nil
 }
 
 func (s *FakeIPStore) expireTombstonesLocked(now time.Time) {
@@ -907,6 +1068,14 @@ func fakeIPv4Key(addr netip.Addr) uint32 {
 	return binary.BigEndian.Uint32(a[:])
 }
 
+func fakeIPAddrFrom16(raw [16]byte) netip.Addr {
+	var zero [16]byte
+	if raw == zero {
+		return netip.Addr{}
+	}
+	return netip.AddrFrom16(raw)
+}
+
 func (s *FakeIPStore) indexReverseLocked(id fakeIPInternID, rec fakeIPRecord) {
 	if rec.ipv4.IsValid() {
 		s.rev4[fakeIPv4Key(rec.ipv4)] = id
@@ -920,9 +1089,24 @@ func (s *FakeIPStore) appendWalLocked(rec fakeIPRecord) error {
 	if s.wal == nil {
 		return fmt.Errorf("fakeip wal is not open")
 	}
+	off, err := s.wal.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
 	var buf [512]byte
 	n := encodeFakeIPWalRecord(buf[:], rec)
-	if _, err := s.wal.Write(buf[:n]); err != nil {
+	if fakeIPWalWriteHook != nil {
+		if hookErr := fakeIPWalWriteHook(buf[:n]); hookErr != nil {
+			return hookErr
+		}
+	}
+	nw, err := s.wal.Write(buf[:n])
+	if err != nil || nw != n {
+		_ = s.wal.Truncate(off)
+		_, _ = s.wal.Seek(off, io.SeekStart)
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return err
 	}
 	return nil
@@ -959,17 +1143,19 @@ func encodeFakeIPWalRecord(dst []byte, rec fakeIPRecord) int {
 }
 
 func encodePrefixTo(dst []byte, p netip.Prefix) int {
-	if p.IsValid() && (p.Addr().Is4() || p.Addr().Is4In6()) {
+	if !p.IsValid() {
+		dst[0] = 0xff
+		return 17
+	}
+	if p.Addr().Is4() || p.Addr().Is4In6() {
 		dst[0] = byte(p.Bits())
 		raw := p.Addr().Unmap().As4()
 		copy(dst[1:], raw[:])
 		return 5
 	}
 	dst[0] = byte(p.Bits())
-	if p.IsValid() {
-		raw := p.Addr().As16()
-		copy(dst[1:], raw[:])
-	}
+	raw := p.Addr().As16()
+	copy(dst[1:], raw[:])
 	return 17
 }
 
@@ -1033,7 +1219,7 @@ func (s *FakeIPStore) decodeSnapshotLocked(body []byte) error {
 		wanted4, wanted6 = s.active.inet4, s.active.inet6
 	}
 	fileActive := newFakeIPGeneration(inet4, inet6)
-	rangeChanged := s.active != nil && (wanted4 != inet4 || wanted6 != inet6)
+	inet4Changed := s.active != nil && wanted4 != inet4
 
 	if ver >= fakeIPStoreVersionV2 {
 		if off+4 > len(body) {
@@ -1061,7 +1247,7 @@ func (s *FakeIPStore) decodeSnapshotLocked(body []byte) error {
 	}
 	count := binary.LittleEndian.Uint32(body[off:])
 	off += 4
-	if rangeChanged {
+	if inet4Changed {
 		s.retired = append(s.retired, fileActive)
 	} else {
 		s.active = fileActive
@@ -1083,6 +1269,7 @@ func (s *FakeIPStore) decodeSnapshotLocked(body []byte) error {
 		}
 		s.placeRecordLocked(rec)
 	}
+	s.applyRangesLocked(wanted4, wanted6, false)
 	s.durable = s.seq
 	return nil
 }
@@ -1153,6 +1340,14 @@ func (s *FakeIPStore) placeRecordLocked(rec fakeIPRecord) {
 	}
 	s.records[id] = rec
 	s.indexReverseLocked(id, rec)
+	if s.active != nil && !rec.retired && rec.origin4 == s.active.inet4 && s.active.inet4.Contains(rec.ipv4) {
+		s.active.forward[rec.qname] = id
+		s.markUsedLocked(s.active, id, rec)
+		if rec.ipv6.IsValid() && (!s.active.inet6.IsValid() || !s.active.inet6.Contains(rec.ipv6)) {
+			s.ensureParkedInet6Locked(rec.origin6, id, rec)
+		}
+		return
+	}
 	gen := s.genMatchingOriginLocked(rec.origin4, rec.origin6)
 	if gen == nil {
 		gen = newFakeIPGeneration(rec.origin4, rec.origin6)
@@ -1161,11 +1356,6 @@ func (s *FakeIPStore) placeRecordLocked(rec fakeIPRecord) {
 		} else {
 			s.retired = append(s.retired, gen)
 		}
-	}
-	if s.active != nil && gen == s.active && !rec.retired {
-		s.active.forward[rec.qname] = id
-		s.markUsedLocked(s.active, id, rec)
-		return
 	}
 	s.records[id].retired = true
 	s.markUsedLocked(gen, id, rec)
@@ -1205,7 +1395,7 @@ func (s *FakeIPStore) replayWalLocked(body []byte) error {
 		rec := fakeIPRecord{
 			qname:       canonicalizeFakeIPQname(qname),
 			ipv4:        netip.AddrFrom4(v4raw),
-			ipv6:        netip.AddrFrom16(v6raw),
+			ipv6:        fakeIPAddrFrom16(v6raw),
 			updatedUnix: updated,
 			seq:         seq,
 		}
@@ -1234,6 +1424,12 @@ func decodePrefix(b []byte) (netip.Prefix, int, error) {
 		return netip.Prefix{}, 0, io.ErrUnexpectedEOF
 	}
 	bits := int(b[0])
+	if bits > 128 {
+		if len(b) < 17 {
+			return netip.Prefix{}, 0, io.ErrUnexpectedEOF
+		}
+		return netip.Prefix{}, 17, nil
+	}
 	if bits <= 32 {
 		if len(b) < 5 {
 			return netip.Prefix{}, 0, io.ErrUnexpectedEOF
@@ -1282,7 +1478,7 @@ func decodeFakeIPRecord(b []byte, ver uint32) (fakeIPRecord, int, error) {
 	rec := fakeIPRecord{
 		qname:       qname,
 		ipv4:        netip.AddrFrom4(v4raw),
-		ipv6:        netip.AddrFrom16(v6raw),
+		ipv6:        fakeIPAddrFrom16(v6raw),
 		updatedUnix: updated,
 	}
 	if ver >= fakeIPStoreVersionV2 {
@@ -1450,6 +1646,12 @@ func encodeFakeIPSnapshotRecord(dst []byte, rec fakeIPRecord) int {
 }
 
 func writePrefix(w io.Writer, p netip.Prefix) error {
+	if !p.IsValid() {
+		var b [17]byte
+		b[0] = 0xff
+		_, err := w.Write(b[:])
+		return err
+	}
 	if p.Addr().Is4() {
 		var b [5]byte
 		b[0] = byte(p.Bits())

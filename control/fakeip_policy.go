@@ -32,6 +32,7 @@ type FakeIPPolicy struct {
 type fakeIPPackedKey struct {
 	qname string
 	qtype uint16
+	inet6 string
 }
 
 func NewFakeIPPolicy(cfg config.FakeIP, store *FakeIPStore, matcher *RoutingMatcher, filter *fakeIPFilterMatcher, epoch uint64) *FakeIPPolicy {
@@ -81,6 +82,10 @@ func (p *FakeIPPolicy) PackedOrReal(qname string, qtype uint16, realPacked []byt
 	if !p.ShouldFake(qname, qtype, src, mac) {
 		return realPacked, nil
 	}
+	msg := new(dnsmessage.Msg)
+	if err := msg.Unpack(realPacked); err != nil || !p.shouldRewrite(msg, qtype) {
+		return realPacked, nil
+	}
 	return p.packedAnswer(qname, qtype)
 }
 
@@ -88,20 +93,11 @@ func (p *FakeIPPolicy) RewriteMsg(msg *dnsmessage.Msg, src netip.Addr, mac [6]by
 	if msg == nil || len(msg.Question) == 0 {
 		return nil
 	}
-	if msg.Rcode != dnsmessage.RcodeSuccess {
-		return nil
-	}
 	q := msg.Question[0]
 	if !p.ShouldFake(q.Name, q.Qtype, src, mac) {
 		return nil
 	}
-	// Do not synthesize a Fake A/AAAA when the real answer has no address
-	// of that family. Happy Eyeballs would otherwise try Fake AAAA first
-	// and hang on names that only have A records.
-	if q.Qtype == dnsmessage.TypeA && !fakeIPMsgHasIP(msg, false) {
-		return nil
-	}
-	if q.Qtype == dnsmessage.TypeAAAA && !fakeIPMsgHasIP(msg, true) {
+	if !p.shouldRewrite(msg, q.Qtype) {
 		return nil
 	}
 	packed, err := p.packedAnswer(q.Name, q.Qtype)
@@ -117,14 +113,40 @@ func (p *FakeIPPolicy) RewriteMsg(msg *dnsmessage.Msg, src netip.Addr, mac [6]by
 	return nil
 }
 
+// shouldRewrite mirrors the real-answer guards for both packed and unpacked
+// paths. NXDOMAIN / SERVFAIL stay as-is. A/AAAA are faked when the real
+// answer has that family. With no inet6 pool, eligible AAAA becomes NODATA
+// and AAAA-only names (no real A) still get a Fake A so clients have a
+// mapping handle; dial_mode domain++ uses the qname, not the missing IPv4.
+func (p *FakeIPPolicy) shouldRewrite(msg *dnsmessage.Msg, qtype uint16) bool {
+	if msg == nil || msg.Rcode != dnsmessage.RcodeSuccess {
+		return false
+	}
+	switch qtype {
+	case dnsmessage.TypeA:
+		if fakeIPMsgHasIP(msg, false) {
+			return true
+		}
+		return !p.inet6Enabled()
+	case dnsmessage.TypeAAAA:
+		if !p.inet6Enabled() {
+			return true
+		}
+		return fakeIPMsgHasIP(msg, true)
+	default:
+		return true
+	}
+}
+
 func (p *FakeIPPolicy) packedAnswer(qname string, qtype uint16) ([]byte, error) {
 	qname = canonicalizeFakeIPQname(qname)
-	key := fakeIPPackedKey{qname: qname, qtype: qtype}
+	key := fakeIPPackedKey{qname: qname, qtype: qtype, inet6: p.inet6CacheID()}
 	p.mu.Lock()
 	if packed, ok := p.packed[key]; ok {
+		out := cloneFakeIPPacked(packed)
 		p.mu.Unlock()
 		p.store.Touch(qname)
-		return packed, nil
+		return out, nil
 	}
 	p.mu.Unlock()
 
@@ -150,11 +172,13 @@ func (p *FakeIPPolicy) packedAnswer(qname string, qtype uint16) ([]byte, error) 
 				Hdr: dnsmessage.RR_Header{Name: qname, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: p.ttl},
 				A:   net.IP(v4.AsSlice()),
 			}}
-		} else {
+		} else if v6.IsValid() {
 			msg.Answer = []dnsmessage.RR{&dnsmessage.AAAA{
 				Hdr:  dnsmessage.RR_Header{Name: qname, Rrtype: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, Ttl: p.ttl},
 				AAAA: net.IP(v6.AsSlice()),
 			}}
+		} else {
+			msg.Answer = nil
 		}
 	default:
 		// Eligible HTTPS/SVCB and other types: NODATA so clients fall back to A/AAAA.
@@ -168,12 +192,21 @@ func (p *FakeIPPolicy) packedAnswer(qname string, qtype uint16) ([]byte, error) 
 	p.mu.Lock()
 	p.packed[key] = packed
 	p.mu.Unlock()
-	return packed, nil
+	return cloneFakeIPPacked(packed), nil
+}
+
+func cloneFakeIPPacked(packed []byte) []byte {
+	if packed == nil {
+		return nil
+	}
+	out := make([]byte, len(packed))
+	copy(out, packed)
+	return out
 }
 
 func (p *FakeIPPolicy) assign(qname string) (netip.Addr, netip.Addr, error) {
 	v4, v6, ok := p.store.Lookup(qname)
-	if ok {
+	if ok && (!p.inet6Enabled() || v6.IsValid()) {
 		return v4, v6, nil
 	}
 	v4, v6, _, err := p.store.Assign(qname)
@@ -181,6 +214,23 @@ func (p *FakeIPPolicy) assign(qname string) (netip.Addr, netip.Addr, error) {
 		return netip.Addr{}, netip.Addr{}, err
 	}
 	return v4, v6, nil
+}
+
+func (p *FakeIPPolicy) inet6Enabled() bool {
+	return p.inet6CacheID() != "off"
+}
+
+func (p *FakeIPPolicy) inet6CacheID() string {
+	if p == nil || p.store == nil {
+		return "off"
+	}
+	active, _ := p.store.Prefixes()
+	for _, prefix := range active {
+		if prefix.IsValid() && prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+			return prefix.String()
+		}
+	}
+	return "off"
 }
 
 func (p *FakeIPPolicy) Store() *FakeIPStore {

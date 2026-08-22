@@ -148,6 +148,45 @@ dns {
 	require.Contains(t, err.Error(), "qname()")
 }
 
+func TestParseFakeIPOmitsInet6DisablesIPv6(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+routing { fallback: direct }
+dns {
+  fakeip {
+    enable: true
+    inet4_range: '28.0.0.0/15'
+  }
+}
+`)
+	require.NoError(t, err)
+	conf, err := New(sections)
+	require.NoError(t, err)
+	p6, err := conf.Dns.FakeIP.Inet6Prefix()
+	require.NoError(t, err)
+	require.False(t, p6.IsValid())
+	require.Equal(t, "", conf.Dns.FakeIP.Inet6Range)
+}
+
+func TestParseFakeIPExplicitInet6(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+routing { fallback: direct }
+dns {
+  fakeip {
+    enable: true
+    inet6_range: 'fd00:daee::/96'
+  }
+}
+`)
+	require.NoError(t, err)
+	conf, err := New(sections)
+	require.NoError(t, err)
+	p6, err := conf.Dns.FakeIP.Inet6Prefix()
+	require.NoError(t, err)
+	require.Equal(t, FakeIPDefaultInet6Range, p6.String())
+}
+
 func TestParseFakeIPDefaultsOff(t *testing.T) {
 	sections, err := config_parser.Parse(`
 global {}
@@ -207,5 +246,5 @@ func TestParseFakeIPUserDnsSnippet(t *testing.T) {
 	require.Equal(t, "28.0.0.0/8", p4.String())
 	p6, err := fake.Inet6Prefix()
 	require.NoError(t, err)
-	require.Equal(t, FakeIPDefaultInet6Range, p6.String())
+	require.False(t, p6.IsValid(), "omitted inet6_range must disable IPv6 FakeIP")
 }

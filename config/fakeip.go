@@ -36,7 +36,7 @@ const (
 type FakeIP struct {
 	Enable        bool                      `mapstructure:"enable" default:"false"`
 	Inet4Range    string                    `mapstructure:"inet4_range" default:"198.18.0.0/15"`
-	Inet6Range    string                    `mapstructure:"inet6_range" default:"fd00:daee::/96"`
+	Inet6Range    string                    `mapstructure:"inet6_range"`
 	Match         string                    `mapstructure:"match" default:"domain-rule"`
 	Ttl           int                       `mapstructure:"ttl" default:"60"`
 	MaxEntries    int                       `mapstructure:"max_entries" default:"32768"`
@@ -51,6 +51,9 @@ func (f FakeIP) Inet4Prefix() (netip.Prefix, error) {
 }
 
 func (f FakeIP) Inet6Prefix() (netip.Prefix, error) {
+	if strings.TrimSpace(f.Inet6Range) == "" {
+		return netip.Prefix{}, nil
+	}
 	return parseFakeIPPrefix(f.Inet6Range, false)
 }
 
@@ -81,8 +84,10 @@ func (f FakeIP) Validate() error {
 	if _, err := f.Inet4Prefix(); err != nil {
 		return fmt.Errorf("dns.fakeip.inet4_range: %w", err)
 	}
-	if _, err := f.Inet6Prefix(); err != nil {
+	if p, err := f.Inet6Prefix(); err != nil {
 		return fmt.Errorf("dns.fakeip.inet6_range: %w", err)
+	} else if strings.TrimSpace(f.Inet6Range) != "" && !p.IsValid() {
+		return fmt.Errorf("dns.fakeip.inet6_range: invalid prefix")
 	}
 	if err := ValidateFakeIPPath(f.Path); err != nil {
 		return err
@@ -144,7 +149,7 @@ func parseFakeIPPrefix(raw string, ipv4 bool) (netip.Prefix, error) {
 		if ipv4 {
 			raw = FakeIPDefaultInet4Range
 		} else {
-			raw = FakeIPDefaultInet6Range
+			return netip.Prefix{}, nil
 		}
 	}
 	prefix, err := netip.ParsePrefix(raw)
