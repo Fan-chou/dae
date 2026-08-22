@@ -20,6 +20,123 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+func seedDnsCacheA(t *testing.T, cp *ControlPlane, domain string, ip netip.Addr) {
+	t.Helper()
+	ctrl := newTestDnsController()
+	rr := &dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{
+			Name:   dnsmessage.CanonicalName(domain),
+			Rrtype: dnsmessage.TypeA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    60,
+		},
+		A: ip.AsSlice(),
+	}
+	ctrl.dnsCache.Store(ctrl.cacheKey(domain, dnsmessage.TypeA), &DnsCache{Answer: []dnsmessage.RR{rr}})
+	cp.controlPlaneDNSRuntime = controlPlaneDNSRuntime{dnsController: ctrl}
+}
+
+func TestRealIPForFakeIPRouteUsesCachedAnswer(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "codexradar.com")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	real := netip.MustParseAddr("104.26.14.186")
+	seedDnsCacheA(t, cp, "codexradar.com", real)
+	got, err := cp.realIPForFakeIPRoute(context.Background(), "codexradar.com", fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != real {
+		t.Fatalf("real IP = %v, want %v", got, real)
+	}
+}
+
+func TestRealIPForFakeIPRouteSkipsPoolAddress(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "codexradar.com")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	seedDnsCacheA(t, cp, "codexradar.com", fake)
+	_, err := cp.realIPForFakeIPRoute(context.Background(), "codexradar.com", fake)
+	if err == nil {
+		t.Fatal("expected error when cache only has FakeIP")
+	}
+}
+
+func TestRealIPForFakeIPRouteMissingCacheFails(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "codexradar.com")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	_, err := cp.realIPForFakeIPRoute(context.Background(), "codexradar.com", fake)
+	if err == nil {
+		t.Fatal("expected error when DnsCache has no real IP")
+	}
+}
+
+func TestChooseProxyDialerFakeIPRoutesOnRealIP(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "codexradar.com")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	cp.dialMode = consts.DialMode_DomainPlus
+	cp.routingMatcher = testFakeIPMatcher(t, `
+ip(0.0.0.0/8) -> direct
+ip(203.0.113.0/24) -> proxy
+fallback: direct
+`, []string{"proxy"})
+	real := netip.MustParseAddr("203.0.113.10")
+	seedDnsCacheA(t, cp, "codexradar.com", real)
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 443),
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "codexradar.com:443" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain dial", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestChooseProxyDialerFakeIPRefusesWhenRealIPIsDirect(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "cn.example")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	cp.routingMatcher = testFakeIPMatcher(t, `
+ip(203.0.113.0/24) -> direct
+fallback: proxy
+`, []string{"proxy"})
+	seedDnsCacheA(t, cp, "cn.example", netip.MustParseAddr("203.0.113.10"))
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 443),
+		Network:  "tcp",
+	})
+	if err == nil {
+		t.Fatal("expected refuse FakeIP via direct")
+	}
+}
+
+func TestRouteNilRoutingResultDoesNotPanic(t *testing.T) {
+	cp := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			routingMatcher: testFakeIPMatcher(t, `fallback: direct`, nil),
+		},
+	}
+	src := netip.MustParseAddrPort("192.0.2.10:40000")
+	dst := netip.MustParseAddrPort("1.1.1.1:53")
+	outbound, _, _, err := cp.Route(src, dst, "dns.google", consts.L4ProtoType_UDP, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbound != consts.OutboundDirect {
+		t.Fatalf("outbound = %v, want direct", outbound)
+	}
+}
+
 func newTestFakeIPStore(t *testing.T, names ...string) (*FakeIPStore, netip.Addr) {
 	t.Helper()
 	store := NewFakeIPStore(t.TempDir(), 8)
@@ -135,10 +252,12 @@ func TestChooseProxyDialerUDPWithoutDomainPinsDest(t *testing.T) {
 	}
 }
 
-func TestChooseProxyDialerFakeIPUDPPassesDomainWithoutCache(t *testing.T) {
+func TestChooseProxyDialerFakeIPUDPPassesDomain(t *testing.T) {
 	store, fake := newTestFakeIPStore(t, "chatgpt.com")
 	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
 	attachFakeIPStore(cp, store)
+	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
+	seedDnsCacheA(t, cp, "chatgpt.com", netip.MustParseAddr("203.0.113.20"))
 	dst := netip.AddrPortFrom(fake, 443)
 	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
 		Outbound: consts.OutboundUserDefinedMin,
@@ -150,7 +269,7 @@ func TestChooseProxyDialerFakeIPUDPPassesDomainWithoutCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.DialTarget != "chatgpt.com:443" {
-		t.Fatalf("DialTarget = %q, want chatgpt.com:443 (must not consult DnsCache)", res.DialTarget)
+		t.Fatalf("DialTarget = %q, want chatgpt.com:443", res.DialTarget)
 	}
 	if res.IsDialIp {
 		t.Fatal("expected domain dial")

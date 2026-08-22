@@ -137,6 +137,10 @@ func (c *ControlPlane) shouldTryTcpSniff(dst netip.AddrPort, routingResult *bpfR
 		return false
 	}
 	outbound := consts.OutboundIndex(routingResult.Outbound)
+	// FakeIP dest has no useful IP identity; SNI/LookBack is the only name.
+	if c.destIsFakeIP(dst.Addr()) {
+		return true
+	}
 	// Reserved outbounds that don't benefit from sniffed domains.
 	if outbound == consts.OutboundDirect || outbound == consts.OutboundBlock {
 		return false

@@ -111,6 +111,19 @@ setup_cached_routing_result(__u32 saddr, __u32 daddr,
 					     IPPROTO_TCP, outbound, mark);
 }
 
+/* Match cidrToBpfLpmKey: IPv4 prefixlen = 96 + v4 bits, ::ffff:network. */
+static __always_inline int
+program_fakeip_inet4(__u32 network, __u32 v4_bits)
+{
+	struct lpm_key key = {};
+	__u32 one = 1;
+
+	key.prefixlen = 96 + v4_bits;
+	key.data[2] = bpf_htonl(0x0000ffff);
+	key.data[3] = bpf_htonl(network);
+	return bpf_map_update_elem(&fakeip_lpm_map, &key, &one, BPF_ANY);
+}
+
 static __always_inline int
 set_test_outbound_connectivity(__u8 outbound, __u8 l4proto, __u32 alive)
 {
@@ -2512,4 +2525,53 @@ int testcheck_not_mismtach(struct __sk_buff *skb)
 				      TC_ACT_REDIRECT,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
+}
+
+/* Forwarded LAN→WAN FakeIP must SHOT (not leak 28.x onto the wire). */
+SEC("tc/pktgen/wan_egress_fakeip_forward_drop")
+int testpktgen_wan_egress_fakeip_forward_drop(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,124,220), IPV4(28,1,102,250),
+			    54321, 443);
+}
+
+SEC("tc/setup/wan_egress_fakeip_forward_drop")
+int testsetup_wan_egress_fakeip_forward_drop(struct __sk_buff *skb)
+{
+	if (program_fakeip_inet4(IPV4(28,0,0,0), 15))
+		return TC_ACT_SHOT;
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_wan_egress(skb, 14);
+}
+
+SEC("tc/check/wan_egress_fakeip_forward_drop")
+int testcheck_wan_egress_fakeip_forward_drop(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
+}
+
+/* Established FakeIP TCP without conn-state must tproxy, not passthrough. */
+SEC("tc/pktgen/lan_fakeip_nonsyn_stateless_tproxy")
+int testpktgen_lan_fakeip_nonsyn_stateless_tproxy(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,124,220), IPV4(28,1,102,250),
+				       54321, 443,
+				       false, true, true);
+}
+
+SEC("tc/setup/lan_fakeip_nonsyn_stateless_tproxy")
+int testsetup_lan_fakeip_nonsyn_stateless_tproxy(struct __sk_buff *skb)
+{
+	if (program_fakeip_inet4(IPV4(28,0,0,0), 15))
+		return TC_ACT_SHOT;
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/lan_fakeip_nonsyn_stateless_tproxy")
+int testcheck_lan_fakeip_nonsyn_stateless_tproxy(struct __sk_buff *skb)
+{
+	return check_redirect_non_syn_tcp(skb);
 }

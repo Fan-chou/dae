@@ -556,10 +556,12 @@ func reportUDPDispatcherPanic(dispatcher, taskKind string, panicCount *atomic.Ui
 	if !shouldReportEveryPow2(count) {
 		return
 	}
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
 	logrus.WithFields(logrus.Fields{
 		"dispatcher":  dispatcher,
 		"task_kind":   taskKind,
 		"panic":       recovered,
 		"panic_count": count,
-	}).Error("recovered panic in UDP dispatcher task")
+	}).Errorf("recovered panic in UDP dispatcher task\n%s", buf[:n])
 }

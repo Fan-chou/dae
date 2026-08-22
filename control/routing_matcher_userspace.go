@@ -162,7 +162,7 @@ func (m *RoutingMatcher) newFacts(
 			facts.macAssocBins = m.lookupMacAssoc(mac6)
 		}
 	}
-	if domain != "" {
+	if domain != "" && m.domainMatcher != nil {
 		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
 	}
 	return facts, nil

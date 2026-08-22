@@ -116,6 +116,13 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		return nil, err
 	}
 
+	fakeDest := c.destIsFakeIP(dst.Addr())
+	if fakeDest {
+		// Kernel tproxy always marks FakeIP as 0xFD, but a stale conn_state
+		// DIRECT/group result must not skip name-based reroute.
+		outboundIndex = consts.OutboundControlPlaneRouting
+	}
+
 	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
 	if shouldReroute {
 		outboundIndex = consts.OutboundControlPlaneRouting
@@ -134,9 +141,17 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
 		}
+		routeDst := dst
+		if fakeDest {
+			realIP, realErr := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+			if realErr != nil {
+				return nil, realErr
+			}
+			routeDst = netip.AddrPortFrom(realIP, dst.Port())
+		}
 		if outboundIndex, newMark, must, err = c.Route(
 			src,
-			dst,
+			routeDst,
 			domain,
 			proto,
 			routingResult,

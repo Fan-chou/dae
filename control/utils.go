@@ -23,8 +23,15 @@ import (
 )
 
 // Route resolves a routing input with the userspace matcher. An empty domain
-// means no domain is known for this invocation.
+// means no domain is known for this invocation. A nil routingResult is treated
+// as an empty identity (internal DNS lookups have no client 5-tuple).
 func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	if c == nil || c.routingMatcher == nil {
+		return 0, 0, false, fmt.Errorf("nil routing matcher")
+	}
+	if routingResult == nil {
+		routingResult = &bpfRoutingResult{}
+	}
 	var ipVersion consts.IpVersionType
 	if dst.Addr().Is4() || dst.Addr().Is4In6() {
 		ipVersion = consts.IpVersion_4

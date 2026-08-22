@@ -472,6 +472,14 @@ func TestWanEgressUdpRedirectTrack(t *testing.T) {
 	runProgramSetByID(t, "WanEgressUdpRedirectTrack")
 }
 
+func TestWanEgressFakeipForwardDrop(t *testing.T) {
+	runProgramSetByID(t, "WanEgressFakeipForwardDrop")
+}
+
+func TestLanFakeipNonsynStatelessTproxy(t *testing.T) {
+	runProgramSetByID(t, "LanFakeipNonsynStatelessTproxy")
+}
+
 func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
 }

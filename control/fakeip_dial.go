@@ -22,6 +22,82 @@ import (
 // Tests replace it to avoid a real network round-trip.
 var resolveIPViaDialer = netutils.ResolveNetip
 
+func (c *ControlPlane) destIsFakeIP(addr netip.Addr) bool {
+	store := c.fakeIPStore()
+	return store != nil && store.Contains(addr)
+}
+
+// realIPForFakeIPRoute looks up the on-wire destination for FakeIP rematch.
+// DnsCache keeps the real A/AAAA; the client dest (28.x / 198.18) must not
+// feed geoip/ip(). Cache miss re-resolves; still missing is a hard error.
+func (c *ControlPlane) realIPForFakeIPRoute(ctx context.Context, domain string, fake netip.Addr) (netip.Addr, error) {
+	if domain == "" {
+		return netip.Addr{}, fmt.Errorf("unnamed FakeIP %s", fake)
+	}
+	preferV6 := fake.Is6() && !fake.Is4In6()
+	if ip := c.realIPFromDnsCache(domain, preferV6); ip.IsValid() {
+		return ip, nil
+	}
+	dns := c.ActiveDnsController()
+	if dns == nil {
+		return netip.Addr{}, fmt.Errorf("no real IP for FakeIP %s (%s)", fake, domain)
+	}
+	// Re-resolve only when DNS routing is live. Unit tests seed DnsCache
+	// without a resolver; a missing real RR is then a hard error.
+	if rt := dns.runtime(); rt != nil && rt.routing != nil {
+		qtypes := [2]uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA}
+		if preferV6 {
+			qtypes[0], qtypes[1] = dnsmessage.TypeAAAA, dnsmessage.TypeA
+		}
+		var lastErr error
+		for _, qtype := range qtypes {
+			if err := dns.EnsureRealAnswers(ctx, domain, qtype); err != nil {
+				lastErr = err
+				continue
+			}
+			if ip := c.realIPFromDnsCache(domain, preferV6); ip.IsValid() {
+				return ip, nil
+			}
+		}
+		if lastErr != nil {
+			return netip.Addr{}, fmt.Errorf("no real IP for FakeIP %s (%s): %w", fake, domain, lastErr)
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("no real IP for FakeIP %s (%s)", fake, domain)
+}
+
+func (c *ControlPlane) realIPFromDnsCache(domain string, preferV6 bool) netip.Addr {
+	dns := c.ActiveDnsController()
+	if dns == nil || domain == "" {
+		return netip.Addr{}
+	}
+	qtypes := [2]uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA}
+	if preferV6 {
+		qtypes[0], qtypes[1] = dnsmessage.TypeAAAA, dnsmessage.TypeA
+	}
+	var addrs []netip.Addr
+	for _, qtype := range qtypes {
+		addrs = append(addrs, ipsFromAnswers(dns.LookupCacheAnswers(domain, qtype))...)
+	}
+	ip, err := pickResolvedDialIP(addrs, preferV6, c.fakeIPStore())
+	if err != nil {
+		return netip.Addr{}
+	}
+	return ip
+}
+
+func ipsFromAnswers(answers []dnsmessage.RR) []netip.Addr {
+	var addrs []netip.Addr
+	for _, rr := range answers {
+		ip, ok := dnsAnswerIP(rr)
+		if !ok {
+			continue
+		}
+		addrs = append(addrs, ip)
+	}
+	return addrs
+}
+
 func (c *ControlPlane) resolveFakeIPDomain(domain string, dst netip.Addr) (string, error) {
 	store := c.fakeIPStore()
 	if store == nil || !store.Contains(dst) {

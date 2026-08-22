@@ -274,6 +274,9 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// Dial and relay.
 	rConn, res, err := c.routeDial(ctx, dialParam)
 	if err != nil {
+		if c.destIsFakeIP(dst.Addr()) {
+			return fmt.Errorf("failed to dial FakeIP %v sniffed=%q: %w", dst, domain, err)
+		}
 		if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 			res.Outbound.HandleNoAliveDialer(
 				res.OrigNetworkType,

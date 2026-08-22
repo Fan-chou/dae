@@ -391,6 +391,37 @@ static __always_inline bool fakeip_hit_dest(const struct tuples *t, __u16 eth_pr
 	return val != NULL;
 }
 
+/* Dest-only LPM from the IP header. Used when L4 parse fails, and as a
+ * WAN-egress safety net for forwarded packets (those skip the localhost-only
+ * wan_egress path and would otherwise leak 28.x/198.18 onto the wire). */
+static __always_inline bool fakeip_skb_daddr(struct __sk_buff *skb, __u32 link_h_len)
+{
+	__u16 eth_proto;
+	__u32 ip_off = link_h_len;
+
+	if (link_h_len >= ETH_HLEN) {
+		if (bpf_skb_load_bytes(skb, 12, &eth_proto, sizeof(eth_proto)))
+			return false;
+	} else {
+		eth_proto = skb->protocol;
+	}
+	if (eth_proto == bpf_htons(ETH_P_IP)) {
+		__be32 daddr;
+
+		if (bpf_skb_load_bytes(skb, ip_off + 16, &daddr, sizeof(daddr)))
+			return false;
+		return fakeip_hit_v4(daddr);
+	}
+	if (eth_proto == bpf_htons(ETH_P_IPV6)) {
+		union ip6 daddr = {};
+
+		if (bpf_skb_load_bytes(skb, ip_off + 24, &daddr, sizeof(daddr)))
+			return false;
+		return fakeip_hit_v6(&daddr);
+	}
+	return false;
+}
+
 struct fakeip_icmphdr {
 	__u8 type;
 	__u8 code;
@@ -2748,28 +2779,24 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		{
+		if (fakeip_skb_daddr(skb, link_h_len)) {
 			__u32 k = 0;
 			struct parse_transport_ctx *tctx =
 				bpf_map_lookup_elem(&parse_ctx_scratch_map, &k);
 
-			if (tctx) {
-				bool hit = false;
-
-				if (tctx->ethh.h_proto == bpf_htons(ETH_P_IP))
-					hit = fakeip_hit_v4(tctx->iph.daddr);
-				else if (tctx->ethh.h_proto == bpf_htons(ETH_P_IPV6))
-					hit = fakeip_hit_v6((const union ip6 *)&tctx->ipv6h.daddr);
-				if (hit)
-					return fakeip_lan_non_tcpudp(
-						skb, link_h_len, tctx->ethh.h_proto,
-						tctx->iph.protocol, tctx->l4proto);
-			}
+			if (tctx)
+				return fakeip_lan_non_tcpudp(
+					skb, link_h_len, tctx->ethh.h_proto,
+					tctx->iph.protocol, tctx->l4proto);
+			return TC_ACT_SHOT;
 		}
 		return TC_ACT_OK;
 	}
 
 	bool dest_is_fakeip = fakeip_hit_dest(&pkt->tuples, pkt->ethh.h_proto);
+
+	if (!dest_is_fakeip)
+		dest_is_fakeip = fakeip_skb_daddr(skb, link_h_len);
 
 	if (link_h_len == ETH_HLEN)
 		mac_assoc_learn(pkt->ethh.h_source,
@@ -2799,14 +2826,21 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					  ROUTING_EPOCH_SLOT_UNKNOWN);
 		// No cached state for an established packet: keep the historical
 		// passthrough behavior instead of recomputing routing.
-		if (!tcp_state)
+		// FakeIP must not take that passthrough: 28.x/198.18 is not a
+		// real on-wire destination (RFC 6890). Fall through and tproxy.
+		if (!tcp_state) {
+			if (dest_is_fakeip)
+				goto lan_new_flow_route;
 			return TC_ACT_OK;
+		}
 
 		/* Compatibility restore for 030902f behavior and align with WAN
 		 * non-SYN session handling: reuse cached routing result for
 		 * established TCP packets.
 		 */
 		if (!tcp_state->meta.data.has_routing) {
+			if (dest_is_fakeip)
+				goto lan_new_flow_route;
 			/* No cache: keep historical direct-pass semantics (e.g.
 			 * single-arm / reply-path traffic).
 			 */
@@ -2832,6 +2866,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	}
 
 	// Routing for new connection.
+lan_new_flow_route:;
 	__u32 route_flag[8] = {};
 	struct conn_state *tcp_state = NULL;
 	struct conn_state *udp_state = NULL;
@@ -2852,7 +2887,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 						  NULL, NULL, NULL, NULL,
 						  pkt->tuples.dscp, NULL, 0,
 						  ROUTING_EPOCH_SLOT_UNKNOWN);
-			if (udp_state && udp_state->is_wan_ingress_direction) {
+			if (udp_state && udp_state->is_wan_ingress_direction &&
+			    !dest_is_fakeip) {
 				// Replay (outbound) of an inbound flow => direct.
 				return TC_ACT_OK;
 			}
@@ -2989,7 +3025,10 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	}
 
 	// Fail-closed: TCP without conn state must drop to prevent traffic leakage.
-	if (pkt->l4proto == IPPROTO_TCP && !tcp_state) {
+	// FakeIP is the exception: non-SYN never creates conn_state, and
+	// forwarding 28.x/198.18 is RFC 6890 leakage. Tproxy even if the map
+	// did not insert an entry.
+	if (pkt->l4proto == IPPROTO_TCP && !tcp_state && !dest_is_fakeip) {
 		if (outbound == OUTBOUND_DIRECT && mark == 0) {
 			skb->mark = mark;
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
@@ -3533,6 +3572,13 @@ fast_path_skip_routing:
 // Per-CPU scratch to stay under 512-byte stack limit across the call chain.
 static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
+	/* Forwarded LAN→WAN frames have ingress_ifindex != 0 and used to skip
+	 * this hook entirely. If LAN ingress missed the FakeIP trap, 28.x
+	 * leaked onto PPPoE (real DoD space) and TLS died with unexpected EOF.
+	 */
+	if (fakeip_skb_daddr(skb, link_h_len))
+		return TC_ACT_SHOT;
+
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
 		return TC_ACT_OK;
 

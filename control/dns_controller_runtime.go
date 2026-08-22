@@ -207,7 +207,7 @@ func (c *DnsController) rewriteClientMsg(msg *dnsmessage.Msg, req *udpRequest) {
 }
 
 func (c *DnsController) LookupCacheAnswers(qname string, qtype uint16) []dnsmessage.RR {
-	if c == nil {
+	if c == nil || c.dnsControllerStore == nil {
 		return nil
 	}
 	key := c.cacheKey(qname, qtype)
