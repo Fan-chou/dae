@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 )
@@ -68,5 +69,80 @@ func TestAliveDialerSet_GetRandExcludedConcurrent(t *testing.T) {
 
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestAliveDialerSet_RandomNotifiesZeroBoundary(t *testing.T) {
+	networkType := newTestNetworkType()
+	dialers := []*Dialer{
+		newNamedTestDialer(t, "dialer-1"),
+		newNamedTestDialer(t, "dialer-2"),
+	}
+	var notifies int
+	set := NewAliveDialerSet(
+		dialers[0].Log,
+		"random-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_Random,
+		dialers,
+		[]*Annotation{{}, {}},
+		func(bool) { notifies++ },
+		true,
+	)
+	if notifies != 0 {
+		t.Fatalf("init notifies = %d, want 0", notifies)
+	}
+
+	set.NotifyLatencyChange(dialers[0], false)
+	if notifies != 0 {
+		t.Fatalf("2→1 notifies = %d, want 0", notifies)
+	}
+	set.NotifyLatencyChange(dialers[1], false)
+	if notifies != 1 {
+		t.Fatalf("1→0 notifies = %d, want 1", notifies)
+	}
+	set.NotifyLatencyChange(dialers[0], true)
+	if notifies != 2 {
+		t.Fatalf("0→1 notifies = %d, want 2", notifies)
+	}
+	set.NotifyLatencyChange(dialers[1], true)
+	if notifies != 2 {
+		t.Fatalf("1→2 notifies = %d, want 2", notifies)
+	}
+}
+
+func TestAliveDialerSet_MinNotifiesLatencySampleWithoutBestChange(t *testing.T) {
+	networkType := newTestNetworkType()
+	best := newNamedTestDialer(t, "best")
+	other := newNamedTestDialer(t, "other")
+	dialers := []*Dialer{best, other}
+	var notifies int
+	set := NewAliveDialerSet(
+		best.Log,
+		"min-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_MinLastLatency,
+		dialers,
+		[]*Annotation{{}, {}},
+		func(bool) { notifies++ },
+		true,
+	)
+	best.MustGetLatencies10(networkType).AppendLatency(time.Millisecond)
+	other.MustGetLatencies10(networkType).AppendLatency(100 * time.Millisecond)
+	set.NotifyLatencyChange(best, true)
+	set.NotifyLatencyChange(other, true)
+	if got, _ := set.GetMinLatency(nil); got != best {
+		t.Fatalf("flat best = %v, want %v", got, best)
+	}
+	before := notifies
+	other.MustGetLatencies10(networkType).AppendLatency(50 * time.Millisecond)
+	set.NotifyLatencyChange(other, true)
+	if got, _ := set.GetMinLatency(nil); got != best {
+		t.Fatalf("flat best changed to %v, want %v", got, best)
+	}
+	if notifies == before {
+		t.Fatal("min must notify on a latency sample even when the flat best pointer is unchanged")
 	}
 }

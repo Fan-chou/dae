@@ -229,7 +229,6 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	fromInit := a.dialerToIndex[dialer] == -Init
-	oldBest := a.minLatency.dialer
 	oldLen := len(a.aliveEntries)
 	var (
 		rawLatency     time.Duration
@@ -394,7 +393,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			}).Infof("Group selects dialer")
 		}
 	}
-	a.notifySelectionChangeLocked(fromInit, oldBest, oldLen)
+	a.notifySelectionChangeLocked(fromInit, oldLen)
 }
 
 func (a *AliveDialerSet) calcMinLatency() {
@@ -417,27 +416,28 @@ func (a *AliveDialerSet) calcMinLatency() {
 	}
 }
 
-func (a *AliveDialerSet) notifySelectionChangeLocked(fromInit bool, oldBest *Dialer, oldLen int) {
+func (a *AliveDialerSet) notifySelectionChangeLocked(fromInit bool, oldLen int) {
 	if fromInit || a.aliveChangeCallback == nil {
 		return
 	}
-	newBest := a.minLatency.dialer
 	newLen := len(a.aliveEntries)
 	shouldNotify := false
-	alive := false
+	alive := newLen > 0
 	switch a.selectionPolicy {
 	case consts.DialerSelectionPolicy_FirstAlive:
-		if oldLen != newLen {
-			shouldNotify = true
-			alive = newLen > 0
-		}
+		shouldNotify = oldLen != newLen
+	case consts.DialerSelectionPolicy_Random:
+		// Random has no stable leaf, but 0↔n changes whether a nested
+		// first_alive/min parent can select this group. A parent that already
+		// published backup DIRECT must republish when this group recovers.
+		shouldNotify = (oldLen == 0) != (newLen == 0)
 	case consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
-		if oldBest != newBest {
-			shouldNotify = true
-			alive = newBest != nil
-		}
+		// Nested min compares the selected child leaf and parent health views,
+		// not this set's minLatency.dialer pointer. Republish on every update
+		// so a real winner change is not missed.
+		shouldNotify = true
 	default:
 		return
 	}

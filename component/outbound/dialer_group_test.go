@@ -120,6 +120,14 @@ func markDialersDead(set *dialer.AliveDialerSet, dialers ...*dialer.Dialer) {
 	}
 }
 
+func markParentHealthViewDead(view *dialer.Dialer) {
+	snapshot := view.HealthSnapshot()
+	for i := range snapshot.Collections {
+		snapshot.Collections[i].Alive = false
+	}
+	view.RestoreHealthSnapshot(snapshot)
+}
+
 func TestDialerGroup_Select_Fixed(t *testing.T) {
 	option := &dialer.GlobalOption{
 		Log:               log,
@@ -1634,6 +1642,257 @@ func TestDialerGroup_KernelFastPathDirectIgnoresRandom(t *testing.T) {
 	}
 }
 
+func TestDialerGroup_KernelFastPathDirectFirstAliveDoesNotSampleRandomChild(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	directDialer := newDirectDialer(option, false)
+	proxyDialer := newNoopDialer(option)
+	randomChild := NewDialerGroup(option, "mixed-random", []*dialer.Dialer{directDialer, proxyDialer}, newEmptyAnnotations(2),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Random}, func(bool, *dialer.NetworkType, bool) {})
+	backupDialer := newDirectDialer(option, false)
+	backup := NewDialerGroup(option, "backup-direct", []*dialer.Dialer{backupDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroup(option, "fallback", []NestedDialerGroupMember{
+		{Group: randomChild},
+		{Group: backup},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(parent) error = %v", err)
+	}
+	defer parent.Close()
+	defer randomChild.Close()
+	defer backup.Close()
+	defer directDialer.Close()
+	defer proxyDialer.Close()
+	defer backupDialer.Close()
+
+	for i := 0; i < 100; i++ {
+		if parent.KernelFastPathDirect(TestNetworkType) {
+			t.Fatal("first_alive must not advertise kernel-direct when the selected member is a random child")
+		}
+	}
+
+	// A later unused random member is not on the selected path.
+	stableFirst, err := NewNestedDialerGroup(option, "stable-first", []NestedDialerGroupMember{
+		{Group: backup},
+		{Group: randomChild},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(stable-first) error = %v", err)
+	}
+	defer stableFirst.Close()
+	if !stableFirst.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive should advertise kernel-direct when the selected member is stable DIRECT")
+	}
+
+	randomChild.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(directDialer, false)
+	randomChild.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(proxyDialer, false)
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() after random child died: %v", err)
+	}
+	if selected != backupDialer {
+		t.Fatalf("parent.Select() = %p (%v), want backup DIRECT %p; random len=%d", selected, selected.Property(), backupDialer, randomChild.MustGetAliveDialerSet(TestNetworkType).Len())
+	}
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive should advertise kernel-direct after the random child dies and fallback DIRECT is selected")
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectMinDoesNotSampleRandomChild(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	directDialer := newDirectDialer(option, false)
+	direct := NewDialerGroup(option, consts.OutboundDirect.String(), []*dialer.Dialer{directDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	proxyDialer := newNoopDialer(option)
+	proxy := NewDialerGroup(option, "Apple_Proxy", []*dialer.Dialer{proxyDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	randomChild, err := NewNestedDialerGroup(option, "mixed-random", []NestedDialerGroupMember{
+		{Group: direct},
+		{Group: proxy},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Random}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(random) error = %v", err)
+	}
+	slowDialer := newNoopDialer(option)
+	slow := NewDialerGroup(option, "slow-proxy", []*dialer.Dialer{slowDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroup(option, "url-test", []NestedDialerGroupMember{
+		{Group: randomChild},
+		{Group: slow},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(parent) error = %v", err)
+	}
+	defer parent.Close()
+	defer randomChild.Close()
+	defer direct.Close()
+	defer proxy.Close()
+	defer slow.Close()
+	defer directDialer.Close()
+	defer proxyDialer.Close()
+	defer slowDialer.Close()
+
+	directDialer.MustGetLatencies10(TestNetworkType).AppendLatency(time.Millisecond)
+	proxyDialer.MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	slowDialer.MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
+	randomSet := randomChild.MustGetAliveDialerSet(TestNetworkType)
+	randomSet.NotifyLatencyChange(directDialer, true)
+	randomSet.NotifyLatencyChange(proxyDialer, true)
+	parentSet := parent.MustGetAliveDialerSet(TestNetworkType)
+	parentSet.NotifyLatencyChange(directDialer, true)
+	parentSet.NotifyLatencyChange(proxyDialer, true)
+	parentSet.NotifyLatencyChange(slowDialer, true)
+
+	for i := 0; i < 100; i++ {
+		if parent.KernelFastPathDirect(TestNetworkType) {
+			t.Fatal("min must not advertise kernel-direct when the winning member is a random child")
+		}
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectMinKeepsTiedRandomAheadOfFasterDirect(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	slowDirectDialer := newDirectDialer(option, false)
+	slowDirect := NewDialerGroup(option, consts.OutboundDirect.String(), []*dialer.Dialer{slowDirectDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	proxyDialer := newNoopDialer(option)
+	proxy := NewDialerGroup(option, "Apple_Proxy", []*dialer.Dialer{proxyDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	randomChild, err := NewNestedDialerGroup(option, "mixed-random", []NestedDialerGroupMember{
+		{Group: slowDirect},
+		{Group: proxy},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Random}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(random) error = %v", err)
+	}
+	fastDirectDialer := newDirectDialer(option, false)
+	fastDirect := NewDialerGroup(option, "fast-direct", []*dialer.Dialer{fastDirectDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroup(option, "url-test", []NestedDialerGroupMember{
+		{Group: randomChild},
+		{Group: fastDirect},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup(parent) error = %v", err)
+	}
+	defer parent.Close()
+	defer randomChild.Close()
+	defer slowDirect.Close()
+	defer proxy.Close()
+	defer fastDirect.Close()
+	defer slowDirectDialer.Close()
+	defer proxyDialer.Close()
+	defer fastDirectDialer.Close()
+
+	// Leaf latencies would pick the later DIRECT if KernelFastPathDirect
+	// recomputed the min winner itself. Real nested min compares the 0
+	// latency random/fixed children return, so the earlier random member
+	// stays the winner.
+	slowDirectDialer.MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
+	proxyDialer.MustGetLatencies10(TestNetworkType).AppendLatency(200 * time.Millisecond)
+	fastDirectDialer.MustGetLatencies10(TestNetworkType).AppendLatency(time.Millisecond)
+	randomSet := randomChild.MustGetAliveDialerSet(TestNetworkType)
+	randomSet.NotifyLatencyChange(slowDirectDialer, true)
+	randomSet.NotifyLatencyChange(proxyDialer, true)
+
+	for i := 0; i < 100; i++ {
+		if parent.KernelFastPathDirect(TestNetworkType) {
+			t.Fatal("min must not advertise kernel-direct when a tied random child is kept ahead of a faster DIRECT")
+		}
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectFirstAliveRespectsParentHealthAdmission(t *testing.T) {
+	childOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	parentOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	directDialer := newDirectDialer(childOption, false)
+	direct := NewDialerGroup(childOption, consts.OutboundDirect.String(), []*dialer.Dialer{directDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	proxyDialer := newNoopDialer(childOption)
+	proxy := NewDialerGroup(childOption, "Apple_Proxy", []*dialer.Dialer{proxyDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(parentOption, "fallback", []NestedDialerGroupMember{
+		{Group: direct},
+		{Group: proxy},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive},
+		func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer direct.Close()
+	defer proxy.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer directDialer.Close()
+	defer proxyDialer.Close()
+
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive should advertise kernel-direct while the parent still admits DIRECT")
+	}
+
+	directView := parent.parentHealthViews[directDialer]
+	if directView == nil {
+		t.Fatal("parent did not create a health view for DIRECT")
+	}
+	markParentHealthViewDead(directView)
+
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if selected != proxyDialer {
+		t.Fatalf("selected dialer = %p, want proxy %p after parent health rejected DIRECT", selected, proxyDialer)
+	}
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive must not advertise kernel-direct after parent health rejected DIRECT in favor of a proxy")
+	}
+}
+
 func TestDialerGroup_KernelFastPathDirectFirstAliveFollowsAliveSet(t *testing.T) {
 	option := &dialer.GlobalOption{
 		Log:               log,
@@ -1753,6 +2012,158 @@ func TestDialerGroup_KernelFastPathDirectNestedChildNotifiesParent(t *testing.T)
 	}
 	if !parent.KernelFastPathDirect(TestNetworkType) {
 		t.Fatal("nested first_alive should advertise kernel-direct after the proxy child dies")
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectRandomChildRecoveryRepublishesParent(t *testing.T) {
+	childOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	parentOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	proxyDialer := newNoopDialer(childOption)
+	proxyDialer2 := newNoopDialer(childOption)
+	randomChild := NewDialerGroup(childOption, "mixed-random", []*dialer.Dialer{proxyDialer, proxyDialer2}, newEmptyAnnotations(2),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Random}, func(bool, *dialer.NetworkType, bool) {})
+	directDialer := newDirectDialer(childOption, false)
+	direct := NewDialerGroup(childOption, consts.OutboundDirect.String(), []*dialer.Dialer{directDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	var parentPublishes int
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(parentOption, "fallback", []NestedDialerGroupMember{
+		{Group: randomChild},
+		{Group: direct},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+			if !isInit {
+				parentPublishes++
+			}
+		}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer randomChild.Close()
+	defer direct.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer proxyDialer.Close()
+	defer proxyDialer2.Close()
+	defer directDialer.Close()
+
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive must not advertise kernel-direct while the random child is selectable")
+	}
+
+	before := parentPublishes
+	randomSet := randomChild.MustGetAliveDialerSet(TestNetworkType)
+	randomSet.NotifyLatencyChange(proxyDialer, false)
+	if parentPublishes != before {
+		t.Fatal("random child 2→1 must not republish the nested parent")
+	}
+	randomSet.NotifyLatencyChange(proxyDialer2, false)
+	if parentPublishes == before {
+		t.Fatal("random child going empty must republish the nested parent")
+	}
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("parent should advertise kernel-direct after the random child dies")
+	}
+
+	before = parentPublishes
+	randomSet.NotifyLatencyChange(proxyDialer, true)
+	if parentPublishes == before {
+		t.Fatal("random child recovery must republish the nested parent to revoke DIRECT")
+	}
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("parent must not keep kernel-direct after the random child recovers")
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectNestedMinRepublishesWithoutFlatBestChange(t *testing.T) {
+	childOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	parentOption := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	proxyDialer := newNoopDialer(childOption)
+	unusedFast := newNoopDialer(childOption)
+	child := NewDialerGroup(childOption, "Apple_Proxy", []*dialer.Dialer{proxyDialer, unusedFast}, newEmptyAnnotations(2),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *dialer.NetworkType, bool) {})
+	directDialer := newDirectDialer(childOption, false)
+	direct := NewDialerGroup(childOption, consts.OutboundDirect.String(), []*dialer.Dialer{directDialer}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	var parentPublishes int
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(parentOption, "url-test", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: direct},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+			if !isInit {
+				parentPublishes++
+			}
+		}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer child.Close()
+	defer direct.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	defer proxyDialer.Close()
+	defer unusedFast.Close()
+	defer directDialer.Close()
+
+	unusedView := parent.parentHealthViews[unusedFast]
+	proxyView := parent.parentHealthViews[proxyDialer]
+	directView := parent.parentHealthViews[directDialer]
+	if unusedView == nil || proxyView == nil || directView == nil {
+		t.Fatal("parent did not create health views for nested leaves")
+	}
+	unusedView.MustGetLatencies10(TestNetworkType).AppendLatency(time.Millisecond)
+	proxyView.MustGetLatencies10(TestNetworkType).AppendLatency(100 * time.Millisecond)
+	directView.MustGetLatencies10(TestNetworkType).AppendLatency(10 * time.Millisecond)
+	parentSet := parent.MustGetAliveDialerSet(TestNetworkType)
+	parentSet.NotifyLatencyChange(unusedView, true)
+	parentSet.NotifyLatencyChange(proxyView, true)
+	parentSet.NotifyLatencyChange(directView, true)
+	if got, _ := parentSet.GetMinLatency(nil); got != unusedView {
+		t.Fatalf("flat best = %p, want unused fast view %p", got, unusedView)
+	}
+	if !parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("nested min should advertise kernel-direct while the selected proxy view is slower than DIRECT")
+	}
+
+	before := parentPublishes
+	proxyView.MustGetLatencies10(TestNetworkType).AppendLatency(5 * time.Millisecond)
+	parentSet.NotifyLatencyChange(proxyView, true)
+	if got, _ := parentSet.GetMinLatency(nil); got != unusedView {
+		t.Fatalf("flat best changed to %p, want unused fast view %p", got, unusedView)
+	}
+	if parentPublishes == before {
+		t.Fatal("nested min must republish when a non-best view latency changes the real winner")
+	}
+	if parent.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("nested min must not keep kernel-direct after the selected proxy becomes faster than DIRECT")
 	}
 }
 
