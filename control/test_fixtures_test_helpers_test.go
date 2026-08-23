@@ -38,6 +38,30 @@ func (d *errorDialer) DialContext(context.Context, string, string) (netproxy.Con
 	return nil, d.err
 }
 
+type delayedDialer struct {
+	delay time.Duration
+	inner netproxy.Dialer
+}
+
+func (d *delayedDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
+	time.Sleep(d.delay)
+	return d.inner.DialContext(ctx, network, addr)
+}
+
+func newDelayedTestEndpointDialer(delay time.Duration, conns ...netproxy.Conn) *componentdialer.Dialer {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	return componentdialer.NewDialer(
+		&delayedDialer{delay: delay, inner: &scriptedDialer{conns: conns}},
+		&componentdialer.GlobalOption{
+			Log:           logger,
+			CheckInterval: time.Second,
+		},
+		componentdialer.InstanceOption{DisableCheck: true},
+		&componentdialer.Property{},
+	)
+}
+
 // newTestEndpointDialer builds a componentdialer backed by scriptedDialer.
 // Recovered from udp_endpoint_pool_test.go.
 func newTestEndpointDialer(conns ...netproxy.Conn) *componentdialer.Dialer {
@@ -52,6 +76,14 @@ func newTestEndpointDialer(conns ...netproxy.Conn) *componentdialer.Dialer {
 		componentdialer.InstanceOption{DisableCheck: true},
 		&componentdialer.Property{},
 	)
+}
+
+func newNamedTestEndpointDialer(name string, conns ...netproxy.Conn) *componentdialer.Dialer {
+	d := newTestEndpointDialer(conns...)
+	if p := d.Property(); p != nil {
+		p.Name = name
+	}
+	return d
 }
 
 // newTestEndpointErrorDialer builds a componentdialer backed by errorDialer.
@@ -98,6 +130,26 @@ func newTestFixedOutboundGroup(dialers ...*componentdialer.Dialer) *ob.DialerGro
 			Policy:     consts.DialerSelectionPolicy_Fixed,
 			FixedIndex: 0,
 		},
+		func(bool, *componentdialer.NetworkType, bool) {},
+	)
+}
+
+func newTestOutboundGroup(policy ob.DialerSelectionPolicy, dialers ...*componentdialer.Dialer) *ob.DialerGroup {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	annotations := make([]*componentdialer.Annotation, 0, len(dialers))
+	for range dialers {
+		annotations = append(annotations, &componentdialer.Annotation{})
+	}
+	return ob.NewDialerGroup(
+		&componentdialer.GlobalOption{
+			Log:           logger,
+			CheckInterval: time.Second,
+		},
+		"policy-test",
+		dialers,
+		annotations,
+		policy,
 		func(bool, *componentdialer.NetworkType, bool) {},
 	)
 }

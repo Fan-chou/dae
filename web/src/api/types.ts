@@ -21,6 +21,8 @@ export type AdminGroupMember = {
   name: string;
   alive: boolean;
   latency_ms?: number | null;
+  admission?: "alive" | "degraded" | "dead" | string;
+  reason?: string;
 };
 
 export type AdminGroup = {

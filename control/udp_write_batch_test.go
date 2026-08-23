@@ -12,9 +12,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
+	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
@@ -76,6 +79,68 @@ func (r *batchRecorder) SetWriteDeadline(time.Time) error           { return nil
 
 func newBatchTestEndpoint(rec *batchRecorder) *UdpEndpoint {
 	return &UdpEndpoint{conn: rec}
+}
+
+func dataUDPNetworkType() componentdialer.NetworkType {
+	return componentdialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		UdpHealthDomain: componentdialer.UdpHealthDomainData,
+	}
+}
+
+func newDialerAwareUDPEndpoint(conn netproxy.PacketConn, batched bool) (*UdpEndpoint, *componentdialer.Dialer, *componentdialer.NetworkType) {
+	d := newTestEndpointDialer()
+	typ := dataUDPNetworkType()
+	ue := &UdpEndpoint{
+		conn:                conn,
+		Dialer:              d,
+		endpointNetworkType: typ,
+		lifecycleProfile:    newDataSessionLifecycleProfile(d),
+	}
+	if batched {
+		ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	}
+	return ue, d, &typ
+}
+
+func primeUDPTrafficFails(d *componentdialer.Dialer, typ *componentdialer.NetworkType, n int) {
+	for i := 0; i < n; i++ {
+		d.ReportUnavailable(typ, errors.New("udp write fail"))
+	}
+}
+
+// blockingBatchRecorder holds WriteBatch until release() so tests can observe
+// enqueue-without-flush. The 1ms batch window would otherwise race.
+type blockingBatchRecorder struct {
+	batchRecorder
+	started chan struct{}
+	block   chan struct{}
+}
+
+func newBlockingBatchRecorder() *blockingBatchRecorder {
+	return &blockingBatchRecorder{
+		started: make(chan struct{}),
+		block:   make(chan struct{}),
+	}
+}
+
+func (r *blockingBatchRecorder) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-r.block
+	return r.batchRecorder.WriteBatch(items)
+}
+
+func (r *blockingBatchRecorder) release() {
+	select {
+	case <-r.block:
+	default:
+		close(r.block)
+	}
 }
 
 // TestAggregatorFlushOnFull: the 33rd Append flushes the first 32; the 33rd
@@ -577,5 +642,122 @@ func TestAggregatorFlushNotCorruptedByConcurrentAppend(t *testing.T) {
 	}
 	if got := rec.sentItem(1); !bytes.Equal(got, second) {
 		t.Fatalf("second datagram corrupted: got % x…, want all 0xBB", got[:min(8, len(got))])
+	}
+}
+
+// Enqueue (WriteTo → Append) must not clear the data-UDP write-fail streak.
+// The datagram is still in the user-space batch; only a completed flush is a
+// local send.
+func TestBatchedWriteToEnqueueDoesNotResetTrafficFailCount(t *testing.T) {
+	rec := newBlockingBatchRecorder()
+	ue, d, typ := newDialerAwareUDPEndpoint(rec, true)
+	t.Cleanup(rec.release)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if !d.MustGetAlive(typ) {
+		t.Fatal("49 write failures must keep the node Alive")
+	}
+
+	if _, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo enqueue: %v", err)
+	}
+	go ue.writeBatch.flush()
+	select {
+	case <-rec.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush did not enter WriteBatch")
+	}
+
+	d.ReportUnavailable(typ, errors.New("udp write fail"))
+	if d.MustGetAlive(typ) {
+		t.Fatal("enqueue must not reset the write-fail streak; 50th failure should mark Dead")
+	}
+}
+
+// A completed batched flush is a local send: it breaks the fail streak but
+// must not recover Degraded / Alive from a later single failure.
+func TestBatchedFlushSuccessResetsTrafficFailCount(t *testing.T) {
+	rec := &batchRecorder{}
+	ue, d, typ := newDialerAwareUDPEndpoint(rec, true)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if _, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	ue.writeBatch.flush()
+	if rec.batchCount() != 1 {
+		t.Fatalf("expected 1 flushed batch, got %d", rec.batchCount())
+	}
+
+	d.ReportUnavailable(typ, errors.New("udp write fail"))
+	if !d.MustGetAlive(typ) {
+		t.Fatal("successful flush must reset the write-fail streak")
+	}
+}
+
+// ECONNREFUSED is a hard write failure: it is not soft-tolerated, so a flush
+// error must count toward the 50-fail Dead threshold.
+func TestBatchedFlushHardFailureCountsTowardDead(t *testing.T) {
+	rec := &batchRecorder{err: syscall.ECONNREFUSED}
+	ue, d, typ := newDialerAwareUDPEndpoint(rec, true)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if _, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo enqueue: %v", err)
+	}
+	ue.writeBatch.flush()
+	if d.MustGetAlive(typ) {
+		t.Fatal("hard flush failure must count as the 50th write failure")
+	}
+}
+
+// n>0 with err is a partial send: stamp hasSent, but do not treat it as a
+// local-write success that clears the fail streak.
+func TestBatchedPartialFlushDoesNotResetTrafficFailCount(t *testing.T) {
+	rec := &batchRecorder{err: syscall.ECONNREFUSED, shortN: 1}
+	ue, d, typ := newDialerAwareUDPEndpoint(rec, true)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if _, err := ue.WriteTo([]byte("a"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if _, err := ue.WriteTo([]byte("b"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	ue.writeBatch.flush()
+	if d.MustGetAlive(typ) {
+		t.Fatal("partial flush with hard error must not count as write success")
+	}
+}
+
+// Transient flush errors are tolerated (not reported to the dialer) and also
+// must not reset the fail streak.
+func TestBatchedFlushSoftErrorDoesNotResetTrafficFailCount(t *testing.T) {
+	rec := &batchRecorder{err: errors.New("boom")}
+	ue, d, typ := newDialerAwareUDPEndpoint(rec, true)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if _, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo enqueue: %v", err)
+	}
+	ue.writeBatch.flush()
+	d.ReportUnavailable(typ, errors.New("udp write fail"))
+	if d.MustGetAlive(typ) {
+		t.Fatal("tolerated flush error must not reset the write-fail streak")
+	}
+}
+
+// Synchronous WriteTo (no aggregator) still breaks the fail streak on a
+// completed conn.WriteTo.
+func TestSyncWriteToSuccessResetsTrafficFailCount(t *testing.T) {
+	ue, d, typ := newDialerAwareUDPEndpoint(&mockPacketConn{}, false)
+
+	primeUDPTrafficFails(d, typ, 49)
+	if _, err := ue.WriteTo([]byte("hello"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	d.ReportUnavailable(typ, errors.New("udp write fail"))
+	if !d.MustGetAlive(typ) {
+		t.Fatal("synchronous WriteTo success must reset the write-fail streak")
 	}
 }

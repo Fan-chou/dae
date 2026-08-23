@@ -7,11 +7,14 @@ package control
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
@@ -130,5 +133,118 @@ func TestRouteDialReturnsFailedTcpSelection(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("routeDial() result = nil, want failed selection result")
+	}
+}
+
+func TestRouteDialCanceledDoesNotFailSite(t *testing.T) {
+	dFail, _ := newTestEndpointErrorDialer("hysteria2", "proxy.example:443", context.Canceled)
+	dOk := newTestEndpointDialer()
+	defer dFail.Close()
+	defer dOk.Close()
+	g := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, dFail, dOk)
+	defer g.Close()
+
+	g.PinSite("youtube.com", dFail, false)
+	cp := newTestDialControlPlane(g)
+	_, _, err := cp.routeDial(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "youtube.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:42687"),
+		Dest:     netip.MustParseAddrPort("198.51.100.10:443"),
+		Network:  "tcp",
+	})
+	if err == nil {
+		t.Fatal("routeDial() error = nil, want canceled")
+	}
+
+	nt := &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	selected, _, _, selErr := g.SelectWithExclusionResultForSite(nt, true, nil, "youtube.com")
+	if selErr != nil {
+		t.Fatalf("SelectForSite() error = %v", selErr)
+	}
+	if selected != dFail {
+		t.Fatalf("selected %p after canceled dial, want original pin %p", selected, dFail)
+	}
+}
+
+func TestIdleFinishDoesNotFailSiteOrDegrade(t *testing.T) {
+	d := newTestEndpointDialer()
+	other := newTestEndpointDialer()
+	defer d.Close()
+	defer other.Close()
+	g := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, d, other)
+	defer g.Close()
+
+	g.PinSite("youtube.com", d, false)
+	nt := dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+	flow, err := manager.adoptTCP(
+		&memoryLayoutConn{id: 3},
+		nil,
+		TcpFlowBinding{
+			Egress: TcpEgressBinding{
+				Dialer:        d,
+				Outbound:      g,
+				NetworkType:   nt,
+				SniffedDomain: "youtube.com",
+			},
+		},
+		runtime,
+		nil,
+		netip.MustParseAddrPort("192.0.2.1:1"),
+		netip.MustParseAddrPort("198.51.100.1:443"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow.startUnixNano = time.Now().Add(-4 * time.Second).UnixNano()
+	flow.finish()
+
+	if d.AdmissionState(&nt) == dialer.AdmissionDegraded {
+		t.Fatal("idle finish must not mark the node Degraded")
+	}
+	selected, _, _, selErr := g.SelectWithExclusionResultForSite(&nt, true, nil, "youtube.com")
+	if selErr != nil {
+		t.Fatalf("SelectForSite() error = %v", selErr)
+	}
+	if selected != d {
+		t.Fatalf("selected %p after idle finish, want original pin %p", selected, d)
+	}
+}
+
+func TestRouteDialRetrySuccessRecordsHandshake(t *testing.T) {
+	dFail, _ := newTestEndpointErrorDialer("hysteria2", "proxy.example:443", errors.New("network is unreachable"))
+	dOk := newDelayedTestEndpointDialer(5*time.Millisecond, &memoryLayoutConn{id: 4})
+	defer dFail.Close()
+	defer dOk.Close()
+	g := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, dFail, dOk)
+	defer g.Close()
+
+	cp := newTestDialControlPlane(g)
+	conn, result, err := cp.routeDial(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "youtube.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:42687"),
+		Dest:     netip.MustParseAddrPort("198.51.100.10:443"),
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatalf("routeDial() error = %v", err)
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if result == nil || result.Dialer != dOk {
+		t.Fatalf("retry result dialer = %p, want %p", result.Dialer, dOk)
+	}
+	nt := result.SelectionNetworkTypeObj
+	if nt == nil {
+		t.Fatal("retry result missing selection network type")
+	}
+	if got := dOk.HealthSnapshot().Health[nt.Index()].LastSampleRTT; got <= 0 {
+		t.Fatalf("retry success LastSampleRTT = %v, want recorded handshake", got)
 	}
 }

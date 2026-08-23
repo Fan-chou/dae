@@ -198,8 +198,10 @@ export function mergeLogSnapshots(prev: ParsedLog[], incomingOldestFirst: string
 }
 
 export function policyLabel(policy: string): string {
+  if (policy === "fallback") return "fallback（按序自动）";
   if (policy === "first_alive") return "first_alive（fallback，自动）";
   if (policy === "fixed") return "fixed（select）";
+  if (policy === "url_test") return "url_test（质量自动）";
   if (policy === "min_avg10") return "min_avg10（url-test）";
   if (policy === "min_moving_avg") return "min_moving_avg（url-test）";
   if (policy === "min") return "min（url-test）";
@@ -219,8 +221,73 @@ export function latencyText(alive: boolean, latencyMs?: number | null): string {
   return latencyMs + " ms";
 }
 
+export type MemberAdmission = "alive" | "degraded" | "dead";
+
+export function memberAdmission(member: { admission?: string | null; alive?: boolean }): MemberAdmission {
+  if (member.admission === "degraded") return "degraded";
+  if (member.admission === "dead") return "dead";
+  if (member.admission === "alive") return "alive";
+  return member.alive ? "alive" : "dead";
+}
+
+export function admissionLabel(admission: MemberAdmission): string {
+  if (admission === "degraded") return "变差";
+  if (admission === "dead") return "死亡";
+  return "健康";
+}
+
+export function admissionBadgeClass(admission: MemberAdmission): string {
+  if (admission === "degraded") return "badge badge-warning badge-sm";
+  if (admission === "dead") return "badge badge-error badge-sm";
+  return "badge badge-success badge-sm";
+}
+
+export function admissionReasonLabel(reason?: string | null): string {
+  if (!reason || reason === "ok") return "";
+  return reason
+    .split(",")
+    .map((part) => {
+      if (part === "fail") return "探测/握手/业务失败";
+      if (part === "rtt") return "相对基线变慢";
+      if (part === "congestion") return "拥塞";
+      if (part === "not_alive") return "连续失败已判死";
+      return part;
+    })
+    .join("，");
+}
+
+export function admissionTitle(member: { admission?: string | null; alive?: boolean; reason?: string | null }): string {
+  const admission = memberAdmission(member);
+  const reason = admissionReasonLabel(member.reason);
+  return reason ? admissionLabel(admission) + " · " + reason : admissionLabel(admission);
+}
+
+export function admissionCounts(members?: { admission?: string | null; alive?: boolean }[]): {
+  alive: number;
+  degraded: number;
+  dead: number;
+} {
+  const counts = { alive: 0, degraded: 0, dead: 0 };
+  for (const member of members || []) {
+    counts[memberAdmission(member)] += 1;
+  }
+  return counts;
+}
+
+export function memberCardClass(current: boolean, admission: MemberAdmission): string {
+  if (current) return "border-success bg-base-100";
+  if (admission === "dead") return "border-error/50 hover:border-error";
+  if (admission === "degraded") return "border-warning/50 hover:border-warning";
+  return "border-base-300 hover:border-base-content/40";
+}
+
+export function siteLocalSelectionPolicy(policy?: string): boolean {
+  return policy === "fallback" || policy === "url_test";
+}
+
 export function displayedSelected(group: { selected?: string; policy?: string; members?: { name: string; alive: boolean; latency_ms?: number | null }[] }): string {
   if (group.selected) return group.selected;
+  if (siteLocalSelectionPolicy(group.policy)) return "按站点自动";
   const members = group.members || [];
   if (group.policy === "first_alive") {
     const alive = members.find((m) => m.alive);
@@ -619,9 +686,20 @@ export function trafficForName(rows: ConnectionView[], name: string): TrafficBuc
   return bucket;
 }
 
-export function latencyFingerprint(group: { members?: { name: string; alive: boolean; latency_ms?: number | null }[] }): string {
+export function latencyFingerprint(group: {
+  members?: { name: string; alive: boolean; latency_ms?: number | null; admission?: string | null }[];
+}): string {
   return (group.members || [])
-    .map((member) => member.name + ":" + (member.alive ? "1" : "0") + ":" + String(member.latency_ms ?? ""))
+    .map(
+      (member) =>
+        member.name +
+        ":" +
+        (member.alive ? "1" : "0") +
+        ":" +
+        String(member.latency_ms ?? "") +
+        ":" +
+        String(member.admission ?? ""),
+    )
     .join("|");
 }
 

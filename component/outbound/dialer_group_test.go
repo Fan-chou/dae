@@ -345,6 +345,57 @@ func TestDialerGroup_NestedParentHealthViewRetriesChildAlternative(t *testing.T)
 	}
 }
 
+func TestDialerGroup_NestedFallbackSkipsParentViewDegraded(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaves := []*dialer.Dialer{namedNoopDialer(option, "proxy-a"), namedNoopDialer(option, "proxy-b")}
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "fallback-parent", []NestedDialerGroupMember{
+		{Dialer: leaves[0]},
+		{Dialer: leaves[1]},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback},
+		func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	for _, view := range parent.ParentHealthViewDialers() {
+		defer view.Close()
+	}
+	for _, leaf := range leaves {
+		defer leaf.Close()
+	}
+
+	view := parent.parentHealthViews[leaves[0]]
+	if view == nil {
+		t.Fatal("parent did not create a health view for the first leaf")
+	}
+	view.SetDegradedForTest(TestNetworkType, true)
+	if leaves[0].AdmissionState(TestNetworkType) != dialer.AdmissionAlive {
+		t.Fatal("concrete leaf must stay Alive so the bug is parent-view Degraded")
+	}
+
+	selected, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() error = %v", err)
+	}
+	if selected != leaves[0] {
+		t.Fatalf("selected dialer = %p, want first leaf; RTT-only parent Degraded must not skip fallback order", selected)
+	}
+
+	view.SetFailDegradedForTest(TestNetworkType, true)
+	selected, _, err = parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("parent.Select() after fail-degrade error = %v", err)
+	}
+	if selected != leaves[1] {
+		t.Fatalf("selected dialer = %p, want later Alive parent view %p after fail-degrade", selected, leaves[1])
+	}
+}
+
 func TestDialerGroup_NestedParentHealthViewPreservesFixedSelection(t *testing.T) {
 	option := &dialer.GlobalOption{
 		Log:               log,
@@ -979,6 +1030,116 @@ func TestDialerGroup_Select_FirstAlivePreservesDeclarationOrder(t *testing.T) {
 	}
 }
 
+func TestDialerGroup_Select_FallbackKeepsRTTDegradedFirst(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	})
+	defer g.Close()
+	for _, d := range dialers {
+		defer d.Close()
+	}
+
+	dialers[0].SetDegradedForTest(TestNetworkType, true)
+	if dialers[0].MustGetAlive(TestNetworkType) != true {
+		t.Fatal("degraded dialer must remain BPF/collection alive")
+	}
+	if got := dialers[0].AdmissionState(TestNetworkType); got != dialer.AdmissionDegraded {
+		t.Fatalf("AdmissionState after RTT degrade = %v, want Degraded", got)
+	}
+	if got := dialers[0].FallbackAdmission(TestNetworkType); got != dialer.AdmissionAlive {
+		t.Fatalf("FallbackAdmission after RTT degrade = %v, want Alive", got)
+	}
+	selected, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("selected = %p, want first leaf; RTT-only Degraded must not reorder fallback", selected)
+	}
+}
+
+func TestDialerGroup_Select_FallbackSkipsFailDegradedWhenAliveExists(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	})
+	defer g.Close()
+	for _, d := range dialers {
+		defer d.Close()
+	}
+
+	selected, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("selected = %p, want first Alive dialer", selected)
+	}
+
+	dialers[0].SetFailDegradedForTest(TestNetworkType, true)
+	if dialers[0].MustGetAlive(TestNetworkType) != true {
+		t.Fatal("fail-degraded dialer must remain BPF/collection alive")
+	}
+	selected, _, err = g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() after fail-degrade error = %v", err)
+	}
+	if selected != dialers[1] {
+		t.Fatalf("selected = %p, want later Alive dialer after first fail-degraded", selected)
+	}
+
+	dialers[1].SetFailDegradedForTest(TestNetworkType, true)
+	selected, _, err = g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() when all fail-degraded error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("selected = %p, want first fail-degraded dialer when no Alive remains", selected)
+	}
+
+	dialers[0].SetFailDegradedForTest(TestNetworkType, false)
+	dialers[0].SetDegradedForTest(TestNetworkType, false)
+	selected, _, err = g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() after recover error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("selected = %p, want recovered first Alive dialer", selected)
+	}
+}
+
+func TestDialerGroup_Select_UrlTestUsesQualityPenalty(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_UrlTest,
+	})
+	defer g.Close()
+	for _, d := range dialers {
+		defer d.Close()
+	}
+
+	dialers[0].MustGetLatencies10(TestNetworkType).AppendLatency(10 * time.Millisecond)
+	dialers[1].MustGetLatencies10(TestNetworkType).AppendLatency(40 * time.Millisecond)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[1], true)
+
+	selected, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("selected = %p, want lower-latency dialer", selected)
+	}
+
+	dialers[0].SetDegradedForTest(TestNetworkType, true)
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], true)
+	selected, _, err = g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() after degrade error = %v", err)
+	}
+	if selected != dialers[1] {
+		t.Fatalf("selected = %p, want unpenalized dialer after quality degrade", selected)
+	}
+}
+
 func TestDialerGroup_Select_FirstAliveSkipsDeadAndReturnsNoAlive(t *testing.T) {
 	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
 		Policy: consts.DialerSelectionPolicy_FirstAlive,
@@ -997,6 +1158,24 @@ func TestDialerGroup_Select_FirstAliveSkipsDeadAndReturnsNoAlive(t *testing.T) {
 	set.NotifyLatencyChange(dialers[1], false)
 	if _, _, err := g.Select(TestNetworkType, true); !errors.Is(err, ErrNoAliveDialer) {
 		t.Fatalf("Select() with no alive dialers error = %v, want ErrNoAliveDialer", err)
+	}
+}
+
+func TestDialerGroup_Select_FirstAliveKeepsDegradedLeader(t *testing.T) {
+	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_FirstAlive,
+	})
+	defer g.Close()
+	for _, d := range dialers {
+		defer d.Close()
+	}
+	dialers[0].SetDegradedForTest(TestNetworkType, true)
+	selected, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if selected != dialers[0] {
+		t.Fatalf("first_alive selected = %p, want degraded leader %p", selected, dialers[0])
 	}
 }
 
@@ -1765,6 +1944,136 @@ func TestDialerGroup_KernelFastPathDirectMinDoesNotSampleRandomChild(t *testing.
 		if parent.KernelFastPathDirect(TestNetworkType) {
 			t.Fatal("min must not advertise kernel-direct when the winning member is a random child")
 		}
+	}
+}
+
+func TestDialerGroup_NestedUrlTestHonorsCheckTolerance(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    20 * time.Millisecond,
+	}
+	incumbent := newNoopDialer(option)
+	challenger := newNoopDialer(option)
+	incumbent.MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	challenger.MustGetLatencies10(TestNetworkType).AppendLatency(40 * time.Millisecond)
+	parent, err := NewNestedDialerGroup(option, "url-test", []NestedDialerGroupMember{
+		{Dialer: incumbent},
+		{Dialer: challenger},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+	defer incumbent.Close()
+	defer challenger.Close()
+
+	got, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if got != incumbent {
+		t.Fatalf("nested url_test within check_tolerance selected %p, want incumbent %p", got, incumbent)
+	}
+}
+
+func TestDialerGroup_NestedUrlTestHonorsCheckToleranceWithParentHealthViews(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    20 * time.Millisecond,
+	}
+	incumbent := newNoopDialer(option)
+	challenger := newNoopDialer(option)
+	parent, err := NewNestedDialerGroupWithRuntimeOptions(option, "url-test", []NestedDialerGroupMember{
+		{Dialer: incumbent},
+		{Dialer: challenger},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {}, DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	defer parent.Close()
+	defer incumbent.Close()
+	defer challenger.Close()
+
+	viewInc := parent.parentHealthViews[incumbent]
+	viewCh := parent.parentHealthViews[challenger]
+	if viewInc == nil || viewCh == nil {
+		t.Fatal("parent health views were not created")
+	}
+	viewInc.MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	viewCh.MustGetLatencies10(TestNetworkType).AppendLatency(40 * time.Millisecond)
+	set := parent.MustGetAliveDialerSet(TestNetworkType)
+	set.NotifyLatencyChange(viewCh, true)
+	set.NotifyLatencyChange(viewInc, true)
+
+	got, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+	if got != incumbent {
+		t.Fatalf("nested url_test with parent health views selected %p, want incumbent %p", got, incumbent)
+	}
+}
+
+func TestDialerGroup_NestedUrlTestToleranceIgnoresUnselectedChildLeaf(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    20 * time.Millisecond,
+	}
+	unused := namedNoopDialer(option, "unused-fast")
+	incumbent := namedNoopDialer(option, "incumbent")
+	challenger := namedNoopDialer(option, "challenger")
+	unused.MustGetLatencies10(TestNetworkType).AppendLatency(time.Millisecond)
+	incumbent.MustGetLatencies10(TestNetworkType).AppendLatency(50 * time.Millisecond)
+	challenger.MustGetLatencies10(TestNetworkType).AppendLatency(40 * time.Millisecond)
+
+	childFixed := NewDialerGroup(option, "select-child", []*dialer.Dialer{unused, incumbent}, newEmptyAnnotations(2), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 1,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	childChallenger := NewDialerGroup(option, "challenger-child", []*dialer.Dialer{challenger}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	parent, err := NewNestedDialerGroup(option, "url-test", []NestedDialerGroupMember{
+		{Group: childFixed},
+		{Group: childChallenger},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+	defer childFixed.Close()
+	defer childChallenger.Close()
+	defer unused.Close()
+	defer incumbent.Close()
+	defer challenger.Close()
+
+	parent.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(challenger, false)
+	childChallenger.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(challenger, false)
+	got, _, err := parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() before challenger alive error = %v", err)
+	}
+	if got != incumbent {
+		t.Fatalf("first nested url_test selected %p, want fixed child leaf %p", got, incumbent)
+	}
+
+	parent.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(challenger, true)
+	childChallenger.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(challenger, true)
+	got, _, err = parent.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatalf("Select() after challenger alive error = %v", err)
+	}
+	if got != incumbent {
+		t.Fatalf("nested url_test switched to %p, want incumbent %p despite unused faster sibling", got, incumbent)
 	}
 }
 

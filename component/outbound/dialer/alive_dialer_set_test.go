@@ -7,6 +7,7 @@ package dialer
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -144,5 +145,141 @@ func TestAliveDialerSet_MinNotifiesLatencySampleWithoutBestChange(t *testing.T) 
 	}
 	if notifies == before {
 		t.Fatal("min must notify on a latency sample even when the flat best pointer is unchanged")
+	}
+}
+
+func TestAliveDialerSetUrlTestSelectRefreshesDecayedPenalty(t *testing.T) {
+	networkType := newTestNetworkType()
+	fast := newNamedTestDialer(t, "fast")
+	slow := newNamedTestDialer(t, "slow")
+	set := NewAliveDialerSet(
+		fast.Log,
+		"url-test-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_UrlTest,
+		[]*Dialer{fast, slow},
+		[]*Annotation{{}, {}},
+		func(bool) {},
+		true,
+	)
+	fast.MustGetLatencies10(networkType).AppendLatency(10 * time.Millisecond)
+	slow.MustGetLatencies10(networkType).AppendLatency(50 * time.Millisecond)
+
+	idx := networkType.Index()
+	fast.health.mu.Lock()
+	fast.health.slots[idx].penaltyLevel = 8
+	fast.health.slots[idx].lastPenaltyAt = time.Now()
+	fast.health.mu.Unlock()
+
+	set.NotifyLatencyChange(fast, true)
+	set.NotifyLatencyChange(slow, true)
+	if got, _ := set.GetMinLatency(nil); got != slow {
+		t.Fatalf("cached url_test winner = %p, want penalized-slow %p", got, slow)
+	}
+
+	fast.health.mu.Lock()
+	fast.health.slots[idx].lastPenaltyAt = time.Now().Add(-10 * nodeHealthPenaltyHalfLife)
+	fast.health.mu.Unlock()
+	if got, _ := set.GetMinLatency(nil); got != fast {
+		t.Fatalf("live url_test winner = %p, want decayed-fast %p", got, fast)
+	}
+}
+
+func TestAliveDialerSetUrlTestSelectsAdmittedWithoutSamples(t *testing.T) {
+	networkType := newTestNetworkType()
+	first := newNamedTestDialer(t, "first")
+	second := newNamedTestDialer(t, "second")
+	set := NewAliveDialerSet(
+		first.Log,
+		"url-test-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_UrlTest,
+		[]*Dialer{first, second},
+		[]*Annotation{{}, {}},
+		func(bool) {},
+		true,
+	)
+	got, _ := set.GetMinLatency(nil)
+	if got == nil {
+		t.Fatal("url_test with admitted unscored dialers must still select one")
+	}
+	if got != first {
+		t.Fatalf("cold url_test winner = %p, want first admitted %p", got, first)
+	}
+}
+
+func TestAliveDialerSetUrlTestSelectHonorsCheckTolerance(t *testing.T) {
+	networkType := newTestNetworkType()
+	incumbent := newNamedTestDialer(t, "incumbent")
+	challenger := newNamedTestDialer(t, "challenger")
+	incumbent.MustGetLatencies10(networkType).AppendLatency(50 * time.Millisecond)
+	challenger.MustGetLatencies10(networkType).AppendLatency(40 * time.Millisecond)
+	set := NewAliveDialerSet(
+		incumbent.Log,
+		"url-test-group",
+		networkType,
+		20*time.Millisecond,
+		consts.DialerSelectionPolicy_UrlTest,
+		[]*Dialer{incumbent, challenger},
+		[]*Annotation{{}, {}},
+		func(bool) {},
+		true,
+	)
+	if got, _ := set.GetMinLatency(nil); got != incumbent {
+		t.Fatalf("url_test within check_tolerance winner = %p, want incumbent %p", got, incumbent)
+	}
+}
+
+func TestLatencyBeatsIncumbent(t *testing.T) {
+	if LatencyBeatsIncumbent(5*time.Millisecond, 10*time.Millisecond, 20*time.Millisecond) {
+		t.Fatal("5ms must not beat 10ms when tolerance is 20ms")
+	}
+	if !LatencyBeatsIncumbent(20*time.Millisecond, 50*time.Millisecond, 20*time.Millisecond) {
+		t.Fatal("20ms must beat 50ms when tolerance is 20ms")
+	}
+	nearMax := time.Duration(1<<63 - 1)
+	if LatencyBeatsIncumbent(nearMax-5, nearMax, 10) {
+		t.Fatal("delta 5 must not beat tolerance 10 near MaxInt64")
+	}
+	if !LatencyBeatsIncumbent(time.Duration(math.MinInt64), time.Duration(math.MaxInt64), 10) {
+		t.Fatal("MinInt64 must beat MaxInt64 without overflowing subtraction")
+	}
+}
+
+func TestAliveDialerSetUrlTestKeepsReturnedIncumbentAfterPenaltyClears(t *testing.T) {
+	networkType := newTestNetworkType()
+	incumbent := newNamedTestDialer(t, "cached-incumbent")
+	challenger := newNamedTestDialer(t, "live-winner")
+	incumbent.MustGetLatencies10(networkType).AppendLatency(50 * time.Millisecond)
+	challenger.MustGetLatencies10(networkType).AppendLatency(40 * time.Millisecond)
+	set := NewAliveDialerSet(
+		incumbent.Log,
+		"url-test-returned",
+		networkType,
+		20*time.Millisecond,
+		consts.DialerSelectionPolicy_UrlTest,
+		[]*Dialer{incumbent, challenger},
+		[]*Annotation{{}, {}},
+		func(bool) {},
+		true,
+	)
+	if got, _ := set.GetMinLatency(nil); got != incumbent {
+		t.Fatalf("initial winner = %p, want cached incumbent %p", got, incumbent)
+	}
+
+	now := time.Now()
+	incumbent.health.observeFailure(networkType.Index(), now)
+	if got, _ := set.GetMinLatency(nil); got != challenger {
+		t.Fatalf("after incumbent penalty winner = %p, want challenger %p", got, challenger)
+	}
+
+	now = now.Add(time.Second)
+	incumbent.health.observeProbe(networkType.Index(), true, 50*time.Millisecond, now)
+	now = now.Add(time.Second)
+	incumbent.health.observeProbe(networkType.Index(), true, 50*time.Millisecond, now)
+	if got, _ := set.GetMinLatency(nil); got != challenger {
+		t.Fatalf("after penalty cleared winner = %p, want returned incumbent %p", got, challenger)
 	}
 }

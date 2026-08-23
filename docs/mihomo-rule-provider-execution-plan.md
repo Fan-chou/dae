@@ -437,8 +437,8 @@ feat: add native provider refresh lifecycle
 1. 先保证 sidecar 生成的 groups 经真实 `config.New` round-trip。
 2. 验证 group/member 名称、filter 和 policy 的 parser 语义。
 3. 映射：
-   - `fallback` → 明确的最小延迟/移动平均策略，并标记 approximate；
-   - `url-test` → 现有 `min_avg10` 或等价策略，并用行为测试确认；
+   - `fallback` → `fallback`（声明顺序 + Alive/Degraded/Dead 准入）；
+   - `url-test` → `url_test`（质量分 + tolerance）；
    - `select` → 只有在选择语义明确且顺序稳定时才映射；否则保持 unsupported/approximate，不能伪装成完整兼容。
 4. unknown node、重复 group、nested group、DIRECT、REJECT、proxy-provider 成员必须拒绝或进入明确报告。
 5. 验证生成 group outbound 的存在性和 reload 行为。
@@ -779,9 +779,9 @@ result。`min_moving_avg` 仍保留给原生 dae 配置，不能全局替换。
    parent lazy 只延迟 parent view，不能绕过 child 的 lazy；显式 parent option 必须原样使用，
    不能静默退回 global 配置。parent 的 min-latency policy 在 parent view 已有观测时使用
    parent view latency；冷启动无 parent 观测时保留既有 child selection 作为排序回退。
-6. `url-test` 使用 `min_avg10` 加 `tolerance`；只有单一 `DIRECT` 成员的 `url-test` 映射为
-   `fixed(0)`，因为没有可竞速的选择空间；`fallback` 使用 `first_alive`，不使用 tolerance
-   进行延迟排序；`select` 保存选择但不自动因延迟切换。
+6. `url-test` 使用 `url_test`（质量分 + `check_tolerance`）；只有单一 `DIRECT` 成员的 `url-test` 映射为
+   `fixed(0)`，因为没有可竞速的选择空间；`fallback` 使用同名 `fallback` 策略：声明顺序、跳过 Dead，
+   在后面仍有 Alive 时跳过 Degraded。旧的 `first_alive` / `min_avg10` 仍可用但不含失能语义。
 7. 通过 `config.New` 后，还要检查最终 runtime 的 `CheckInterval`、`CheckTolerance`、
    check URL 和 lazy 状态，防止只验证配置文本而漏掉运行时默认值。
 

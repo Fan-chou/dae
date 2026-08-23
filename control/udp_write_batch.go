@@ -146,42 +146,40 @@ func (a *udpWriteBatchAggregator) flush() {
 		}
 		a.mu.Unlock()
 		if fallbackErr != nil {
-			_ = a.ue.handleWriteError(fallbackErr)
-			if sentAny {
-				// Some datagrams already left the socket; keep the
-				// send timestamp honest even though the rest failed.
-				a.ue.hasSent.Store(true)
-				a.ue.lastSendNano.Store(time.Now().UnixNano())
-			}
+			a.ue.applyBatchedFlushResult(fallbackErr, sentAny)
 			return
 		}
-		a.ue.writeSoftErrorCount.Store(0)
-		a.ue.hasSent.Store(true)
-		a.ue.lastSendNano.Store(time.Now().UnixNano())
+		a.ue.applyBatchedFlushResult(nil, true)
 		return
 	}
 	n, err := bw.WriteBatch(items)
 	a.mu.Unlock()
 
 	if err != nil {
-		_ = a.ue.handleWriteError(err)
-		if n > 0 {
-			a.ue.hasSent.Store(true)
-			a.ue.lastSendNano.Store(time.Now().UnixNano())
-		}
+		a.ue.applyBatchedFlushResult(err, n > 0)
 		return
 	}
 	if n < len(items) {
-		_ = a.ue.handleWriteError(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)))
-		if n > 0 {
-			a.ue.hasSent.Store(true)
-			a.ue.lastSendNano.Store(time.Now().UnixNano())
-		}
+		a.ue.applyBatchedFlushResult(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)), n > 0)
 		return
 	}
-	a.ue.writeSoftErrorCount.Store(0)
-	a.ue.hasSent.Store(true)
-	a.ue.lastSendNano.Store(time.Now().UnixNano())
+	a.ue.applyBatchedFlushResult(nil, true)
+}
+
+func (ue *UdpEndpoint) applyBatchedFlushResult(err error, sentAny bool) {
+	if err != nil {
+		classified := ue.handleWriteError(err)
+		if sentAny {
+			ue.hasSent.Store(true)
+			ue.lastSendNano.Store(time.Now().UnixNano())
+		}
+		ue.reportLocalWriteFailure(classified)
+		return
+	}
+	ue.writeSoftErrorCount.Store(0)
+	ue.hasSent.Store(true)
+	ue.lastSendNano.Store(time.Now().UnixNano())
+	ue.reportLocalWriteSuccess()
 }
 
 // Close flushes any pending batch and disables further appends.

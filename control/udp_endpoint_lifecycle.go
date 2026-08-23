@@ -677,6 +677,9 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	}
 	ue.hasSent.Store(true)
 	ue.lastSendNano.Store(time.Now().UnixNano())
+	// Local send completed. This is not peer reachability: only break the
+	// consecutive write-fail streak, never recover Degraded.
+	ue.reportLocalWriteSuccess()
 	return n, nil
 }
 
@@ -711,6 +714,24 @@ func (ue *UdpEndpoint) handleWriteError(err error) error {
 	}
 	ue.retire()
 	return err
+}
+
+func (ue *UdpEndpoint) reportLocalWriteSuccess() {
+	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+		lifecycle.reportWriteSuccess()
+	}
+}
+
+func (ue *UdpEndpoint) reportLocalWriteFailure(err error) {
+	if err == nil || isUdpEndpointWriteTolerated(err) {
+		return
+	}
+	if errors.IsUDPEndpointNormalClose(err) {
+		return
+	}
+	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+		lifecycle.reportUnavailable(fmt.Errorf("udp endpoint write failed: %w", err))
+	}
 }
 
 func (ue *UdpEndpoint) Close() error {

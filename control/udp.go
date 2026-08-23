@@ -576,9 +576,6 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	}
 	RecordUploadTraffic(int64(len(data)))
 	addUDPFlowUpload(ue, len(data))
-	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
-		lifecycle.reportTrafficSuccess()
-	}
 	return true, nil
 }
 
@@ -840,9 +837,6 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				_, err = ue.WriteTo(data, dialTarget)
 				if err == nil {
 					c.recordUploadTraffic(int64(len(data)))
-					if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
-						lifecycle.reportTrafficSuccess()
-					}
 					return nil
 				}
 				if isUdpEndpointWriteTolerated(err) {
@@ -1253,9 +1247,6 @@ getNew:
 		c.recordUploadTraffic(int64(len(payloads[packetIndex])))
 		addUDPFlowUpload(ue, len(payloads[packetIndex]))
 		packetIndex++
-	}
-	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
-		lifecycle.reportTrafficSuccess()
 	}
 
 	// Print log.

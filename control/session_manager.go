@@ -85,6 +85,7 @@ type FlowRuntime struct {
 	network       string
 	uploadBytes   atomic.Uint64
 	downloadBytes atomic.Uint64
+	firstByte     atomic.Bool
 
 	ingress net.Conn
 	egress  netproxy.Conn
@@ -127,6 +128,7 @@ type UDPFlowRuntime struct {
 	network       string
 	uploadBytes   atomic.Uint64
 	downloadBytes atomic.Uint64
+	firstByte     atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -344,6 +346,14 @@ func (f *FlowRuntime) recordDownload(n int64) {
 		return
 	}
 	f.downloadBytes.Add(uint64(n))
+	if f.firstByte.CompareAndSwap(false, true) && f.binding.Egress.Dialer != nil && f.binding.Egress.NetworkType.L4Proto != "" {
+		ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
+		nt := f.binding.Egress.NetworkType
+		slow := f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
+		if g := f.binding.Egress.Outbound; g != nil {
+			g.PinSite(f.binding.Egress.SniffedDomain, f.binding.Egress.Dialer, slow)
+		}
+	}
 }
 
 func addUDPFlowUpload(ue *UdpEndpoint, n int) {
@@ -361,6 +371,14 @@ func addUDPFlowDownload(ue *UdpEndpoint, n int) {
 	}
 	if rt := ue.sessionRuntime; rt != nil {
 		rt.downloadBytes.Add(uint64(n))
+		if rt.firstByte.CompareAndSwap(false, true) && rt.binding.Egress.Dialer != nil && rt.binding.Egress.NetworkType.L4Proto != "" {
+			ttfb := time.Duration(time.Now().UnixNano() - rt.startUnixNano)
+			nt := rt.binding.Egress.NetworkType
+			slow := rt.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
+			if g := rt.binding.Egress.Outbound; g != nil {
+				g.PinSite(rt.binding.Egress.SniffedDomain, rt.binding.Egress.Dialer, slow)
+			}
+		}
 	}
 }
 
@@ -448,6 +466,12 @@ func (f *FlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
+		if d := f.binding.Egress.Dialer; d != nil && f.binding.Egress.NetworkType.L4Proto != "" {
+			elapsed := time.Duration(time.Now().UnixNano() - f.startUnixNano)
+			nt := f.binding.Egress.NetworkType
+			upload, download := f.uploadBytes.Load(), f.downloadBytes.Load()
+			d.ObserveConnFinished(&nt, elapsed, upload, download)
+		}
 		if f.manager != nil {
 			f.manager.releaseFlow(f)
 			return
@@ -616,6 +640,12 @@ func (f *UDPFlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
+		if d := f.binding.Egress.Dialer; d != nil && f.binding.Egress.NetworkType.L4Proto != "" {
+			elapsed := time.Duration(time.Now().UnixNano() - f.startUnixNano)
+			nt := f.binding.Egress.NetworkType
+			upload, download := f.uploadBytes.Load(), f.downloadBytes.Load()
+			d.ObserveConnFinished(&nt, elapsed, upload, download)
+		}
 		if f.manager != nil {
 			f.manager.releaseUDPFlow(f)
 			return

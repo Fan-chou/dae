@@ -498,9 +498,9 @@ func flatGroupPolicy(groupType string) (policy string, approximate bool, err err
 	case "select":
 		return "fixed(0)", true, nil
 	case "fallback":
-		return "first_alive", true, nil
+		return "fallback", true, nil
 	case "url-test":
-		return "min_avg10", true, nil
+		return "url_test", true, nil
 	default:
 		return "", false, fmt.Errorf("group type %q is unsupported for flat conversion", groupType)
 	}
@@ -520,20 +520,18 @@ func fullMihomoGroupPolicy(groupType string, selectionMembers []string) (string,
 		// Mihomo select identity; fixed(0) is only the safe initial fallback.
 		return policy, false, nil
 	case "fallback":
-		// first_alive follows the generated filter-line order, which matches
-		// the Mihomo proxy list.
+		// Native fallback is declaration order plus Alive/Degraded/Dead
+		// admission. That is the complete-generation mapping, not an
+		// approximation of first_alive.
 		return policy, false, nil
 	case "url-test":
-		// A single DIRECT member has no latency choice to approximate: it is
-		// always the selected member, while the group health options remain
-		// available for observability and reload behavior.
+		// A single DIRECT member has no latency choice: it is always the
+		// selected member. Native url_test covers the remaining cases.
 		if len(selectionMembers) == 1 && selectionMembers[0] == "direct" {
 			return "fixed(0)", false, nil
 		}
-		return policy, approximate, nil
+		return policy, false, nil
 	default:
-		// url-test currently maps to min_avg10 without Mihomo's complete
-		// tolerance/latency semantics, so it remains an explicit approximation.
 		return policy, approximate, nil
 	}
 }

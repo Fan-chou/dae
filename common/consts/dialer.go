@@ -34,6 +34,12 @@ const (
 	DialerSelectionPolicy_MinLastLatency DialerSelectionPolicy = "min"
 	// DialerSelectionPolicy_FirstAlive selects the first alive dialer in declaration order.
 	DialerSelectionPolicy_FirstAlive DialerSelectionPolicy = "first_alive"
+	// DialerSelectionPolicy_Fallback is Mihomo fallback: declaration order,
+	// skipping dead nodes and preferring Alive over Degraded.
+	DialerSelectionPolicy_Fallback DialerSelectionPolicy = "fallback"
+	// DialerSelectionPolicy_UrlTest is Mihomo url-test: lowest quality score
+	// among non-dead nodes, with check_tolerance applied to that score.
+	DialerSelectionPolicy_UrlTest DialerSelectionPolicy = "url_test"
 )
 
 const (

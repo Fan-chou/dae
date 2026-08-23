@@ -1724,7 +1724,7 @@ func validateGeneratedMihomoConfig(nodes, groups, routes []byte) error {
 			if !sameStringList(group.SelectionMembers, selectionFromFilters) {
 				return fmt.Errorf("generated group %q selection metadata does not match filters", group.Name)
 			}
-		case "first_alive":
+		case "first_alive", "fallback", "url_test":
 			if len(group.SelectionMembers) != 0 {
 				return fmt.Errorf("generated group %q has selection metadata without fixed policy", group.Name)
 			}
