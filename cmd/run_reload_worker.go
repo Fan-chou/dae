@@ -38,14 +38,28 @@ type reloadWorker struct {
 
 	// Mutable run state shared with Run's signal loop. Field names mirror
 	// Run's original local variables; the signal loop advances c, conf,
-	// currCancel, and listener after publishing a candidate generation, and
-	// this worker swaps log when a reload changes the log level.
+	// currCancel, and listener after publishing a candidate generation.
+	// Reload reconfigures log in place so Run-scoped closures that captured
+	// the original *logrus.Logger keep the current level.
 	log         *logrus.Logger
 	conf        *config.Config
 	c           *control.ControlPlane
 	currCancel  context.CancelFunc
 	listener    *control.Listener
 	pprofServer *http.Server
+}
+
+// applyReloadLogLevel reconfigures the process logger in place so Run-scoped
+// closures and holders that captured the original *logrus.Logger (initial
+// Serve, admin HTTP, rule-provider lifecycle) pick up the new level without
+// swapping the pointer.
+func applyReloadLogLevel(log *logrus.Logger, level string, disableTimestamp bool) {
+	if log == nil {
+		return
+	}
+	logger.SetLogger(log, level, disableTimestamp, nil)
+	logger.SetLogger(logrus.StandardLogger(), level, disableTimestamp, nil)
+	logrus.SetOutput(log.Out)
 }
 
 // run consumes reload requests until the process exits. It is started once by
@@ -98,13 +112,7 @@ func (w *reloadWorker) run() {
 			}
 			w.log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 		}
-		// New logger.
-		oldLogOutput := w.log.Out
-		w.log = logrus.New()
-		logger.SetLogger(w.log, newConf.Global.LogLevel, disableTimestamp, nil)
-		logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
-		w.log.SetOutput(oldLogOutput) // NOTE: Restore log output after creating new logger during reload.
-		logrus.SetOutput(oldLogOutput)
+		applyReloadLogLevel(w.log, newConf.Global.LogLevel, disableTimestamp)
 		if !req.isSuspend {
 			if deferred := preserveReloadInterfaceBindings(w.conf, newConf); len(deferred) > 0 {
 				w.log.WithField("bindings", strings.Join(deferred, ",")).Warnln("[Reload] Deferring interface removal or role change until cold start to preserve established flows")
