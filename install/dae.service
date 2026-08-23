@@ -24,9 +24,11 @@ LimitNOFILE=1048576
 # -100 means dae is less likely to be killed than normal processes
 OOMScoreAdjust=-100
 
-# Go runtime environment (optional, remove to use system defaults)
-# Uncomment these if you want to limit CPU usage or tune GC
-# Environment=GOMAXPROCS=4
+# Go runtime. Unset GOMAXPROCS pins the scheduler to 1 P (few-core relay
+# default). That is not Go's NumCPU/cgroup auto value — do not delete an
+# override expecting "system defaults".
+# Environment=GOMAXPROCS=4   # fixed override
+# Environment=GOMAXPROCS=    # empty: skip the pin, use Go/cgroup auto parallelism
 # Environment=GOGC=100
 
 # Startup and reload commands
