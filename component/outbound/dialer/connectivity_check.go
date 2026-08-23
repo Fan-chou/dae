@@ -37,12 +37,11 @@ import (
 
 const Timeout = 10 * time.Second
 
-// ErrNoApplicableIP is a sentinel error returned by CheckFunc when the health
-// check target has no DNS record for the requested IP version (e.g. an IPv4-only
-// node has no AAAA record). It is distinguished from a plain (false, nil) skip
-// so that check() can mark the node unavailable for that network type instead
-// of preserving the initial alive=true state and silently routing traffic to a
-// dead path.
+// ErrNoApplicableIP is returned by CheckFunc when this network family has no
+// probe address (tcp_check_url is v4-only, hostname has no AAAA, and so on).
+// That is a missing observation, not a dead node: check() must skip without
+// changing liveness or failCount. Treating it as a failure marks the whole
+// group's v6 eBPF slot dead and new v6 flows are TC_ACT_SHOT.
 var ErrNoApplicableIP = stderrors.New("no applicable IP for this network type")
 
 type UdpHealthDomain uint8
@@ -1162,7 +1161,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		if stderrors.Is(err, context.Canceled) {
 			break
 		}
-		if err == nil || err == ErrNoApplicableIP {
+		if err == nil || stderrors.Is(err, ErrNoApplicableIP) {
 			// No applicable IP or a plain skip; don't retry — the DNS record
 			// will not change between two attempts within the same check cycle.
 			break
@@ -1207,7 +1206,23 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			d.Log.WithFields(fields).Debugln("Connectivity Check")
 		}
 		d.informDialerGroupUpdate(update)
-	} else if err != nil && !stderrors.Is(err, context.Canceled) {
+		return ok, err
+	}
+	if stderrors.Is(err, ErrNoApplicableIP) {
+		// Probe target has no address for this family. Do not count a
+		// failure or flip liveness: that is how a v4-only check URL kills
+		// the group's v6 slot.
+		d.collectionFineMu.Lock()
+		collection := d.mustGetCollection(opts.networkType)
+		collection.LastProbe = DialerProbeObservationSnapshot{
+			CheckedAt: checkedAt,
+			Alive:     collection.Alive.Load(),
+			Message:   err.Error(),
+		}
+		d.collectionFineMu.Unlock()
+		return false, nil
+	}
+	if err != nil && !stderrors.Is(err, context.Canceled) {
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
