@@ -1311,10 +1311,26 @@ func (g *DialerGroup) SelectWithPath(networkType *dialer.NetworkType, strictIpVe
 }
 
 func (g *DialerGroup) selectWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, activateLazy bool, site string, path *selectPathBuilder) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
+	if path == nil && len(g.nestedMembers) != 0 {
+		var scratch selectPathBuilder
+		return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site), activateLazy, site, true, true, &scratch)
+	}
 	return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site), activateLazy, site, true, true, path)
 }
 
 func (g *DialerGroup) selectWithSkip(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, skip map[*dialer.Dialer]struct{}, activateLazy bool, site string, allowLastResort bool, applyHoldDown bool, path *selectPathBuilder) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
+	if path != nil && len(g.nestedMembers) != 0 {
+		path.ensureMemo()
+		if key, ok := nestedMemoKey(g, networkType, excluded, site, strictIpVersion, activateLazy, allowLastResort, applyHoldDown); ok {
+			if hit, found := path.memo.get(key, skip); found {
+				path.restoreMemoPath(hit)
+				return hit.d, hit.latency, hit.network, hit.stable, hit.err
+			}
+			defer func() {
+				path.memo.put(key, path.captureMemo(d, latency, selectedNetworkType, stable, err, skipCopy(skip)))
+			}()
+		}
+	}
 	if activateLazy {
 		g.activateLazyCheck()
 	}
@@ -1394,7 +1410,8 @@ func (g *DialerGroup) selectNested(networkType *dialer.NetworkType, policy Diale
 	return nil, time.Hour, nil, false, ErrNoAliveDialer
 }
 
-func (g *DialerGroup) pickNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, skip map[*dialer.Dialer]struct{}, fixed bool, activateLazy bool, site string, applyHoldDown bool) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, sub selectPathBuilder, err error) {
+func (g *DialerGroup) pickNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, skip map[*dialer.Dialer]struct{}, fixed bool, activateLazy bool, site string, applyHoldDown bool, parent *selectPathBuilder) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, sub selectPathBuilder, err error) {
+	sub = childSelectPath(parent)
 	d, latency, selectedNetworkType, stable, err = g.selectNestedMember(networkType, policy, member, skip, fixed, activateLazy, site, applyHoldDown, &sub)
 	return d, latency, selectedNetworkType, stable, sub, err
 }
@@ -1406,7 +1423,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 			return nil, 0, nil, false, fmt.Errorf("selected nested group member index is out of range")
 		}
 		member := g.nestedMembers[policy.FixedIndex]
-		d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, true, activateLazy, site, applyHoldDown)
+		d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, true, activateLazy, site, applyHoldDown, path)
 		if err == nil {
 			path.adopt(member, &sub)
 		}
@@ -1416,7 +1433,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		start := fastrand.Intn(len(g.nestedMembers))
 		for offset := range len(g.nestedMembers) {
 			member := g.nestedMembers[(start+offset)%len(g.nestedMembers)]
-			d, latency, selectedNetworkType, _, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown)
+			d, latency, selectedNetworkType, _, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown, path)
 			if err == nil {
 				path.adopt(member, &sub)
 				return d, latency, selectedNetworkType, false, nil
@@ -1429,7 +1446,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 
 	case consts.DialerSelectionPolicy_FirstAlive:
 		for _, member := range g.nestedMembers {
-			d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown)
+			d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown, path)
 			if err == nil {
 				path.adopt(member, &sub)
 				return d, latency, selectedNetworkType, stable, nil
@@ -1446,9 +1463,9 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		var degradedLatency time.Duration
 		var degradedStable bool
 		var degradedMember dialerGroupMember
-		var degradedPath selectPathBuilder
+		degradedPath := childSelectPath(path)
 		for _, member := range g.nestedMembers {
-			d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown)
+			d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown, path)
 			if err == nil {
 				if g.nestedLeafFallbackAdmission(d, selectedNetworkType) == dialer.AdmissionAlive {
 					path.adopt(member, &sub)
@@ -1475,14 +1492,17 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
 		consts.DialerSelectionPolicy_UrlTest:
+		needPicks := g.checkTolerance > 0
 		var picks []nestedMinPick
 		var best nestedMinPick
 		best.latency = time.Hour
 		for _, member := range g.nestedMembers {
-			d, latency, memberNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown)
+			d, latency, memberNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown, path)
 			if err == nil {
 				pick := nestedMinPick{d: d, latency: latency, network: memberNetworkType, stable: stable, member: member, path: sub}
-				picks = append(picks, pick)
+				if needPicks {
+					picks = append(picks, pick)
+				}
 				if best.d == nil || latency < best.latency {
 					best = pick
 				}
@@ -1495,7 +1515,9 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		if best.d == nil {
 			return nil, time.Hour, nil, false, ErrNoAliveDialer
 		}
-		best = g.preferNestedIncumbent(networkType, skip, picks, best)
+		if needPicks {
+			best = g.preferNestedIncumbent(networkType, skip, picks, best)
+		}
 		g.storeNestedIncumbent(networkType, best.d)
 		path.adopt(best.member, &best.path)
 		return best.d, best.latency, best.network, best.stable, nil
@@ -1586,7 +1608,7 @@ func (g *DialerGroup) chooseNestedIncumbent(skip map[*dialer.Dialer]struct{}, be
 }
 
 func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy consts.DialerSelectionPolicy, member dialerGroupMember, skip map[*dialer.Dialer]struct{}, fixed bool, activateLazy bool, site string, applyHoldDown bool, path *selectPathBuilder) (*dialer.Dialer, time.Duration, *dialer.NetworkType, bool, error) {
-	var first selectPathBuilder
+	first := childSelectPath(path)
 	d, latency, selectedNetworkType, stable, err := member.selectForNestedGroup(networkType, policy, skip, fixed, activateLazy, site, applyHoldDown, &first)
 	// A non-fixed parent asked this child to skip failed/hold-down leaves.
 	// Fixed children ignore skip by design, so the concrete leaf must be
@@ -1616,7 +1638,7 @@ func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy
 	// child one opportunity to select another concrete leaf before this parent
 	// proceeds to its next declared member. A fixed child remains fixed intent.
 	if member.group != nil && member.group.GetSelectionPolicy() != consts.DialerSelectionPolicy_Fixed {
-		var retry selectPathBuilder
+		retry := childSelectPath(path)
 		retrySkip := mergeDialerSkip(d, skip)
 		d, latency, selectedNetworkType, stable, err = member.selectForNestedGroup(networkType, policy, retrySkip, false, activateLazy, site, applyHoldDown, &retry)
 		if err == nil && !dialerSkipped(d, skip) && g.parentHealthViewAlive(d, selectedNetworkType) {

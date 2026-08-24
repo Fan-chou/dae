@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"container/list"
 	"sync"
 	"time"
 
@@ -37,16 +38,24 @@ type siteStickyEntry struct {
 	converged       bool
 	holdDownUntil   map[*dialer.Dialer]time.Time
 	touchedAt       time.Time
+	lru             *list.Element
+	live            bool
 }
 
 type siteStickyTable struct {
 	mu       sync.Mutex
 	detached bool
 	entries  map[string]*siteStickyEntry
+	liveLRU  *list.List
+	deadLRU  *list.List
 }
 
 func newSiteStickyTable() *siteStickyTable {
-	return &siteStickyTable{entries: make(map[string]*siteStickyEntry)}
+	return &siteStickyTable{
+		entries: make(map[string]*siteStickyEntry),
+		liveLRU: list.New(),
+		deadLRU: list.New(),
+	}
 }
 
 func (t *siteStickyTable) detach() {
@@ -57,6 +66,8 @@ func (t *siteStickyTable) detach() {
 	defer t.mu.Unlock()
 	t.detached = true
 	t.entries = nil
+	t.liveLRU = nil
+	t.deadLRU = nil
 }
 
 func usesSiteStickyPolicy(policy consts.DialerSelectionPolicy) bool {
@@ -109,6 +120,44 @@ type selectPathBuilder struct {
 	n            int
 	inline       [selectPathInlineCap]*siteStickyTable
 	extra        []*siteStickyTable
+	memo         *nestedSelectMemo
+}
+
+// nestedSelectMemo reuses one nested group's Select result inside a single
+// top-level Select. Shared child groups form a DAG; without this, url_test
+// walks every root-to-leaf path as a tree. Hits stay in a slice: unique
+// groups in one Select are O(nodes), so a map would cost more than it saves.
+type nestedSelectMemo struct {
+	hits []nestedSelectMemoHit
+}
+
+type nestedSelectMemoHit struct {
+	key nestedSelectMemoKey
+	val nestedSelectMemoVal
+}
+
+type nestedSelectMemoKey struct {
+	group           *DialerGroup
+	network         dialer.NetworkType
+	site            string
+	excluded        *dialer.Dialer
+	strictIpVersion bool
+	activateLazy    bool
+	allowLastResort bool
+	applyHoldDown   bool
+}
+
+type nestedSelectMemoVal struct {
+	d            *dialer.Dialer
+	latency      time.Duration
+	network      *dialer.NetworkType
+	stable       bool
+	err          error
+	nestedMember string
+	n            int
+	inline       [selectPathInlineCap]*siteStickyTable
+	extra        []*siteStickyTable
+	skip         []*dialer.Dialer
 }
 
 func (p SelectPath) HasSiteSticky() bool {
@@ -254,6 +303,128 @@ func (p *selectPathBuilder) take(src *selectPathBuilder) {
 		return
 	}
 	*p = *src
+}
+
+func (p *selectPathBuilder) ensureMemo() {
+	if p == nil {
+		return
+	}
+	if p.memo == nil {
+		p.memo = &nestedSelectMemo{}
+	}
+}
+
+func childSelectPath(parent *selectPathBuilder) selectPathBuilder {
+	var child selectPathBuilder
+	if parent != nil {
+		child.memo = parent.memo
+	}
+	return child
+}
+
+func skipCopy(skip map[*dialer.Dialer]struct{}) []*dialer.Dialer {
+	if len(skip) == 0 {
+		return nil
+	}
+	members := make([]*dialer.Dialer, 0, len(skip))
+	for d := range skip {
+		members = append(members, d)
+	}
+	return members
+}
+
+func skipMemoEqual(stored []*dialer.Dialer, skip map[*dialer.Dialer]struct{}) bool {
+	if len(stored) != len(skip) {
+		return false
+	}
+	for _, d := range stored {
+		if _, ok := skip[d]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func skipSliceEqual(a, b []*dialer.Dialer) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, d := range a {
+		found := false
+		for _, e := range b {
+			if d == e {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func nestedMemoKey(g *DialerGroup, networkType *dialer.NetworkType, excluded *dialer.Dialer, site string, strictIpVersion, activateLazy, allowLastResort, applyHoldDown bool) (nestedSelectMemoKey, bool) {
+	if g == nil || networkType == nil {
+		return nestedSelectMemoKey{}, false
+	}
+	return nestedSelectMemoKey{
+		group:           g,
+		network:         *networkType,
+		site:            site,
+		excluded:        excluded,
+		strictIpVersion: strictIpVersion,
+		activateLazy:    activateLazy,
+		allowLastResort: allowLastResort,
+		applyHoldDown:   applyHoldDown,
+	}, true
+}
+
+func (p *selectPathBuilder) restoreMemoPath(v nestedSelectMemoVal) {
+	if p == nil {
+		return
+	}
+	p.NestedMember = v.nestedMember
+	p.n = v.n
+	p.inline = v.inline
+	p.extra = v.extra
+}
+
+func (p *selectPathBuilder) captureMemo(d *dialer.Dialer, latency time.Duration, network *dialer.NetworkType, stable bool, err error, skip []*dialer.Dialer) nestedSelectMemoVal {
+	v := nestedSelectMemoVal{d: d, latency: latency, network: network, stable: stable, err: err, skip: skip}
+	if p == nil {
+		return v
+	}
+	v.nestedMember = p.NestedMember
+	v.n = p.n
+	v.inline = p.inline
+	v.extra = p.extra
+	return v
+}
+
+func (m *nestedSelectMemo) get(key nestedSelectMemoKey, skip map[*dialer.Dialer]struct{}) (nestedSelectMemoVal, bool) {
+	if m == nil {
+		return nestedSelectMemoVal{}, false
+	}
+	for i := range m.hits {
+		if m.hits[i].key == key && skipMemoEqual(m.hits[i].val.skip, skip) {
+			return m.hits[i].val, true
+		}
+	}
+	return nestedSelectMemoVal{}, false
+}
+
+func (m *nestedSelectMemo) put(key nestedSelectMemoKey, v nestedSelectMemoVal) {
+	if m == nil {
+		return
+	}
+	for i := range m.hits {
+		if m.hits[i].key == key && skipSliceEqual(m.hits[i].val.skip, v.skip) {
+			m.hits[i].val = v
+			return
+		}
+	}
+	m.hits = append(m.hits, nestedSelectMemoHit{key: key, val: v})
 }
 
 func (g *DialerGroup) now() time.Time {
@@ -409,6 +580,7 @@ func (t *siteStickyTable) pin(site string, d *dialer.Dialer, now time.Time, slow
 		entry = &siteStickyEntry{holdDownUntil: make(map[*dialer.Dialer]time.Time), touchedAt: now}
 		t.entries[key] = entry
 	}
+	defer t.touchLocked(key, entry)
 	entry.touchedAt = now
 	if until, ok := entry.holdDownUntil[d]; ok && now.Before(until) && entry.leaf != nil && entry.leaf != d && !entry.probeArmed {
 		return
@@ -464,6 +636,7 @@ func (t *siteStickyTable) fail(site string, d *dialer.Dialer, now time.Time) {
 		entry = &siteStickyEntry{holdDownUntil: make(map[*dialer.Dialer]time.Time), touchedAt: now}
 		t.entries[key] = entry
 	}
+	defer t.touchLocked(key, entry)
 	entry.touchedAt = now
 	entry.holdDown(d, now)
 	if entry.leaf == d {
@@ -523,7 +696,7 @@ func (t *siteStickyTable) lookupLocked(key string, now time.Time) *siteStickyEnt
 	}
 	stamp := entry.activityStamp()
 	if !stamp.IsZero() && now.Sub(stamp) > siteStickyTTL && !entry.hasActiveHoldDown(now) {
-		delete(t.entries, key)
+		t.removeLocked(key)
 		return nil
 	}
 	for d, until := range entry.holdDownUntil {
@@ -532,32 +705,75 @@ func (t *siteStickyTable) lookupLocked(key string, now time.Time) *siteStickyEnt
 		}
 	}
 	if entry.leaf == nil && len(entry.holdDownUntil) == 0 {
-		delete(t.entries, key)
+		t.removeLocked(key)
 		return nil
 	}
+	t.touchLocked(key, entry)
 	return entry
+}
+
+func (t *siteStickyTable) unlinkLocked(entry *siteStickyEntry) {
+	if entry == nil || entry.lru == nil {
+		return
+	}
+	if entry.live && t.liveLRU != nil {
+		t.liveLRU.Remove(entry.lru)
+	} else if !entry.live && t.deadLRU != nil {
+		t.deadLRU.Remove(entry.lru)
+	}
+	entry.lru = nil
+}
+
+func (t *siteStickyTable) removeLocked(key string) {
+	entry := t.entries[key]
+	if entry != nil {
+		t.unlinkLocked(entry)
+	}
+	delete(t.entries, key)
+}
+
+func (t *siteStickyTable) touchLocked(key string, entry *siteStickyEntry) {
+	if t == nil || entry == nil || key == "" {
+		return
+	}
+	live := entry.leaf != nil
+	if t.liveLRU == nil {
+		t.liveLRU = list.New()
+	}
+	if t.deadLRU == nil {
+		t.deadLRU = list.New()
+	}
+	if entry.lru != nil && entry.live == live {
+		if live {
+			t.liveLRU.MoveToFront(entry.lru)
+		} else {
+			t.deadLRU.MoveToFront(entry.lru)
+		}
+		return
+	}
+	t.unlinkLocked(entry)
+	entry.live = live
+	if live {
+		entry.lru = t.liveLRU.PushFront(key)
+		return
+	}
+	entry.lru = t.deadLRU.PushFront(key)
 }
 
 func (t *siteStickyTable) evictLocked(now time.Time) {
 	if t == nil || len(t.entries) < siteStickyMaxEntries {
 		return
 	}
-	var oldestKey string
-	var oldest time.Time
-	first := true
-	for key, entry := range t.entries {
-		stamp := entry.activityStamp()
-		if stamp.IsZero() {
-			stamp = now
-		}
-		if first || stamp.Before(oldest) {
-			oldestKey = key
-			oldest = stamp
-			first = false
+	if t.deadLRU != nil {
+		if back := t.deadLRU.Back(); back != nil {
+			t.removeLocked(back.Value.(string))
+			return
 		}
 	}
-	if oldestKey != "" {
-		delete(t.entries, oldestKey)
+	if t.liveLRU != nil {
+		if back := t.liveLRU.Back(); back != nil {
+			t.removeLocked(back.Value.(string))
+		}
 	}
 }
 
@@ -623,6 +839,7 @@ func (t *siteStickyTable) hit(site string, excluded *dialer.Dialer, now time.Tim
 	}
 	if member != nil && !member(entry.leaf) {
 		entry.leaf = nil
+		t.touchLocked(key, entry)
 		return nil, nil, false
 	}
 	if entry.leaf == excluded {
@@ -634,6 +851,7 @@ func (t *siteStickyTable) hit(site string, excluded *dialer.Dialer, now time.Tim
 		entry.leaf = nil
 		entry.consecutiveSlow = 0
 		entry.probeNext = false
+		t.touchLocked(key, entry)
 		return nil, failed, false
 	}
 	if entry.probeNext {

@@ -1081,3 +1081,170 @@ func TestInternSelectPathSkipsEmptyTables(t *testing.T) {
 		t.Fatalf("interned %d paths, want none for NestedMember-only tokens", n)
 	}
 }
+
+func TestDialerGroup_SharedUrlTestDiamondDoesNotExplode(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := namedNoopDialer(option, "leaf")
+	defer leaf.Close()
+	shared, err := NewNestedDialerGroup(option, "shared", []NestedDialerGroupMember{
+		{Dialer: leaf},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("shared: %v", err)
+	}
+	defer shared.Close()
+	left, right := shared, shared
+	const depth = 8
+	for i := 0; i < depth; i++ {
+		l, err := NewNestedDialerGroup(option, fmt.Sprintf("L%d", i), []NestedDialerGroupMember{
+			{Group: left}, {Group: right},
+		}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+		if err != nil {
+			t.Fatalf("L%d: %v", i, err)
+		}
+		defer l.Close()
+		r, err := NewNestedDialerGroup(option, fmt.Sprintf("R%d", i), []NestedDialerGroupMember{
+			{Group: left}, {Group: right},
+		}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+		if err != nil {
+			t.Fatalf("R%d: %v", i, err)
+		}
+		defer r.Close()
+		left, right = l, r
+	}
+	root, err := NewNestedDialerGroup(option, "root", []NestedDialerGroupMember{
+		{Group: left}, {Group: right},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	defer root.Close()
+
+	selected, _, _, _, err := root.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if selected != leaf {
+		t.Fatalf("selected %p, want shared leaf %p", selected, leaf)
+	}
+	allocs := testing.AllocsPerRun(50, func() {
+		_, _, _, _, err := root.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 2000 {
+		t.Fatalf("diamond SelectWithPath allocs = %.1f, want <= 2000 (shared children must be memoized, not expanded as 2^depth)", allocs)
+	}
+}
+
+func TestNestedSelectMemoCachesLargeSkip(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leaf := namedNoopDialer(option, "leaf")
+	defer leaf.Close()
+	shared, err := NewNestedDialerGroup(option, "shared", []NestedDialerGroupMember{
+		{Dialer: leaf},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("shared: %v", err)
+	}
+	defer shared.Close()
+	left, err := NewNestedDialerGroup(option, "left", []NestedDialerGroupMember{
+		{Group: shared}, {Group: shared},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("left: %v", err)
+	}
+	defer left.Close()
+	right, err := NewNestedDialerGroup(option, "right", []NestedDialerGroupMember{
+		{Group: shared}, {Group: shared},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("right: %v", err)
+	}
+	defer right.Close()
+	root, err := NewNestedDialerGroup(option, "root", []NestedDialerGroupMember{
+		{Group: left}, {Group: right},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_UrlTest}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	defer root.Close()
+
+	skip := make(map[*dialer.Dialer]struct{}, 5)
+	for i := 0; i < 5; i++ {
+		d := namedNoopDialer(option, fmt.Sprintf("held-%d", i))
+		defer d.Close()
+		skip[d] = struct{}{}
+	}
+	var b selectPathBuilder
+	selected, _, _, _, err := root.selectWithSkip(TestNetworkType, true, nil, skip, true, "youtube.com", true, true, &b)
+	if err != nil {
+		t.Fatalf("selectWithSkip large skip: %v", err)
+	}
+	if selected != leaf {
+		t.Fatalf("selected %p, want %p", selected, leaf)
+	}
+	allocs := testing.AllocsPerRun(50, func() {
+		var path selectPathBuilder
+		_, _, _, _, err := root.selectWithSkip(TestNetworkType, true, nil, skip, true, "youtube.com", true, true, &path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 2000 {
+		t.Fatalf("large-skip diamond allocs = %.1f, want <= 2000 (skip>4 must still memoize shared children)", allocs)
+	}
+}
+
+func TestSiteStickyDeadHitEvictedBeforeLivePins(t *testing.T) {
+	table := newSiteStickyTable()
+	now := time.Unix(1_700_000_000, 0)
+	live := &dialer.Dialer{}
+	still := func(*dialer.Dialer) bool { return true }
+	for i := 0; i < siteStickyMaxEntries; i++ {
+		table.pin(fmt.Sprintf("n%d.com", i), live, now, false, still)
+	}
+	d, extra, hit := table.hit("n0.com", nil, now, nil, func(*dialer.Dialer) bool { return false })
+	if hit || d != nil || extra != nil {
+		t.Fatalf("member-false hit = (%v,%v,%v), want miss that clears the pin", d, extra, hit)
+	}
+	table.pin("newest.com", live, now, false, still)
+	if _, ok := table.entries[SiteKey("n0.com")]; ok {
+		t.Fatal("cleared sticky hit should be evicted before live pins")
+	}
+	if _, ok := table.entries[SiteKey("newest.com")]; !ok {
+		t.Fatal("newest pin should survive eviction")
+	}
+}
+
+func TestSiteStickyDeadAdmitEvictedBeforeLivePins(t *testing.T) {
+	table := newSiteStickyTable()
+	now := time.Unix(1_700_000_000, 0)
+	live := &dialer.Dialer{}
+	still := func(*dialer.Dialer) bool { return true }
+	for i := 0; i < siteStickyMaxEntries; i++ {
+		table.pin(fmt.Sprintf("n%d.com", i), live, now, false, still)
+	}
+	d, extra, hit := table.hit("n0.com", nil, now, func(*dialer.Dialer) bool { return false }, still)
+	if hit || d != nil || extra != live {
+		t.Fatalf("admit-false hit = (%v,%v,%v), want cleared pin as extra exclude", d, extra, hit)
+	}
+	table.pin("newest.com", live, now, false, still)
+	if _, ok := table.entries[SiteKey("n0.com")]; ok {
+		t.Fatal("admit-cleared sticky hit should be evicted before live pins")
+	}
+	if _, ok := table.entries[SiteKey("newest.com")]; !ok {
+		t.Fatal("newest pin should survive eviction")
+	}
+}

@@ -67,10 +67,10 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 Existing config files keep parsing, but the following defaults and semantics
 changed. Review them before upgrading:
 
-- `fallback` / `url_test` groups no longer expose a single group-wide selected
-  member on the admin API or Web UI (selection is per-site). Mihomo rule sync
-  maps `fallback` → `fallback` and `url-test` → `url_test` instead of
-  approximating them as `first_alive` / `min_avg10`.
+- `fallback` / `url_test` groups still expose a group-default `selected` on the
+  admin API and Web UI (the no-site Peek/Select result), labeled as varying by
+  site. Mihomo rule sync maps `fallback` → `fallback` and `url-test` →
+  `url_test` instead of approximating them as `first_alive` / `min_avg10`.
 - A local UDP `WriteTo` / batch enqueue success is not peer reachability.
   Only a real reply recovers Degraded / the loss window; a completed local
   send only breaks the consecutive write-fail streak.
