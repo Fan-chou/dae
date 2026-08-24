@@ -421,16 +421,18 @@ func (h *nodeHealth) observeFailure(idx int, now time.Time) {
 	slot.raisePenalty(now)
 }
 
-func (h *nodeHealth) pushSpeed(idx int, bps uint64, now time.Time) {
+func (h *nodeHealth) pushSpeed(idx int, bps uint64, now time.Time) (changed bool) {
 	if bps == 0 {
-		return
+		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	slot := h.slotLocked(idx)
 	if slot == nil {
-		return
+		return false
 	}
+	prevCongested := slot.congested
+	prevDegraded := slot.degraded
 	slot.currentSpeed = bps
 	slot.currentAt = now
 	decayed := slot.decayedPeak(now)
@@ -439,26 +441,29 @@ func (h *nodeHealth) pushSpeed(idx int, bps uint64, now time.Time) {
 		slot.peakAt = now
 	}
 	h.maybeUpdateCongestion(idx, slot, now)
+	return slot.congested != prevCongested || slot.degraded != prevDegraded
 }
 
-func (h *nodeHealth) observeConnFinished(idx int, elapsed time.Duration, upload, download uint64, now time.Time) {
+func (h *nodeHealth) observeConnFinished(idx int, elapsed time.Duration, upload, download uint64, now time.Time) (changed bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	slot := h.slotLocked(idx)
 	if slot == nil {
-		return
+		return false
 	}
 	// Idle close, browser preconnect, AbortAll, and reload all finish with
 	// zero bytes. That is not an outbound failure; only explicit I/O errors
 	// and ObserveSilentFailure may record a negative sample.
 	total := upload + download
 	if elapsed < nodeHealthMinSpeedElapsed || total < nodeHealthMinSpeedBytes {
-		return
+		return false
 	}
 	bps := uint64(float64(total) / elapsed.Seconds())
 	if bps == 0 {
-		return
+		return false
 	}
+	prevCongested := slot.congested
+	prevDegraded := slot.degraded
 	slot.currentSpeed = bps
 	slot.currentAt = now
 	decayed := slot.decayedPeak(now)
@@ -467,6 +472,7 @@ func (h *nodeHealth) observeConnFinished(idx int, elapsed time.Duration, upload,
 		slot.peakAt = now
 	}
 	h.maybeUpdateCongestion(idx, slot, now)
+	return slot.congested != prevCongested || slot.degraded != prevDegraded
 }
 
 func (h *nodeHealth) setDegradedForTest(idx int, degraded bool) {

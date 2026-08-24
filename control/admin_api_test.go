@@ -7,12 +7,15 @@ package control
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
 	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
 )
 
 func TestAdminGroupsOmitsBuiltinAndNodeLinks(t *testing.T) {
@@ -274,5 +277,54 @@ func TestAdminGroupsReportsAdmissionStates(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"admission":"degraded"`) {
 		t.Fatalf("JSON missing degraded admission: %s", body)
+	}
+}
+
+func TestAdminGroupsResolvesNestedMemberHealthAndSelection(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	option := &componentdialer.GlobalOption{Log: logger, CheckInterval: time.Second}
+	annos := []*componentdialer.Annotation{{}, {}}
+	child := outbound.NewDialerGroup(option, "proxy-child", []*componentdialer.Dialer{a, b}, annos, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *componentdialer.NetworkType, bool) {})
+	t.Cleanup(func() { child.Close() })
+	parent, err := outbound.NewNestedDialerGroup(option, "stream", []outbound.NestedDialerGroupMember{{Group: child}}, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *componentdialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	t.Cleanup(func() { parent.Close() })
+
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{parent, child},
+			groupSelectionMembers: map[string][]string{
+				parent.Name: {child.Name},
+				child.Name:  {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	byName := map[string]AdminGroup{}
+	for _, group := range groups {
+		byName[group.Name] = group
+	}
+	stream, ok := byName["stream"]
+	if !ok {
+		t.Fatalf("groups = %#v, want stream parent", groups)
+	}
+	if len(stream.Members) != 1 || stream.Members[0].Name != "proxy-child" {
+		t.Fatalf("stream members = %#v, want nested child name", stream.Members)
+	}
+	if !stream.Members[0].Alive {
+		t.Fatalf("nested child shown dead: %#v", stream.Members[0])
+	}
+	if stream.Selected != "proxy-child" {
+		t.Fatalf("stream selected = %q, want proxy-child", stream.Selected)
 	}
 }

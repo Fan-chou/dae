@@ -34,14 +34,17 @@ type proxyDialParam struct {
 }
 
 type proxyDialResult struct {
-	OutboundIndex           consts.OutboundIndex
-	Outbound                *ob.DialerGroup
-	Dialer                  *dialer.Dialer
-	DialTarget              string
-	Network                 string
-	Mark                    uint32
-	Must                    bool
-	SniffedDomain           string
+	OutboundIndex consts.OutboundIndex
+	Outbound      *ob.DialerGroup
+	Dialer        *dialer.Dialer
+	DialTarget    string
+	Network       string
+	Mark          uint32
+	Must          bool
+	SniffedDomain string
+	// StickySite is the fallback/url_test pin key. It may be a dest IP when
+	// the flow has no sniffed name; it must not replace SniffedDomain.
+	StickySite              string
 	IsDialIp                bool
 	OrigNetworkType         string
 	SelectionNetworkType    string
@@ -118,7 +121,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	fakeDest := c.destIsFakeIP(dst.Addr())
-	domain = stickySelectHost(domain, dst.Addr(), fakeDest)
+	stickySite := stickySelectHost(domain, dst.Addr(), fakeDest)
 	if fakeDest {
 		// Kernel tproxy always marks FakeIP as 0xFD, but a stale conn_state
 		// DIRECT/group result must not skip name-based reroute.
@@ -211,12 +214,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	strictIpVersion := dialIp
-	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResultForSite(selectionNetworkType, strictIpVersion, p.Excluded, domain)
+	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResultForSite(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
-		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResultForSite(altType, false, p.Excluded, domain)
+		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResultForSite(altType, false, p.Excluded, stickySite)
 		if err == nil {
 			selectionNetworkType = altType
 		}
@@ -256,6 +259,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			return common.MagicNetwork(p.Network, mark, c.mptcp)
 		}(),
 		SniffedDomain:           domain,
+		StickySite:              stickySite,
 		Mark:                    mark,
 		Must:                    must,
 		IsDialIp:                strictIpVersion,
@@ -340,16 +344,31 @@ func stickySelectHost(domain string, dst netip.Addr, fakeIP bool) string {
 }
 
 func siteFailDomain(res *proxyDialResult, domain string) string {
-	if res != nil && res.SniffedDomain != "" {
-		return res.SniffedDomain
+	if res != nil {
+		if res.StickySite != "" {
+			return res.StickySite
+		}
+		if res.SniffedDomain != "" {
+			return res.SniffedDomain
+		}
 	}
 	return domain
+}
+
+func pinSiteSubject(sticky, sniffed string) string {
+	if sticky != "" {
+		return sticky
+	}
+	return sniffed
 }
 
 func (c *ControlPlane) canExcludeSlowHandshake(res *proxyDialResult) bool {
 	if res == nil || res.Outbound == nil || res.Dialer == nil || res.SelectionNetworkTypeObj == nil {
 		return false
 	}
-	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.SniffedDomain)
+	if !res.Outbound.HasSiteStickyFor(res.Dialer) {
+		return false
+	}
+	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.StickySite)
 	return err == nil && d != nil && d != res.Dialer
 }

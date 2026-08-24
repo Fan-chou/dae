@@ -30,6 +30,7 @@ type TcpEgressBinding struct {
 	Network       string
 	NetworkType   dialer.NetworkType
 	SniffedDomain string
+	StickySite    string
 	IsDialIp      bool
 }
 
@@ -55,6 +56,7 @@ func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult,
 		Target:        result.DialTarget,
 		Network:       result.Network,
 		SniffedDomain: result.SniffedDomain,
+		StickySite:    result.StickySite,
 		IsDialIp:      result.IsDialIp,
 	}
 	if result.SelectionNetworkTypeObj != nil {

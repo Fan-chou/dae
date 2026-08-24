@@ -44,6 +44,7 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 		Mark:                    42,
 		Must:                    true,
 		SniffedDomain:           "example.com",
+		StickySite:              "example.com",
 		IsDialIp:                true,
 		SelectionNetworkTypeObj: &networkType,
 	}
@@ -52,7 +53,7 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 	if binding.Route.PolicyEpoch != identity.Epoch() || binding.Route.Outbound != result.OutboundIndex || binding.Route.Mark != result.Mark || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
-	if binding.Egress.Dialer != d || binding.Egress.Outbound != outbound || binding.Egress.Target != result.DialTarget || binding.Egress.Network != result.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != result.SniffedDomain || !binding.Egress.IsDialIp || binding.Mac != [6]uint8{2, 0, 0, 0, 0, 1} {
+	if binding.Egress.Dialer != d || binding.Egress.Outbound != outbound || binding.Egress.Target != result.DialTarget || binding.Egress.Network != result.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != result.SniffedDomain || binding.Egress.StickySite != result.StickySite || !binding.Egress.IsDialIp || binding.Mac != [6]uint8{2, 0, 0, 0, 0, 1} {
 		t.Fatalf("egress binding = %+v", binding.Egress)
 	}
 

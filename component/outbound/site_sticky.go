@@ -67,6 +67,14 @@ func (g *DialerGroup) usesSiteSticky() bool {
 	return g != nil && usesSiteStickyPolicy(g.GetSelectionPolicy())
 }
 
+// HasSiteStickyFor reports whether this group or a nested descendant that
+// contains d actually keeps a per-site pin table. Slow-handshake retry must
+// use this, not the top-level policy: first_alive/min/random have no pin, so
+// switching would be a one-shot extra dial that the next connection forgets.
+func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer) bool {
+	return len(g.collectStickyTablesContaining(d)) > 0
+}
+
 func (g *DialerGroup) now() time.Time {
 	if g != nil && g.nowFn != nil {
 		return g.nowFn()

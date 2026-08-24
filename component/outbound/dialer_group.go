@@ -374,6 +374,86 @@ func (g *DialerGroup) nestedConcreteDialers() []*dialer.Dialer {
 	return g.Dialers
 }
 
+func dialerName(d *dialer.Dialer) string {
+	if d == nil || d.Property() == nil {
+		return ""
+	}
+	return d.Property().Name
+}
+
+// NestedGroupNamed returns the direct nested child group with this name.
+func (g *DialerGroup) NestedGroupNamed(name string) *DialerGroup {
+	if g == nil || name == "" {
+		return nil
+	}
+	for _, member := range g.nestedMembers {
+		if member.group != nil && member.group.Name == name {
+			return member.group
+		}
+	}
+	return nil
+}
+
+// DialerNamed returns this group's dialer instance for name, preferring a
+// parent health clone when the group has a nested health layer.
+func (g *DialerGroup) DialerNamed(name string) *dialer.Dialer {
+	if g == nil || name == "" {
+		return nil
+	}
+	for concrete, view := range g.parentHealthViews {
+		if dialerName(view) == name || dialerName(concrete) == name {
+			if view != nil {
+				return view
+			}
+			return concrete
+		}
+	}
+	for _, d := range g.nestedConcreteDialers() {
+		if dialerName(d) != name {
+			continue
+		}
+		if view := g.parentHealthViewForConcrete(d); view != nil {
+			return view
+		}
+		return d
+	}
+	for _, d := range g.Dialers {
+		if dialerName(d) == name {
+			return d
+		}
+	}
+	return nil
+}
+
+// NestedMemberNameFor maps a selected leaf back to the parent member identity
+// stored in groupSelectionMembers: a child group name, or a direct leaf name.
+func (g *DialerGroup) NestedMemberNameFor(d *dialer.Dialer) string {
+	if g == nil || d == nil {
+		return ""
+	}
+	for _, member := range g.nestedMembersContaining(d) {
+		if member.group != nil {
+			return member.group.Name
+		}
+		if name := dialerName(member.dialer); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// HealthViewOf returns the parent-owned health clone of a nested leaf when
+// one exists. Admin/status must read this clone, not the child's dialer.
+func (g *DialerGroup) HealthViewOf(d *dialer.Dialer) *dialer.Dialer {
+	if g == nil || d == nil {
+		return d
+	}
+	if view := g.parentHealthViewForConcrete(d); view != nil {
+		return view
+	}
+	return d
+}
+
 // ParentHealthViewDialers returns the parent-owned dialers created for a
 // nested group health layer. Control-plane construction uses this to retain
 // them on error paths before egressRuntime assumes ownership.

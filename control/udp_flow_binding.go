@@ -30,6 +30,7 @@ type UdpEgressBinding struct {
 	Network       string
 	NetworkType   dialer.NetworkType
 	SniffedDomain string
+	StickySite    string
 	IsDialIp      bool
 }
 
@@ -58,6 +59,7 @@ func newUdpFlowBinding(policyEpoch routing.PolicyEpoch, outboundIndex consts.Out
 		Target:        option.Target,
 		Network:       option.Network,
 		SniffedDomain: option.SniffedDomain,
+		StickySite:    option.StickySite,
 		IsDialIp:      option.IsDialIp,
 	}
 	if option.NetworkType != nil {

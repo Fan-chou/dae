@@ -351,7 +351,7 @@ func (f *FlowRuntime) recordDownload(n int64) {
 		nt := f.binding.Egress.NetworkType
 		slow := f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
 		if g := f.binding.Egress.Outbound; g != nil {
-			g.PinSite(f.binding.Egress.SniffedDomain, f.binding.Egress.Dialer, slow)
+			g.PinSite(pinSiteSubject(f.binding.Egress.StickySite, f.binding.Egress.SniffedDomain), f.binding.Egress.Dialer, slow)
 		}
 	}
 }
@@ -376,7 +376,7 @@ func addUDPFlowDownload(ue *UdpEndpoint, n int) {
 			nt := rt.binding.Egress.NetworkType
 			slow := rt.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
 			if g := rt.binding.Egress.Outbound; g != nil {
-				g.PinSite(rt.binding.Egress.SniffedDomain, rt.binding.Egress.Dialer, slow)
+				g.PinSite(pinSiteSubject(rt.binding.Egress.StickySite, rt.binding.Egress.SniffedDomain), rt.binding.Egress.Dialer, slow)
 			}
 		}
 	}

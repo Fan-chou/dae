@@ -7,6 +7,7 @@ package control
 
 import (
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 )
 
@@ -65,7 +66,6 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 	if c == nil {
 		return nil
 	}
-	latencyByName := c.adminLatencyByMemberName()
 	groups := make([]AdminGroup, 0, len(c.outbounds))
 	for _, group := range c.outbounds {
 		if group == nil || isBuiltinAdminGroup(group.Name) {
@@ -94,7 +94,7 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 		}
 		for _, name := range members {
 			member := AdminGroupMember{Name: name}
-			if sample, ok := latencyByName[name]; ok {
+			if sample, ok := adminSampleForGroupMember(group, name); ok {
 				member.Alive = sample.Alive
 				member.LatencyMs = sample.LatencyMs
 				member.Admission = sample.Admission
@@ -176,43 +176,61 @@ func adminMemberNamesFromDialers(dialers []*dialer.Dialer) []string {
 }
 
 type adminLatencySample struct {
-	Alive      bool
-	LatencyMs  *int32
-	Admission  string
-	Reason     string
+	Alive     bool
+	LatencyMs *int32
+	Admission string
+	Reason    string
 }
 
-func (c *ControlPlane) adminLatencyByMemberName() map[string]adminLatencySample {
-	samples := make(map[string]adminLatencySample)
-	if c == nil {
-		return samples
+func adminSampleFromDialer(d *dialer.Dialer) adminLatencySample {
+	if d == nil {
+		return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 	}
-	for _, group := range c.outbounds {
-		if group == nil {
+	snapshot := bestNodeLatencySnapshotForDialer(d)
+	admission, reason := adminAdmissionForDialer(d)
+	alive := snapshot.Alive
+	if admission != "" && admission != dialer.AdmissionDead.String() {
+		alive = true
+	}
+	if admission == dialer.AdmissionDead.String() {
+		alive = false
+	}
+	return adminLatencySample{
+		Alive:     alive,
+		LatencyMs: snapshot.LatencyMs,
+		Admission: admission,
+		Reason:    reason,
+	}
+}
+
+func adminSampleForGroupMember(group *outbound.DialerGroup, name string) (adminLatencySample, bool) {
+	if group == nil || name == "" {
+		return adminLatencySample{}, false
+	}
+	if child := group.NestedGroupNamed(name); child != nil {
+		return adminSampleForNestedMember(group, child), true
+	}
+	if d := group.DialerNamed(name); d != nil {
+		return adminSampleFromDialer(d), true
+	}
+	return adminLatencySample{}, false
+}
+
+func adminSampleForNestedMember(parent, child *outbound.DialerGroup) adminLatencySample {
+	if child == nil {
+		return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
+	}
+	for _, nt := range adminTCPNetworkTypes() {
+		d, err := child.PeekSelect(nt)
+		if err != nil || d == nil {
 			continue
 		}
-		for _, d := range group.Dialers {
-			if d == nil || d.Property() == nil {
-				continue
-			}
-			name := d.Property().Name
-			if name == "" {
-				continue
-			}
-			snapshot := bestNodeLatencySnapshotForDialer(d)
-			admission, reason := adminAdmissionForDialer(d)
-			sample := adminLatencySample{
-				Alive:     snapshot.Alive,
-				LatencyMs: snapshot.LatencyMs,
-				Admission: admission,
-				Reason:    reason,
-			}
-			if existing, ok := samples[name]; !ok || preferAdminLatency(sample, existing) {
-				samples[name] = sample
-			}
+		if parent != nil {
+			d = parent.HealthViewOf(d)
 		}
+		return adminSampleFromDialer(d)
 	}
-	return samples
+	return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 }
 
 func adminTCPNetworkTypes() []*dialer.NetworkType {
@@ -248,22 +266,7 @@ func adminAdmissionForDialer(d *dialer.Dialer) (state, reason string) {
 	return worst.String(), reason
 }
 
-func preferAdminLatency(candidate, existing adminLatencySample) bool {
-	if candidate.Alive != existing.Alive {
-		return candidate.Alive
-	}
-	if candidate.LatencyMs == nil {
-		return false
-	}
-	if existing.LatencyMs == nil {
-		return true
-	}
-	return *candidate.LatencyMs < *existing.LatencyMs
-}
-
-func adminPeekSelected(group interface {
-	PeekSelect(*dialer.NetworkType) (*dialer.Dialer, error)
-}, policy consts.DialerSelectionPolicy) string {
+func adminPeekSelected(group *outbound.DialerGroup, policy consts.DialerSelectionPolicy) string {
 	switch policy {
 	case consts.DialerSelectionPolicy_Fallback, consts.DialerSelectionPolicy_UrlTest:
 	default:
@@ -272,13 +275,13 @@ func adminPeekSelected(group interface {
 	if group == nil {
 		return ""
 	}
-	for _, nt := range []*dialer.NetworkType{
-		{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
-		{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6},
-	} {
+	for _, nt := range adminTCPNetworkTypes() {
 		d, err := group.PeekSelect(nt)
 		if err != nil || d == nil || d.Property() == nil {
 			continue
+		}
+		if nested := group.NestedMemberNameFor(d); nested != "" {
+			return nested
 		}
 		if name := d.Property().Name; name != "" {
 			return name

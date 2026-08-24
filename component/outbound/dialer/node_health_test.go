@@ -331,7 +331,9 @@ func TestNodeHealthCongestionRecoversWhenSpeedStale(t *testing.T) {
 func TestNodeHealthSmallFlowsDoNotSetPeak(t *testing.T) {
 	var h nodeHealth
 	now := time.Unix(1_700_000_000, 0)
-	h.observeConnFinished(IdxTcp4, 200*time.Millisecond, 100, 100, now)
+	if h.observeConnFinished(IdxTcp4, 200*time.Millisecond, 100, 100, now) {
+		t.Fatal("tiny flow must not report a health change")
+	}
 	if h.slots[IdxTcp4].peakSpeed != 0 {
 		t.Fatalf("peakSpeed = %d, want 0 for a tiny flow", h.slots[IdxTcp4].peakSpeed)
 	}

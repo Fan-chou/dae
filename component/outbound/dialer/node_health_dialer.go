@@ -117,16 +117,18 @@ func (d *Dialer) ObserveConnFinished(typ *NetworkType, elapsed time.Duration, up
 	if d == nil || typ == nil {
 		return
 	}
-	d.health.observeConnFinished(typ.Index(), elapsed, upload, download, time.Now())
-	d.publishQuality(typ)
+	if d.health.observeConnFinished(typ.Index(), elapsed, upload, download, time.Now()) {
+		d.publishQuality(typ)
+	}
 }
 
 func (d *Dialer) PushObservedSpeed(typ *NetworkType, bps uint64) {
 	if d == nil || typ == nil || bps == 0 {
 		return
 	}
-	d.health.pushSpeed(typ.Index(), bps, time.Now())
-	d.publishQuality(typ)
+	if d.health.pushSpeed(typ.Index(), bps, time.Now()) {
+		d.publishQuality(typ)
+	}
 }
 
 // SetDegradedForTest forces the userspace admission state without flipping

@@ -207,6 +207,7 @@ type DialOption struct {
 	Network       string
 	NetworkType   *dialer.NetworkType
 	SniffedDomain string
+	StickySite    string
 	IsDialIp      bool
 	Excluded      *dialer.Dialer
 	Binding       UdpFlowBinding
@@ -1170,6 +1171,7 @@ getNew:
 					Network:       res.Network,
 					NetworkType:   res.SelectionNetworkTypeObj,
 					SniffedDomain: res.SniffedDomain,
+					StickySite:    res.StickySite,
 					IsDialIp:      res.IsDialIp,
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
