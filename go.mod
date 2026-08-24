@@ -8,7 +8,7 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.20.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260822155507-4e6215966a8b
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260824135927-e958317229e9
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -123,5 +123,5 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026082
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
 // Fan-chou/outbound fix/pool-gc-stability: hy2 demux/reassembly plus
-// olicesx UDP session lifecycle (256bb281) and quic-go 8cfce08b.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260822155507-4e6215966a8b
+// per-datagram reply addresses (e958317) for FullCone multi-target sessions.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260824135927-e958317229e9
