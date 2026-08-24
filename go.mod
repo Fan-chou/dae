@@ -15,7 +15,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260822152321-9a83b6d89e2b
+	github.com/olicesx/quic-go v0.0.0-20260824024751-8cfce08be8dc
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -114,14 +114,14 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Pinned to perf/client-skipaddr-and-gro (9a83b6d8): GC-stable bounded channel
-// pools, datagram queue timeout, StreamFrame double-put fix, GSO/datagram/stream
-// lifecycle leaks, dial-only skipAddr, and optional UDP GRO receive.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260822152321-9a83b6d89e2b
+// Pinned to Fan-chou/quic-go 8cfce08b (fix/skipaddr-nil-write-dest on 9a83b6d8):
+// skipAddr close-queue retransmit uses the Dial remote instead of panicking
+// on a nil packet source address.
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
 // Fan-chou/outbound fix/pool-gc-stability: hy2 demux/reassembly plus
-// olicesx UDP session lifecycle (256bb281) and quic-go 9a83b6d8.
+// olicesx UDP session lifecycle (256bb281) and quic-go 8cfce08b.
 replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260822155507-4e6215966a8b
