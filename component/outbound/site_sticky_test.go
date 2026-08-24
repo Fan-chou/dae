@@ -930,6 +930,21 @@ func TestDialerGroup_PeekSelectPathRecordsNestedMember(t *testing.T) {
 	if nested != "child-a" {
 		t.Fatalf("PeekSelectPath nested = %q, want child-a from the same peek", nested)
 	}
+	if n := len(parent.internedSelectPaths); n != 0 {
+		t.Fatalf("PeekSelectPath interned %d paths, want none (admin peek does not need a flow token)", n)
+	}
+	if _, _, _, err := parent.SelectWithExclusionResultForSite(TestNetworkType, true, nil, "youtube.com"); err != nil {
+		t.Fatalf("SelectWithExclusionResultForSite() error = %v", err)
+	}
+	if n := len(parent.internedSelectPaths); n != 0 {
+		t.Fatalf("SelectWithExclusionResultForSite interned %d paths, want none (handshake retry does not store a token)", n)
+	}
+	if _, _, _, _, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com"); err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if n := len(parent.internedSelectPaths); n != 1 {
+		t.Fatalf("SelectWithPath interned %d paths, want 1", n)
+	}
 }
 
 func TestDialerGroup_SelectPathRecordsNineNestedStickyTables(t *testing.T) {
@@ -977,6 +992,24 @@ func TestDialerGroup_SelectPathRecordsNineNestedStickyTables(t *testing.T) {
 	}
 	if path != path2 {
 		t.Fatal("the same nested path must intern to one comparable token")
+	}
+	if n := len(parent.internedSelectPaths); n != 1 {
+		t.Fatalf("interned paths = %d, want 1 unique 9-deep token", n)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		_, _, _, got, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != path2 {
+			t.Fatal("intern hit returned a different token")
+		}
+	})
+	if allocs > 90 {
+		t.Fatalf("intern-hit SelectWithPath allocs = %.1f, want <= 90 (must not recopy interned tables each select)", allocs)
+	}
+	if n := len(parent.internedSelectPaths); n != 1 {
+		t.Fatalf("interned paths = %d after intern hits, want 1", n)
 	}
 
 	snap := parent.SnapshotForEstablishedFlowPath(selected, path)

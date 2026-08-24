@@ -95,11 +95,19 @@ type SelectPath struct {
 	p            *internedSelectPath
 }
 
-// selectPathBuilder records tables during one Select. It may grow past any
-// inline cap; internSelectPath freezes it onto the group's unique token.
+// selectPathInlineCap is the number of sticky tables kept on the Select
+// stack. It is not a path limit: deeper chains overflow to extra, and
+// internSelectPath still stores the full table list on the interned token.
+const selectPathInlineCap = 8
+
+// selectPathBuilder records tables during one Select. Typical paths stay in
+// inline so nested Select does not heap-allocate a slice per layer; extra
+// holds tables beyond the inline cap without truncating.
 type selectPathBuilder struct {
 	NestedMember string
-	tables       []*siteStickyTable
+	n            int
+	inline       [selectPathInlineCap]*siteStickyTable
+	extra        []*siteStickyTable
 }
 
 func (p SelectPath) HasSiteSticky() bool {
@@ -114,53 +122,92 @@ func (p SelectPath) stickyTables() []*siteStickyTable {
 }
 
 func internSelectPath(g *DialerGroup, b selectPathBuilder) SelectPath {
-	tables := uniqueStickyTables(b.tables)
-	if b.NestedMember == "" && len(tables) == 0 {
+	if b.NestedMember == "" && b.n == 0 {
 		return SelectPath{}
 	}
 	if g == nil {
 		return SelectPath{
 			NestedMember: b.NestedMember,
-			p:            &internedSelectPath{nestedMember: b.NestedMember, tables: tables},
+			p:            &internedSelectPath{nestedMember: b.NestedMember, tables: b.copyTables()},
 		}
+	}
+	if existing := g.lookupInternedSelectPath(b); existing != nil {
+		return SelectPath{NestedMember: existing.nestedMember, p: existing}
 	}
 	g.internMu.Lock()
 	defer g.internMu.Unlock()
-	for _, existing := range g.internedSelectPaths {
-		if existing.nestedMember == b.NestedMember && sameStickyTables(existing.tables, tables) {
-			return SelectPath{NestedMember: existing.nestedMember, p: existing}
-		}
+	if existing := g.findInternedSelectPathLocked(b); existing != nil {
+		return SelectPath{NestedMember: existing.nestedMember, p: existing}
 	}
 	tok := &internedSelectPath{
 		nestedMember: b.NestedMember,
-		tables:       append([]*siteStickyTable(nil), tables...),
+		tables:       b.copyTables(),
 	}
 	g.internedSelectPaths = append(g.internedSelectPaths, tok)
 	return SelectPath{NestedMember: tok.nestedMember, p: tok}
 }
 
-func sameStickyTables(a, b []*siteStickyTable) bool {
-	if len(a) != len(b) {
+func (g *DialerGroup) lookupInternedSelectPath(b selectPathBuilder) *internedSelectPath {
+	g.internMu.RLock()
+	defer g.internMu.RUnlock()
+	return g.findInternedSelectPathLocked(b)
+}
+
+func (g *DialerGroup) findInternedSelectPathLocked(b selectPathBuilder) *internedSelectPath {
+	for _, existing := range g.internedSelectPaths {
+		if existing.nestedMember == b.NestedMember && b.sameStickyTables(existing.tables) {
+			return existing
+		}
+	}
+	return nil
+}
+
+func (p *selectPathBuilder) tableAt(i int) *siteStickyTable {
+	if i < selectPathInlineCap {
+		return p.inline[i]
+	}
+	return p.extra[i-selectPathInlineCap]
+}
+
+func (p *selectPathBuilder) sameStickyTables(tables []*siteStickyTable) bool {
+	if p.n != len(tables) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	for i, table := range tables {
+		if p.tableAt(i) != table {
 			return false
 		}
 	}
 	return true
 }
 
+func (p *selectPathBuilder) copyTables() []*siteStickyTable {
+	if p.n == 0 {
+		return nil
+	}
+	out := make([]*siteStickyTable, p.n)
+	for i := 0; i < p.n; i++ {
+		out[i] = p.tableAt(i)
+	}
+	return out
+}
+
 func (p *selectPathBuilder) addTable(t *siteStickyTable) {
 	if p == nil || t == nil {
 		return
 	}
-	for _, existing := range p.tables {
-		if existing == t {
+	for i := 0; i < p.n; i++ {
+		if p.tableAt(i) == t {
 			return
 		}
 	}
-	p.tables = append(p.tables, t)
+	if p.n < selectPathInlineCap {
+		p.inline[p.n] = t
+		p.n++
+		return
+	}
+	p.extra = append(p.extra, t)
+	p.n++
 }
 
 func (p *selectPathBuilder) addSticky(g *DialerGroup) {
@@ -184,8 +231,8 @@ func (p *selectPathBuilder) adopt(member dialerGroupMember, sub *selectPathBuild
 	if sub == nil {
 		return
 	}
-	for _, table := range sub.tables {
-		p.addTable(table)
+	for i := 0; i < sub.n; i++ {
+		p.addTable(sub.tableAt(i))
 	}
 }
 

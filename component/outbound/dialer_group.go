@@ -147,7 +147,7 @@ type DialerGroup struct {
 	// even when that slice is empty (no sticky on the recorded path).
 	establishedSnapshot bool
 	nowFn               func() time.Time
-	internMu            sync.Mutex
+	internMu            sync.RWMutex
 	internedSelectPaths []*internedSelectPath
 
 	// nestedIncumbent is the last nested min/url_test leaf actually returned
@@ -1270,7 +1270,7 @@ func (g *DialerGroup) PeekSelectPath(networkType *dialer.NetworkType) (*dialer.D
 	}
 	var b selectPathBuilder
 	d, _, _, _, err := g.selectWithExclusionResult(networkType, false, nil, false, "", &b)
-	return d, internSelectPath(g, b).NestedMember, err
+	return d, b.NestedMember, err
 }
 
 // PeekSelectNestedMember returns the leaf this parent would currently admit
@@ -1295,7 +1295,8 @@ func (g *DialerGroup) PeekSelectNestedMember(child *DialerGroup, networkType *di
 // SelectWithExclusionResultForSite is SelectWithExclusionResult with per-site
 // stickiness for fallback/url_test. Empty site keeps group-level admission.
 func (g *DialerGroup) SelectWithExclusionResultForSite(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, site string) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
-	d, latency, selectedNetworkType, _, err = g.SelectWithPath(networkType, strictIpVersion, excluded, site)
+	var b selectPathBuilder
+	d, latency, selectedNetworkType, _, err = g.selectWithExclusionResult(networkType, strictIpVersion, excluded, true, site, &b)
 	return d, latency, selectedNetworkType, err
 }
 
