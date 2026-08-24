@@ -51,6 +51,9 @@ type proxyDialResult struct {
 	OrigNetworkTypeObj      *dialer.NetworkType
 	SelectionNetworkTypeObj *dialer.NetworkType
 	AdmissionNetworkTypeObj *dialer.NetworkType
+	// SelectPath is the nested member and sticky tables used by this Select.
+	// Slow-handshake and established-flow snapshots must keep this token.
+	SelectPath ob.SelectPath
 }
 
 func shouldForceMarkUnavailableOnProxyDialError(err error) bool {
@@ -214,12 +217,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	strictIpVersion := dialIp
-	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResultForSite(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
+	d, _, admissionNetworkType, selectPath, err := outbound.SelectWithPath(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
-		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResultForSite(altType, false, p.Excluded, stickySite)
+		d, _, admissionNetworkType, selectPath, err = outbound.SelectWithPath(altType, false, p.Excluded, stickySite)
 		if err == nil {
 			selectionNetworkType = altType
 		}
@@ -268,6 +271,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		OrigNetworkTypeObj:      networkType,
 		SelectionNetworkTypeObj: selectionNetworkType,
 		AdmissionNetworkTypeObj: admissionNetworkType,
+		SelectPath:              selectPath,
 	}
 	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
 		return res, err
@@ -297,7 +301,7 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 			slow := res.Dialer.ObserveHandshake(res.SelectionNetworkTypeObj, handshake)
 			if attempt == 0 && slow && c.canExcludeSlowHandshake(res) {
 				_ = conn.Close()
-				res.Outbound.FailSite(siteFailDomain(res, p.Domain), res.Dialer)
+				res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
 				p.Excluded = res.Dialer
 				lastErr = fmt.Errorf("slow handshake %s", handshake.Truncate(time.Millisecond))
 				lastRes = res
@@ -307,7 +311,7 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		}
 		lastErr = err
 		if res.Outbound != nil && !commonerrors.IsCanceledOrClosed(err) {
-			res.Outbound.FailSite(siteFailDomain(res, p.Domain), res.Dialer)
+			res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
 		}
 		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
 			l4proto := consts.L4ProtoStr(p.Network)
@@ -366,7 +370,7 @@ func (c *ControlPlane) canExcludeSlowHandshake(res *proxyDialResult) bool {
 	if res == nil || res.Outbound == nil || res.Dialer == nil || res.SelectionNetworkTypeObj == nil {
 		return false
 	}
-	if !res.Outbound.HasSiteStickyFor(res.Dialer, res.SelectionNetworkTypeObj) {
+	if !res.SelectPath.HasSiteSticky() {
 		return false
 	}
 	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.StickySite)

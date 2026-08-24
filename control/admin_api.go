@@ -282,11 +282,11 @@ func adminPeekSelected(group *outbound.DialerGroup, policy consts.DialerSelectio
 		return ""
 	}
 	for _, nt := range adminTCPNetworkTypes() {
-		d, err := group.PeekSelect(nt)
+		d, nested, err := group.PeekSelectPath(nt)
 		if err != nil || d == nil || d.Property() == nil {
 			continue
 		}
-		if nested := group.NestedMemberNameFor(d, nt); nested != "" {
+		if nested != "" {
 			return nested
 		}
 		if name := d.Property().Name; name != "" {

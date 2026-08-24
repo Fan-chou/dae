@@ -792,3 +792,142 @@ func TestDialerGroupCloseDetachesStickyFromSnapshots(t *testing.T) {
 		t.Fatal("detached sticky table must ignore FailSite from an established-flow snapshot")
 	}
 }
+
+func TestDialerGroup_SelectPathKeepsStickyWhenEmptySiteWouldReselect(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	a := namedNoopDialer(option, "proxy-a")
+	b := namedNoopDialer(option, "proxy-b")
+	defer a.Close()
+	defer b.Close()
+	child := NewDialerGroup(option, "inner-fallback", []*dialer.Dialer{a, b}, newEmptyAnnotations(2), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	defer child.Close()
+	parent, err := NewNestedDialerGroup(option, "fixed-parent", []NestedDialerGroupMember{
+		{Group: child},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("parent: %v", err)
+	}
+	defer parent.Close()
+
+	child.PinSite("youtube.com", b, false)
+	selected, _, _, path, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if selected != b {
+		t.Fatalf("selected %p, want pinned inner leaf %p", selected, b)
+	}
+	if !path.HasSiteSticky() {
+		t.Fatal("recorded path must keep inner fallback sticky so a slow handshake can still switch")
+	}
+	if parent.HasSiteStickyFor(selected, TestNetworkType) {
+		t.Fatal("empty-site reconstruction must not report sticky: it reselects A and misses the pin to B")
+	}
+}
+
+func TestDialerGroup_SnapshotPathDoesNotPinUnusedFallbackSibling(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	leafA := namedNoopDialer(option, "shared-a")
+	leafB := namedNoopDialer(option, "leaf-b")
+	defer leafA.Close()
+	defer leafB.Close()
+	fixedChild := NewDialerGroup(option, "direct-child", []*dialer.Dialer{leafA}, newEmptyAnnotations(1), DialerSelectionPolicy{
+		Policy:     consts.DialerSelectionPolicy_Fixed,
+		FixedIndex: 0,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	defer fixedChild.Close()
+	fallbackChild := NewDialerGroup(option, "unused-fallback", []*dialer.Dialer{leafB, leafA}, newEmptyAnnotations(2), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	defer fallbackChild.Close()
+	parent, err := NewNestedDialerGroup(option, "first-alive-parent", []NestedDialerGroupMember{
+		{Group: fixedChild},
+		{Group: fallbackChild},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("parent: %v", err)
+	}
+	defer parent.Close()
+
+	selected, _, _, path, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if selected != leafA {
+		t.Fatalf("selected %p, want shared leaf via fixed child %p", selected, leafA)
+	}
+	if path.HasSiteSticky() {
+		t.Fatal("first_alive path through a non-sticky child must not record unused fallback sticky")
+	}
+	if path.NestedMember != "direct-child" {
+		t.Fatalf("NestedMember = %q, want direct-child", path.NestedMember)
+	}
+
+	snap := parent.SnapshotForEstablishedFlowPath(selected, path)
+	snap.PinSite("youtube.com", leafA, false)
+	got, _, _, err := fallbackChild.SelectWithExclusionResultForSite(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("unused fallback SelectForSite() error = %v", err)
+	}
+	if got != leafB {
+		t.Fatalf("unused fallback selected %p, want B %p (recorded-path snapshot must not pin the sibling table)", got, leafB)
+	}
+}
+
+func TestDialerGroup_PeekSelectPathRecordsNestedMember(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	a := namedNoopDialer(option, "proxy-a")
+	b := namedNoopDialer(option, "proxy-b")
+	defer a.Close()
+	defer b.Close()
+	childA, err := NewNestedDialerGroup(option, "child-a", []NestedDialerGroupMember{
+		{Dialer: a},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("child-a: %v", err)
+	}
+	defer childA.Close()
+	childB, err := NewNestedDialerGroup(option, "child-b", []NestedDialerGroupMember{
+		{Dialer: b},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("child-b: %v", err)
+	}
+	defer childB.Close()
+	parent, err := NewNestedDialerGroup(option, "parent", []NestedDialerGroupMember{
+		{Group: childA},
+		{Group: childB},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("parent: %v", err)
+	}
+	defer parent.Close()
+
+	d, nested, err := parent.PeekSelectPath(TestNetworkType)
+	if err != nil {
+		t.Fatalf("PeekSelectPath() error = %v", err)
+	}
+	if d != a {
+		t.Fatalf("peek leaf %p, want child-a leaf %p", d, a)
+	}
+	if nested != "child-a" {
+		t.Fatalf("PeekSelectPath nested = %q, want child-a from the same peek", nested)
+	}
+}

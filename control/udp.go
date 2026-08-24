@@ -209,6 +209,7 @@ type DialOption struct {
 	SniffedDomain string
 	StickySite    string
 	IsDialIp      bool
+	SelectPath    ob.SelectPath
 	Excluded      *dialer.Dialer
 	Binding       UdpFlowBinding
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
@@ -1173,6 +1174,7 @@ getNew:
 					SniffedDomain: res.SniffedDomain,
 					StickySite:    res.StickySite,
 					IsDialIp:      res.IsDialIp,
+					SelectPath:    res.SelectPath,
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
 				}

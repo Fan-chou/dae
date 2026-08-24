@@ -408,7 +408,7 @@ func (m *SessionManager) adoptTCP(
 	if ingress == nil {
 		return nil, fmt.Errorf("adopt TCP flow: ingress is required")
 	}
-	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound, binding.Egress.SelectPath)
 	if !ok {
 		return nil, fmt.Errorf("adopt TCP flow: egress runtime is retiring")
 	}
@@ -589,7 +589,7 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 	if binding.Egress.Outbound == nil {
 		binding.Egress.Outbound = endpoint.Outbound
 	}
-	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound, binding.Egress.SelectPath)
 	if !ok {
 		return nil, fmt.Errorf("adopt UDP flow: egress runtime is retiring")
 	}

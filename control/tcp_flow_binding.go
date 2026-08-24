@@ -32,6 +32,7 @@ type TcpEgressBinding struct {
 	SniffedDomain string
 	StickySite    string
 	IsDialIp      bool
+	SelectPath    outbound.SelectPath
 }
 
 // TcpFlowBinding combines the policy and egress decisions fixed after a TCP dial succeeds.
@@ -58,6 +59,7 @@ func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult,
 		SniffedDomain: result.SniffedDomain,
 		StickySite:    result.StickySite,
 		IsDialIp:      result.IsDialIp,
+		SelectPath:    result.SelectPath,
 	}
 	if result.SelectionNetworkTypeObj != nil {
 		binding.Egress.NetworkType = *result.SelectionNetworkTypeObj

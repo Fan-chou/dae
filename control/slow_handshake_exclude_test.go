@@ -17,6 +17,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+func attachRecordedSelectPath(t *testing.T, res *proxyDialResult) {
+	t.Helper()
+	if res == nil || res.Outbound == nil || res.SelectionNetworkTypeObj == nil {
+		t.Fatal("missing select inputs")
+	}
+	_, _, _, path, err := res.Outbound.SelectWithPath(res.SelectionNetworkTypeObj, true, nil, res.StickySite)
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	res.SelectPath = path
+}
+
 func TestCanExcludeSlowHandshake_FixedKeepsSameDialer(t *testing.T) {
 	a := newTestEndpointDialer()
 	b := newTestEndpointDialer()
@@ -31,6 +43,7 @@ func TestCanExcludeSlowHandshake_FixedKeepsSameDialer(t *testing.T) {
 		Dialer:                  a,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if cp.canExcludeSlowHandshake(res) {
 		t.Fatal("fixed policy must not auto-switch after a slow handshake")
 	}
@@ -64,6 +77,7 @@ func TestCanExcludeSlowHandshake_NestedFixedSwitchesInnerFallback(t *testing.T) 
 		Dialer:                  a,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if !cp.canExcludeSlowHandshake(res) {
 		t.Fatal("outer fixed wrapping fallback must still exclude a slow inner leaf")
 	}
@@ -83,6 +97,7 @@ func TestCanExcludeSlowHandshake_FallbackSwitchesDialer(t *testing.T) {
 		Dialer:                  a,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if !cp.canExcludeSlowHandshake(res) {
 		t.Fatal("fallback should exclude the slow handshake dialer when another leaf is alive")
 	}
@@ -102,6 +117,7 @@ func TestCanExcludeSlowHandshake_FirstAliveDoesNotSwitch(t *testing.T) {
 		Dialer:                  a,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if cp.canExcludeSlowHandshake(res) {
 		t.Fatal("first_alive must not close a successful handshake to redial another leaf")
 	}
@@ -138,6 +154,7 @@ func TestCanExcludeSlowHandshake_FirstAliveSharedLeafDoesNotSwitch(t *testing.T)
 		Dialer:                  direct,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if cp.canExcludeSlowHandshake(res) {
 		t.Fatal("first_alive path through a non-sticky child must not close a successful handshake because an unused fallback sibling shares the same leaf")
 	}
@@ -157,8 +174,57 @@ func TestCanExcludeSlowHandshake_MinLastDoesNotSwitch(t *testing.T) {
 		Dialer:                  a,
 		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 	}
+	attachRecordedSelectPath(t, res)
 	if cp.canExcludeSlowHandshake(res) {
 		t.Fatal("min policy must not close a successful handshake to redial another leaf")
+	}
+}
+
+func TestCanExcludeSlowHandshake_PinnedNestedLeafStillSwitches(t *testing.T) {
+	a := newTestEndpointDialer()
+	b := newTestEndpointDialer()
+	defer a.Close()
+	defer b.Close()
+	child := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, a, b)
+	defer child.Close()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	parent, err := ob.NewNestedDialerGroup(
+		&componentdialer.GlobalOption{Log: logger, CheckInterval: time.Second},
+		"fixed-parent",
+		[]ob.NestedDialerGroupMember{{Group: child}},
+		ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0},
+		func(bool, *componentdialer.NetworkType, bool) {},
+	)
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+
+	child.PinSite("youtube.com", b, false)
+	nt := &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	selected, _, _, path, err := parent.SelectWithPath(nt, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if selected != b {
+		t.Fatalf("selected %p, want pinned leaf %p", selected, b)
+	}
+
+	cp := &ControlPlane{}
+	res := &proxyDialResult{
+		Outbound:                parent,
+		Dialer:                  selected,
+		StickySite:              "youtube.com",
+		SelectionNetworkTypeObj: nt,
+		SelectPath:              path,
+	}
+	if parent.HasSiteStickyFor(selected, nt) {
+		t.Fatal("empty-site HasSiteStickyFor must miss the pin; this test documents the reconstruction hole")
+	}
+	if !cp.canExcludeSlowHandshake(res) {
+		t.Fatal("recorded path must still allow excluding a slow pinned inner leaf")
 	}
 }
 

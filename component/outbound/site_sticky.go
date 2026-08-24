@@ -77,6 +77,80 @@ func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer, networkType *dialer.Net
 	return len(g.collectStickyTablesOnSelectedPath(d, networkType)) > 0
 }
 
+const selectPathMaxTables = 8
+
+// SelectPath is the nested member and sticky tables actually used by one Select.
+// Control-plane slow-handshake, PinSite snapshots, and admin identity must use
+// this recorded path, not a later re-selection that can drop the site key or
+// resample a random child. Tables are inlined so the token is comparable and
+// Select does not allocate a backing array on the connection hot path.
+type SelectPath struct {
+	NestedMember string
+	tables       [selectPathMaxTables]*siteStickyTable
+	n            uint8
+}
+
+func (p SelectPath) HasSiteSticky() bool {
+	return p.n > 0
+}
+
+func (p SelectPath) stickyTables() []*siteStickyTable {
+	if p.n == 0 {
+		return nil
+	}
+	return append([]*siteStickyTable(nil), p.tables[:p.n]...)
+}
+
+func (p *SelectPath) addTable(t *siteStickyTable) {
+	if p == nil || t == nil || p.n >= selectPathMaxTables {
+		return
+	}
+	for i := uint8(0); i < p.n; i++ {
+		if p.tables[i] == t {
+			return
+		}
+	}
+	p.tables[p.n] = t
+	p.n++
+}
+
+func (p *SelectPath) addSticky(g *DialerGroup) {
+	if p == nil || g == nil || !g.usesSiteSticky() || g.siteSticky == nil {
+		return
+	}
+	p.addTable(g.siteSticky)
+}
+
+func (p *SelectPath) adopt(member dialerGroupMember, sub *SelectPath) {
+	if p == nil {
+		return
+	}
+	if p.NestedMember == "" {
+		if member.group != nil {
+			p.NestedMember = member.group.Name
+		} else {
+			p.NestedMember = dialerName(member.dialer)
+		}
+	}
+	if sub == nil {
+		return
+	}
+	for i := uint8(0); i < sub.n; i++ {
+		p.addTable(sub.tables[i])
+	}
+}
+
+func (p *SelectPath) take(src *SelectPath) {
+	if p == nil {
+		return
+	}
+	if src == nil {
+		*p = SelectPath{}
+		return
+	}
+	*p = *src
+}
+
 func (g *DialerGroup) now() time.Time {
 	if g != nil && g.nowFn != nil {
 		return g.nowFn()
@@ -123,7 +197,7 @@ func (g *DialerGroup) collectStickyTablesOnSelectedPath(d *dialer.Dialer, networ
 	if g == nil {
 		return nil
 	}
-	if len(g.siteStickyTree) > 0 {
+	if g.establishedSnapshot {
 		return uniqueStickyTables(g.siteStickyTree)
 	}
 	var out []*siteStickyTable
@@ -145,7 +219,7 @@ func (g *DialerGroup) collectStickyTablesContainingSeen(d *dialer.Dialer, seen m
 	if g == nil {
 		return nil
 	}
-	if len(g.siteStickyTree) > 0 {
+	if g.establishedSnapshot {
 		return uniqueStickyTables(g.siteStickyTree)
 	}
 	var out []*siteStickyTable
@@ -180,7 +254,7 @@ func (g *DialerGroup) PinSite(site string, d *dialer.Dialer, slow bool) {
 // pinStillMember is nil on established-flow snapshots so dwell stays locked
 // without retaining every sibling dialer on the compact view.
 func (g *DialerGroup) pinStillMember() func(*dialer.Dialer) bool {
-	if g == nil || len(g.siteStickyTree) > 0 {
+	if g == nil || g.establishedSnapshot {
 		return nil
 	}
 	return g.hasConcreteMember
@@ -195,6 +269,19 @@ func (g *DialerGroup) FailSite(site string, d *dialer.Dialer) {
 	now := g.now()
 	for _, table := range g.collectStickyTablesContaining(d) {
 		table.fail(site, d, now)
+	}
+}
+
+// FailSitePath is FailSite using the tables recorded by the original Select.
+// An empty path is a no-op: membership collection would hold-down unused
+// sticky siblings that share the failed leaf.
+func (g *DialerGroup) FailSitePath(site string, d *dialer.Dialer, path SelectPath) {
+	if g == nil || d == nil || path.n == 0 {
+		return
+	}
+	now := g.now()
+	for i := uint8(0); i < path.n; i++ {
+		path.tables[i].fail(site, d, now)
 	}
 }
 
