@@ -67,12 +67,14 @@ func (g *DialerGroup) usesSiteSticky() bool {
 	return g != nil && usesSiteStickyPolicy(g.GetSelectionPolicy())
 }
 
-// HasSiteStickyFor reports whether this group or a nested descendant that
-// contains d actually keeps a per-site pin table. Slow-handshake retry must
-// use this, not the top-level policy: first_alive/min/random have no pin, so
-// switching would be a one-shot extra dial that the next connection forgets.
-func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer) bool {
-	return len(g.collectStickyTablesContaining(d)) > 0
+// HasSiteStickyFor reports whether the exclusive selected path to d keeps a
+// per-site pin table. Membership is not enough: a first_alive parent can pick
+// a fixed DIRECT child while an unused fallback sibling also lists that same
+// leaf. Slow-handshake retry must ignore the unused sticky sibling, or it
+// would close a successful DIRECT dial and redial a proxy the next connection
+// cannot remember.
+func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer, networkType *dialer.NetworkType) bool {
+	return len(g.collectStickyTablesOnSelectedPath(d, networkType)) > 0
 }
 
 func (g *DialerGroup) now() time.Time {
@@ -115,6 +117,28 @@ func uniqueStickyTables(tables []*siteStickyTable) []*siteStickyTable {
 
 func (g *DialerGroup) collectStickyTablesContaining(d *dialer.Dialer) []*siteStickyTable {
 	return uniqueStickyTables(g.collectStickyTablesContainingSeen(d, make(map[*siteStickyTable]struct{})))
+}
+
+func (g *DialerGroup) collectStickyTablesOnSelectedPath(d *dialer.Dialer, networkType *dialer.NetworkType) []*siteStickyTable {
+	if g == nil {
+		return nil
+	}
+	if len(g.siteStickyTree) > 0 {
+		return uniqueStickyTables(g.siteStickyTree)
+	}
+	var out []*siteStickyTable
+	if g.usesSiteSticky() && g.siteSticky != nil && (d == nil || g.hasConcreteMember(d)) {
+		out = append(out, g.siteSticky)
+	}
+	if len(g.nestedMembers) == 0 {
+		return uniqueStickyTables(out)
+	}
+	for _, member := range g.nestedMembersOnExclusivePath(d, networkType) {
+		if member.group != nil {
+			out = append(out, member.group.collectStickyTablesOnSelectedPath(d, networkType)...)
+		}
+	}
+	return uniqueStickyTables(out)
 }
 
 func (g *DialerGroup) collectStickyTablesContainingSeen(d *dialer.Dialer, seen map[*siteStickyTable]struct{}) []*siteStickyTable {

@@ -107,6 +107,42 @@ func TestCanExcludeSlowHandshake_FirstAliveDoesNotSwitch(t *testing.T) {
 	}
 }
 
+func TestCanExcludeSlowHandshake_FirstAliveSharedLeafDoesNotSwitch(t *testing.T) {
+	direct := newTestEndpointDialer()
+	proxy := newTestEndpointDialer()
+	defer direct.Close()
+	defer proxy.Close()
+
+	directChild := newTestFixedOutboundGroup(direct)
+	defer directChild.Close()
+	fallbackChild := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, direct, proxy)
+	defer fallbackChild.Close()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	parent, err := ob.NewNestedDialerGroup(
+		&componentdialer.GlobalOption{Log: logger, CheckInterval: time.Second},
+		"first-alive-parent",
+		[]ob.NestedDialerGroupMember{{Group: directChild}, {Group: fallbackChild}},
+		ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive},
+		func(bool, *componentdialer.NetworkType, bool) {},
+	)
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	defer parent.Close()
+
+	cp := &ControlPlane{}
+	res := &proxyDialResult{
+		Outbound:                parent,
+		Dialer:                  direct,
+		SelectionNetworkTypeObj: &componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
+	}
+	if cp.canExcludeSlowHandshake(res) {
+		t.Fatal("first_alive path through a non-sticky child must not close a successful handshake because an unused fallback sibling shares the same leaf")
+	}
+}
+
 func TestCanExcludeSlowHandshake_MinLastDoesNotSwitch(t *testing.T) {
 	a := newTestEndpointDialer()
 	b := newTestEndpointDialer()

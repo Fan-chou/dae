@@ -427,19 +427,21 @@ func (g *DialerGroup) DialerNamed(name string) *dialer.Dialer {
 
 // NestedMemberNameFor maps a selected leaf back to the parent member identity
 // stored in groupSelectionMembers: a child group name, or a direct leaf name.
-func (g *DialerGroup) NestedMemberNameFor(d *dialer.Dialer) string {
+// networkType selects the exclusive child that produced d; pointer membership
+// is not enough when siblings share builtin DIRECT.
+func (g *DialerGroup) NestedMemberNameFor(d *dialer.Dialer, networkType *dialer.NetworkType) string {
 	if g == nil || d == nil {
 		return ""
 	}
-	for _, member := range g.nestedMembersContaining(d) {
-		if member.group != nil {
-			return member.group.Name
-		}
-		if name := dialerName(member.dialer); name != "" {
-			return name
-		}
+	members := g.nestedMembersOnExclusivePath(d, networkType)
+	if len(members) == 0 {
+		return ""
 	}
-	return ""
+	member := members[0]
+	if member.group != nil {
+		return member.group.Name
+	}
+	return dialerName(member.dialer)
 }
 
 // HealthViewOf returns the parent-owned health clone of a nested leaf when
@@ -804,6 +806,29 @@ func (g *DialerGroup) nestedMembersOnSelectedPath(selected *dialer.Dialer, netwo
 		return members
 	}
 	return g.nestedMembersContaining(selected)
+}
+
+// nestedMembersOnExclusivePath is nestedMembersOnSelectedPath without the
+// pointer-membership fallback. Sticky and admin identity must not treat an
+// unused sibling that shares a leaf as the selected child.
+func (g *DialerGroup) nestedMembersOnExclusivePath(selected *dialer.Dialer, networkType *dialer.NetworkType) []dialerGroupMember {
+	if g == nil || selected == nil || networkType == nil {
+		return nil
+	}
+	policy := g.CurrentSelectionPolicy().Policy
+	match := func(skip map[*dialer.Dialer]struct{}, applyHoldDown bool) []dialerGroupMember {
+		for _, member := range g.nestedMembers {
+			d, _, _, _, err := g.selectNestedMember(networkType, policy, member, skip, false, false, "", applyHoldDown)
+			if err == nil && d == selected {
+				return []dialerGroupMember{member}
+			}
+		}
+		return nil
+	}
+	if members := match(g.siteHoldDownSet(""), true); len(members) > 0 {
+		return members
+	}
+	return match(nil, false)
 }
 
 func (g *DialerGroup) nestedMembersContaining(d *dialer.Dialer) []dialerGroupMember {
@@ -1214,6 +1239,25 @@ func (g *DialerGroup) PeekSelect(networkType *dialer.NetworkType) (*dialer.Diale
 	}
 	d, _, _, _, err := g.selectWithExclusionResult(networkType, false, nil, false, "")
 	return d, err
+}
+
+// PeekSelectNestedMember returns the leaf this parent would currently admit
+// from child, including the parent health-view retry. Admin must use this
+// instead of child.PeekSelect: a parent clone can reject the child's first
+// leaf while the data plane already moved to the next one.
+func (g *DialerGroup) PeekSelectNestedMember(child *DialerGroup, networkType *dialer.NetworkType) (*dialer.Dialer, error) {
+	if g == nil || child == nil || networkType == nil {
+		return nil, ErrNoAliveDialer
+	}
+	policy := g.CurrentSelectionPolicy().Policy
+	for _, member := range g.nestedMembers {
+		if member.group != child {
+			continue
+		}
+		d, _, _, _, err := g.selectNestedMember(networkType, policy, member, nil, false, false, "", false)
+		return d, err
+	}
+	return nil, ErrNoAliveDialer
 }
 
 // SelectWithExclusionResultForSite is SelectWithExclusionResult with per-site

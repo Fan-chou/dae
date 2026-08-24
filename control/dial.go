@@ -366,7 +366,7 @@ func (c *ControlPlane) canExcludeSlowHandshake(res *proxyDialResult) bool {
 	if res == nil || res.Outbound == nil || res.Dialer == nil || res.SelectionNetworkTypeObj == nil {
 		return false
 	}
-	if !res.Outbound.HasSiteStickyFor(res.Dialer) {
+	if !res.Outbound.HasSiteStickyFor(res.Dialer, res.SelectionNetworkTypeObj) {
 		return false
 	}
 	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.StickySite)

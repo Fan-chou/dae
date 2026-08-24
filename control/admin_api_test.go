@@ -328,3 +328,70 @@ func TestAdminGroupsResolvesNestedMemberHealthAndSelection(t *testing.T) {
 		t.Fatalf("stream selected = %q, want proxy-child", stream.Selected)
 	}
 }
+
+func TestAdminGroupsParentHealthRetryKeepsNestedChildAlive(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	childOption := &componentdialer.GlobalOption{
+		Log:               logger,
+		CheckInterval:     time.Second,
+		TcpCheckOptionRaw: componentdialer.TcpCheckOptionRaw{Raw: []string{"https://child.example/check"}},
+	}
+	parentOption := &componentdialer.GlobalOption{
+		Log:               logger,
+		CheckInterval:     time.Second,
+		TcpCheckOptionRaw: componentdialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+	}
+	annos := []*componentdialer.Annotation{{}, {}}
+	child := outbound.NewDialerGroup(childOption, "proxy-child", []*componentdialer.Dialer{a, b}, annos, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *componentdialer.NetworkType, bool) {})
+	t.Cleanup(func() { child.Close() })
+	parent, err := outbound.NewNestedDialerGroupWithRuntimeOptions(parentOption, "stream", []outbound.NestedDialerGroupMember{{Group: child}}, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *componentdialer.NetworkType, bool) {}, outbound.DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	t.Cleanup(func() { parent.Close() })
+	t.Cleanup(func() {
+		for _, view := range parent.ParentHealthViewDialers() {
+			_ = view.Close()
+		}
+	})
+
+	firstView := parent.HealthViewOf(a)
+	if firstView == nil || firstView == a {
+		t.Fatal("parent health clone for first child leaf is required")
+	}
+	snapshot := firstView.HealthSnapshot()
+	for i := range snapshot.Collections {
+		snapshot.Collections[i].Alive = false
+	}
+	firstView.RestoreHealthSnapshot(snapshot)
+
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{parent, child},
+			groupSelectionMembers: map[string][]string{
+				parent.Name: {child.Name},
+				child.Name:  {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	byName := map[string]AdminGroup{}
+	for _, group := range groups {
+		byName[group.Name] = group
+	}
+	stream, ok := byName["stream"]
+	if !ok {
+		t.Fatalf("groups = %#v, want stream parent", groups)
+	}
+	if len(stream.Members) != 1 || !stream.Members[0].Alive {
+		t.Fatalf("nested child shown dead after parent retry should admit second leaf: %#v", stream)
+	}
+}

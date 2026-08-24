@@ -221,7 +221,13 @@ func adminSampleForNestedMember(parent, child *outbound.DialerGroup) adminLatenc
 		return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 	}
 	for _, nt := range adminTCPNetworkTypes() {
-		d, err := child.PeekSelect(nt)
+		var d *dialer.Dialer
+		var err error
+		if parent != nil {
+			d, err = parent.PeekSelectNestedMember(child, nt)
+		} else {
+			d, err = child.PeekSelect(nt)
+		}
 		if err != nil || d == nil {
 			continue
 		}
@@ -280,7 +286,7 @@ func adminPeekSelected(group *outbound.DialerGroup, policy consts.DialerSelectio
 		if err != nil || d == nil || d.Property() == nil {
 			continue
 		}
-		if nested := group.NestedMemberNameFor(d); nested != "" {
+		if nested := group.NestedMemberNameFor(d, nt); nested != "" {
 			return nested
 		}
 		if name := d.Property().Name; name != "" {

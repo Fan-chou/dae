@@ -491,6 +491,12 @@ func TestDialerGroup_KernelFastPathDirectFirstAliveIgnoresSharedDirectStickySibl
 	if !parent.KernelFastPathDirect(TestNetworkType) {
 		t.Fatal("first_alive parent selecting DIRECT must keep kernel DIRECT despite an unused sibling that shares the same DIRECT pointer")
 	}
+	if parent.HasSiteStickyFor(directDialer, TestNetworkType) {
+		t.Fatal("first_alive path through fixed DIRECT must not inherit sticky from an unused fallback sibling that shares the same leaf")
+	}
+	if got := parent.NestedMemberNameFor(directDialer, TestNetworkType); got != "direct-child" {
+		t.Fatalf("NestedMemberNameFor() = %q, want direct-child not the unused sticky sibling", got)
+	}
 }
 
 func TestDialerGroup_KernelFastPathDirectFallbackStaysUserspaceWhileProxyAdmitted(t *testing.T) {
