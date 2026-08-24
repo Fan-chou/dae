@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -57,6 +58,10 @@ type AliveDialerSet struct {
 
 	selectionPolicy consts.DialerSelectionPolicy
 	minLatency      minLatency
+	// urlTestReturned is the leaf actually returned by a live url_test scan.
+	// minLatency stays the last NotifyLatencyChange cache and can lag behind
+	// penalty decay; hysteresis must follow what Select really used.
+	urlTestReturned atomic.Pointer[Dialer]
 }
 
 func NewAliveDialerSet(
@@ -108,13 +113,20 @@ func (a *AliveDialerSet) GetRand() *Dialer {
 }
 
 func (a *AliveDialerSet) GetRandExcluded(excluded *Dialer) *Dialer {
+	if excluded == nil {
+		return a.GetRandSkipping(nil)
+	}
+	return a.GetRandSkipping(map[*Dialer]struct{}{excluded: {}})
+}
+
+func (a *AliveDialerSet) GetRandSkipping(skip map[*Dialer]struct{}) *Dialer {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	if len(a.aliveEntries) == 0 {
 		return nil
 	}
-	if excluded == nil {
+	if len(skip) == 0 {
 		return a.aliveEntries[fastrand.Intn(len(a.aliveEntries))].dialer
 	}
 
@@ -122,11 +134,10 @@ func (a *AliveDialerSet) GetRandExcluded(excluded *Dialer) *Dialer {
 	var candidateCount int
 	for i := range a.aliveEntries {
 		d := a.aliveEntries[i].dialer
-		if d == excluded {
+		if _, skipped := skip[d]; skipped {
 			continue
 		}
 		candidateCount++
-		// Reservoir sampling keeps uniform randomness without a shared scratch buffer.
 		if fastrand.Intn(candidateCount) == 0 {
 			chosen = d
 		}
@@ -163,21 +174,48 @@ func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 }
 
 // GetMinLatency acquires correct selectionPolicy.
+// CachedMinDialer returns the last published minimum without a live rescan.
+// Nested url_test uses this as the incumbent identity so check_tolerance can
+// apply to child-member scores the same way the flat selector does.
+func (a *AliveDialerSet) CachedMinDialer() *Dialer {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.minLatency.dialer
+}
+
 func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency time.Duration) {
+	if excluded == nil {
+		return a.GetMinLatencySkipping(nil)
+	}
+	return a.GetMinLatencySkipping(map[*Dialer]struct{}{excluded: {}})
+}
+
+func (a *AliveDialerSet) GetMinLatencySkipping(skip map[*Dialer]struct{}) (d *Dialer, latency time.Duration) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.minLatency.dialer != nil && excluded != a.minLatency.dialer {
-		return a.minLatency.dialer, a.minLatency.sortingLatency
+	if a.selectionPolicy == consts.DialerSelectionPolicy_UrlTest {
+		d, latency := a.liveMinLatencyLocked(skip)
+		if len(skip) == 0 && d != nil {
+			a.urlTestReturned.Store(d)
+		}
+		return d, latency
 	}
 
-	// Find the best non-excluded dialer.
-	// Using aliveEntries with direct field access avoids map lookups.
+	if a.minLatency.dialer != nil {
+		if _, skipped := skip[a.minLatency.dialer]; !skipped {
+			return a.minLatency.dialer, a.minLatency.sortingLatency
+		}
+	}
+
 	var nextBest *Dialer
 	var nextBestSortingLatency = time.Hour
 	for i := range a.aliveEntries {
 		entry := &a.aliveEntries[i]
-		if entry.dialer == excluded {
+		if _, skipped := skip[entry.dialer]; skipped {
 			continue
 		}
 		if entry.sortingLatency < nextBestSortingLatency {
@@ -190,7 +228,107 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 		return nextBest, nextBestSortingLatency
 	}
 
-	// No dialer available
+	return nil, time.Hour
+}
+
+func (a *AliveDialerSet) liveMinLatencyLocked(skip map[*Dialer]struct{}) (*Dialer, time.Duration) {
+	var nextBest *Dialer
+	nextBestSortingLatency := time.Hour
+	var unscored []*Dialer
+	for i := range a.aliveEntries {
+		entry := &a.aliveEntries[i]
+		if _, skipped := skip[entry.dialer]; skipped {
+			continue
+		}
+		lat, ok := entry.dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
+		if !ok {
+			unscored = append(unscored, entry.dialer)
+			continue
+		}
+		lat += a.dialerToLatencyOffset[entry.dialer]
+		if lat < nextBestSortingLatency {
+			nextBestSortingLatency = lat
+			nextBest = entry.dialer
+		}
+	}
+	if nextBest == nil {
+		return a.unscoredMinLatencyLocked(skip, unscored)
+	}
+	incumbent := a.urlTestReturned.Load()
+	if incumbent == nil || !a.isAdmittedLocked(incumbent) {
+		incumbent = a.minLatency.dialer
+	}
+	if incumbent == nil || incumbent == nextBest {
+		return nextBest, nextBestSortingLatency
+	}
+	if _, skipped := skip[incumbent]; skipped || !a.isAdmittedLocked(incumbent) {
+		return nextBest, nextBestSortingLatency
+	}
+	incLat, ok := incumbent.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
+	if !ok {
+		return nextBest, nextBestSortingLatency
+	}
+	incLat += a.dialerToLatencyOffset[incumbent]
+	if a.betterThanIncumbent(nextBestSortingLatency, incLat) {
+		return nextBest, nextBestSortingLatency
+	}
+	return incumbent, incLat
+}
+
+func (a *AliveDialerSet) isAdmittedLocked(d *Dialer) bool {
+	if d == nil {
+		return false
+	}
+	index, ok := a.dialerToIndex[d]
+	return ok && index >= 0 && index < len(a.aliveEntries) && a.aliveEntries[index].dialer == d
+}
+
+// LatencyBeatsIncumbent reports whether candidate is far enough ahead of
+// incumbent to justify a switch. Subtraction is used because candidate is
+// already known to be <= incumbent, so incumbent-candidate cannot underflow;
+// adding candidate+tolerance can overflow near MaxInt64. Opposite-signed
+// values still overflow subtraction (MinInt64 vs MaxInt64); a negative
+// candidate against a non-negative incumbent always beats any duration
+// tolerance because add_latency may produce negative ranking values.
+func LatencyBeatsIncumbent(candidate, incumbent, tolerance time.Duration) bool {
+	if candidate > incumbent {
+		return false
+	}
+	if tolerance <= 0 {
+		return true
+	}
+	// candidate <= incumbent is already known, but incumbent-candidate still
+	// overflows when the values straddle MinInt64 and MaxInt64. A negative
+	// candidate against a non-negative incumbent always beats any duration
+	// tolerance; add_latency may produce negative ranking values.
+	if candidate < 0 && incumbent >= 0 {
+		return true
+	}
+	return incumbent-candidate >= tolerance
+}
+
+func (a *AliveDialerSet) betterThanIncumbent(candidate, incumbent time.Duration) bool {
+	return LatencyBeatsIncumbent(candidate, incumbent, a.tolerance)
+}
+
+func (a *AliveDialerSet) unscoredMinLatencyLocked(skip map[*Dialer]struct{}, unscored []*Dialer) (*Dialer, time.Duration) {
+	if inc := a.minLatency.dialer; inc != nil {
+		if _, skipped := skip[inc]; !skipped && a.isAdmittedLocked(inc) {
+			return inc, a.minLatency.sortingLatency
+		}
+	}
+	var next *Dialer
+	nextLat := time.Hour
+	for _, d := range unscored {
+		lat := a.dialerToLatencyOffset[d]
+		if next == nil || lat < nextLat {
+			next = d
+			nextLat = lat
+		}
+	}
+	if next != nil {
+		return next, nextLat
+	}
 	return nil, time.Hour
 }
 
@@ -244,7 +382,8 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	case consts.DialerSelectionPolicy_MinAverage10Latencies:
 		rawLatency, hasLatency = dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
 		minPolicy = true
-	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+	case consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_UrlTest:
 		rawLatency, hasLatency = dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
 		minPolicy = true
 	}
@@ -324,9 +463,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		if index := a.dialerToIndex[dialer]; index >= 0 {
 			a.aliveEntries[index].sortingLatency = sortingLatency
 		}
-		if alive &&
-			sortingLatency <= a.minLatency.sortingLatency &&
-			(a.minLatency.sortingLatency < a.tolerance || sortingLatency <= a.minLatency.sortingLatency-a.tolerance) {
+		if alive && LatencyBeatsIncumbent(sortingLatency, a.minLatency.sortingLatency, a.tolerance) {
 			a.minLatency.sortingLatency = sortingLatency
 			a.minLatency.dialer = dialer
 		} else if a.minLatency.dialer == dialer {
@@ -408,9 +545,7 @@ func (a *AliveDialerSet) calcMinLatency() {
 	if a.minLatency.dialer == nil {
 		a.minLatency.sortingLatency = minLatency
 		a.minLatency.dialer = minDialer
-	} else if minDialer != nil &&
-		minLatency <= a.minLatency.sortingLatency &&
-		(a.minLatency.sortingLatency < a.tolerance || minLatency <= a.minLatency.sortingLatency-a.tolerance) {
+	} else if minDialer != nil && LatencyBeatsIncumbent(minLatency, a.minLatency.sortingLatency, a.tolerance) {
 		a.minLatency.sortingLatency = minLatency
 		a.minLatency.dialer = minDialer
 	}
@@ -426,6 +561,10 @@ func (a *AliveDialerSet) notifySelectionChangeLocked(fromInit bool, oldLen int) 
 	switch a.selectionPolicy {
 	case consts.DialerSelectionPolicy_FirstAlive:
 		shouldNotify = oldLen != newLen
+	case consts.DialerSelectionPolicy_Fallback:
+		// Degraded is still Alive in this set; republish so kernel-direct
+		// tracks the userspace fallback leaf.
+		shouldNotify = true
 	case consts.DialerSelectionPolicy_Random:
 		// Random has no stable leaf, but 0↔n changes whether a nested
 		// first_alive/min parent can select this group. A parent that already
@@ -433,7 +572,8 @@ func (a *AliveDialerSet) notifySelectionChangeLocked(fromInit bool, oldLen int) 
 		shouldNotify = (oldLen == 0) != (newLen == 0)
 	case consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_UrlTest:
 		// Nested min compares the selected child leaf and parent health views,
 		// not this set's minLatency.dialer pointer. Republish on every update
 		// so a real winner change is not missed.
@@ -489,7 +629,8 @@ func isMinLatencyPolicy(policy consts.DialerSelectionPolicy) bool {
 	switch policy {
 	case consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_UrlTest:
 		return true
 	default:
 		return false

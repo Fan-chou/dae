@@ -208,11 +208,22 @@ func (d *Dialer) snapshotLatencyForPolicy(
 		rawLatency, hasLatency = collection.Latencies10.LastLatency()
 	case consts.DialerSelectionPolicy_MinAverage10Latencies:
 		rawLatency, hasLatency = collection.Latencies10.AvgLatency()
-	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+	case consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_UrlTest:
 		rawLatency = collection.MovingAverage
 		hasLatency = rawLatency > 0
+		if policy == consts.DialerSelectionPolicy_UrlTest && !hasLatency {
+			rawLatency, hasLatency = collection.Latencies10.AvgLatency()
+		}
 	}
 	d.collectionFineMu.RUnlock()
+
+	if policy == consts.DialerSelectionPolicy_UrlTest {
+		quality, ok := d.health.quality(typ.Index(), rawLatency, hasLatency, time.Now())
+		if ok {
+			rawLatency, hasLatency = quality, true
+		}
+	}
 
 	if hasLatency {
 		penalty := d.getBackoffPenaltyForType(typ)
@@ -1006,6 +1017,9 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 	}
 	d.collectionFineMu.Unlock()
 
+	d.health.observeFailure(idx, time.Now())
+	d.maybeLogAdmission(typ)
+
 	if wasAlive != alive {
 		d.notifyAliveTransition(typ, alive)
 	}
@@ -1040,6 +1054,9 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	}
 	d.collectionFineMu.Unlock()
 
+	d.health.observeProbe(idx, true, latency, time.Now())
+	d.maybeLogAdmission(typ)
+
 	// Notify about health check success.
 	// isRevival is true if we were dead.
 	// We no longer trigger recovery detection for explicit resuscitation probes on already-alive nodes
@@ -1073,6 +1090,7 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
 	}
+	d.maybeLogAdmission(typ)
 	return update
 }
 
@@ -1125,13 +1143,33 @@ func (d *Dialer) ReportUnavailableForced(typ *NetworkType, err error) {
 	d.informDialerGroupUpdate(d.markUnavailableInternal(typ, true, true))
 }
 
-func (d *Dialer) ReportAvailableTraffic(typ *NetworkType) {
+// ResetTrafficFailCount clears the consecutive data-path failure streak.
+// A local WriteTo success is not remote reachability, so this must not
+// recover Degraded, decay penalty, or flush the loss window.
+func (d *Dialer) ResetTrafficFailCount(typ *NetworkType) {
+	if d == nil || typ == nil || typ.IpVersion == "" {
+		return
+	}
 	idx := typ.Index()
 	if d.trafficFailCount[idx].Load() != 0 {
 		d.trafficFailCount[idx].Store(0)
 	}
-	if typ.L4Proto == consts.L4ProtoStr_UDP && typ.EffectiveUdpHealthDomain() == UdpHealthDomainData && !d.MustGetAlive(typ) {
+}
+
+func (d *Dialer) ReportAvailableTraffic(typ *NetworkType) {
+	d.ResetTrafficFailCount(typ)
+	idx := typ.Index()
+	if typ.L4Proto != consts.L4ProtoStr_UDP || typ.EffectiveUdpHealthDomain() != UdpHealthDomainData {
+		return
+	}
+	// Data-UDP has no periodic latency probe. A real failure marks Degraded
+	// while the node often stays Alive; successful replies must still advance
+	// health recovery and republish quality, not only revive a Dead flag.
+	if !d.MustGetAlive(typ) {
 		d.informDialerGroupUpdate(d.markAvailableTraffic(typ))
+	}
+	if d.health.observeTrafficSuccess(idx, time.Now()) {
+		d.publishQuality(typ)
 	}
 }
 

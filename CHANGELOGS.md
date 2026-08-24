@@ -51,11 +51,48 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 
 ### Unreleased
 
+#### Features
+
+- Group policies `fallback` and `url_test` are now first-class (Mihomo-style
+  admission plus a quality score), with Alive / Degraded / Dead node health and
+  per-site stickiness. The Web UI and admin API expose per-member admission
+  (`alive` / `degraded` / `dead`) for these groups. Debug logs record each
+  promotion/demotion with cause and selection behavior. Existing
+  `first_alive` / `min` / `min_avg10` / `min_moving_avg` keep their old
+  selection semantics. User-facing notes:
+  [`docs/zh/quality-urltest-fallback.md`](docs/zh/quality-urltest-fallback.md).
+
 #### Behavior changes / Upgrade notes
 
 Existing config files keep parsing, but the following defaults and semantics
 changed. Review them before upgrading:
 
+- `fallback` / `url_test` groups still expose a group-default `selected` on the
+  admin API and Web UI (the no-site Peek/Select result), labeled as varying by
+  site. Mihomo rule sync maps `fallback` → `fallback` and `url-test` →
+  `url_test` instead of approximating them as `first_alive` / `min_avg10`.
+- A local UDP `WriteTo` / batch enqueue success is not peer reachability.
+  Only a real reply recovers Degraded / the loss window; a completed local
+  send only breaks the consecutive write-fail streak.
+- UDP-based outbounds (Hysteria / TUIC / Juicity) use a looser TCP-slot
+  Degraded/congestion bar (about 2× RTT or 3 consecutive failures; Brutal-style
+  high-rate high-RTT is not congestion). Inner TCP handshake on these nodes is
+  local QUIC stream-open and is **not** written into the RTT baseline; site
+  stickiness also uses the 2× bar (not 1.5×) against probe RTT. Samples under
+  about 10ms are ignored, and a real probe replaces a leftover sub-10ms
+  baseline instead of being treated as a spike. TCP outbounds and data-UDP
+  write semantics are unchanged.
+- `fallback` no longer yields to a later member just because the first is
+  slower than its own RTT baseline or looks congested. It still skips Dead
+  and failure/loss-based Degraded. `url_test` keeps ranking by quality score.
+- `fallback` site stickiness can reclaim an earlier Alive member on **new**
+  connections after about 2 minutes, so a recovered higher-priority node is
+  not stuck behind a busy lower pin forever. Sites that already probed away
+  from a slow first member stay on the pin. Established flows are not moved.
+- Site stickiness also keys on a unicast destination IP when there is no
+  sniffed domain (same pin / hold-down / reclaim rules). Loopback, unspecified,
+  multicast, and link-local addresses are not sticky. A sniffed name still
+  wins over the FakeIP or literal address.
 - `sniffing_timeout` default lowered from `100ms` to `30ms`. Slow first-packet
   clients that previously sniffed successfully may now fall back to non-sniffed
   routing; combined with the sniff negative cache this makes domain-based

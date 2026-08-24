@@ -7,33 +7,42 @@ package control
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
+	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
 )
 
 func TestAdminGroupsOmitsBuiltinAndNodeLinks(t *testing.T) {
 	t.Parallel()
+	d := newTestEndpointDialer()
+	t.Cleanup(func() { _ = d.Close() })
+	group := newTestFixedOutboundGroup(d)
+	t.Cleanup(func() { group.Close() })
 	store := outbound.NewGroupSelectionStore(t.TempDir() + "/state.json")
-	if err := store.Set("proxy", "Cherry_Proxy"); err != nil {
+	if err := store.Set(group.Name, "Cherry_Proxy"); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
-	group := &outbound.DialerGroup{Name: "proxy"}
 	direct := &outbound.DialerGroup{Name: consts.OutboundDirect.String()}
 	c := &ControlPlane{
 		controlPlaneGenerationState: controlPlaneGenerationState{
-			outbounds:             []*outbound.DialerGroup{direct, group},
-			groupSelectionStore:   store,
-			groupSelectionMembers: map[string][]string{"proxy": {"Cherry_Proxy", "Other"}},
+			outbounds:           []*outbound.DialerGroup{direct, group},
+			groupSelectionStore: store,
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"Cherry_Proxy", "Other"},
+			},
 		},
 	}
 	groups := c.AdminGroups()
 	if len(groups) != 1 {
 		t.Fatalf("groups = %#v, want 1 user group", groups)
 	}
-	if groups[0].Name != "proxy" || !groups[0].Selectable || groups[0].Selected != "Cherry_Proxy" {
+	if groups[0].Name != group.Name || !groups[0].Selectable || groups[0].Selected != "Cherry_Proxy" {
 		t.Fatalf("group = %#v", groups[0])
 	}
 	body, err := json.Marshal(groups)
@@ -57,6 +66,113 @@ func TestAdminInferredSelectedFirstAlive(t *testing.T) {
 	}
 	if adminInferredSelected(consts.DialerSelectionPolicy_FirstAlive, []AdminGroupMember{{Name: "dead", Alive: false}}) != "" {
 		t.Fatal("want empty selected when no member is alive")
+	}
+}
+
+func TestAdminInferredSelectedSkipsFallbackAndUrlTest(t *testing.T) {
+	t.Parallel()
+	ms := int32(20)
+	members := []AdminGroupMember{
+		{Name: "a", Alive: true, LatencyMs: &ms},
+		{Name: "b", Alive: true},
+	}
+	if got := adminInferredSelected(consts.DialerSelectionPolicy_Fallback, members); got != "" {
+		t.Fatalf("fallback selected = %q, want empty (per-site, not global)", got)
+	}
+	if got := adminInferredSelected(consts.DialerSelectionPolicy_UrlTest, members); got != "" {
+		t.Fatalf("url_test selected = %q, want empty (quality + per-site)", got)
+	}
+}
+
+func TestAdminGroupsReportsLiveFallbackLeaf(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	group := newTestOutboundGroup(outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, a, b)
+	t.Cleanup(func() { group.Close() })
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{group},
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	if len(groups) != 1 {
+		t.Fatalf("groups = %#v, want 1", groups)
+	}
+	if groups[0].Selected != "hk-1" {
+		t.Fatalf("selected = %q, want live fallback leaf hk-1", groups[0].Selected)
+	}
+}
+
+func TestAdminGroupsIgnoresStaleSelectionAfterPolicyChange(t *testing.T) {
+	t.Parallel()
+	a := newTestEndpointDialer()
+	b := newTestEndpointDialer()
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	group := newTestOutboundGroup(outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, a, b)
+	t.Cleanup(func() { group.Close() })
+
+	store := outbound.NewGroupSelectionStore(t.TempDir() + "/state.json")
+	if err := store.Set(group.Name, "Cherry_Proxy"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds:           []*outbound.DialerGroup{group},
+			groupSelectionStore: store,
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"Cherry_Proxy", "Other"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	if len(groups) != 1 {
+		t.Fatalf("groups = %#v, want 1", groups)
+	}
+	if groups[0].Policy != string(consts.DialerSelectionPolicy_Fallback) {
+		t.Fatalf("policy = %q, want fallback", groups[0].Policy)
+	}
+	if groups[0].Selected != "" {
+		t.Fatalf("selected = %q, want empty after select→fallback leftover store value", groups[0].Selected)
+	}
+}
+
+func TestAdminGroupsUsesLiveFixedIndexWhenPersistedMemberGone(t *testing.T) {
+	t.Parallel()
+	d := newTestEndpointDialer()
+	t.Cleanup(func() { _ = d.Close() })
+	group := newTestFixedOutboundGroup(d)
+	t.Cleanup(func() { group.Close() })
+
+	store := outbound.NewGroupSelectionStore(t.TempDir() + "/state.json")
+	if err := store.Set(group.Name, "Cherry_Proxy"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds:           []*outbound.DialerGroup{group},
+			groupSelectionStore: store,
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"Other", "Next"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	if len(groups) != 1 {
+		t.Fatalf("groups = %#v, want 1", groups)
+	}
+	if groups[0].Selected != "Other" {
+		t.Fatalf("selected = %q, want live FixedIndex member Other, not stale Cherry_Proxy", groups[0].Selected)
 	}
 }
 
@@ -110,5 +226,172 @@ func TestTriggerLatencyChecksForGroupRejectsUnknownAndBuiltin(t *testing.T) {
 	}
 	if err := c.TriggerLatencyChecksForGroup("AI"); err != nil {
 		t.Fatalf("AI group: %v", err)
+	}
+}
+
+func TestAdminGroupsReportsAdmissionStates(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	typ := &componentdialer.NetworkType{
+		L4Proto:   consts.L4ProtoStr_TCP,
+		IpVersion: consts.IpVersionStr_4,
+	}
+	a.SetFailDegradedForTest(typ, true)
+	group := newTestOutboundGroup(outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, a, b)
+	t.Cleanup(func() { group.Close() })
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{group},
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	if len(groups) != 1 || len(groups[0].Members) != 2 {
+		t.Fatalf("groups = %#v", groups)
+	}
+	byName := map[string]AdminGroupMember{}
+	for _, member := range groups[0].Members {
+		byName[member.Name] = member
+	}
+	hk := byName["hk-1"]
+	if hk.Admission != "degraded" {
+		t.Fatalf("hk-1 admission = %q, want degraded", hk.Admission)
+	}
+	if !strings.Contains(hk.Reason, "fail") {
+		t.Fatalf("hk-1 reason = %q, want fail", hk.Reason)
+	}
+	us := byName["us-1"]
+	if us.Admission != "alive" && us.Admission != "" {
+		t.Fatalf("us-1 admission = %q, want alive", us.Admission)
+	}
+	body, err := json.Marshal(groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"admission":"degraded"`) {
+		t.Fatalf("JSON missing degraded admission: %s", body)
+	}
+}
+
+func TestAdminGroupsResolvesNestedMemberHealthAndSelection(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	option := &componentdialer.GlobalOption{Log: logger, CheckInterval: time.Second}
+	annos := []*componentdialer.Annotation{{}, {}}
+	child := outbound.NewDialerGroup(option, "proxy-child", []*componentdialer.Dialer{a, b}, annos, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *componentdialer.NetworkType, bool) {})
+	t.Cleanup(func() { child.Close() })
+	parent, err := outbound.NewNestedDialerGroup(option, "stream", []outbound.NestedDialerGroupMember{{Group: child}}, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *componentdialer.NetworkType, bool) {})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroup() error = %v", err)
+	}
+	t.Cleanup(func() { parent.Close() })
+
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{parent, child},
+			groupSelectionMembers: map[string][]string{
+				parent.Name: {child.Name},
+				child.Name:  {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	byName := map[string]AdminGroup{}
+	for _, group := range groups {
+		byName[group.Name] = group
+	}
+	stream, ok := byName["stream"]
+	if !ok {
+		t.Fatalf("groups = %#v, want stream parent", groups)
+	}
+	if len(stream.Members) != 1 || stream.Members[0].Name != "proxy-child" {
+		t.Fatalf("stream members = %#v, want nested child name", stream.Members)
+	}
+	if !stream.Members[0].Alive {
+		t.Fatalf("nested child shown dead: %#v", stream.Members[0])
+	}
+	if stream.Selected != "proxy-child" {
+		t.Fatalf("stream selected = %q, want proxy-child", stream.Selected)
+	}
+}
+
+func TestAdminGroupsParentHealthRetryKeepsNestedChildAlive(t *testing.T) {
+	t.Parallel()
+	a := newNamedTestEndpointDialer("hk-1")
+	b := newNamedTestEndpointDialer("us-1")
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	childOption := &componentdialer.GlobalOption{
+		Log:               logger,
+		CheckInterval:     time.Second,
+		TcpCheckOptionRaw: componentdialer.TcpCheckOptionRaw{Raw: []string{"https://child.example/check"}},
+	}
+	parentOption := &componentdialer.GlobalOption{
+		Log:               logger,
+		CheckInterval:     time.Second,
+		TcpCheckOptionRaw: componentdialer.TcpCheckOptionRaw{Raw: []string{"https://parent.example/check"}},
+	}
+	annos := []*componentdialer.Annotation{{}, {}}
+	child := outbound.NewDialerGroup(childOption, "proxy-child", []*componentdialer.Dialer{a, b}, annos, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *componentdialer.NetworkType, bool) {})
+	t.Cleanup(func() { child.Close() })
+	parent, err := outbound.NewNestedDialerGroupWithRuntimeOptions(parentOption, "stream", []outbound.NestedDialerGroupMember{{Group: child}}, outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(bool, *componentdialer.NetworkType, bool) {}, outbound.DialerGroupRuntimeOptions{HealthCheckEnabled: true})
+	if err != nil {
+		t.Fatalf("NewNestedDialerGroupWithRuntimeOptions() error = %v", err)
+	}
+	t.Cleanup(func() { parent.Close() })
+	t.Cleanup(func() {
+		for _, view := range parent.ParentHealthViewDialers() {
+			_ = view.Close()
+		}
+	})
+
+	firstView := parent.HealthViewOf(a)
+	if firstView == nil || firstView == a {
+		t.Fatal("parent health clone for first child leaf is required")
+	}
+	snapshot := firstView.HealthSnapshot()
+	for i := range snapshot.Collections {
+		snapshot.Collections[i].Alive = false
+	}
+	firstView.RestoreHealthSnapshot(snapshot)
+
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{parent, child},
+			groupSelectionMembers: map[string][]string{
+				parent.Name: {child.Name},
+				child.Name:  {"hk-1", "us-1"},
+			},
+		},
+	}
+	groups := c.AdminGroups()
+	byName := map[string]AdminGroup{}
+	for _, group := range groups {
+		byName[group.Name] = group
+	}
+	stream, ok := byName["stream"]
+	if !ok {
+		t.Fatalf("groups = %#v, want stream parent", groups)
+	}
+	if len(stream.Members) != 1 || !stream.Members[0].Alive {
+		t.Fatalf("nested child shown dead after parent retry should admit second leaf: %#v", stream)
 	}
 }

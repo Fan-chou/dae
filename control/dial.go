@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"time"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
@@ -33,20 +34,26 @@ type proxyDialParam struct {
 }
 
 type proxyDialResult struct {
-	OutboundIndex           consts.OutboundIndex
-	Outbound                *ob.DialerGroup
-	Dialer                  *dialer.Dialer
-	DialTarget              string
-	Network                 string
-	Mark                    uint32
-	Must                    bool
-	SniffedDomain           string
+	OutboundIndex consts.OutboundIndex
+	Outbound      *ob.DialerGroup
+	Dialer        *dialer.Dialer
+	DialTarget    string
+	Network       string
+	Mark          uint32
+	Must          bool
+	SniffedDomain string
+	// StickySite is the fallback/url_test pin key. It may be a dest IP when
+	// the flow has no sniffed name; it must not replace SniffedDomain.
+	StickySite              string
 	IsDialIp                bool
 	OrigNetworkType         string
 	SelectionNetworkType    string
 	OrigNetworkTypeObj      *dialer.NetworkType
 	SelectionNetworkTypeObj *dialer.NetworkType
 	AdmissionNetworkTypeObj *dialer.NetworkType
+	// SelectPath is the nested member and sticky tables used by this Select.
+	// Slow-handshake and established-flow snapshots must keep this token.
+	SelectPath ob.SelectPath
 }
 
 func shouldForceMarkUnavailableOnProxyDialError(err error) bool {
@@ -117,6 +124,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	fakeDest := c.destIsFakeIP(dst.Addr())
+	stickySite := stickySelectHost(domain, dst.Addr(), fakeDest)
 	if fakeDest {
 		// Kernel tproxy always marks FakeIP as 0xFD, but a stale conn_state
 		// DIRECT/group result must not skip name-based reroute.
@@ -209,12 +217,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	strictIpVersion := dialIp
-	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResult(selectionNetworkType, strictIpVersion, p.Excluded)
+	d, _, admissionNetworkType, selectPath, err := outbound.SelectWithPath(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
-		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResult(altType, false, p.Excluded)
+		d, _, admissionNetworkType, selectPath, err = outbound.SelectWithPath(altType, false, p.Excluded, stickySite)
 		if err == nil {
 			selectionNetworkType = altType
 		}
@@ -254,6 +262,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			return common.MagicNetwork(p.Network, mark, c.mptcp)
 		}(),
 		SniffedDomain:           domain,
+		StickySite:              stickySite,
 		Mark:                    mark,
 		Must:                    must,
 		IsDialIp:                strictIpVersion,
@@ -262,6 +271,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		OrigNetworkTypeObj:      networkType,
 		SelectionNetworkTypeObj: selectionNetworkType,
 		AdmissionNetworkTypeObj: admissionNetworkType,
+		SelectPath:              selectPath,
 	}
 	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
 		return res, err
@@ -283,12 +293,26 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		lastRes = res
 
 		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+		start := time.Now()
 		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
+		handshake := time.Since(start)
 		cancel()
 		if err == nil {
+			slow := res.Dialer.ObserveHandshake(res.SelectionNetworkTypeObj, handshake)
+			if attempt == 0 && slow && c.canExcludeSlowHandshake(res) {
+				_ = conn.Close()
+				res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
+				p.Excluded = res.Dialer
+				lastErr = fmt.Errorf("slow handshake %s", handshake.Truncate(time.Millisecond))
+				lastRes = res
+				continue
+			}
 			return conn, res, nil
 		}
 		lastErr = err
+		if res.Outbound != nil && !commonerrors.IsCanceledOrClosed(err) {
+			res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
+		}
 		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
 			l4proto := consts.L4ProtoStr(p.Network)
 			if res.SelectionNetworkTypeObj != nil {
@@ -305,4 +329,50 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		}
 	}
 	return nil, lastRes, lastErr
+}
+
+// stickySelectHost prefers a sniffed domain. When the flow is IP-only (no
+// SNI / FakeIP name), the destination unicast IP becomes the sticky subject so
+// fallback/url_test can pin the same node for that address.
+func stickySelectHost(domain string, dst netip.Addr, fakeIP bool) string {
+	if ob.SiteKey(domain) != "" {
+		return domain
+	}
+	if fakeIP || !dst.IsValid() {
+		return domain
+	}
+	if key := ob.SiteKey(dst.Unmap().String()); key != "" {
+		return key
+	}
+	return domain
+}
+
+func siteFailDomain(res *proxyDialResult, domain string) string {
+	if res != nil {
+		if res.StickySite != "" {
+			return res.StickySite
+		}
+		if res.SniffedDomain != "" {
+			return res.SniffedDomain
+		}
+	}
+	return domain
+}
+
+func pinSiteSubject(sticky, sniffed string) string {
+	if sticky != "" {
+		return sticky
+	}
+	return sniffed
+}
+
+func (c *ControlPlane) canExcludeSlowHandshake(res *proxyDialResult) bool {
+	if res == nil || res.Outbound == nil || res.Dialer == nil || res.SelectionNetworkTypeObj == nil {
+		return false
+	}
+	if !res.SelectPath.HasSiteSticky() {
+		return false
+	}
+	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.StickySite)
+	return err == nil && d != nil && d != res.Dialer
 }

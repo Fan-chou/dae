@@ -36,9 +36,15 @@ type egressRuntime struct {
 	forgetDialerEpochs func([]*dialer.Dialer)
 }
 
+// egressBindingKey identifies one established-flow snapshot. The recorded
+// SelectPath is the identity: NestedMember is only the top-level child, so
+// two deep routes can share that name and the same leaf while carrying
+// different sticky tables. Reusing a snapshot across those routes would skip
+// a pin or pollute an unused fallback table.
 type egressBindingKey struct {
 	group  *outbound.DialerGroup
 	dialer *dialer.Dialer
+	path   outbound.SelectPath
 }
 
 type egressRuntimeActions struct {
@@ -102,7 +108,7 @@ type egressRuntimeLease struct {
 	once    sync.Once
 }
 
-func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.DialerGroup) (*egressRuntimeLease, *outbound.DialerGroup, bool) {
+func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.DialerGroup, path outbound.SelectPath) (*egressRuntimeLease, *outbound.DialerGroup, bool) {
 	if r == nil {
 		return nil, group, true
 	}
@@ -123,10 +129,10 @@ func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.D
 		}
 		r.dialerRefs[selected] = refs + 1
 		if group != nil {
-			key := egressBindingKey{group: group, dialer: selected}
+			key := egressBindingKey{group: group, dialer: selected, path: path}
 			retainedGroup = r.snapshots[key]
 			if retainedGroup == nil {
-				retainedGroup = group.SnapshotForEstablishedFlow(selected)
+				retainedGroup = group.SnapshotForEstablishedFlowPath(selected, path)
 				r.snapshots[key] = retainedGroup
 			}
 		}
@@ -143,7 +149,7 @@ func (r *egressRuntime) transferLease(oldLease *egressRuntimeLease) (*egressRunt
 	if r == nil || oldLease == nil || oldLease.dialer == nil {
 		return nil, nil
 	}
-	newLease, retainedGroup, ok := r.acquireEgress(oldLease.dialer, nil)
+	newLease, retainedGroup, ok := r.acquireEgress(oldLease.dialer, nil, outbound.SelectPath{})
 	if !ok {
 		return nil, nil
 	}

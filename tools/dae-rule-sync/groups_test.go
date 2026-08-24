@@ -40,10 +40,10 @@ func TestGenerateFlatDaeGroupsMapsSimplePolicies(t *testing.T) {
 		t.Fatalf("GenerateFlatDaeGroups() error = %v", err)
 	}
 	if report.Converted != 1 || report.Approximated != 1 || len(report.Unsupported) != 0 {
-		t.Fatalf("report = %#v", report)
+		t.Fatalf("report = %#v, want fallback marked approximate", report)
 	}
-	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1')\n        filter: name('us-1')") || !strings.Contains(output, "policy: first_alive") {
-		t.Fatalf("output = %q, want fallback mapped to ordered first_alive filters", output)
+	if !strings.Contains(output, "group {") || !strings.Contains(output, "filter: name('hk-1')\n        filter: name('us-1')") || !strings.Contains(output, "policy: fallback") {
+		t.Fatalf("output = %q, want fallback mapped to ordered fallback filters", output)
 	}
 }
 
@@ -295,7 +295,7 @@ func TestGenerateFlatDaeGroupsRetainsNestedParentHealthOptions(t *testing.T) {
 	}
 }
 
-func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsExact(t *testing.T) {
+func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsFixed(t *testing.T) {
 	config := MihomoConfig{
 		Proxies: []MihomoProxy{{Name: "node"}},
 		Groups: []MihomoGroup{{
@@ -310,7 +310,7 @@ func TestGenerateFullMihomoGroupsTreatsSingleDirectURLTestAsExact(t *testing.T) 
 		t.Fatalf("generateFullMihomoGroups() error = %v", err)
 	}
 	if report.Approximated != 0 || len(report.Unsupported) != 0 {
-		t.Fatalf("report = %#v, want exact conversion", report)
+		t.Fatalf("report = %#v, want single DIRECT url-test treated as lossless fixed(0)", report)
 	}
 	if !strings.Contains(output, "policy: fixed(0)") {
 		t.Fatalf("output = %q, missing fixed single-member policy", output)
@@ -337,11 +337,36 @@ func TestGenerateFullMihomoGroupsEmitsOneFallbackFilterPerMember(t *testing.T) {
 		t.Fatalf("generateFullMihomoGroups() error = %v", err)
 	}
 	if report.Approximated != 0 {
-		t.Fatalf("report = %#v, want exact fallback conversion", report)
+		t.Fatalf("report = %#v, want native fallback treated as lossless", report)
 	}
 	want := "filter: name('HK_GG_IPLC_Dmit_HK')\n        filter: name('HK_DMIT_HK_Hysteria')"
 	if !strings.Contains(output, want) {
 		t.Fatalf("output = %q, want declared fallback order %q", output, want)
+	}
+	if !strings.Contains(output, "policy: fallback") {
+		t.Fatalf("output = %q, want fallback policy", output)
+	}
+}
+
+func TestGenerateFullMihomoGroupsEmitsUrlTestPolicy(t *testing.T) {
+	config := MihomoConfig{
+		Proxies: []MihomoProxy{{Name: "hk-1"}, {Name: "us-1"}},
+		Groups: []MihomoGroup{{
+			Name:    "Auto",
+			Type:    "url-test",
+			Proxies: []string{"hk-1", "us-1"},
+			URL:     mihomoStringPtr("http://example.com/generate_204"),
+		}},
+	}
+	output, report, err := generateFullMihomoGroups(config, map[string]string{"hk-1": "hk_1", "us-1": "us_1"})
+	if err != nil {
+		t.Fatalf("generateFullMihomoGroups() error = %v", err)
+	}
+	if report.Approximated != 0 || len(report.Unsupported) != 0 {
+		t.Fatalf("report = %#v, want native url_test treated as lossless", report)
+	}
+	if !strings.Contains(output, "policy: url_test") {
+		t.Fatalf("output = %q, want url_test policy", output)
 	}
 }
 

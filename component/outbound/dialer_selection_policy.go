@@ -32,7 +32,9 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
-		consts.DialerSelectionPolicy_FirstAlive:
+		consts.DialerSelectionPolicy_FirstAlive,
+		consts.DialerSelectionPolicy_Fallback,
+		consts.DialerSelectionPolicy_UrlTest:
 		return &DialerSelectionPolicy{
 			Policy: fName,
 		}, nil

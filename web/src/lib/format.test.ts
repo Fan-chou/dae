@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { connectionsPath } from "../api/client";
 import { defaultBaseUrl } from "../api/settings";
-import { applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, parseLogLine, rateScale, srcHost, summarizeConnections, uniqueOutbounds } from "./format";
+import { applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, displayedSelected, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, parseLogLine, rateScale, siteLocalSelectionPolicy, srcHost, summarizeConnections, uniqueOutbounds, admissionCounts, admissionLabel, admissionReasonLabel, memberAdmission } from "./format";
 import { effectiveConnView } from "./layout";
 import { lintDae } from "./dae-lint";
 
@@ -204,5 +204,44 @@ describe("rateScale and connection summaries", () => {
       { ts: 2, up: 2, down: 2 },
       { ts: 3, up: 3, down: 3 },
     ]);
+  });
+});
+
+describe("displayedSelected", () => {
+  const members = [
+    { name: "a", alive: true, latency_ms: 40 },
+    { name: "b", alive: true, latency_ms: 10 },
+  ];
+
+  it("does not invent a global node for fallback or url_test when selected is empty", () => {
+    expect(siteLocalSelectionPolicy("fallback")).toBe(true);
+    expect(siteLocalSelectionPolicy("url_test")).toBe(true);
+    expect(displayedSelected({ policy: "fallback", members })).toBe("按站点自动");
+    expect(displayedSelected({ policy: "url_test", members })).toBe("按站点自动");
+  });
+
+  it("still infers first_alive and min_* when selected is empty", () => {
+    expect(displayedSelected({ policy: "first_alive", members })).toBe("a");
+    expect(displayedSelected({ policy: "min_avg10", members })).toBe("b");
+  });
+
+  it("keeps an explicit selected name", () => {
+    expect(displayedSelected({ selected: "b", policy: "fallback", members })).toBe("b");
+  });
+});
+
+describe("memberAdmission", () => {
+  it("maps API admission to labels and counts", () => {
+    expect(memberAdmission({ admission: "degraded", alive: true })).toBe("degraded");
+    expect(memberAdmission({ alive: false })).toBe("dead");
+    expect(admissionLabel("alive")).toBe("健康");
+    expect(admissionLabel("degraded")).toBe("变差");
+    expect(admissionLabel("dead")).toBe("死亡");
+    expect(admissionReasonLabel("fail,rtt")).toContain("失败");
+    expect(admissionCounts([{ admission: "alive", alive: true }, { admission: "degraded", alive: true }, { alive: false }])).toEqual({
+      alive: 1,
+      degraded: 1,
+      dead: 1,
+    });
   });
 });

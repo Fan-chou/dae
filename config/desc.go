@@ -93,13 +93,15 @@ Available functions: name, subtag. Not operator is supported.
 Available keys in name function: keyword, regex. No key indicates full match.
 Available keys in subtag function: regex. No key indicates full match.`,
 	"policy": `Dialer selection policy. For each new connection, select a node as dialer from group by this policy.
-Available values: random, fixed, first_alive, min, min_avg10, min_moving_avg.
+Available values: random, fixed, first_alive, fallback, min, min_avg10, min_moving_avg, url_test.
 random: Select randomly.
 fixed: Select the fixed node. Connectivity check will be disabled.
 first_alive: Select the first alive node in declaration order.
+fallback: Mihomo fallback: declaration order, skip dead nodes, skip degraded nodes when a later alive node exists.
 min: Select node by the latency of last check.
 min_avg10: Select node by the average of latencies of last 10 checks.
 min_moving_avg: Select node by the moving average of latencies of checks, which means more recent latencies have higher weight.
+url_test: Mihomo url-test: select the lowest quality score (moving-average latency, loss, and congestion disability) among non-dead nodes. check_tolerance applies to that score.
 `,
 	"tcp_check_url":         "Override global config.",
 	"tcp_check_http_method": "Override global config.",

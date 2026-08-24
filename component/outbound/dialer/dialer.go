@@ -144,6 +144,8 @@ type Dialer struct {
 	recoveryManagerMu sync.Mutex
 	recoveryManager   *dialerRecoveryManager
 
+	health nodeHealth
+
 	metadataRetirer establishedFlowMetadataRetirer
 	retireOnce      sync.Once
 	closeOnce       sync.Once
@@ -177,6 +179,17 @@ type DialerRecoveryHealthSnapshot struct {
 type DialerHealthSnapshot struct {
 	Collections [8]DialerCollectionHealthSnapshot
 	Recovery    [3]DialerRecoveryHealthSnapshot
+	Health      [8]NodeHealthSlotSnapshot
+}
+
+// NodeHealthSlotSnapshot is the stable quality state inherited across reload.
+// Transient penalties, congestion, and loss windows are intentionally omitted.
+type NodeHealthSlotSnapshot struct {
+	Baseline            time.Duration
+	BaselineSamples     int
+	RecentSuccessDelays []time.Duration
+	LastSampleRTT       time.Duration
+	Degraded            bool
 }
 
 type GlobalOption struct {
@@ -289,6 +302,7 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 		httpClients:      make(map[string]*http.Client),
 	}
 	d.Dialer = dialer
+	d.health.udpTransport = udpTransportFromProperty(property)
 	d.recoveryManager = newDialerRecoveryManager(d)
 
 	// Initialize recovery detection with adjusted max backoff
@@ -544,6 +558,7 @@ func (d *Dialer) HealthSnapshot() DialerHealthSnapshot {
 		}
 	}
 	snapshot.Recovery = d.ensureRecoveryManager().snapshot(time.Now().UnixNano())
+	snapshot.Health = d.health.snapshot()
 	return snapshot
 }
 
@@ -600,6 +615,7 @@ func (d *Dialer) RestoreHealthSnapshot(snapshot DialerHealthSnapshot) {
 			groups: d.snapshotAliveDialerGroupsLocked(collection),
 		})
 	}
+	d.health.restore(snapshot.Health)
 	d.collectionFineMu.Unlock()
 
 	// Only defer the first health check when ALL inherited collections are
@@ -610,6 +626,8 @@ func (d *Dialer) RestoreHealthSnapshot(snapshot DialerHealthSnapshot) {
 		d.reloadInheritedHealth.Store(true)
 	}
 
+	d.ensureRecoveryManager().restore(snapshot.Recovery)
+
 	for _, update := range updates {
 		for _, a := range update.groups {
 			a.NotifyLatencyChange(d, update.alive)
@@ -618,8 +636,6 @@ func (d *Dialer) RestoreHealthSnapshot(snapshot DialerHealthSnapshot) {
 			d.notifyAliveTransition(update.typ, update.alive)
 		}
 	}
-
-	d.ensureRecoveryManager().restore(snapshot.Recovery)
 }
 
 // MarkAliveForReloadFallback keeps one group candidate selectable when reload

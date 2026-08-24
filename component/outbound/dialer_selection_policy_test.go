@@ -29,3 +29,13 @@ func TestNewDialerSelectionPolicyFromGroupParamParsesFirstAlive(t *testing.T) {
 	require.Equal(t, consts.DialerSelectionPolicy_FirstAlive, policy.Policy)
 	require.Zero(t, policy.FixedIndex)
 }
+
+func TestNewDialerSelectionPolicyFromGroupParamParsesFallbackAndUrlTest(t *testing.T) {
+	fallback, err := NewDialerSelectionPolicyFromGroupParam(&config.Group{Policy: "fallback"})
+	require.NoError(t, err)
+	require.Equal(t, consts.DialerSelectionPolicy_Fallback, fallback.Policy)
+
+	urlTest, err := NewDialerSelectionPolicyFromGroupParam(&config.Group{Policy: "url_test"})
+	require.NoError(t, err)
+	require.Equal(t, consts.DialerSelectionPolicy_UrlTest, urlTest.Policy)
+}

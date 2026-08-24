@@ -64,6 +64,11 @@ func newUdpSessionLifecycleContext(ue *UdpEndpoint, fallbackIpVersion consts.IpV
 			networkType.IpVersion = fallbackIpVersion
 		}
 	}
+	if networkType.IpVersion == "" {
+		// Cannot map this session onto a health collection; skip reporting
+		// rather than panicking in Index() on an incomplete NetworkType.
+		return udpLifecycleContext{}, false
+	}
 	return udpLifecycleContext{
 		dialer:      ue.Dialer,
 		networkType: networkType,
@@ -99,6 +104,13 @@ func (c udpLifecycleContext) reportTrafficSuccess() {
 		return
 	}
 	c.dialer.ReportAvailableTraffic(&c.networkType)
+}
+
+func (c udpLifecycleContext) reportWriteSuccess() {
+	if c.dialer == nil {
+		return
+	}
+	c.dialer.ResetTrafficFailCount(&c.networkType)
 }
 
 func (c udpLifecycleContext) reportUnavailable(err error) {
@@ -141,6 +153,8 @@ func (c udpLifecycleContext) handleReply(ue *UdpEndpoint, nowNano int64) {
 	if c.profile.PromoteOnReply {
 		ue.markReplied(nowNano)
 	}
+	// Only a real downstream datagram proves the peer is reachable.
+	// WriteTo success only means the local socket accepted the payload.
 	if c.profile.StickyAfterReply {
 		c.reportTrafficSuccess()
 	}

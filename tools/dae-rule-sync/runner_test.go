@@ -2805,12 +2805,12 @@ routes:
 		t.Fatalf("initial RunSync() error = %v", err)
 	}
 	oldTarget, oldRoutes, oldGroups := readCurrentGeneration(t, generationDir)
-	approximateGroups := strings.ReplaceAll(mustReadFile(t, groupsPath), "type: select", "type: url-test")
+	approximateGroups := strings.ReplaceAll(mustReadFile(t, groupsPath), "type: select", "type: load-balance")
 	if err := os.WriteFile(groupsPath, []byte(approximateGroups), 0o600); err != nil {
 		t.Fatalf("WriteFile(approximate groups) error = %v", err)
 	}
-	if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), "approximated") {
-		t.Fatalf("RunSync() error = %v, want approximation gate rejection", err)
+	if _, err := RunSync(context.Background(), options); err == nil || !strings.Contains(strings.ToLower(err.Error()), "unsupported") {
+		t.Fatalf("RunSync() error = %v, want unsupported group rejection", err)
 	}
 	newTarget, newRoutes, newGroups := readCurrentGeneration(t, generationDir)
 	if newTarget != oldTarget || string(newRoutes) != string(oldRoutes) || string(newGroups) != string(oldGroups) {

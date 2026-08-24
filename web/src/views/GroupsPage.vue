@@ -4,7 +4,20 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useDocumentVisibility, useIntervalFn } from "@vueuse/core";
 import type { AdminGroup, AdminGroupMember } from "@/api/types";
 import { persistPrefs } from "@/store/session";
-import { displayedSelected, latencyClass, latencyText, policyLabel, trafficForName } from "@/lib/format";
+import {
+  admissionBadgeClass,
+  admissionCounts,
+  admissionLabel,
+  admissionTitle,
+  displayedSelected,
+  latencyClass,
+  latencyText,
+  memberAdmission,
+  memberCardClass,
+  policyLabel,
+  siteLocalSelectionPolicy,
+  trafficForName,
+} from "@/lib/format";
 import { checkGroupDelay, refresh, refreshConnections, selectMember, ui } from "@/store/session";
 
 const search = ref("");
@@ -12,6 +25,7 @@ const visibility = useDocumentVisibility();
 const { pause, resume } = useIntervalFn(
   () => {
     void refreshConnections({ silent: true, outbound: "" });
+    void refresh("groups", { silent: true });
   },
   2000,
   { immediate: false },
@@ -50,6 +64,7 @@ function membersOf(group: AdminGroup): AdminGroupMember[] {
 }
 
 function isCurrent(group: AdminGroup, member: AdminGroupMember): boolean {
+  if (siteLocalSelectionPolicy(group.policy) && !group.selected) return false;
   return member.name === displayedSelected(group);
 }
 
@@ -70,6 +85,14 @@ function onGroupSort(event: Event): void {
   const value = (event.target as HTMLSelectElement).value;
   if (value === "default" || value === "latency" || value === "traffic") persistPrefs({ groupSort: value });
 }
+
+function cardClass(group: AdminGroup, member: AdminGroupMember): string {
+  return memberCardClass(isCurrent(group, member), memberAdmission(member));
+}
+
+function groupAdmission(group: AdminGroup) {
+  return admissionCounts(group.members);
+}
 </script>
 
 <template>
@@ -89,6 +112,10 @@ function onGroupSort(event: Event): void {
           <div class="text-sm opacity-70">
             {{ policyLabel(group.policy) }} · 当前
             <span class="font-semibold text-success">{{ displayedSelected(group) }}</span>
+            <span v-if="siteLocalSelectionPolicy(group.policy)" class="opacity-60">（组默认，按站点可能不同）</span>
+            <span v-if="siteLocalSelectionPolicy(group.policy)" class="opacity-80">
+              · 健康 {{ groupAdmission(group).alive }} · 变差 {{ groupAdmission(group).degraded }} · 死亡 {{ groupAdmission(group).dead }}
+            </span>
             · {{ groupTraffic(group).count }} 连接
             · ↓ {{ prettyBytes(groupTraffic(group).downloadRate) }}/s
           </div>
@@ -104,10 +131,15 @@ function onGroupSort(event: Event): void {
           :key="member.name"
           type="button"
           class="min-h-16 rounded-box border bg-base-200 p-3 text-left transition"
-          :class="isCurrent(group, member) ? 'border-success bg-base-100' : 'border-base-300 hover:border-base-content/40'"
+          :class="cardClass(group, member)"
           @click="onSelect(group, member)"
         >
-          <div class="truncate text-sm font-medium" :title="member.name">{{ member.name }}</div>
+          <div class="flex items-start justify-between gap-1">
+            <div class="truncate text-sm font-medium" :title="member.name">{{ member.name }}</div>
+            <span :class="admissionBadgeClass(memberAdmission(member))" :title="admissionTitle(member)">{{
+              admissionLabel(memberAdmission(member))
+            }}</span>
+          </div>
           <div class="mt-1 flex items-center justify-between gap-1 text-xs">
             <span :class="latencyClass(member.alive, member.latency_ms)">{{ latencyText(member.alive, member.latency_ms) }}</span>
             <span class="opacity-70">{{ memberTraffic(member).count }}</span>

@@ -30,7 +30,9 @@ type UdpEgressBinding struct {
 	Network       string
 	NetworkType   dialer.NetworkType
 	SniffedDomain string
+	StickySite    string
 	IsDialIp      bool
+	SelectPath    outbound.SelectPath
 }
 
 // UdpFlowBinding combines the policy and egress decisions fixed at endpoint creation.
@@ -58,7 +60,9 @@ func newUdpFlowBinding(policyEpoch routing.PolicyEpoch, outboundIndex consts.Out
 		Target:        option.Target,
 		Network:       option.Network,
 		SniffedDomain: option.SniffedDomain,
+		StickySite:    option.StickySite,
 		IsDialIp:      option.IsDialIp,
+		SelectPath:    option.SelectPath,
 	}
 	if option.NetworkType != nil {
 		binding.Egress.NetworkType = *option.NetworkType
