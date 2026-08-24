@@ -1022,3 +1022,62 @@ func TestDialerGroup_SelectPathRecordsNineNestedStickyTables(t *testing.T) {
 		t.Fatal("recorded 9-deep path must pin the innermost sticky table, not drop it at cap 8")
 	}
 }
+
+func TestInternSelectPathSharesTablesAcrossNestedMembers(t *testing.T) {
+	g := &DialerGroup{}
+	table := &siteStickyTable{}
+	var a, b selectPathBuilder
+	a.NestedMember = "child-a"
+	b.NestedMember = "child-b"
+	a.addTable(table)
+	b.addTable(table)
+	pa := internSelectPath(g, a)
+	pb := internSelectPath(g, b)
+	if pa.NestedMember != "child-a" || pb.NestedMember != "child-b" {
+		t.Fatalf("NestedMember a=%q b=%q", pa.NestedMember, pb.NestedMember)
+	}
+	if pa == pb {
+		t.Fatal("different NestedMember must keep distinct SelectPath tokens")
+	}
+	if pa.p == nil || pa.p != pb.p {
+		t.Fatal("sibling leaves sharing one sticky table must reuse the interned slice")
+	}
+	if n := len(g.internedSelectPaths); n != 1 {
+		t.Fatalf("interned paths = %d, want 1 shared table sequence", n)
+	}
+}
+
+func TestInternSelectPathIndexesByLastTable(t *testing.T) {
+	g := &DialerGroup{}
+	shared := &siteStickyTable{}
+	const n = 64
+	var first [n]SelectPath
+	for i := 0; i < n; i++ {
+		var b selectPathBuilder
+		b.NestedMember = "child"
+		b.addTable(shared)
+		b.addTable(&siteStickyTable{})
+		first[i] = internSelectPath(g, b)
+		again := internSelectPath(g, b)
+		if again != first[i] {
+			t.Fatalf("path %d intern hit returned a different token", i)
+		}
+	}
+	if got := len(g.internedSelectPaths); got != n {
+		t.Fatalf("interned paths = %d, want %d distinct last tables", got, n)
+	}
+	if got := len(g.internedByLastTable); got != n {
+		t.Fatalf("last-table index size = %d, want %d", got, n)
+	}
+}
+
+func TestInternSelectPathSkipsEmptyTables(t *testing.T) {
+	g := &DialerGroup{}
+	p := internSelectPath(g, selectPathBuilder{NestedMember: "child-a"})
+	if p.NestedMember != "child-a" || p.p != nil {
+		t.Fatalf("empty-table path = %+v, want NestedMember only", p)
+	}
+	if n := len(g.internedSelectPaths); n != 0 {
+		t.Fatalf("interned %d paths, want none for NestedMember-only tokens", n)
+	}
+}

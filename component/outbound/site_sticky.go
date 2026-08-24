@@ -77,19 +77,20 @@ func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer, networkType *dialer.Net
 	return len(g.collectStickyTablesOnSelectedPath(d, networkType)) > 0
 }
 
-// internedSelectPath is the unique recorded nested member and sticky tables
-// for one Select. DialerGroup interns these so flow bindings can store a
-// comparable token without copying the table list onto every connection.
+// internedSelectPath is the unique sticky-table sequence recorded by one
+// Select. NestedMember stays on SelectPath: sibling leaves that share the
+// same exclusive sticky tables must reuse one interned slice, while still
+// comparing as different tokens for admin identity and snapshot caches.
 type internedSelectPath struct {
-	nestedMember string
-	tables       []*siteStickyTable
+	tables []*siteStickyTable
 }
 
-// SelectPath is an interned token for the nested member and sticky tables
-// actually used by one Select. Slow-handshake, PinSite snapshots, and admin
-// identity must use this recorded path. The token is comparable (a pointer
-// plus NestedMember) so snapshot caches can key on it; the table slice lives
-// once per unique path on the group, not per flow, and is not truncated.
+// SelectPath is the recorded nested member plus interned sticky tables for
+// one Select. Slow-handshake, PinSite snapshots, and admin identity must use
+// this path. The token is comparable (NestedMember plus interned pointer) so
+// snapshot caches can key on it; the table slice lives once per unique table
+// sequence on the group, not per flow or per nested member, and is not
+// truncated.
 type SelectPath struct {
 	NestedMember string
 	p            *internedSelectPath
@@ -125,26 +126,31 @@ func internSelectPath(g *DialerGroup, b selectPathBuilder) SelectPath {
 	if b.NestedMember == "" && b.n == 0 {
 		return SelectPath{}
 	}
+	if b.n == 0 {
+		return SelectPath{NestedMember: b.NestedMember}
+	}
 	if g == nil {
 		return SelectPath{
 			NestedMember: b.NestedMember,
-			p:            &internedSelectPath{nestedMember: b.NestedMember, tables: b.copyTables()},
+			p:            &internedSelectPath{tables: b.copyTables()},
 		}
 	}
 	if existing := g.lookupInternedSelectPath(b); existing != nil {
-		return SelectPath{NestedMember: existing.nestedMember, p: existing}
+		return SelectPath{NestedMember: b.NestedMember, p: existing}
 	}
 	g.internMu.Lock()
 	defer g.internMu.Unlock()
 	if existing := g.findInternedSelectPathLocked(b); existing != nil {
-		return SelectPath{NestedMember: existing.nestedMember, p: existing}
+		return SelectPath{NestedMember: b.NestedMember, p: existing}
 	}
-	tok := &internedSelectPath{
-		nestedMember: b.NestedMember,
-		tables:       b.copyTables(),
-	}
+	tok := &internedSelectPath{tables: b.copyTables()}
 	g.internedSelectPaths = append(g.internedSelectPaths, tok)
-	return SelectPath{NestedMember: tok.nestedMember, p: tok}
+	if g.internedByLastTable == nil {
+		g.internedByLastTable = make(map[*siteStickyTable][]*internedSelectPath)
+	}
+	last := tok.tables[len(tok.tables)-1]
+	g.internedByLastTable[last] = append(g.internedByLastTable[last], tok)
+	return SelectPath{NestedMember: b.NestedMember, p: tok}
 }
 
 func (g *DialerGroup) lookupInternedSelectPath(b selectPathBuilder) *internedSelectPath {
@@ -154,8 +160,11 @@ func (g *DialerGroup) lookupInternedSelectPath(b selectPathBuilder) *internedSel
 }
 
 func (g *DialerGroup) findInternedSelectPathLocked(b selectPathBuilder) *internedSelectPath {
-	for _, existing := range g.internedSelectPaths {
-		if existing.nestedMember == b.NestedMember && b.sameStickyTables(existing.tables) {
+	if b.n == 0 || g.internedByLastTable == nil {
+		return nil
+	}
+	for _, existing := range g.internedByLastTable[b.tableAt(b.n-1)] {
+		if b.sameStickyTables(existing.tables) {
 			return existing
 		}
 	}

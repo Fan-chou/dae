@@ -149,6 +149,7 @@ type DialerGroup struct {
 	nowFn               func() time.Time
 	internMu            sync.RWMutex
 	internedSelectPaths []*internedSelectPath
+	internedByLastTable map[*siteStickyTable][]*internedSelectPath
 
 	// nestedIncumbent is the last nested min/url_test leaf actually returned
 	// for each health domain. Flattened AliveDialerSet minima can be unused
