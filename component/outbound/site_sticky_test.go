@@ -931,3 +931,61 @@ func TestDialerGroup_PeekSelectPathRecordsNestedMember(t *testing.T) {
 		t.Fatalf("PeekSelectPath nested = %q, want child-a from the same peek", nested)
 	}
 }
+
+func TestDialerGroup_SelectPathRecordsNineNestedStickyTables(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	a := namedNoopDialer(option, "proxy-a")
+	b := namedNoopDialer(option, "proxy-b")
+	defer a.Close()
+	defer b.Close()
+
+	inner := NewDialerGroup(option, "inner", []*dialer.Dialer{a, b}, newEmptyAnnotations(2), DialerSelectionPolicy{
+		Policy: consts.DialerSelectionPolicy_Fallback,
+	}, func(bool, *dialer.NetworkType, bool) {})
+	defer inner.Close()
+	parent := inner
+	for i := range 8 {
+		next, err := NewNestedDialerGroup(option, fmt.Sprintf("wrap-%d", i), []NestedDialerGroupMember{
+			{Group: parent},
+		}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+		if err != nil {
+			t.Fatalf("wrap-%d: %v", i, err)
+		}
+		defer next.Close()
+		parent = next
+	}
+
+	selected, _, _, path, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("SelectWithPath() error = %v", err)
+	}
+	if selected != a {
+		t.Fatalf("selected %p, want inner first leaf %p", selected, a)
+	}
+	if got := len(path.stickyTables()); got != 9 {
+		t.Fatalf("sticky tables = %d, want 9 (must not truncate at 8)", got)
+	}
+
+	_, _, _, path2, err := parent.SelectWithPath(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("second SelectWithPath() error = %v", err)
+	}
+	if path != path2 {
+		t.Fatal("the same nested path must intern to one comparable token")
+	}
+
+	snap := parent.SnapshotForEstablishedFlowPath(selected, path)
+	snap.PinSite("youtube.com", b, false)
+	got, _, _, err := inner.SelectWithExclusionResultForSite(TestNetworkType, true, nil, "youtube.com")
+	if err != nil {
+		t.Fatalf("inner SelectForSite() after 9-deep pin error = %v", err)
+	}
+	if got != b {
+		t.Fatal("recorded 9-deep path must pin the innermost sticky table, not drop it at cap 8")
+	}
+}

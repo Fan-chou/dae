@@ -77,51 +77,100 @@ func (g *DialerGroup) HasSiteStickyFor(d *dialer.Dialer, networkType *dialer.Net
 	return len(g.collectStickyTablesOnSelectedPath(d, networkType)) > 0
 }
 
-const selectPathMaxTables = 8
+// internedSelectPath is the unique recorded nested member and sticky tables
+// for one Select. DialerGroup interns these so flow bindings can store a
+// comparable token without copying the table list onto every connection.
+type internedSelectPath struct {
+	nestedMember string
+	tables       []*siteStickyTable
+}
 
-// SelectPath is the nested member and sticky tables actually used by one Select.
-// Control-plane slow-handshake, PinSite snapshots, and admin identity must use
-// this recorded path, not a later re-selection that can drop the site key or
-// resample a random child. Tables are inlined so the token is comparable and
-// Select does not allocate a backing array on the connection hot path.
+// SelectPath is an interned token for the nested member and sticky tables
+// actually used by one Select. Slow-handshake, PinSite snapshots, and admin
+// identity must use this recorded path. The token is comparable (a pointer
+// plus NestedMember) so snapshot caches can key on it; the table slice lives
+// once per unique path on the group, not per flow, and is not truncated.
 type SelectPath struct {
 	NestedMember string
-	tables       [selectPathMaxTables]*siteStickyTable
-	n            uint8
+	p            *internedSelectPath
+}
+
+// selectPathBuilder records tables during one Select. It may grow past any
+// inline cap; internSelectPath freezes it onto the group's unique token.
+type selectPathBuilder struct {
+	NestedMember string
+	tables       []*siteStickyTable
 }
 
 func (p SelectPath) HasSiteSticky() bool {
-	return p.n > 0
+	return p.p != nil && len(p.p.tables) > 0
 }
 
 func (p SelectPath) stickyTables() []*siteStickyTable {
-	if p.n == 0 {
+	if p.p == nil {
 		return nil
 	}
-	return append([]*siteStickyTable(nil), p.tables[:p.n]...)
+	return p.p.tables
 }
 
-func (p *SelectPath) addTable(t *siteStickyTable) {
-	if p == nil || t == nil || p.n >= selectPathMaxTables {
+func internSelectPath(g *DialerGroup, b selectPathBuilder) SelectPath {
+	tables := uniqueStickyTables(b.tables)
+	if b.NestedMember == "" && len(tables) == 0 {
+		return SelectPath{}
+	}
+	if g == nil {
+		return SelectPath{
+			NestedMember: b.NestedMember,
+			p:            &internedSelectPath{nestedMember: b.NestedMember, tables: tables},
+		}
+	}
+	g.internMu.Lock()
+	defer g.internMu.Unlock()
+	for _, existing := range g.internedSelectPaths {
+		if existing.nestedMember == b.NestedMember && sameStickyTables(existing.tables, tables) {
+			return SelectPath{NestedMember: existing.nestedMember, p: existing}
+		}
+	}
+	tok := &internedSelectPath{
+		nestedMember: b.NestedMember,
+		tables:       append([]*siteStickyTable(nil), tables...),
+	}
+	g.internedSelectPaths = append(g.internedSelectPaths, tok)
+	return SelectPath{NestedMember: tok.nestedMember, p: tok}
+}
+
+func sameStickyTables(a, b []*siteStickyTable) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *selectPathBuilder) addTable(t *siteStickyTable) {
+	if p == nil || t == nil {
 		return
 	}
-	for i := uint8(0); i < p.n; i++ {
-		if p.tables[i] == t {
+	for _, existing := range p.tables {
+		if existing == t {
 			return
 		}
 	}
-	p.tables[p.n] = t
-	p.n++
+	p.tables = append(p.tables, t)
 }
 
-func (p *SelectPath) addSticky(g *DialerGroup) {
+func (p *selectPathBuilder) addSticky(g *DialerGroup) {
 	if p == nil || g == nil || !g.usesSiteSticky() || g.siteSticky == nil {
 		return
 	}
 	p.addTable(g.siteSticky)
 }
 
-func (p *SelectPath) adopt(member dialerGroupMember, sub *SelectPath) {
+func (p *selectPathBuilder) adopt(member dialerGroupMember, sub *selectPathBuilder) {
 	if p == nil {
 		return
 	}
@@ -135,17 +184,17 @@ func (p *SelectPath) adopt(member dialerGroupMember, sub *SelectPath) {
 	if sub == nil {
 		return
 	}
-	for i := uint8(0); i < sub.n; i++ {
-		p.addTable(sub.tables[i])
+	for _, table := range sub.tables {
+		p.addTable(table)
 	}
 }
 
-func (p *SelectPath) take(src *SelectPath) {
+func (p *selectPathBuilder) take(src *selectPathBuilder) {
 	if p == nil {
 		return
 	}
 	if src == nil {
-		*p = SelectPath{}
+		*p = selectPathBuilder{}
 		return
 	}
 	*p = *src
@@ -276,12 +325,12 @@ func (g *DialerGroup) FailSite(site string, d *dialer.Dialer) {
 // An empty path is a no-op: membership collection would hold-down unused
 // sticky siblings that share the failed leaf.
 func (g *DialerGroup) FailSitePath(site string, d *dialer.Dialer, path SelectPath) {
-	if g == nil || d == nil || path.n == 0 {
+	if g == nil || d == nil || !path.HasSiteSticky() {
 		return
 	}
 	now := g.now()
-	for i := uint8(0); i < path.n; i++ {
-		path.tables[i].fail(site, d, now)
+	for _, table := range path.stickyTables() {
+		table.fail(site, d, now)
 	}
 }
 
