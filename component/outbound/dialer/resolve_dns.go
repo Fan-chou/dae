@@ -57,8 +57,7 @@ func extractLinkResolveDNS(link string) (stripped string, dns netip.AddrPort, er
 	if err != nil || u == nil {
 		return link, netip.AddrPort{}, nil
 	}
-	q := u.Query()
-	raw := q.Get(LinkQuery_ResolveDNS)
+	raw := u.Query().Get(LinkQuery_ResolveDNS)
 	if raw == "" {
 		return link, netip.AddrPort{}, nil
 	}
@@ -66,7 +65,29 @@ func extractLinkResolveDNS(link string) (stripped string, dns netip.AddrPort, er
 	if err != nil {
 		return "", netip.AddrPort{}, fmt.Errorf("node %s: %w", LinkQuery_ResolveDNS, err)
 	}
-	q.Del(LinkQuery_ResolveDNS)
-	u.RawQuery = q.Encode()
+	u.RawQuery = stripQueryParam(u.RawQuery, LinkQuery_ResolveDNS)
 	return u.String(), dns, nil
+}
+
+// stripQueryParam removes key from a raw query string without re-encoding
+// remaining parameters. Query().Encode() would turn + into space and %3A
+// colons, which breaks protocol fields such as pinSHA256 and obfs-password.
+func stripQueryParam(rawQuery, key string) string {
+	if rawQuery == "" || key == "" {
+		return rawQuery
+	}
+	parts := strings.Split(rawQuery, "&")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		name, _, _ := strings.Cut(p, "=")
+		decoded, err := url.QueryUnescape(name)
+		if err != nil {
+			decoded = name
+		}
+		if decoded == key {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, "&")
 }

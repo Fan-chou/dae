@@ -7,6 +7,7 @@ package dialer
 
 import (
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -59,6 +60,41 @@ func TestExtractLinkResolveDNS(t *testing.T) {
 	}
 	if !strings.Contains(stripped, "sni=example.com") {
 		t.Fatalf("stripped lost sni: %s", stripped)
+	}
+
+	preserved, dns, err := extractLinkResolveDNS("hysteria2://pass@203.0.113.1:443?obfs-password=a+b&pinSHA256=aa:bb:cc&resolve_dns=8.8.8.8#US")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dns != netip.MustParseAddrPort("8.8.8.8:53") {
+		t.Fatalf("dns = %v", dns)
+	}
+	if strings.Contains(preserved, "resolve_dns") {
+		t.Fatalf("stripped still has resolve_dns: %s", preserved)
+	}
+	if !strings.Contains(preserved, "obfs-password=a+b") {
+		t.Fatalf("stripped re-encoded plus: %s", preserved)
+	}
+	if !strings.Contains(preserved, "pinSHA256=aa:bb:cc") {
+		t.Fatalf("stripped re-encoded pinSHA256: %s", preserved)
+	}
+
+	encoded, dns, err := extractLinkResolveDNS("hysteria2://pass@203.0.113.1:443?sni=example.com&%72esolve_dns=8.8.8.8&resolve%5Fdns=1.1.1.1#US")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dns != netip.MustParseAddrPort("8.8.8.8:53") {
+		t.Fatalf("encoded dns = %v", dns)
+	}
+	parsed, err := url.Parse(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("resolve_dns") != "" {
+		t.Fatalf("encoded resolve_dns still present: %s", encoded)
+	}
+	if !strings.Contains(encoded, "sni=example.com") {
+		t.Fatalf("encoded strip lost sni: %s", encoded)
 	}
 
 	plain, dns, err := extractLinkResolveDNS("hysteria2://pass@203.0.113.1:443?sni=example.com#US")

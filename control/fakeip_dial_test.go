@@ -287,12 +287,14 @@ func TestApplyProxyResolveDNSPinsIPViaSelectedDialer(t *testing.T) {
 	var gotDNS netip.AddrPort
 	var gotHost string
 	var gotType uint16
+	var gotNetwork string
 	old := resolveIPViaDialer
 	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
 		gotDialer = dialer
 		gotDNS = resolver
 		gotHost = host
 		gotType = typ
+		gotNetwork = network
 		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
@@ -313,6 +315,8 @@ func TestApplyProxyResolveDNSPinsIPViaSelectedDialer(t *testing.T) {
 	if res.DialTarget != "104.18.32.1:443" || !res.IsDialIp {
 		t.Fatalf("DialTarget = (%q, %v), want pinned 104.18.32.1:443", res.DialTarget, res.IsDialIp)
 	}
+	assertMagicIPVersion(t, gotNetwork, "4")
+	assertMagicIPVersion(t, res.Network, "4")
 }
 
 func TestApplyProxyResolveDNSFailureDoesNotFallBackToDomain(t *testing.T) {
@@ -401,6 +405,10 @@ func TestApplyProxyResolveDNSFallsBackToOtherFamily(t *testing.T) {
 	if res.DialTarget != "[2001:db8::9]:443" || !res.IsDialIp {
 		t.Fatalf("DialTarget = (%q, %v), want pinned AAAA", res.DialTarget, res.IsDialIp)
 	}
+	assertMagicIPVersion(t, res.Network, "4")
+	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_4 {
+		t.Fatalf("selection IP version = %v, want 4", res.SelectionNetworkTypeObj)
+	}
 }
 
 func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
@@ -410,9 +418,11 @@ func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
 	cp.dialMode = consts.DialMode_DomainPlus
 
 	var types []uint16
+	var gotNetwork string
 	old := resolveIPViaDialer
 	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
 		types = append(types, typ)
+		gotNetwork = network
 		if typ == dnsmessage.TypeAAAA {
 			return nil, nil
 		}
@@ -435,5 +445,58 @@ func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
 	}
 	if res.DialTarget != "203.0.113.9:443" || !res.IsDialIp {
 		t.Fatalf("DialTarget = (%q, %v), want pinned A", res.DialTarget, res.IsDialIp)
+	}
+	assertMagicIPVersion(t, gotNetwork, "6")
+	assertMagicIPVersion(t, res.Network, "6")
+	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_6 {
+		t.Fatalf("selection IP version = %v, want 6", res.SelectionNetworkTypeObj)
+	}
+}
+
+func TestApplyProxyResolveDNSCacheHit(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.dialMode = consts.DialMode_DomainPlus
+
+	var calls int
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+		calls++
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	param := &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	}
+	first, err := cp.chooseProxyDialer(context.Background(), param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cp.chooseProxyDialer(context.Background(), param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolve calls = %d, want 1", calls)
+	}
+	if first.DialTarget != second.DialTarget || second.DialTarget != "104.18.32.1:443" {
+		t.Fatalf("cached target = %q / %q", first.DialTarget, second.DialTarget)
+	}
+}
+
+func assertMagicIPVersion(t *testing.T, network, want string) {
+	t.Helper()
+	magic, err := netproxy.ParseMagicNetwork(network)
+	if err != nil {
+		t.Fatalf("ParseMagicNetwork(%q) error = %v", network, err)
+	}
+	if magic.IPVersion != want {
+		t.Fatalf("network %q IP version = %q, want %q", network, magic.IPVersion, want)
 	}
 }

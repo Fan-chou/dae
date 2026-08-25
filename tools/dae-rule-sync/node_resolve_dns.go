@@ -60,6 +60,35 @@ func validateOverlayResolveDNSAddr(addr netip.Addr) error {
 	return nil
 }
 
+func stripQueryParam(rawQuery, key string) string {
+	if rawQuery == "" || key == "" {
+		return rawQuery
+	}
+	parts := strings.Split(rawQuery, "&")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		name, _, _ := strings.Cut(p, "=")
+		decoded, err := url.QueryUnescape(name)
+		if err != nil {
+			decoded = name
+		}
+		if decoded == key {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, "&")
+}
+
+func appendQueryParam(rawQuery, key, value string) string {
+	rawQuery = stripQueryParam(rawQuery, key)
+	param := key + "=" + url.QueryEscape(value)
+	if rawQuery == "" {
+		return param
+	}
+	return rawQuery + "&" + param
+}
+
 func withResolveDNSQuery(link, dns string) (string, error) {
 	normalized, err := normalizeResolveDNSQuery(dns)
 	if err != nil {
@@ -69,9 +98,7 @@ func withResolveDNSQuery(link, dns string) (string, error) {
 	if err != nil || u == nil || u.Scheme == "" {
 		return "", fmt.Errorf("cannot attach resolve_dns to generated link")
 	}
-	query := u.Query()
-	query.Set("resolve_dns", normalized)
-	u.RawQuery = query.Encode()
+	u.RawQuery = appendQueryParam(u.RawQuery, "resolve_dns", normalized)
 	out := u.String()
 	if err := validateDaeLiteral(out); err != nil {
 		return "", fmt.Errorf("resolve_dns produced an invalid dae link")

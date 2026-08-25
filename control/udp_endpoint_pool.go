@@ -627,19 +627,20 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 		baseCtx = context.Background()
 	}
 
-	// Tie endpoint creation to the caller lifecycle so reload/shutdown cancels
-	// in-flight UDP dials instead of waiting for the full dial timeout.
-	ctx, cancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-	defer cancel()
-
-	dialOption, err := createOption.GetDialOption(ctx)
+	// Select and dial use separate DefaultDialTimeout budgets so a
+	// resolve_dns lookup inside GetDialOption cannot starve the handshake.
+	selectCtx, selectCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+	dialOption, err := createOption.GetDialOption(selectCtx)
+	selectCancel()
 	if err != nil {
 		if shouldCacheUdpEndpointCreateFailure(err) {
 			p.cacheFailureLocked(key, createOption.Log)
 		}
 		return nil, err
 	}
-	udpConn, err := dialOption.Dialer.DialContext(ctx, dialOption.Network, dialOption.Target)
+	dialCtx, dialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+	defer dialCancel()
+	udpConn, err := dialOption.Dialer.DialContext(dialCtx, dialOption.Network, dialOption.Target)
 	if err != nil {
 		reportUdpEndpointDialCreateFailure(key, dialOption, err)
 		if shouldForceMarkUnavailableOnProxyDialError(err) {
@@ -649,18 +650,19 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 			// after a long timeout), the second dial would otherwise immediately
 			// fail with context.DeadlineExceeded and incorrectly penalize the new
 			// dialer selected by GetDialOption.
-			retryCtx, retryCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-			retryOption, retryErr := createOption.GetDialOption(retryCtx)
+			retrySelectCtx, retrySelectCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+			retryOption, retryErr := createOption.GetDialOption(retrySelectCtx)
+			retrySelectCancel()
 			if retryErr == nil {
 				dialOption = retryOption
-				udpConn, err = dialOption.Dialer.DialContext(retryCtx, dialOption.Network, dialOption.Target)
-				retryCancel()
+				retryDialCtx, retryDialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+				udpConn, err = dialOption.Dialer.DialContext(retryDialCtx, dialOption.Network, dialOption.Target)
+				retryDialCancel()
 				if err == nil {
 					goto dialSuccess
 				}
 				reportUdpEndpointDialCreateFailure(key, dialOption, err)
 			} else {
-				retryCancel()
 				err = retryErr
 			}
 		}

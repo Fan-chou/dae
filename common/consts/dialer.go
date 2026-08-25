@@ -47,6 +47,12 @@ const (
 	UdpCheckLookupHost = "connectivitycheck.gstatic.com."
 	// DefaultDialTimeout is the default timeout for dialing.
 	DefaultDialTimeout = 8 * time.Second
+	// ResolveDNSTimeout is the budget for a node resolve_dns lookup.
+	// It is independent of DefaultDialTimeout so a slow DNS query cannot
+	// starve the subsequent proxy handshake.
+	ResolveDNSTimeout = 3 * time.Second
+	// ResolveDNSCacheTTL is how long a successful resolve_dns pin is reused.
+	ResolveDNSCacheTTL = 30 * time.Second
 )
 
 // L4ProtoStr represents a layer 4 protocol as a string.

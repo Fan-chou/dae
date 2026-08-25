@@ -247,25 +247,30 @@ return view.extend({
 	handleSave(ev) {
 		const table = document.getElementById('kdae-mixin-table');
 		if (table) {
-			[]
-				.concat(uci.sections('dae', 'mixin') || [])
-				.concat(uci.sections('dae', 'node_dns') || [])
-				.slice()
-				.forEach(function (sec) {
-					uci.remove('dae', sec['.name']);
+			const rows = table.querySelectorAll('tr[data-node]');
+			// An empty node list means metadata is missing, not "clear all
+			// mixins". Rebuilding from zero rows would wipe saved resolve_dns.
+			if (rows.length) {
+				[]
+					.concat(uci.sections('dae', 'mixin') || [])
+					.concat(uci.sections('dae', 'node_dns') || [])
+					.slice()
+					.forEach(function (sec) {
+						uci.remove('dae', sec['.name']);
+					});
+				rows.forEach(function (tr) {
+					const name = tr.getAttribute('data-node');
+					const on = tr.querySelector('.kdae-mixin-on').checked;
+					let dns = (tr.querySelector('.kdae-mixin-dns').value || '').trim();
+					if (!on)
+						return;
+					if (!dns)
+						dns = '8.8.8.8';
+					const id = uci.add('dae', 'mixin');
+					uci.set('dae', id, 'name', name);
+					uci.set('dae', id, 'resolve_dns', dns);
 				});
-			table.querySelectorAll('tr[data-node]').forEach(function (tr) {
-				const name = tr.getAttribute('data-node');
-				const on = tr.querySelector('.kdae-mixin-on').checked;
-				let dns = (tr.querySelector('.kdae-mixin-dns').value || '').trim();
-				if (!on)
-					return;
-				if (!dns)
-					dns = '8.8.8.8';
-				const id = uci.add('dae', 'mixin');
-				uci.set('dae', id, 'name', name);
-				uci.set('dae', id, 'resolve_dns', dns);
-			});
+			}
 		}
 		return this.super('handleSave', ev);
 	},

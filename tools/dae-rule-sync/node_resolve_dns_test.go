@@ -105,6 +105,48 @@ func TestGenerateMihomoNodesWithResolveDNSOverlay(t *testing.T) {
 	}
 }
 
+func TestWithResolveDNSQueryPreservesOtherParams(t *testing.T) {
+	link := "hysteria2://pass@127.0.0.1:443?obfs-password=a+b&pinSHA256=aa:bb:cc&sni=us.example"
+	got, err := withResolveDNSQuery(link, "8.8.8.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "obfs-password=a+b") {
+		t.Fatalf("re-encoded plus: %s", got)
+	}
+	if !strings.Contains(got, "pinSHA256=aa:bb:cc") {
+		t.Fatalf("re-encoded pinSHA256: %s", got)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("resolve_dns") != "8.8.8.8:53" {
+		t.Fatalf("resolve_dns = %q", parsed.Query().Get("resolve_dns"))
+	}
+}
+
+func TestWithResolveDNSQueryReplacesEncodedKey(t *testing.T) {
+	link := "hysteria2://pass@127.0.0.1:443?sni=us.example&%72esolve_dns=1.1.1.1"
+	got, err := withResolveDNSQuery(link, "8.8.8.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Query().Get("resolve_dns") != "8.8.8.8:53" {
+		t.Fatalf("resolve_dns = %q", parsed.Query().Get("resolve_dns"))
+	}
+	if len(parsed.Query()["resolve_dns"]) != 1 {
+		t.Fatalf("resolve_dns values = %v in %q", parsed.Query()["resolve_dns"], got)
+	}
+	if !strings.Contains(got, "sni=us.example") {
+		t.Fatalf("lost sni: %s", got)
+	}
+}
+
 func TestGenerateMihomoNodesWithResolveDNSRejectsHostname(t *testing.T) {
 	config := MihomoConfig{Proxies: []MihomoProxy{{
 		Name:     "us-hy2",

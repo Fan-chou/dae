@@ -96,6 +96,7 @@ type ControlPlane struct {
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
 	tcpConnPanicCount              atomic.Uint64
+	resolveDNSPins                 proxyResolveDNSPinCache
 	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
