@@ -7,7 +7,7 @@
 return view.extend({
 	render() {
 		const m = new form.Map('dae', _('配置'),
-			_('编辑 /etc/dae/config.dae 的 include/global/dns/routing。节点 URI 在 nodes.dae（0600），routing.dae 请用 kdae-ui 配置页。保存会先校验，失败则还原文件；校验通过后才会热重载。'));
+			_('保存前校验，失败则还原。节点 URI 不在此编辑。'));
 
 		m.section(form.TypedSection).anonymous = true;
 
