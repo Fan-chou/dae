@@ -6,7 +6,11 @@
 package control
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
+
+	"net/netip"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
@@ -43,7 +47,7 @@ func phase0QuicSniffingCorpusFixtures() []quicSniffingCorpusFixture {
 		expectedOutbound: consts.OutboundUserDefinedMin + 1,
 		expectedMark:     77,
 		expectedMust:     true,
-		expectedTarget:   "52.199.194.44:443",
+		expectedTarget:   "i.ytimg.com:443",
 		expectedAction:   phase0QuicActionProxy,
 	}}
 }
@@ -51,8 +55,8 @@ func phase0QuicSniffingCorpusFixtures() []quicSniffingCorpusFixture {
 // TestPhase0QuicSniffingCorpus_LegacyBaseline records the observable result
 // of the QUIC sniffing pipeline. The captured Initial spans two datagrams; its
 // first packet must wait for more crypto data, while the completed handshake
-// must bind the SNI, select the SNI-matched outbound, preserve the original IP
-// dial target, and reuse that bound flow for later packets.
+// must bind the SNI, select the SNI-matched outbound, pass domain:port
+// (no resolve_dns on the test dialer), and reuse that bound flow for later packets.
 func TestPhase0QuicSniffingCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range phase0QuicSniffingCorpusFixtures() {
 		fixture := fixture
@@ -113,7 +117,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 		t.Fatalf("endpoint outbound = %p, want SNI-matched outbound %p", got, cp.outbounds[fixture.expectedOutbound])
 	}
 	if got := endpoint.DialTarget; got != fixture.expectedTarget {
-		t.Fatalf("DialTarget = %q, want original destination %q", got, fixture.expectedTarget)
+		t.Fatalf("DialTarget = %q, want domain:port %q", got, fixture.expectedTarget)
 	}
 	binding := endpoint.FlowBinding()
 	if binding.Route.Outbound != fixture.expectedOutbound || binding.Route.Mark != fixture.expectedMark || binding.Route.Must != fixture.expectedMust {
@@ -147,6 +151,15 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	if got := sniffedConn.writeCalls.Load(); got != 2 {
 		t.Fatalf("replayed packet writes = %d, want 2", got)
 	}
+	if addrs := sniffedConn.recordedWriteAddrs(); len(addrs) != 2 {
+		t.Fatalf("WriteTo addrs after sniff = %v, want 2", addrs)
+	} else {
+		for i, addr := range addrs {
+			if addr != fixture.expectedTarget {
+				t.Fatalf("WriteTo[%d] = %q, want %q (must not send the packet IP)", i, addr, fixture.expectedTarget)
+			}
+		}
+	}
 
 	thirdDecision := ClassifyUdpFlow(src, dst, second)
 	if err := cp.handlePkt(nil, second, src, dst, routingResult, thirdDecision, false); err != nil {
@@ -157,6 +170,121 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	}
 	if got := sniffedConn.writeCalls.Load(); got != 3 {
 		t.Fatalf("packet writes after bound-flow reuse = %d, want 3", got)
+	}
+	if addrs := sniffedConn.recordedWriteAddrs(); len(addrs) != 3 {
+		t.Fatalf("WriteTo addrs after reuse = %v, want 3", addrs)
+	} else if addrs[2] != fixture.expectedTarget {
+		t.Fatalf("WriteTo[2] = %q, want %q", addrs[2], fixture.expectedTarget)
+	}
+}
+
+func TestHandlePkt_TransportShutdownKeepsSniffedDomain(t *testing.T) {
+	rebuildAfterSniffedEndpointEviction(t, false, "transport")
+}
+
+func TestHandlePkt_TransportShutdownPinsResolveDNS(t *testing.T) {
+	rebuildAfterSniffedEndpointEviction(t, true, "transport")
+}
+
+func TestHandlePkt_PoolResetKeepsSniffedDomain(t *testing.T) {
+	rebuildAfterSniffedEndpointEviction(t, false, "reset")
+}
+
+func TestHandlePkt_PoolResetPinsResolveDNS(t *testing.T) {
+	rebuildAfterSniffedEndpointEviction(t, true, "reset")
+}
+
+func rebuildAfterSniffedEndpointEviction(t *testing.T, withResolveDNS bool, evict string) {
+	t.Helper()
+	defer setupQuicInitialRegressionTestState(t)()
+	resetQuicRejectMemoryForTest()
+	t.Cleanup(resetQuicRejectMemoryForTest)
+
+	fixture := phase0QuicSniffingCorpusFixtures()[0]
+	first, second := newSnifferNeedMorePayloads(t)
+	fallbackConn := &udpReuseSimulationConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	fallbackDialer, _ := newCountingProxyEndpointDialer("hysteria2", "fallback.example:443", fallbackConn)
+	conn1 := &udpReuseSimulationTransportConn{
+		udpReuseSimulationConn: &udpReuseSimulationConn{
+			reads:   make(chan scriptedPacketRead),
+			closeCh: make(chan struct{}),
+		},
+		transportDone: make(chan struct{}),
+	}
+	conn2 := &udpReuseSimulationConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	var factoryCalls atomic.Int32
+	sniffedDialer, sniffedUnderlay := newFactoryProxyEndpointDialer("hysteria2", "sniffed.example:443", func() netproxy.Conn {
+		if factoryCalls.Add(1) == 1 {
+			return conn1
+		}
+		return conn2
+	})
+	wantTarget := fixture.expectedTarget
+	var lookups atomic.Int32
+	if withResolveDNS {
+		sniffedDialer.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+		old := resolveIPViaDialer
+		resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+			lookups.Add(1)
+			return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, nil
+		}
+		t.Cleanup(func() { resolveIPViaDialer = old })
+		wantTarget = "203.0.113.9:443"
+	}
+
+	cp := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(fallbackDialer))
+	cp.outbounds = append(cp.outbounds, newTestFixedOutboundGroup(sniffedDialer))
+	cp.routingMatcher = newQuicSniffingCorpusMatcher(t, fixture)
+
+	src, dst, firstDecision := newQuicInitialRegressionFlow(t, first)
+	primeQuicRegressionAnyfrom(src, dst)
+	routingResult := &bpfRoutingResult{Outbound: uint8(consts.OutboundControlPlaneRouting)}
+	if err := cp.handlePkt(nil, first, src, dst, routingResult, firstDecision, false); err != nil {
+		t.Fatalf("handlePkt(first): %v", err)
+	}
+	secondDecision := ClassifyUdpFlow(src, dst, second).EnsureSnifferSession()
+	if err := cp.handlePkt(nil, second, src, dst, routingResult, secondDecision, false); err != nil {
+		t.Fatalf("handlePkt(second): %v", err)
+	}
+
+	switch evict {
+	case "transport":
+		close(conn1.transportDone)
+		waitForCloseSignal(t, conn1.closeCh, "transport lifecycle shutdown should retire the sniffed endpoint")
+	case "reset":
+		ResetGlobalUdpFlowState()
+		waitForCloseSignal(t, conn1.closeCh, "fresh-datapath reset should close the sniffed endpoint")
+		primeQuicRegressionAnyfrom(src, dst)
+	default:
+		t.Fatalf("unknown eviction mode %q", evict)
+	}
+	if _, ok := DefaultUdpEndpointPool.Get(firstDecision.SymmetricNatEndpointKey()); ok {
+		t.Fatal("expected eviction to remove the sniffed endpoint")
+	}
+
+	shortHeader := []byte{0x41, 0x00, 0x01, 0x02, 0x03, 0x04}
+	shortDecision := ClassifyUdpFlow(src, dst, shortHeader)
+	if shortDecision.IsQuicInitial {
+		t.Fatal("1-RTT short header must not be classified as QUIC Initial")
+	}
+	if err := cp.handlePkt(nil, shortHeader, src, dst, routingResult, shortDecision, false); err != nil {
+		t.Fatalf("handlePkt(short): %v", err)
+	}
+	if got := sniffedUnderlay.calls.Load(); got != 2 {
+		t.Fatalf("DialContext calls after rebuild = %d, want 2", got)
+	}
+	addrs := conn2.recordedWriteAddrs()
+	if len(addrs) != 1 || addrs[0] != wantTarget {
+		t.Fatalf("WriteTo after rebuild = %v, want [%s] (must not fall back to packet IP)", addrs, wantTarget)
+	}
+	if withResolveDNS && lookups.Load() == 0 {
+		t.Fatal("resolve_dns must be queried when rebuilding after endpoint eviction")
 	}
 }
 

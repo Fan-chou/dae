@@ -31,6 +31,8 @@ type proxyDialParam struct {
 	Mark        uint32
 	Network     string         // e.g. "tcp", "udp"
 	Excluded    *dialer.Dialer // Dialer to exclude in selection
+	// IdentifiedQuic is set by the UDP GetDialOption path. TCP leaves it false.
+	IdentifiedQuic bool
 }
 
 type proxyDialResult struct {
@@ -273,7 +275,16 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		AdmissionNetworkTypeObj: admissionNetworkType,
 		SelectPath:              selectPath,
 	}
+	// Reject identified QUIC before resolve_dns. A failing lookup must not
+	// hide REJECT-NO-DROP behind a DNS error (no ICMP, client waits out the
+	// handshake instead of falling back to HTTP/2).
+	if p.IdentifiedQuic && c.shouldRejectProxiedQuic(d, true) {
+		return res, ErrQuicAdministrativelyProhibited
+	}
 	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
+		return res, err
+	}
+	if err := c.ensureUdpDialTargetIP(ctx, p, res); err != nil {
 		return res, err
 	}
 	return res, nil

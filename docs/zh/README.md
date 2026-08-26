@@ -200,6 +200,8 @@ global {
   log_level: info
   allow_insecure: false
   auto_config_kernel_parameter: true
+  # block_quic 默认 true：对非数据报节点上的 QUIC 做 REJECT-NO-DROP。
+  # block_quic: true
 }
 
 subscription {
@@ -239,8 +241,9 @@ routing {
 
   ### 以下为自定义规则
 
-  # 禁用 h3，因为它通常消耗很多 CPU 和内存资源
-  l4proto(udp) && dport(443) -> block
+  # 可选：内核静默丢弃全部 UDP/443（含 Hy2/TUIC/direct）。global.block_quic
+  # 默认已对 TCP/UoT 节点上识别到的 QUIC 做 REJECT-NO-DROP。
+  # l4proto(udp) && dport(443) -> block
   dip(geoip:private) -> direct
   dip(geoip:cn) -> direct
   domain(geosite:cn) -> direct

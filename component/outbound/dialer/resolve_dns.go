@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+
+	"github.com/daeuniverse/dae/common"
 )
 
 const (
@@ -52,8 +54,13 @@ func validateResolveDNSAddr(addr netip.Addr) error {
 
 // extractLinkResolveDNS pulls resolve_dns off a node link query so outbound
 // protocol parsers never see it. Invalid values fail node load.
+//
+// Named nodes are stored as "Name:scheme://..." (dae KeyableString). url.Parse
+// treats the name as the scheme and never sees the query, so the tag is split
+// off first the same way NewNetproxyDialerFromLink does.
 func extractLinkResolveDNS(link string) (stripped string, dns netip.AddrPort, err error) {
-	u, err := url.Parse(link)
+	tag, body := common.GetTagFromLinkLikePlaintext(link)
+	u, err := url.Parse(body)
 	if err != nil || u == nil {
 		return link, netip.AddrPort{}, nil
 	}
@@ -66,7 +73,11 @@ func extractLinkResolveDNS(link string) (stripped string, dns netip.AddrPort, er
 		return "", netip.AddrPort{}, fmt.Errorf("node %s: %w", LinkQuery_ResolveDNS, err)
 	}
 	u.RawQuery = stripQueryParam(u.RawQuery, LinkQuery_ResolveDNS)
-	return u.String(), dns, nil
+	stripped = u.String()
+	if tag != "" {
+		stripped = tag + ":" + stripped
+	}
+	return stripped, dns, nil
 }
 
 // stripQueryParam removes key from a raw query string without re-encoding

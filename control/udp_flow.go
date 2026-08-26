@@ -80,11 +80,12 @@ func udpRouteScopeNeedsDestinationAffinity(result *bpfRoutingResult) bool {
 // UdpFlowDecision centralizes the cheap ingress classification that is shared
 // across scheduling, sniffing, and UDP endpoint selection.
 type UdpFlowDecision struct {
-	Key               UdpFlowKey
-	SnifferKey        PacketSnifferKey
-	HasSnifferSession bool
-	IsQuicInitial     bool
-	AllowsSniffing    bool
+	Key                   UdpFlowKey
+	SnifferKey            PacketSnifferKey
+	HasSnifferSession     bool
+	IsQuicInitial         bool
+	IsStrictClientInitial bool
+	AllowsSniffing        bool
 }
 
 func udpPortAllowsSniffing(port uint16) bool {
@@ -98,21 +99,24 @@ func udpFlowAllowsSniffing(src, dst netip.AddrPort) bool {
 func ClassifyUdpFlow(src, dst netip.AddrPort, data []byte) UdpFlowDecision {
 	key := NewUdpFlowKey(src, dst)
 	sniffEligible := udpFlowAllowsSniffing(src, dst)
-	isQuicInitial := sniffEligible && sniffing.IsLikelyQuicInitialPacket(data)
+	strictInitial := sniffing.IsStrictQuicClientInitialPacket(data)
+	isQuicInitial := (sniffEligible && sniffing.IsLikelyQuicInitialPacket(data)) || strictInitial
+	allowsSniffing := sniffEligible || strictInitial
 	snifferKey := key.PacketSnifferKey()
-	if sniffEligible {
+	if allowsSniffing {
 		snifferKey = NewPacketSnifferKey(src, dst, data)
 	}
 
-	// Tightened UDP sniffing semantics: only explicit QUIC ports (443, 8443) are allowed to
-	// enter the sniffing-related flow model. All other UDP bypasses sniffing
-	// entirely, even if the payload happens to resemble a QUIC Initial packet.
+	// 443/8443 still use the cheap likely-check so sniffing can start early.
+	// Non-standard ports only enter the QUIC flow model for a strict RFC 9000
+	// client Initial (known version, parseable long header, ≥1200 bytes).
 	return UdpFlowDecision{
-		Key:               key,
-		SnifferKey:        snifferKey,
-		HasSnifferSession: sniffEligible && DefaultPacketSnifferSessionMgr.HasFlowFamilySession(snifferKey),
-		IsQuicInitial:     isQuicInitial,
-		AllowsSniffing:    sniffEligible,
+		Key:                   key,
+		SnifferKey:            snifferKey,
+		HasSnifferSession:     allowsSniffing && DefaultPacketSnifferSessionMgr.HasFlowFamilySession(snifferKey),
+		IsQuicInitial:         isQuicInitial,
+		IsStrictClientInitial: strictInitial,
+		AllowsSniffing:        allowsSniffing,
 	}
 }
 
@@ -185,6 +189,19 @@ func (d UdpFlowDecision) NatTimeoutForDial(domain string) time.Duration {
 	return DefaultNatTimeout
 }
 
+// withIdentifiedQuic upgrades lookup/dial keys so remembered or marked QUIC
+// 1-RTT uses dest-scoped NAT. It must not be copied onto sniffing flags used
+// by handlePkt (those stay on the original ClassifyUdpFlow decision).
+func (d UdpFlowDecision) withIdentifiedQuic(identified bool) UdpFlowDecision {
+	if !identified {
+		return d
+	}
+	d.IsQuicInitial = true
+	d.IsStrictClientInitial = true
+	d.AllowsSniffing = true
+	return d
+}
+
 // EndpointKeyForInitialLookup returns the appropriate endpoint pool key for the initial lookup.
 // Port-based sniff eligibility is intentionally used here only for reuse of an
 // already-established symmetric session. Allocation decisions are deferred
@@ -228,8 +245,15 @@ func (d UdpFlowDecision) EnsureSnifferSession() UdpFlowDecision {
 	if d.HasSnifferSession || !d.IsQuicInitial {
 		return d
 	}
-	_, _ = DefaultPacketSnifferSessionMgr.GetOrCreate(d.PacketSnifferKey(), nil)
-	d.HasSnifferSession = true
+	key := d.PacketSnifferKey()
+	qs, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(key, nil)
+	if qs != nil && DefaultPacketSnifferSessionMgr.Get(key) == qs {
+		d.HasSnifferSession = true
+		return d
+	}
+	if qs != nil {
+		_ = qs.Close()
+	}
 	return d
 }
 

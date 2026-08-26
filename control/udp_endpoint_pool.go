@@ -116,6 +116,10 @@ type UdpEndpoint struct {
 	// Non-empty indicates this UDP Endpoint is related with a sniffed domain.
 	SniffedDomain string
 	DialTarget    string
+	// quicIdentified is set when this endpoint forwarded identified QUIC
+	// (Initial, sniffer session, or persisted mark). Later 1-RTT packets
+	// keep that identity after the sniffer expires.
+	quicIdentified atomic.Bool
 
 	routingMu         sync.RWMutex
 	routingCacheDst   netip.AddrPort
@@ -183,6 +187,16 @@ type UdpEndpointKey struct {
 	Src        netip.AddrPort
 	Dst        netip.AddrPort
 	RouteScope udpEndpointRouteScope
+}
+
+func (ue *UdpEndpoint) identifiedQuic() bool {
+	return ue != nil && ue.quicIdentified.Load()
+}
+
+func (ue *UdpEndpoint) markIdentifiedQuic() {
+	if ue != nil {
+		ue.quicIdentified.Store(true)
+	}
 }
 
 type udpEndpointPoolShard struct {
@@ -640,6 +654,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 	}
 	dialCtx, dialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
 	defer dialCancel()
+	dialCtx = netproxy.ContextWithUDPReplyAddr(dialCtx, dialOption.Target, key.Dst)
 	udpConn, err := dialOption.Dialer.DialContext(dialCtx, dialOption.Network, dialOption.Target)
 	if err != nil {
 		reportUdpEndpointDialCreateFailure(key, dialOption, err)
@@ -656,6 +671,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 			if retryErr == nil {
 				dialOption = retryOption
 				retryDialCtx, retryDialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+				retryDialCtx = netproxy.ContextWithUDPReplyAddr(retryDialCtx, dialOption.Target, key.Dst)
 				udpConn, err = dialOption.Dialer.DialContext(retryDialCtx, dialOption.Network, dialOption.Target)
 				retryDialCancel()
 				if err == nil {
@@ -777,7 +793,7 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	// "No alive dialer" is group-level admission state rather than flow-local
 	// endpoint creation failure. Caching it per flow key can explode memory
 	// under unhealthy-node bursts without preventing any extra dial attempts.
-	if stderrors.Is(err, outbound.ErrNoAliveDialer) {
+	if stderrors.Is(err, outbound.ErrNoAliveDialer) || stderrors.Is(err, ErrQuicAdministrativelyProhibited) {
 		return false
 	}
 	if isTransientLocalUdpDialCreateError(err) {
@@ -906,6 +922,7 @@ func (p *UdpEndpointPool) startJanitor() {
 			defer close(p.janitorDone)
 
 			var toClose []*UdpEndpoint
+			var expiredIdle []*UdpEndpoint
 
 			for {
 				select {
@@ -920,17 +937,26 @@ func (p *UdpEndpointPool) startJanitor() {
 						shard.mu.Lock()
 						entriesSeen += len(shard.pool)
 						toClose = toClose[:0]
+						expiredIdle = expiredIdle[:0]
 						for key, ue := range shard.pool {
-							if ue.IsExpired(nowNano) || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)) {
+							if ue.IsExpired(nowNano) {
+								delete(shard.pool, key)
+								expiredIdle = append(expiredIdle, ue)
+								continue
+							}
+							if !p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue) {
 								delete(shard.pool, key)
 								toClose = append(toClose, ue)
 							}
 						}
 						shard.mu.Unlock()
+						for _, ue := range expiredIdle {
+							_ = ue.closeIdleExpired()
+						}
 						for _, ue := range toClose {
 							_ = ue.Close()
 						}
-						cleaned += len(toClose)
+						cleaned += len(expiredIdle) + len(toClose)
 					}
 					// Back off only while the pool is completely empty, so an
 					// idle dae does not wake up to no-op scans. Any entries at

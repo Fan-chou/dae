@@ -120,6 +120,15 @@ global {
     # Allow insecure TLS certificates. It is not recommended to turn it on unless you have to.
     allow_insecure: false
 
+    # When true (default), identified QUIC/HTTP3 is REJECT-NO-DROP unless the
+    # selected node's final chain is unreliable datagram UDP (Hysteria2 / TUIC
+    # native / Juicity / Shadowsocks UDP / SOCKS5 / direct). TCP-based or
+    # UDP-over-TCP hops (AnyTLS, VLESS/VMess/Trojan, WS/gRPC) get ICMP
+    # Destination Unreachable — Communication Administratively Prohibited so
+    # browsers fall back to HTTP/2. There is no auto-switch to another node.
+    # false restores forwarding QUIC on whatever node the group already selected.
+    block_quic: true
+
     # Timeout to waiting for first data sending for sniffing. It is always 0 if dial_mode is ip.
     # Default 30ms is suitable for most networks. Increase to 100-300ms for high-latency networks.
     sniffing_timeout: 30ms
@@ -388,8 +397,10 @@ routing {
 
     ### Write your rules below.
 
-    # Disable h3 because it usually consumes too much cpu/mem resources.
-    l4proto(udp) && dport(443) -> block
+    # Optional extra hammer: silently drop ALL UDP/443 in kernel, including
+    # datagram nodes. global.block_quic already REJECT-NO-DROP identified QUIC
+    # on TCP/UoT nodes. Uncomment only if you also want to disable H3 on Hy2/TUIC.
+    # l4proto(udp) && dport(443) -> block
     dip(geoip:cn) -> direct
     domain(geosite:cn) -> direct
 

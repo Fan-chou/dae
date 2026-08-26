@@ -87,6 +87,7 @@ type ControlPlane struct {
 
 	sniffingTimeout        time.Duration
 	tproxyPortProtect      bool
+	blockQuic              bool
 	soMarkFromDae          uint32
 	mptcp                  bool
 	udpRouteScopeSensitive bool
@@ -1094,6 +1095,7 @@ func newControlPlaneWithContextOptions(
 		wanInterface:                  global.WanInterface,
 		sniffingTimeout:               sniffingTimeout,
 		tproxyPortProtect:             global.TproxyPortProtect,
+		blockQuic:                     global.BlockQuic,
 		soMarkFromDae:                 global.SoMarkFromDae,
 		mptcp:                         global.Mptcp,
 		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),

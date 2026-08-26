@@ -7,6 +7,7 @@ package sniffing
 
 import (
 	"encoding/hex"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -73,6 +74,101 @@ func TestIsLikelyQuicInitialPacket(t *testing.T) {
 	mutated[0] &^= 1 << QuicFlag_FixedBit
 	if !IsLikelyQuicInitialPacket(mutated) {
 		t.Fatal("packet with fixed bit cleared should be recognized (relaxed check)")
+	}
+}
+
+func paddedQuicClientInitial(version []byte, first byte, dcid, scid []byte) []byte {
+	buf := make([]byte, quicMinClientInitialDatagram)
+	buf[0] = first
+	copy(buf[1:5], version)
+	off := 5
+	buf[off] = byte(len(dcid))
+	off++
+	copy(buf[off:], dcid)
+	off += len(dcid)
+	buf[off] = byte(len(scid))
+	off++
+	copy(buf[off:], scid)
+	off += len(scid)
+	buf[off] = 0x00 // empty token
+	off++
+	remain := len(buf) - off - 2
+	buf[off] = 0x40 | byte(remain>>8) // 2-byte varint
+	buf[off+1] = byte(remain)
+	return buf
+}
+
+func TestIsStrictQuicClientInitialPacket(t *testing.T) {
+	t.Parallel()
+	short := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01}
+	if !IsLikelyQuicInitialPacket(short) {
+		t.Fatal("cheap likely-check should still accept a 7-byte long header")
+	}
+	if IsStrictQuicClientInitialPacket(short) {
+		t.Fatal("short long-header datagram must not count as a client Initial")
+	}
+
+	unknown := make([]byte, quicMinClientInitialDatagram)
+	unknown[0] = 0xc0
+	copy(unknown[1:5], []byte{0x12, 0x34, 0x56, 0x78})
+	if !IsLikelyQuicInitialPacket(unknown) {
+		t.Fatal("cheap likely-check accepts arbitrary versions")
+	}
+	if IsStrictQuicClientInitialPacket(unknown) {
+		t.Fatal("unknown QUIC version must not identify off-port QUIC")
+	}
+
+	good := paddedQuicClientInitial(
+		[]byte{0x00, 0x00, 0x00, 0x01},
+		0xc0,
+		[]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		nil,
+	)
+	if !IsStrictQuicClientInitialPacket(good) {
+		t.Fatal("padded QUIC v1 client Initial must be recognized")
+	}
+
+	v2 := paddedQuicClientInitial(
+		[]byte{0x6b, 0x33, 0x43, 0xcf},
+		0xd0,
+		[]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		nil,
+	)
+	if !IsStrictQuicClientInitialPacket(v2) {
+		t.Fatal("padded QUIC v2 client Initial must be recognized")
+	}
+
+	if !IsStrictQuicClientInitialPacket(QuicStream3) {
+		t.Fatal("captured padded client Initial must be recognized")
+	}
+}
+
+func TestIsStrictQuicClientInitialPacket_RandomUDP(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewSource(1))
+	likely := 0
+	strict := 0
+	const n = 4000
+	for i := 0; i < n; i++ {
+		buf := make([]byte, 64)
+		_, _ = rng.Read(buf)
+		if IsLikelyQuicInitialPacket(buf) {
+			likely++
+		}
+		if IsStrictQuicClientInitialPacket(buf) {
+			strict++
+		}
+		padded := make([]byte, quicMinClientInitialDatagram)
+		_, _ = rng.Read(padded)
+		if IsStrictQuicClientInitialPacket(padded) {
+			strict++
+		}
+	}
+	if likely == 0 {
+		t.Fatal("expected the cheap likely-check to fire on some random 64-byte datagrams")
+	}
+	if strict != 0 {
+		t.Fatalf("strict client Initial must not match random UDP, got %d", strict)
 	}
 }
 

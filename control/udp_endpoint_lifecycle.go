@@ -397,7 +397,42 @@ func (ue *UdpEndpoint) markDeadIfOwnedBy(owner udpConnStateOwner) bool {
 	return true
 }
 
+func (ue *UdpEndpoint) rememberFlowIdentityOnRetire() {
+	if ue == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	identified := ue.identifiedQuic()
+	domain := strings.TrimSuffix(ue.SniffedDomain, ".")
+	if domain != "" && isIPLikeDomain(domain) {
+		domain = ""
+	}
+	if !identified && domain == "" {
+		return
+	}
+	remember := func(src, dst netip.AddrPort) {
+		if !src.IsValid() || !dst.IsValid() || dst.Port() == 0 {
+			return
+		}
+		key := NewUdpFlowKey(src, dst)
+		if identified {
+			defaultQuicRejectMemory.rememberIdentified(key, now)
+		}
+		if domain != "" {
+			defaultQuicRejectMemory.rememberDomain(key, now, domain)
+		}
+	}
+	src := ue.lAddr
+	if src.IsValid() && ue.poolKey.Dst.IsValid() {
+		remember(src, ue.poolKey.Dst)
+	}
+	if pair := ue.udpConnStateLastPair.Load(); pair != nil {
+		remember(pair.src, pair.dst)
+	}
+}
+
 func (ue *UdpEndpoint) retire() {
+	ue.rememberFlowIdentityOnRetire()
 	ue.dead.Store(true)
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
@@ -409,6 +444,7 @@ func (ue *UdpEndpoint) retire() {
 // replyQueueDone, which only the sender itself closes, so calling retire()
 // from handleReceivedPacket or replySender would deadlock on <-done.
 func (ue *UdpEndpoint) markRetiredFromReceiver() {
+	ue.rememberFlowIdentityOnRetire()
 	ue.dead.Store(true)
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
@@ -735,7 +771,25 @@ func (ue *UdpEndpoint) reportLocalWriteFailure(err error) {
 }
 
 func (ue *UdpEndpoint) Close() error {
+	return ue.closePreservingFlowIdentity(true)
+}
+
+// closeIdleExpired tears down a NAT-timeout endpoint without refreshing
+// QUIC/domain memory. The 4-tuple is then free for reuse; extending identity
+// another quicRejectRememberTTL would mis-apply block_quic and resolve_dns.
+func (ue *UdpEndpoint) closeIdleExpired() error {
+	return ue.closePreservingFlowIdentity(false)
+}
+
+func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 	ue.closeOnce.Do(func() {
+		// Reset/Abort/Remove/write-failure call Close() without retire().
+		// Save QUIC identity and sniffed domain before lastPair is cleared.
+		// Natural NAT expiry uses closeIdleExpired() so a dead flow is not
+		// renewed for another 5 minutes.
+		if keepIdentity {
+			ue.rememberFlowIdentityOnRetire()
+		}
 		ue.dead.Store(true)
 		ue.expiresAtNano.Store(0)
 		ue.stopTransportReceiver()
@@ -851,6 +905,17 @@ func (ue *UdpEndpoint) clearPendingReplyPeers() {
 	for i := range ue.pendingReplyPeers {
 		ue.pendingReplyPeers[i] = netip.AddrPort{}
 	}
+}
+
+func (ue *UdpEndpoint) canonicalReplyFrom(from netip.AddrPort) netip.AddrPort {
+	if ue == nil {
+		return from
+	}
+	dst := ue.poolKey.Dst
+	if dst.IsValid() && dst.Port() != 0 {
+		return dst
+	}
+	return from
 }
 
 func (ue *UdpEndpoint) acceptsInitialReplyFrom(from netip.AddrPort) bool {

@@ -31,6 +31,8 @@ type udpReuseSimulationConn struct {
 	writeCalls       atomic.Int32
 	sharedWriteCalls *atomic.Int32 // optional shared counter across multiple conn instances
 	closeCalls       atomic.Int32
+	writeMu          sync.Mutex
+	writeAddrs       []string
 }
 
 type udpReuseSimulationTransportConn struct {
@@ -65,12 +67,23 @@ func (c *udpReuseSimulationConn) ReadFrom(p []byte) (int, netip.AddrPort, error)
 	}
 }
 
-func (c *udpReuseSimulationConn) WriteTo(b []byte, _ string) (int, error) {
+func (c *udpReuseSimulationConn) WriteTo(b []byte, addr string) (int, error) {
 	c.writeCalls.Add(1)
 	if c.sharedWriteCalls != nil {
 		c.sharedWriteCalls.Add(1)
 	}
+	c.writeMu.Lock()
+	c.writeAddrs = append(c.writeAddrs, addr)
+	c.writeMu.Unlock()
 	return len(b), nil
+}
+
+func (c *udpReuseSimulationConn) recordedWriteAddrs() []string {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	out := make([]string, len(c.writeAddrs))
+	copy(out, c.writeAddrs)
+	return out
 }
 
 func (c *udpReuseSimulationConn) Close() error {

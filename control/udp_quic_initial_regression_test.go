@@ -32,6 +32,13 @@ func makeLikelyQuicInitialPayload(dcidSeed byte) []byte {
 	}
 }
 
+func makePaddedQuicClientInitial(dcidSeed byte) []byte {
+	p := makeLikelyQuicInitialPayload(dcidSeed)
+	buf := make([]byte, 1200)
+	copy(buf, p)
+	return buf
+}
+
 func setupQuicInitialRegressionTestState(t testing.TB) func() {
 	t.Helper()
 

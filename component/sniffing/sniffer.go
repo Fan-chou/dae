@@ -292,6 +292,9 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 }
 
 func (s *Sniffer) SniffUdp() (d string, err error) {
+	if s == nil {
+		return "", ErrNotApplicable
+	}
 	if s.sniffed != "" {
 		return s.sniffed, nil
 	}
@@ -302,6 +305,13 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 	}()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
+
+	if s.buf == nil {
+		// Closed by the packet-sniffer janitor while this UDP flow still
+		// held the session. Treat as not applicable so handlePkt can fall
+		// through to IP routing instead of nil-deref on buf.Len.
+		return "", ErrNotApplicable
+	}
 
 	// Always ready.
 	select {
@@ -327,6 +337,14 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 }
 
 func (s *Sniffer) AppendData(data []byte) {
+	if s == nil {
+		return
+	}
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.buf == nil {
+		return
+	}
 	s.needMore = false
 	ori := s.buf.Len()
 	_, _ = s.buf.Write(data)
@@ -334,16 +352,22 @@ func (s *Sniffer) AppendData(data []byte) {
 }
 
 func (s *Sniffer) Data() [][]byte {
+	if s == nil {
+		return nil
+	}
 	return s.data
 }
 
 func (s *Sniffer) NeedMore() bool {
-	return s.needMore
+	return s != nil && s.needMore
 }
 
 // GiveUpIncomplete clears NeedMore so a stalled QUIC ClientHello (packet
 // budget exceeded) can fall through to IP routing instead of holding datagrams.
 func (s *Sniffer) GiveUpIncomplete() {
+	if s == nil {
+		return
+	}
 	s.needMore = false
 }
 

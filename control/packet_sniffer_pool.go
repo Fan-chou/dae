@@ -433,6 +433,26 @@ func (ps *PacketSniffer) ShouldBypassSniff(now time.Time) bool {
 	return now.Before(ps.bypassSniffUntil)
 }
 
+// Close detaches and recycles the inner packet sniffer.
+// Must not be called while holding ps.Mu; use closeLocked instead.
+func (ps *PacketSniffer) Close() error {
+	if ps == nil {
+		return nil
+	}
+	ps.Mu.Lock()
+	defer ps.Mu.Unlock()
+	return ps.closeLocked()
+}
+
+func (ps *PacketSniffer) closeLocked() error {
+	if ps.Sniffer == nil {
+		return nil
+	}
+	err := ps.Sniffer.Close()
+	ps.Sniffer = nil
+	return err
+}
+
 func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 	ps.noSniStreak++
 	if ps.noSniStreak >= udpSniffNoSniThreshold {
@@ -518,9 +538,13 @@ func parseQuicInitialFingerprint(data []byte) (sig quicInitialFingerprint, ok bo
 type PacketSnifferPool struct {
 	pool         sync.Map
 	flowFamilies sync.Map
-	janitorOnce  sync.Once
-	janitorStop  chan struct{}
-	janitorDone  chan struct{}
+	// createMu serializes insert/replace so GetOrCreate never returns a
+	// sniffer that is not the current pool member. handlePkt only sniffs
+	// when GetOrCreate's result still equals Get(key).
+	createMu    sync.Mutex
+	janitorOnce sync.Once
+	janitorStop chan struct{}
+	janitorDone chan struct{}
 }
 
 type PacketSnifferOptions struct {
@@ -788,14 +812,6 @@ func (p *PacketSnifferPool) RemoveFlowFamilySessions(key PacketSnifferKey) int {
 }
 
 func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *PacketSnifferOptions) (qs *PacketSniffer, isNew bool) {
-	// Fast path: check if exists without any lock
-	if _qs, ok := p.pool.Load(key); ok {
-		qs = _qs.(*PacketSniffer)
-		qs.RefreshTtl()
-		return qs, false
-	}
-
-	// Slow path: create using LoadOrStore for atomic semantics
 	if createOption == nil {
 		createOption = &PacketSnifferOptions{}
 	}
@@ -803,24 +819,100 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *Pack
 		createOption.Ttl = PacketSnifferTtl
 	}
 
-	newQs := &PacketSniffer{
-		Sniffer: sniffing.NewPacketSniffer(nil, createOption.Ttl),
-		ttl:     createOption.Ttl,
+	if existing, ok := p.pool.Load(key); ok {
+		qs = existing.(*PacketSniffer)
+		if p.touchLiveSniffer(key, qs) {
+			return qs, false
+		}
 	}
-	newQs.RefreshTtl()
 
-	// LoadOrStore ensures atomic create-or-get semantics
-	actual, loaded := p.pool.LoadOrStore(key, newQs)
-	qs = actual.(*PacketSniffer)
-	qs.RefreshTtl()
-	if loaded {
+	p.createMu.Lock()
+	defer p.createMu.Unlock()
+
+	if existing, ok := p.pool.Load(key); ok {
+		qs = existing.(*PacketSniffer)
+		if p.touchLiveSniffer(key, qs) {
+			return qs, false
+		}
+		p.discardDeadSniffer(key, qs)
+	}
+
+	for {
+		newQs := &PacketSniffer{
+			Sniffer: sniffing.NewPacketSniffer(nil, createOption.Ttl),
+			ttl:     createOption.Ttl,
+		}
+		newQs.RefreshTtl()
+		actual, loaded := p.pool.LoadOrStore(key, newQs)
+		qs = actual.(*PacketSniffer)
+		if !loaded {
+			if family := p.retainFlowFamilyRef(key); family != nil {
+				family.storeMember(key, qs)
+			}
+			return qs, true
+		}
 		_ = newQs.Close()
-		return qs, false
+		if p.touchLiveSniffer(key, qs) {
+			return qs, false
+		}
+		p.discardDeadSniffer(key, qs)
 	}
-	if family := p.retainFlowFamilyRef(key); family != nil {
-		family.storeMember(key, qs)
+}
+
+func (p *PacketSnifferPool) discardDeadSniffer(key PacketSnifferKey, qs *PacketSniffer) {
+	if p == nil || qs == nil {
+		return
 	}
-	return qs, true
+	if p.pool.CompareAndDelete(key, qs) {
+		p.deleteFlowFamilyMember(key, qs)
+		p.releaseFlowFamily(key)
+	}
+}
+
+// touchLiveSniffer refreshes TTL under the same mutex the janitor uses to
+// decide expiry, then confirms the instance is still the pool member. A
+// lock-free RefreshTtl can otherwise return a sniffer the janitor is about
+// to Close, and handlePkt falls back to IP routing without SNI.
+func (p *PacketSnifferPool) touchLiveSniffer(key PacketSnifferKey, qs *PacketSniffer) bool {
+	if p == nil || qs == nil {
+		return false
+	}
+	qs.Mu.Lock()
+	defer qs.Mu.Unlock()
+	if qs.Sniffer == nil {
+		return false
+	}
+	cur, ok := p.pool.Load(key)
+	if !ok || cur != qs {
+		return false
+	}
+	qs.RefreshTtl()
+	return true
+}
+
+// retireExpiredPacketSniffer removes an expired session without racing an
+// in-flight sniff. TryLock skips busy sessions (decrypt can take longer than
+// a janitor tick). Expiry is re-checked under Mu because GetOrCreate may have
+// just RefreshTtl'd. CompareAndDelete happens only after that, so we do not
+// drop a live key and let GetOrCreate fork a second sniffer for the same DCID.
+func (p *PacketSnifferPool) retireExpiredPacketSniffer(key any, ps *PacketSniffer, nowNano int64) bool {
+	if p == nil || ps == nil {
+		return false
+	}
+	if !ps.Mu.TryLock() {
+		return false
+	}
+	defer ps.Mu.Unlock()
+	if !ps.IsExpired(nowNano) {
+		return false
+	}
+	if !p.pool.CompareAndDelete(key, ps) {
+		return false
+	}
+	p.deleteFlowFamilyMember(key.(PacketSnifferKey), ps)
+	p.releaseFlowFamily(key.(PacketSnifferKey))
+	_ = ps.closeLocked()
+	return true
 }
 
 func (p *PacketSnifferPool) startJanitor() {
@@ -862,13 +954,7 @@ func (p *PacketSnifferPool) startJanitor() {
 						if ps.IsExpired(nowNano) {
 							consecutiveFresh = 0
 							expiredFound++
-							// Use CompareAndDelete for atomic CAS - only delete if still the same expired sniffer
-							if p.pool.CompareAndDelete(key, ps) {
-								p.deleteFlowFamilyMember(key.(PacketSnifferKey), ps)
-								p.releaseFlowFamily(key.(PacketSnifferKey))
-								_ = ps.Close()
-							}
-							// Continue scanning - there might be more expired items
+							_ = p.retireExpiredPacketSniffer(key, ps, nowNano)
 							return true
 						}
 						consecutiveFresh++

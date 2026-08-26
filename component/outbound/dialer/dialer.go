@@ -89,7 +89,8 @@ type Dialer struct {
 	*GlobalOption
 	InstanceOption
 	netproxy.Dialer
-	property *Property
+	property       *Property
+	udpForwardMode UdpForwardMode
 
 	collectionFineMu sync.RWMutex
 	collections      [8]*collection
@@ -302,6 +303,7 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 		httpClients:      make(map[string]*http.Client),
 	}
 	d.Dialer = dialer
+	d.udpForwardMode = udpForwardModeFromProperty(property)
 	d.health.udpTransport = udpTransportFromProperty(property)
 	d.recoveryManager = newDialerRecoveryManager(d)
 
@@ -330,6 +332,7 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 		clone, err := NewFromLinkWithProxyCacheContext(ctx, option, d.InstanceOption, d.property.Link, d.property.SubscriptionTag, NewProxyIpCache())
 		if err == nil {
 			clone.property = cloneProperty(d.property)
+			clone.udpForwardMode = udpForwardModeFromProperty(clone.property)
 			clone.resolveDNS = d.resolveDNS
 			return clone
 		}

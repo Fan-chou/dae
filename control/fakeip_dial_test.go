@@ -7,9 +7,11 @@ package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -208,7 +210,7 @@ func TestUdpDialTargetPrefersSelected(t *testing.T) {
 	}
 }
 
-func TestChooseProxyDialerUDPPassesDomain(t *testing.T) {
+func TestChooseProxyDialerUDPPinsDestIP(t *testing.T) {
 	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
 	cp.dialMode = consts.DialMode_DomainPlus
 	src := netip.MustParseAddrPort("192.0.2.10:40000")
@@ -223,11 +225,95 @@ func TestChooseProxyDialerUDPPassesDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.DialTarget != "chatgpt.com:443" {
-		t.Fatalf("DialTarget = %q, want chatgpt.com:443", res.DialTarget)
+	if res.DialTarget != "chatgpt.com:443" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain:port", res.DialTarget, res.IsDialIp)
 	}
-	if res.IsDialIp {
-		t.Fatal("expected domain dial")
+	if res.SniffedDomain != "chatgpt.com" {
+		t.Fatalf("SniffedDomain = %q, want chatgpt.com", res.SniffedDomain)
+	}
+}
+
+func TestEnsureUdpDialTargetIPPassesDomainWithoutResolveDNS(t *testing.T) {
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	cp.dialMode = consts.DialMode_DomainPlus
+	seedDnsCacheA(t, cp, "chatgpt.com", netip.MustParseAddr("1.1.1.1"))
+	dst := netip.MustParseAddrPort("198.51.100.20:443")
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     dst,
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "chatgpt.com:443" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain not cache/packet IP", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestEnsureUdpDialTargetIPPassesDomainInIPMode(t *testing.T) {
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	cp.dialMode = consts.DialMode_Ip
+	dst := netip.MustParseAddrPort("198.51.100.20:443")
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     dst,
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "chatgpt.com:443" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain:port", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestEnsureUdpDialTargetIPResolveDNSWinsOverDnsCache(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.dialMode = consts.DialMode_DomainPlus
+	seedDnsCacheA(t, cp, "chatgpt.com", netip.MustParseAddr("1.1.1.1"))
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "104.18.32.1:443" {
+		t.Fatalf("DialTarget = %q, want resolve_dns pin not cache 1.1.1.1", res.DialTarget)
+	}
+}
+
+func TestEnsureUdpDialTargetIPLeavesTCPDomain(t *testing.T) {
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	cp.dialMode = consts.DialMode_DomainPlus
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "chatgpt.com:443" || res.IsDialIp {
+		t.Fatalf("TCP DialTarget = (%q, %v), want domain", res.DialTarget, res.IsDialIp)
 	}
 }
 
@@ -252,12 +338,13 @@ func TestChooseProxyDialerUDPWithoutDomainPinsDest(t *testing.T) {
 	}
 }
 
-func TestChooseProxyDialerFakeIPUDPPassesDomain(t *testing.T) {
+func TestChooseProxyDialerFakeIPUDPPinsCachedRealIP(t *testing.T) {
 	store, fake := newTestFakeIPStore(t, "chatgpt.com")
 	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
 	attachFakeIPStore(cp, store)
 	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
-	seedDnsCacheA(t, cp, "chatgpt.com", netip.MustParseAddr("203.0.113.20"))
+	real := netip.MustParseAddr("203.0.113.20")
+	seedDnsCacheA(t, cp, "chatgpt.com", real)
 	dst := netip.AddrPortFrom(fake, 443)
 	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
 		Outbound: consts.OutboundUserDefinedMin,
@@ -268,11 +355,8 @@ func TestChooseProxyDialerFakeIPUDPPassesDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.DialTarget != "chatgpt.com:443" {
-		t.Fatalf("DialTarget = %q, want chatgpt.com:443", res.DialTarget)
-	}
-	if res.IsDialIp {
-		t.Fatal("expected domain dial")
+	if res.DialTarget != "chatgpt.com:443" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain:port not cached IP", res.DialTarget, res.IsDialIp)
 	}
 }
 
@@ -339,6 +423,37 @@ func TestApplyProxyResolveDNSFailureDoesNotFallBackToDomain(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected resolve failure")
+	}
+}
+
+func TestChooseProxyDialerRejectsIdentifiedQuicBeforeResolveDNS(t *testing.T) {
+	conn := &udpReuseSimulationConn{closeCh: make(chan struct{})}
+	d, _ := newCountingProxyEndpointDialer("anytls", "anytls.example:443", conn)
+	d.SetResolveDNS(netip.MustParseAddrPort("1.1.1.1:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.blockQuic = true
+	cp.dialMode = consts.DialMode_DomainPlus
+	var lookups atomic.Int32
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		return nil, fmt.Errorf("resolver down")
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound:       consts.OutboundUserDefinedMin,
+		Domain:         "chatgpt.com",
+		Src:            netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:           netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:        "udp",
+		IdentifiedQuic: true,
+	})
+	if !errors.Is(err, ErrQuicAdministrativelyProhibited) {
+		t.Fatalf("err = %v, want ErrQuicAdministrativelyProhibited", err)
+	}
+	if got := lookups.Load(); got != 0 {
+		t.Fatalf("resolve_dns lookups = %d, want 0 before QUIC reject", got)
 	}
 }
 

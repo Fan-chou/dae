@@ -481,3 +481,17 @@ func TestArmWriteDeadlineStillArmsPlainConn(t *testing.T) {
 		t.Fatal("writeDeadlineArmedAtNano should be armed for a plain conn")
 	}
 }
+
+func TestCanonicalReplyFromUsesSymmetricPoolKey(t *testing.T) {
+	orig := netip.MustParseAddrPort("198.18.0.10:443")
+	resolved := netip.MustParseAddrPort("203.0.113.20:443")
+	ue := &UdpEndpoint{poolKey: UdpEndpointKey{Dst: orig}}
+	if got := ue.canonicalReplyFrom(resolved); got != orig {
+		t.Fatalf("canonicalReplyFrom() = %v, want original dest %v", got, orig)
+	}
+
+	fullCone := &UdpEndpoint{}
+	if got := fullCone.canonicalReplyFrom(resolved); got != resolved {
+		t.Fatalf("FullCone canonicalReplyFrom() = %v, want server peer %v", got, resolved)
+	}
+}

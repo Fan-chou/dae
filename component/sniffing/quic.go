@@ -62,7 +62,80 @@ func IsLikelyQuicInitialPacket(buf []byte) bool {
 	return isQuicInitialLongHeader(buf)
 }
 
+const (
+	quicMaxConnIDLen             = 20
+	quicMinClientInitialDatagram = 1200
+)
+
+// IsStrictQuicClientInitialPacket reports a client Initial suitable for
+// block_quic on any UDP port. Unlike IsLikelyQuicInitialPacket, it requires a
+// known version, a parseable long header (DCID/SCID/token/length), and the
+// RFC 9000 §14.1 1200-byte client datagram floor. The cheap likely-check is
+// reserved for 443/8443 sniffing and must not be used as a global QUIC oracle.
+func IsStrictQuicClientInitialPacket(buf []byte) bool {
+	if len(buf) < quicMinClientInitialDatagram {
+		return false
+	}
+	if ((buf[0] >> QuicFlag_HeaderForm) & 0b1) != QuicFlag_HeaderForm_LongHeader {
+		return false
+	}
+	version := binary.BigEndian.Uint32(buf[1:5])
+	if version == 0 {
+		return false
+	}
+	if _, err := quicutils.ParseVersion(version); err != nil {
+		return false
+	}
+	packetType := (buf[0] >> QuicFlag_LongPacketType) & 0b11
+	if packetType != quicInitialPacketTypeForVersion(version) {
+		return false
+	}
+	off := 5
+	if off >= len(buf) {
+		return false
+	}
+	dcidLen := int(buf[off])
+	off++
+	if dcidLen > quicMaxConnIDLen || off+dcidLen > len(buf) {
+		return false
+	}
+	off += dcidLen
+	if off >= len(buf) {
+		return false
+	}
+	scidLen := int(buf[off])
+	off++
+	if scidLen > quicMaxConnIDLen || off+scidLen > len(buf) {
+		return false
+	}
+	off += scidLen
+	tokenLen, n, err := quicutils.BigEndianUvarint(buf[off:])
+	if err != nil {
+		return false
+	}
+	off += n
+	if tokenLen > uint64(len(buf)-off) {
+		return false
+	}
+	off += int(tokenLen)
+	pktLen, n, err := quicutils.BigEndianUvarint(buf[off:])
+	if err != nil {
+		return false
+	}
+	off += n
+	if pktLen == 0 || pktLen > uint64(len(buf)-off) {
+		return false
+	}
+	return true
+}
+
 func (s *Sniffer) SniffQuic() (d string, err error) {
+	if s == nil || s.buf == nil {
+		return "", ErrNotApplicable
+	}
+	if s.quicNextRead > s.buf.Len() {
+		return "", ErrNotApplicable
+	}
 	nextBlock := s.buf.Bytes()[s.quicNextRead:]
 	isQuic := false
 	for {

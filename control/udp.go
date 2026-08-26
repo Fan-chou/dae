@@ -550,11 +550,19 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	if !ok {
 		return false, nil
 	}
+	identified := quicIdentifiedFromEndpoint(c.isQuicBlockCandidate(flowDecision, data), ue)
+	if identified {
+		c.rememberIdentifiedQuic(src, realDst)
+	}
 	if !c.checkUdpEndpointHealth(ue, ue.poolKey, true) {
+		c.preserveIdentifiedQuic(ue, identified, src, realDst)
 		ue.retire()
 		return true, nil
 	}
-	if flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
+	if c.rejectEndpointQuic(ue, data, src, realDst, identified) {
+		return true, nil
+	}
+	if identified || flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
@@ -567,6 +575,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
 			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
 		}
+		c.preserveIdentifiedQuic(ue, identified, src, realDst)
 		ue.retire()
 		if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 			c.log.WithFields(logrus.Fields{
@@ -611,6 +620,43 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 		return nil, false, err
 	}
 	return currentPolicyUDPRoutingResult(stale), true, err
+}
+
+func lookupUdpEndpointForFlow(flowDecision UdpFlowDecision, routeScope udpEndpointRouteScope, forceSymmetric bool, realDst netip.AddrPort, identified bool) (UdpEndpointKey, *UdpEndpoint, bool) {
+	keyDecision := flowDecision.withIdentifiedQuic(identified)
+	ueKey := keyDecision.EndpointKeyForInitialLookupWithScope(routeScope, forceSymmetric)
+	ue, ok := DefaultUdpEndpointPool.Get(ueKey)
+
+	if !forceSymmetric {
+		symmetricKey := flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
+		if candidate, exists := DefaultUdpEndpointPool.Get(symmetricKey); exists {
+			// Dest-scoped sessions win over a pre-existing full-cone mapping
+			// for the same client socket. Off-port QUIC 1-RTT otherwise sticks
+			// to src-only lookup and migrates the QUIC association.
+			// The key already pins destination, so do not require DialTarget to
+			// equal the raw IP: sniffed sessions store a domain there.
+			ueKey = symmetricKey
+			ue = candidate
+			ok = true
+		} else if !ok && ueKey.Dst.Port() != 0 {
+			srcOnlyKey := flowDecision.FullConeNatEndpointKeyWithScope(routeScope)
+			if srcOnlyKey != ueKey {
+				if candidate, exists := DefaultUdpEndpointPool.Get(srcOnlyKey); exists &&
+					candidate.DialTarget == realDst.String() {
+					ueKey = srcOnlyKey
+					ue = candidate
+					ok = true
+				}
+			}
+		}
+	}
+	if !ok {
+		if fallbackKey, fb := keyDecision.InitialLookupFallbackKeyWithScope(routeScope, forceSymmetric); fb {
+			ueKey = fallbackKey
+			ue, ok = DefaultUdpEndpointPool.Get(ueKey)
+		}
+	}
+	return ueKey, ue, ok
 }
 
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
@@ -720,52 +766,19 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	// - Symmetric NAT (Src+Dst) for confirmed QUIC/sniffing sessions on sniff-eligible UDP
 	// - Full-Cone NAT (Src-only) for other UDP traffic
 	isQuicInitial := flowDecision.IsQuicInitial
+	quicIdentified := c.isQuicBlockCandidate(flowDecision, data)
 	var quicSnifferKey PacketSnifferKey
 	failedQuicDcidKnown := false
 	if isQuicInitial {
 		quicSnifferKey = flowDecision.PacketSnifferKey()
 		failedQuicDcidKnown = IsQuicDcidFailedAt(quicSnifferKey, now)
 	}
-	ueKey = flowDecision.EndpointKeyForInitialLookupWithScope(routeScope, forceSymmetricKey)
-	ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
-	if !ueExists && !forceSymmetricKey {
-		if ueKey.Dst.Port() != 0 {
-			// Sniff-eligible UDP can re-enter here with a symmetric lookup even
-			// though the live session is already tracked under the cheaper
-			// src-only key. Reuse that exact src-only endpoint when it targets
-			// the same remote, otherwise we fork a second UdpEndpoint for the
-			// same 4-tuple and start another read loop.
-			srcOnlyKey := flowDecision.FullConeNatEndpointKeyWithScope(routeScope)
-			if srcOnlyKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(srcOnlyKey); ok &&
-					candidate.DialTarget == realDst.String() {
-					ueKey = srcOnlyKey
-					ue = candidate
-					ueExists = true
-				}
-			}
-		} else {
-			// The reverse race also exists: a sniff-eligible packet may have
-			// already created a symmetric endpoint before a sibling ordinary
-			// packet reaches here. Probe that exact symmetric key before
-			// creating a new src-only endpoint so the visible UDP flow stays
-			// single-instanced.
-			symmetricKey := flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
-			if symmetricKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok &&
-					candidate.DialTarget == realDst.String() {
-					ueKey = symmetricKey
-					ue = candidate
-					ueExists = true
-				}
-			}
-		}
+	ueKey, ue, ueExists = lookupUdpEndpointForFlow(flowDecision, routeScope, forceSymmetricKey, realDst, quicIdentified)
+	if ueExists {
+		quicIdentified = quicIdentifiedFromEndpoint(quicIdentified, ue)
 	}
-	if !ueExists {
-		if fallbackKey, ok := flowDecision.InitialLookupFallbackKeyWithScope(routeScope, forceSymmetricKey); ok {
-			ueKey = fallbackKey
-			ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
-		}
+	if ueExists && c.rejectEndpointQuic(ue, data, realSrc, realDst, quicIdentified) {
+		return nil
 	}
 	if ueExists {
 		switch {
@@ -796,12 +809,14 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 						"sniffers_removed": removedSniffers,
 					}).Debug("Removed trapped domain-less UdpEndpoint for new QUIC Initial packet after flow-family mismatch")
 				}
+				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 				ue = nil
 				ueExists = false
 				break
 			}
 			if !c.checkUdpEndpointHealth(ue, ueKey, false) {
+				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				ue = nil
 				ueExists = false
 			}
@@ -812,6 +827,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			dialTarget := ue.dialTargetForWrite(realDst)
 
 			if !c.checkUdpEndpointHealth(ue, ueKey, true) {
+				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				ue = nil
 				ueExists = false
 			} else {
@@ -864,6 +880,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 					}
 					excludedDialer = ue.Dialer
 				}
+				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 				ue = nil
 				ueExists = false
@@ -871,6 +888,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		default:
 			// Non-fast-path existing endpoint. Check health.
 			if !c.checkUdpEndpointHealth(ue, ueKey, false) {
+				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				ue = nil
 				ueExists = false
 			}
@@ -906,6 +924,15 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		sniffer := DefaultPacketSnifferSessionMgr.Get(key)
 		if _sniffer == sniffer {
 
+			if sniffer == nil || sniffer.Sniffer == nil {
+				if sniffer != nil {
+					sniffer.Mu.Unlock()
+				} else {
+					_sniffer.Mu.Unlock()
+				}
+				goto afterSniffing
+			}
+
 			// Check if we've hit the bypass threshold for this DCID.
 			// After consecutive failures, fall back to IP routing to avoid
 			// indefinitely blocking QUIC connections waiting for sniffing completion.
@@ -918,7 +945,15 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 
 			// Safe sniffing: wrap in a function to allow recover() from potential
 			// sniffer panics (e.g., malformed packets or internal logic errors).
+			holdForMore := false
 			func() {
+				held := true
+				unlock := func() {
+					if held {
+						held = false
+						sniffer.Mu.Unlock()
+					}
+				}
 				defer func() {
 					if r := recover(); r != nil {
 						if c.log.IsLevelEnabled(logrus.ErrorLevel) {
@@ -929,8 +964,8 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 							}).Error("UDP sniffing panicked; bypassing sniffing for this DCID")
 						}
 						MarkQuicDcidFailed(key, quicDcidFailureReasonPanic)
-						sniffer.Mu.Unlock()
 					}
+					unlock()
 				}()
 
 				_, _ = sniffer.ObserveQuicInitial(data)
@@ -958,7 +993,6 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 								}).Debug("QUIC decrypt failed repeatedly, marking DCID as failed")
 							}
 							MarkQuicDcidFailed(key, quicDcidFailureReasonDecryptFailure)
-							sniffer.Mu.Unlock()
 							return
 						}
 					} else {
@@ -979,14 +1013,20 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 
 				if sniffer.NeedMore() {
 					// We don't record No SNI streak for NeedMore because handshakes naturally span multiple packets.
-					sniffer.Mu.Unlock()
+					holdForMore = true
 					return
 				}
 
-				if (err != nil && !stderrors.Is(err, sniffing.ErrNeedMore)) || domain == "" {
-					sniffer.RecordSniffNoSni(now)
-				} else if domain != "" {
+				if err == nil && domain != "" {
 					sniffer.RecordSniffSuccess()
+					// SniffUdp only extracts QUIC SNI. That is identified QUIC,
+					// unlike FakeIP look-back which can set SniffedDomain on
+					// non-QUIC UDP/443.
+					quicIdentified = true
+					c.rememberIdentifiedQuic(realSrc, realDst)
+					c.rememberUdpFlowDomain(realSrc, realDst, domain)
+				} else {
+					sniffer.RecordSniffNoSni(now)
 				}
 
 				if err != nil {
@@ -1000,29 +1040,36 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 
 				// Flush previously buffered packets on the same endpoint path before the
 				// current packet so QUIC sniff completion preserves original ingress order.
-				toReplay := sniffer.Data()[1 : len(sniffer.Data())-1] // Skip the first empty and the last (self).
-				if len(toReplay) > 0 {
-					replayPackets = make([]pool.PB, 0, len(toReplay))
-					for _, d := range toReplay {
-						dCopy := pool.Get(len(d))
-						copy(dCopy, d)
-						replayPackets = append(replayPackets, dCopy)
+				if buffered := sniffer.Data(); len(buffered) >= 2 {
+					toReplay := buffered[1 : len(buffered)-1] // Skip the first empty and the last (self).
+					if len(toReplay) > 0 {
+						replayPackets = make([]pool.PB, 0, len(toReplay))
+						for _, d := range toReplay {
+							dCopy := pool.Get(len(d))
+							copy(dCopy, d)
+							replayPackets = append(replayPackets, dCopy)
+						}
 					}
 				}
 				sniffer.CompactPacketState()
-				sniffer.Mu.Unlock()
 			}()
-			if sniffer.NeedMore() {
+			if holdForMore {
 				return nil
 			}
 
 		} else {
 			_sniffer.Mu.Unlock()
-			// sniffer may be nil.
+			// GetOrCreate raced with Reset/janitor: this object is not the
+			// pool member, so sniffing it would split the Initial stream.
+			// Close it so a detached leftover cannot leak its buffer.
+			_ = _sniffer.Close()
 		}
 	}
 
 afterSniffing:
+	if domain == "" {
+		domain = c.rememberedUdpFlowDomain(realSrc, realDst)
+	}
 	if routingResult.Mark == 0 {
 		routingResult.Mark = c.soMarkFromDae
 	}
@@ -1064,14 +1111,16 @@ getNew:
 		return fmt.Errorf("touch max retry limit")
 	}
 
-	// Determine NAT timeout based on connection type
-	natTimeout = flowDecision.NatTimeoutForDial(domain)
+	// Identified QUIC (including remembered 1-RTT) must keep dest-scoped NAT
+	// even when this datagram is no longer a client Initial.
+	dialDecision := flowDecision.withIdentifiedQuic(quicIdentified)
+	natTimeout = dialDecision.NatTimeoutForDial(domain)
 
 	// Allocate symmetric endpoints only for confirmed QUIC state. If the initial
 	// lookup found an existing symmetric endpoint via the sniff-eligible UDP
 	// path, keep using that existing entry instead of silently forking a new
 	// src-only one.
-	ueKey = flowDecision.EndpointKeyForDialWithScope(domain, routeScope, forceSymmetricKey)
+	ueKey = dialDecision.EndpointKeyForDialWithScope(domain, routeScope, forceSymmetricKey)
 	if ueExists && foundUeKey.Dst.Port() != 0 && ueKey.Dst.Port() == 0 {
 		ueKey = foundUeKey
 		natTimeout = ue.natTimeout()
@@ -1121,17 +1170,18 @@ getNew:
 			egressRuntime:  c.egressRuntime,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
-					Outbound:    consts.OutboundIndex(routingResult.Outbound),
-					Must:        routingResult.Must != 0,
-					Domain:      domain,
-					Mac:         routingResult.Mac,
-					Dscp:        routingResult.Dscp,
-					ProcessName: routingResult.Pname,
-					Src:         realSrc,
-					Dest:        realDst,
-					Mark:        routingResult.Mark,
-					Network:     "udp",
-					Excluded:    excludedDialer,
+					Outbound:       consts.OutboundIndex(routingResult.Outbound),
+					Must:           routingResult.Must != 0,
+					Domain:         domain,
+					Mac:            routingResult.Mac,
+					Dscp:           routingResult.Dscp,
+					ProcessName:    routingResult.Pname,
+					Src:            realSrc,
+					Dest:           realDst,
+					Mark:           routingResult.Mark,
+					Network:        "udp",
+					Excluded:       excludedDialer,
+					IdentifiedQuic: quicIdentified,
 				}
 
 				res, err := c.chooseProxyDialer(ctx, dialParam)
@@ -1148,6 +1198,9 @@ getNew:
 						return nil, err
 					}
 					return nil, err
+				}
+				if c.shouldRejectProxiedQuic(res.Dialer, quicIdentified) {
+					return nil, ErrQuicAdministrativelyProhibited
 				}
 				if shouldRejectNewUdpDialSelection(res) {
 					if res.Outbound != nil {
@@ -1184,6 +1237,10 @@ getNew:
 			},
 		})
 		if err != nil {
+			if stderrors.Is(err, ErrQuicAdministrativelyProhibited) {
+				c.rejectQuicWithICMP(data, realSrc, realDst)
+				return nil
+			}
 			if stderrors.Is(err, ob.ErrNoAliveDialer) || stderrors.Is(err, ErrEndpointFailed) ||
 				stderrors.Is(err, errUdpEndpointAdmissionClosed) {
 				// Already emitted a rate-limited diagnostic log above, or hit negative cache.
@@ -1200,6 +1257,7 @@ getNew:
 	// exact endpoint network type before writing. This keeps the slow path aligned
 	// with the fast-path health checks and exact per-family invalidation.
 	if !isNew && !c.checkUdpEndpointHealth(ue, ueKey, false) {
+		quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 		// Exclude the dead dialer to force selection of a different one on retry.
 		excludedDialer = ue.Dialer
 		retry++
@@ -1209,7 +1267,15 @@ getNew:
 		// It is used for showing.
 		domain = ue.SniffedDomain
 	}
+	if c.rejectEndpointQuic(ue, data, realSrc, realDst, quicIdentified) {
+		return nil
+	}
+	quicIdentified = quicIdentifiedFromEndpoint(quicIdentified, ue)
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
+	// GetOrCreate (and node-retry GetDialOption) store the chosen domain or
+	// resolve_dns IP on the endpoint. The pre-getNew dialTarget is still the
+	// packet dest and would send the first/retry batch at the raw IP.
+	dialTarget = ue.dialTargetForWrite(realDst)
 
 	for packetIndex < len(payloads) {
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
@@ -1244,6 +1310,7 @@ getNew:
 			if c.shouldPenalizeUdpEndpointWriteError(err) {
 				excludedDialer = ue.Dialer
 			}
+			quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 			_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 			retry++
 			goto getNew

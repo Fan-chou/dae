@@ -77,3 +77,28 @@ func TestNewFromLinkResolveDNSAndClone(t *testing.T) {
 		t.Fatalf("clone ResolveDNS = %v, want %v", clone.ResolveDNS(), want)
 	}
 }
+
+func TestNewFromLinkNamedNodeResolveDNS(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     30 * time.Second,
+	}
+	src, err := dialer.NewFromLink(option, dialer.InstanceOption{DisableCheck: true},
+		"US_Dmit_LAX_Hysteria:hysteria2://pass@127.0.0.1:443?sni=example.com&resolve_dns=127.0.0.2%3A53", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	want := netip.MustParseAddrPort("127.0.0.2:53")
+	if src.ResolveDNS() != want {
+		t.Fatalf("ResolveDNS = %v, want %v (named node must not drop query)", src.ResolveDNS(), want)
+	}
+	if src.Property() == nil || src.Property().Name != "US_Dmit_LAX_Hysteria" {
+		t.Fatalf("name = %v", src.Property())
+	}
+	if src.Property() != nil && strings.Contains(src.Property().Link, "resolve_dns") {
+		t.Fatalf("protocol link still has resolve_dns: %s", src.Property().Link)
+	}
+}

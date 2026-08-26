@@ -245,8 +245,9 @@ routing {
 
   ### Write your rules below.
 
-  # Disable h3 because it usually consumes too much cpu/mem resources.
-  l4proto(udp) && dport(443) -> block
+  # Optional kernel silent-drop of all UDP/443, including datagram nodes.
+  # global.block_quic already REJECT-NO-DROP identified QUIC on TCP/UoT nodes.
+  # l4proto(udp) && dport(443) -> block
   dip(geoip:private) -> direct
   dip(geoip:cn) -> direct
   domain(geosite:cn) -> direct

@@ -7,7 +7,9 @@ package control
 
 import (
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestPacketSnifferFlowFamilyReleaseRemovesLastEntry(t *testing.T) {
@@ -265,5 +267,185 @@ func BenchmarkPacketSnifferPool_RemoveFlowFamilySessions(b *testing.B) {
 		b.StopTimer()
 		key = repopulate()
 		b.StartTimer()
+	}
+}
+
+func TestPacketSnifferCloseDetachesInnerSniffer(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40000"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0x61),
+	)
+	ps, _ := pool.GetOrCreate(key, nil)
+	ps.AppendData(makeLikelyQuicInitialPayload(0x61))
+	if err := ps.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ps.Sniffer != nil {
+		t.Fatal("Close must detach the inner sniffer before the struct is recycled")
+	}
+	ps.AppendData(makeLikelyQuicInitialPayload(0x62))
+	_, _ = ps.SniffUdp()
+}
+
+func TestRetireExpiredPacketSnifferSkipsBusyAndRefreshed(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40010"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0x71),
+	)
+	ps, _ := pool.GetOrCreate(key, nil)
+	ps.expiresAtNano.Store(1)
+	ps.Mu.Lock()
+	if pool.retireExpiredPacketSniffer(key, ps, time.Now().UnixNano()) {
+		t.Fatal("busy sniffer must not be retired")
+	}
+	ps.Mu.Unlock()
+	if got := pool.Get(key); got != ps {
+		t.Fatal("busy sniffer must stay in the pool")
+	}
+
+	ps.RefreshTtl()
+	if pool.retireExpiredPacketSniffer(key, ps, time.Now().UnixNano()) {
+		t.Fatal("refreshed sniffer must not be retired")
+	}
+
+	ps.expiresAtNano.Store(1)
+	if !pool.retireExpiredPacketSniffer(key, ps, time.Now().UnixNano()) {
+		t.Fatal("expired idle sniffer must retire")
+	}
+	if pool.Get(key) != nil {
+		t.Fatal("retired sniffer must leave the pool")
+	}
+	if ps.Sniffer != nil {
+		t.Fatal("retire must detach the inner sniffer")
+	}
+}
+
+func TestGetOrCreateDoesNotReturnSnifferClosedByJanitor(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40011"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0x81),
+	)
+	ps, isNew := pool.GetOrCreate(key, nil)
+	if !isNew || ps == nil || ps.Sniffer == nil {
+		t.Fatal("expected a live sniffer")
+	}
+	ps.expiresAtNano.Store(1)
+	ps.Mu.Lock()
+	started := make(chan struct{})
+	done := make(chan *PacketSniffer, 1)
+	go func() {
+		close(started)
+		got, _ := pool.GetOrCreate(key, nil)
+		done <- got
+	}()
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	if !pool.pool.CompareAndDelete(key, ps) {
+		ps.Mu.Unlock()
+		t.Fatal("expected to delete the expired sniffer under Mu")
+	}
+	_ = ps.closeLocked()
+	ps.Mu.Unlock()
+
+	select {
+	case got := <-done:
+		if got == ps {
+			t.Fatal("GetOrCreate must not return the sniffer the janitor just closed")
+		}
+		if got == nil || got.Sniffer == nil {
+			t.Fatal("replacement sniffer must still be live")
+		}
+		if pool.Get(key) != got {
+			t.Fatal("GetOrCreate must return the pooled member, not a detached sniffer")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetOrCreate blocked after janitor released Mu")
+	}
+}
+
+func TestGetOrCreateReplacesClosedPooledSniffer(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40012"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0x91),
+	)
+	ps, isNew := pool.GetOrCreate(key, nil)
+	if !isNew || ps == nil || ps.Sniffer == nil {
+		t.Fatal("expected a live sniffer")
+	}
+	if err := ps.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Get(key) != ps {
+		t.Fatal("Close must not itself remove the pooled sniffer")
+	}
+	got, _ := pool.GetOrCreate(key, nil)
+	if got == ps {
+		t.Fatal("GetOrCreate must not return a closed pooled sniffer")
+	}
+	if pool.Get(key) != got {
+		t.Fatal("GetOrCreate must return the pooled member, not a detached sniffer")
+	}
+	if got == nil || got.Sniffer == nil {
+		t.Fatal("replacement sniffer must be live")
+	}
+}
+
+func TestGetOrCreateReturnsPooledMemberAfterRepeatedReplaces(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40013"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0xa1),
+	)
+	for i := 0; i < 32; i++ {
+		got, _ := pool.GetOrCreate(key, nil)
+		if pool.Get(key) != got {
+			t.Fatalf("iteration %d: GetOrCreate returned a sniffer that is not the pool member", i)
+		}
+		if got == nil || got.Sniffer == nil {
+			t.Fatalf("iteration %d: replacement sniffer must be live", i)
+		}
+		if err := got.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestGetOrCreateConcurrentReturnsSamePooledMember(t *testing.T) {
+	pool := &PacketSnifferPool{}
+	key := NewPacketSnifferKey(
+		mustParseAddrPort("192.0.2.10:40014"),
+		mustParseAddrPort("198.51.100.20:443"),
+		makeLikelyQuicInitialPayload(0xb1),
+	)
+	const n = 32
+	got := make([]*PacketSniffer, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			qs, _ := pool.GetOrCreate(key, nil)
+			got[i] = qs
+		}(i)
+	}
+	wg.Wait()
+	first := pool.Get(key)
+	if first == nil || first.Sniffer == nil {
+		t.Fatal("pool must hold a live sniffer")
+	}
+	for i, qs := range got {
+		if qs != first {
+			t.Fatalf("goroutine %d got %p, want pooled %p", i, qs, first)
+		}
 	}
 }

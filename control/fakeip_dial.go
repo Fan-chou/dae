@@ -160,6 +160,69 @@ func udpDialTarget(selected, pinned string) string {
 	return pinned
 }
 
+// ensureUdpDialTargetIP makes UDP DialTarget something the leaf can send.
+//
+// resolve_dns: applyProxyResolveDNS already pinned an IP (and its cache);
+// leave that IP alone.
+// No resolve_dns: pass domain:port when we have a name (Hy2/TUIC accept
+// host:port on the wire). No name: pass the packet dest IP. FakeIP 28.x
+// is never dialed — rewriteFakeIPDialTarget must have produced a domain.
+func (c *ControlPlane) ensureUdpDialTargetIP(ctx context.Context, p *proxyDialParam, res *proxyDialResult) error {
+	if res == nil || p == nil || p.Network != "udp" {
+		return nil
+	}
+	if udpDialTargetPinnedByResolveDNS(res) {
+		return nil
+	}
+	dest := p.Dest.Addr()
+	fake := dest.IsValid() && c.destIsFakeIP(dest)
+	domain := udpDialDomain(res)
+	if domain != "" {
+		c.setUdpDialTargetDomain(res, domain, p.Dest.Port())
+		return nil
+	}
+	if _, err := parseDialTargetIP(res.DialTarget); err == nil {
+		return nil
+	}
+	if dest.IsValid() && !fake {
+		c.pinProxyResolveDNSTarget(res, dest, p.Dest.Port())
+		return nil
+	}
+	return fmt.Errorf("udp dial target is not an IP: %s", res.DialTarget)
+}
+
+func (c *ControlPlane) setUdpDialTargetDomain(res *proxyDialResult, domain string, port uint16) {
+	if res == nil || domain == "" {
+		return
+	}
+	res.DialTarget = net.JoinHostPort(domain, strconv.Itoa(int(port)))
+	res.IsDialIp = false
+}
+
+func udpDialDomain(res *proxyDialResult) string {
+	if res == nil {
+		return ""
+	}
+	domain := strings.TrimSuffix(res.SniffedDomain, ".")
+	if domain == "" || isIPLikeDomain(domain) {
+		if host, _, err := net.SplitHostPort(res.DialTarget); err == nil {
+			domain = host
+		}
+	}
+	if domain == "" || isIPLikeDomain(domain) {
+		return ""
+	}
+	return domain
+}
+
+func udpDialTargetPinnedByResolveDNS(res *proxyDialResult) bool {
+	if res == nil || res.Dialer == nil || !res.Dialer.ResolveDNS().IsValid() {
+		return false
+	}
+	_, err := parseDialTargetIP(res.DialTarget)
+	return err == nil
+}
+
 func parseDialTargetIP(target string) (netip.Addr, error) {
 	if addr, err := netip.ParseAddr(target); err == nil {
 		return addr, nil

@@ -82,6 +82,12 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 			"needs_cache":   needsCache,
 			"subscription":  subscriptionTag,
 		}).Debug("[DialerRegister] Checking if sticky IP caching is needed")
+		if resolveDNS.IsValid() {
+			gOption.Log.WithFields(logrus.Fields{
+				"dialer":      p.Name,
+				"resolve_dns": resolveDNS.String(),
+			}).Debug("node resolve_dns attached")
+		}
 	}
 
 	// If the proxy address is a domain (not an IP), wrap with sticky IP dialer

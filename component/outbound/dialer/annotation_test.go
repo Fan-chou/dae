@@ -112,6 +112,24 @@ func TestExtractLinkResolveDNS(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid resolve_dns on node link")
 	}
+
+	named := "US_Dmit_LAX_Hysteria:hysteria2://pass@[2605:52c0::1]:443?sni=example.com&resolve_dns=127.0.0.2%3A53"
+	stripped, dns, err = extractLinkResolveDNS(named)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dns != netip.MustParseAddrPort("127.0.0.2:53") {
+		t.Fatalf("named dns = %v", dns)
+	}
+	if !strings.HasPrefix(stripped, "US_Dmit_LAX_Hysteria:hysteria2://") {
+		t.Fatalf("named stripped lost tag: %s", stripped)
+	}
+	if strings.Contains(stripped, "resolve_dns") {
+		t.Fatalf("named stripped still has resolve_dns: %s", stripped)
+	}
+	if !strings.Contains(stripped, "sni=example.com") {
+		t.Fatalf("named stripped lost sni: %s", stripped)
+	}
 }
 
 func TestNewAnnotationRejectsResolveDNS(t *testing.T) {
