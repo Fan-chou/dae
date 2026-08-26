@@ -21,11 +21,12 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // resolveIPViaDialer is the UDP DNS lookup used by resolve_dns pinning.
 // Tests replace it to avoid a real network round-trip.
-var resolveIPViaDialer = netutils.ResolveNetip
+var resolveIPViaDialer = netutils.ResolveNetipTTL
 
 func (c *ControlPlane) destIsFakeIP(addr netip.Addr) bool {
 	store := c.fakeIPStore()
@@ -237,16 +238,21 @@ func parseDialTargetIP(target string) (netip.Addr, error) {
 const resolveDNSPinCacheMax = 1024
 
 type proxyResolveDNSPin struct {
-	ip      netip.Addr
-	expires time.Time
+	ip         netip.Addr
+	expires    time.Time
+	staleUntil time.Time
+	refreshing bool
 }
 
 type proxyResolveDNSPinCache struct {
-	mu      sync.Mutex
-	entries map[string]proxyResolveDNSPin
+	mu       sync.Mutex
+	entries  map[string]proxyResolveDNSPin
+	sf       singleflight.Group
+	prefetch sync.Map
 }
 
 func proxyResolveDNSPinKey(d *dialer.Dialer, dns netip.AddrPort, domain string, preferV6 bool) string {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	fam := byte('4')
 	if preferV6 {
 		fam = '6'
@@ -254,23 +260,56 @@ func proxyResolveDNSPinKey(d *dialer.Dialer, dns netip.AddrPort, domain string, 
 	return fmt.Sprintf("%p\x00%s\x00%s\x00%c", d, dns.String(), domain, fam)
 }
 
-func (c *proxyResolveDNSPinCache) lookup(key string, now time.Time) (netip.Addr, bool) {
+func (c *proxyResolveDNSPinCache) lookupFreshOrStale(key string, now time.Time) (ip netip.Addr, stale bool, ok bool) {
 	if c == nil {
-		return netip.Addr{}, false
+		return netip.Addr{}, false, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ent, ok := c.entries[key]
-	if !ok || now.After(ent.expires) || !ent.ip.IsValid() {
-		if ok {
-			delete(c.entries, key)
-		}
-		return netip.Addr{}, false
+	if !ok || !ent.ip.IsValid() {
+		return netip.Addr{}, false, false
 	}
-	return ent.ip, true
+	if !now.After(ent.expires) {
+		return ent.ip, false, true
+	}
+	if now.After(ent.staleUntil) {
+		delete(c.entries, key)
+		return netip.Addr{}, false, false
+	}
+	return ent.ip, true, true
 }
 
-func (c *proxyResolveDNSPinCache) store(key string, ip netip.Addr, now time.Time) {
+func (c *proxyResolveDNSPinCache) tryMarkStaleRefresh(key string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ent, ok := c.entries[key]
+	if !ok || ent.refreshing || !ent.ip.IsValid() {
+		return false
+	}
+	ent.refreshing = true
+	c.entries[key] = ent
+	return true
+}
+
+func (c *proxyResolveDNSPinCache) clearRefreshing(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ent, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	ent.refreshing = false
+	c.entries[key] = ent
+}
+
+func (c *proxyResolveDNSPinCache) store(key string, ip netip.Addr, now time.Time, ttl time.Duration) {
 	if c == nil || !ip.IsValid() || key == "" {
 		return
 	}
@@ -281,15 +320,37 @@ func (c *proxyResolveDNSPinCache) store(key string, ip netip.Addr, now time.Time
 	}
 	if len(c.entries) >= resolveDNSPinCacheMax {
 		for k, ent := range c.entries {
-			if now.After(ent.expires) {
+			if now.After(ent.staleUntil) {
 				delete(c.entries, k)
+			}
+		}
+		if len(c.entries) >= resolveDNSPinCacheMax {
+			for k, ent := range c.entries {
+				if now.After(ent.expires) {
+					delete(c.entries, k)
+				}
 			}
 		}
 		if len(c.entries) >= resolveDNSPinCacheMax {
 			c.entries = make(map[string]proxyResolveDNSPin)
 		}
 	}
-	c.entries[key] = proxyResolveDNSPin{ip: ip, expires: now.Add(consts.ResolveDNSCacheTTL)}
+	fresh := clampResolveDNSPinTTL(ttl)
+	c.entries[key] = proxyResolveDNSPin{
+		ip:         ip,
+		expires:    now.Add(fresh),
+		staleUntil: now.Add(fresh + consts.ResolveDNSStaleTTL),
+	}
+}
+
+func clampResolveDNSPinTTL(ttl time.Duration) time.Duration {
+	if ttl < consts.ResolveDNSCacheTTLMin {
+		return consts.ResolveDNSCacheTTLMin
+	}
+	if ttl > consts.ResolveDNSCacheTTLMax {
+		return consts.ResolveDNSCacheTTLMax
+	}
+	return ttl
 }
 
 func (c *ControlPlane) pinProxyResolveDNSTarget(res *proxyDialResult, ip netip.Addr, port uint16) {
@@ -336,7 +397,7 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 	if res == nil || p == nil || p.Network != "udp" {
 		return nil
 	}
-	domain := strings.TrimSuffix(res.SniffedDomain, ".")
+	domain := strings.ToLower(strings.TrimSuffix(res.SniffedDomain, "."))
 	if domain == "" || isIPLikeDomain(domain) {
 		return nil
 	}
@@ -348,28 +409,94 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 		return nil
 	}
 	preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-	key := proxyResolveDNSPinKey(res.Dialer, dns, domain, preferV6)
-	now := time.Now()
-	if ip, ok := c.resolveDNSPins.lookup(key, now); ok {
-		c.pinProxyResolveDNSTarget(res, ip, p.Dest.Port())
-		return nil
+	ip, err := c.lookupProxyResolveDNSPin(res, domain, preferV6)
+	if err != nil {
+		return err
 	}
+	c.pinProxyResolveDNSTarget(res, ip, p.Dest.Port())
+	if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
+		dialerName := ""
+		if prop := res.Dialer.Property(); prop != nil {
+			dialerName = prop.Name
+		}
+		c.log.WithFields(logrus.Fields{
+			"domain": domain,
+			"dns":    dns.String(),
+			"dialer": dialerName,
+			"target": res.DialTarget,
+		}).Debug("pinned UDP dest via resolve_dns")
+	}
+	return nil
+}
+
+func (c *ControlPlane) lookupProxyResolveDNSPin(res *proxyDialResult, domain string, preferV6 bool) (netip.Addr, error) {
+	dns := res.Dialer.ResolveDNS()
+	key := proxyResolveDNSPinKey(res.Dialer, dns, domain, preferV6)
+	if ip, stale, ok := c.resolveDNSPins.lookupFreshOrStale(key, time.Now()); ok {
+		if stale && c.resolveDNSPins.tryMarkStaleRefresh(key) {
+			c.refreshProxyResolveDNSPin(res.Dialer, res.Mark, domain, preferV6)
+		}
+		return ip, nil
+	}
+	v, err, _ := c.resolveDNSPins.sf.Do(key, func() (any, error) {
+		if ip, stale, ok := c.resolveDNSPins.lookupFreshOrStale(key, time.Now()); ok && !stale {
+			return ip, nil
+		}
+		ip, ttl, err := c.lookupProxyResolveDNSUncached(res, domain, preferV6)
+		if err != nil {
+			return nil, err
+		}
+		c.resolveDNSPins.store(key, ip, time.Now(), ttl)
+		return ip, nil
+	})
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	ip, _ := v.(netip.Addr)
+	if !ip.IsValid() {
+		return netip.Addr{}, fmt.Errorf("no real IP for %s via %s", domain, dns)
+	}
+	return ip, nil
+}
+
+func (c *ControlPlane) refreshProxyResolveDNSPin(d *dialer.Dialer, mark uint32, domain string, preferV6 bool) {
+	if c == nil || d == nil {
+		return
+	}
+	dns := d.ResolveDNS()
+	key := proxyResolveDNSPinKey(d, dns, domain, preferV6)
+	go func() {
+		_, _, _ = c.resolveDNSPins.sf.Do(key, func() (any, error) {
+			defer c.resolveDNSPins.clearRefreshing(key)
+			if ip, stale, ok := c.resolveDNSPins.lookupFreshOrStale(key, time.Now()); ok && !stale {
+				return ip, nil
+			}
+			res := &proxyDialResult{Dialer: d, Mark: mark}
+			ip, ttl, err := c.lookupProxyResolveDNSUncached(res, domain, preferV6)
+			if err != nil {
+				return nil, err
+			}
+			c.resolveDNSPins.store(key, ip, time.Now(), ttl)
+			return ip, nil
+		})
+	}()
+}
+
+func (c *ControlPlane) lookupProxyResolveDNSUncached(res *proxyDialResult, domain string, preferV6 bool) (netip.Addr, time.Duration, error) {
+	dns := res.Dialer.ResolveDNS()
 	qtypes := [2]uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA}
 	if preferV6 {
 		qtypes[0], qtypes[1] = dnsmessage.TypeAAAA, dnsmessage.TypeA
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	dnsCtx, cancel := context.WithTimeout(ctx, consts.ResolveDNSTimeout)
+	// Independent of the caller's ctx so prefetch and the first packet share
+	// one in-flight lookup instead of cancelling each other.
+	dnsCtx, cancel := context.WithTimeout(context.Background(), consts.ResolveDNSTimeout)
 	defer cancel()
-	// Do not copy res.Network or the resolver family: both would pin the
-	// outer hop to the node (SS/stickyip). The DNS target is dns.String().
 	lookupNet := resolveDNSLookupNetwork(res.Mark, c.mptcp)
 	store := c.fakeIPStore()
 	var lastErr error
 	for _, qtype := range qtypes {
-		addrs, err := resolveIPViaDialer(dnsCtx, res.Dialer, dns, domain, qtype, lookupNet)
+		addrs, ttl, err := resolveIPViaDialer(dnsCtx, res.Dialer, dns, domain, qtype, lookupNet)
 		if err != nil {
 			lastErr = err
 			continue
@@ -379,26 +506,106 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 			lastErr = err
 			continue
 		}
-		c.pinProxyResolveDNSTarget(res, ip, p.Dest.Port())
-		c.resolveDNSPins.store(key, ip, now)
-		if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
-			dialerName := ""
-			if prop := res.Dialer.Property(); prop != nil {
-				dialerName = prop.Name
-			}
-			c.log.WithFields(logrus.Fields{
-				"domain": domain,
-				"dns":    dns.String(),
-				"dialer": dialerName,
-				"target": res.DialTarget,
-			}).Debug("pinned UDP dest via resolve_dns")
-		}
-		return nil
+		return ip, ttl, nil
 	}
 	if lastErr != nil {
-		return fmt.Errorf("resolve %s via %s: %w", domain, dns, lastErr)
+		return netip.Addr{}, 0, fmt.Errorf("resolve %s via %s: %w", domain, dns, lastErr)
 	}
-	return fmt.Errorf("no real IP for %s via %s", domain, dns)
+	return netip.Addr{}, 0, fmt.Errorf("no real IP for %s via %s", domain, dns)
+}
+
+func (c *ControlPlane) prefetchProxyResolveDNS(domain string, preferV6 bool, src netip.AddrPort, mac [6]uint8, mark uint32, pname [16]uint8) {
+	if c == nil || len(c.outbounds) == 0 || c.routingMatcher == nil || !c.hasResolveDNSNode() {
+		return
+	}
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	if domain == "" || isIPLikeDomain(domain) {
+		return
+	}
+	key := domain + "\x00"
+	if preferV6 {
+		key += "6"
+	} else {
+		key += "4"
+	}
+	if _, loaded := c.resolveDNSPins.prefetch.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer time.AfterFunc(time.Second, func() {
+			c.resolveDNSPins.prefetch.Delete(key)
+		})
+		dest := c.prefetchResolveDNSDest(domain, preferV6)
+		if !src.IsValid() {
+			src = netip.MustParseAddrPort("192.0.2.1:0")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), consts.ResolveDNSTimeout)
+		defer cancel()
+		_, _ = c.chooseProxyDialer(ctx, &proxyDialParam{
+			Outbound:    consts.OutboundControlPlaneRouting,
+			Domain:      domain,
+			Mac:         mac,
+			ProcessName: pname,
+			Src:         src,
+			Dest:        dest,
+			Mark:        mark,
+			Network:     "udp",
+		})
+	}()
+}
+
+func (c *ControlPlane) prefetchResolveDNSDest(domain string, preferV6 bool) netip.AddrPort {
+	if store := c.fakeIPStore(); store != nil {
+		if v4, v6, ok := store.Lookup(domain); ok {
+			if preferV6 && v6.IsValid() {
+				return netip.AddrPortFrom(v6, 443)
+			}
+			if !preferV6 && v4.IsValid() {
+				return netip.AddrPortFrom(v4, 443)
+			}
+		}
+	}
+	if ip := c.realIPFromDnsCache(domain, preferV6); ip.IsValid() {
+		return netip.AddrPortFrom(ip, 443)
+	}
+	if preferV6 {
+		return netip.MustParseAddrPort("[2001:db8::1]:443")
+	}
+	return netip.MustParseAddrPort("192.0.2.1:443")
+}
+
+func (c *ControlPlane) hasResolveDNSNode() bool {
+	if c == nil {
+		return false
+	}
+	for _, out := range c.outbounds {
+		if out == nil {
+			continue
+		}
+		for _, d := range out.Dialers {
+			if d != nil && d.ResolveDNS().IsValid() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *ControlPlane) prefetchResolveDNSFromDNS(qname string, qtype uint16, req *udpRequest) {
+	preferV6 := qtype == dnsmessage.TypeAAAA
+	var src netip.AddrPort
+	var mac [6]uint8
+	var mark uint32
+	var pname [16]uint8
+	if req != nil {
+		src = req.realSrc
+		if req.routingResult != nil {
+			mac = req.routingResult.Mac
+			mark = req.routingResult.Mark
+			pname = req.routingResult.Pname
+		}
+	}
+	c.prefetchProxyResolveDNS(qname, preferV6, src, mac, mark, pname)
 }
 
 func pickResolvedDialIP(addrs []netip.Addr, preferV6 bool, store *FakeIPStore) (netip.Addr, error) {

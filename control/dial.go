@@ -284,6 +284,10 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
 		return res, err
 	}
+	if p.Network == "tcp" && res.Dialer != nil && res.Dialer.ResolveDNS().IsValid() {
+		preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
+		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName)
+	}
 	if err := c.ensureUdpDialTargetIP(ctx, p, res); err != nil {
 		return res, err
 	}

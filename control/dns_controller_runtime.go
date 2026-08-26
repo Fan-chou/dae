@@ -30,6 +30,7 @@ type dnsControllerRuntimeState struct {
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 	fixedDomainTtl        map[string]int
 	fakeIPPolicy          *FakeIPPolicy
+	prefetchResolveDNS    func(qname string, qtype uint16, req *udpRequest)
 }
 
 func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint16, optimisticCacheEnabled bool, optimisticCacheTtl int, maxCacheSize int, err error) {
@@ -145,6 +146,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 		fixedDomainTtl:        option.FixedDomainTtl,
 		fakeIPPolicy:          option.FakeIPPolicy,
+		prefetchResolveDNS:    option.PrefetchResolveDNS,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)
@@ -182,6 +184,7 @@ func fakeIPClientFromReq(req *udpRequest) (netip.Addr, [6]byte) {
 func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed []byte, req *udpRequest) []byte {
 	policy := c.fakeIPPolicy()
 	if policy == nil {
+		c.maybePrefetchResolveDNS(qname, qtype, req)
 		return packed
 	}
 	src, mac := fakeIPClientFromReq(req)
@@ -190,20 +193,39 @@ func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed [
 		if c.log != nil {
 			c.log.WithError(err).Warn("fakeip packed rewrite failed; sending real response")
 		}
+		c.maybePrefetchResolveDNS(qname, qtype, req)
 		return packed
 	}
+	c.maybePrefetchResolveDNS(qname, qtype, req)
 	return out
 }
 
 func (c *DnsController) rewriteClientMsg(msg *dnsmessage.Msg, req *udpRequest) {
 	policy := c.fakeIPPolicy()
 	if policy == nil || msg == nil {
+		if msg != nil && len(msg.Question) > 0 {
+			c.maybePrefetchResolveDNS(msg.Question[0].Name, msg.Question[0].Qtype, req)
+		}
 		return
 	}
 	src, mac := fakeIPClientFromReq(req)
 	if err := policy.RewriteMsg(msg, src, mac); err != nil && c.log != nil {
 		c.log.WithError(err).Warn("fakeip message rewrite failed; sending real response")
 	}
+	if len(msg.Question) > 0 {
+		c.maybePrefetchResolveDNS(msg.Question[0].Name, msg.Question[0].Qtype, req)
+	}
+}
+
+func (c *DnsController) maybePrefetchResolveDNS(qname string, qtype uint16, req *udpRequest) {
+	if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
+		return
+	}
+	rt := c.runtime()
+	if rt == nil || rt.prefetchResolveDNS == nil {
+		return
+	}
+	rt.prefetchResolveDNS(qname, qtype, req)
 }
 
 func (c *DnsController) LookupCacheAnswers(qname string, qtype uint16) []dnsmessage.RR {

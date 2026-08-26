@@ -27,7 +27,8 @@ var (
 	systemDns                netip.AddrPort
 	systemDnsNextUpdateAfter time.Time
 
-	ErrBadDnsAns = fmt.Errorf("bad dns answer")
+	ErrBadDnsAns      = fmt.Errorf("bad dns answer")
+	ErrResolveTimeout = fmt.Errorf("timeout")
 
 	FallbackDns netip.AddrPort
 )
@@ -94,10 +95,18 @@ func SystemDns() (dns netip.AddrPort, err error) {
 }
 
 func ResolveNetip(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host string, typ uint16, network string) (addrs []netip.Addr, err error) {
+	addrs, _, err = ResolveNetipTTL(ctx, d, dns, host, typ, network)
+	return addrs, err
+}
+
+// ResolveNetipTTL is ResolveNetip plus the minimum TTL among matching answers.
+func ResolveNetipTTL(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host string, typ uint16, network string) (addrs []netip.Addr, ttl time.Duration, err error) {
 	resources, err := resolve(ctx, d, dns, host, typ, network)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	var minTTL uint32
+	foundTTL := false
 	for _, ans := range resources {
 		if ans.Header().Rrtype != typ {
 			continue
@@ -110,13 +119,13 @@ func ResolveNetip(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, ho
 		case dnsmessage.TypeA:
 			a, ok := ans.(*dnsmessage.A)
 			if !ok {
-				return nil, ErrBadDnsAns
+				return nil, 0, ErrBadDnsAns
 			}
 			ip, okk = netip.AddrFromSlice(a.A)
 		case dnsmessage.TypeAAAA:
 			a, ok := ans.(*dnsmessage.AAAA)
 			if !ok {
-				return nil, ErrBadDnsAns
+				return nil, 0, ErrBadDnsAns
 			}
 			ip, okk = netip.AddrFromSlice(a.AAAA)
 		}
@@ -124,8 +133,16 @@ func ResolveNetip(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, ho
 			continue
 		}
 		addrs = append(addrs, ip)
+		hdrTTL := ans.Header().Ttl
+		if !foundTTL || hdrTTL < minTTL {
+			minTTL = hdrTTL
+			foundTTL = true
+		}
 	}
-	return addrs, nil
+	if foundTTL {
+		ttl = time.Duration(minTTL) * time.Second
+	}
+	return addrs, ttl, nil
 }
 
 func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host string, typ uint16, network string) ([]dnsmessage.RR, error) {
@@ -214,8 +231,7 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	ch := make(chan dnsResolveResult, 2)
 	if magicNetwork.Network == "udp" {
 		go func() {
-			// Resend every 3 seconds for UDP.
-			ticker := time.NewTicker(3 * time.Second)
+			ticker := time.NewTicker(consts.ResolveDNSUDPResendInterval)
 			defer ticker.Stop()
 
 			for {
@@ -266,7 +282,10 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	}()
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("timeout")
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, ErrResolveTimeout
+		}
+		return nil, ctx.Err()
 	case res := <-ch:
 		if res.err != nil {
 			return nil, res.err

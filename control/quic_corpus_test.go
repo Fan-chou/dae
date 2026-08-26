@@ -9,6 +9,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"net/netip"
 
@@ -230,9 +231,9 @@ func rebuildAfterSniffedEndpointEviction(t *testing.T, withResolveDNS bool, evic
 	if withResolveDNS {
 		sniffedDialer.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
 		old := resolveIPViaDialer
-		resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+		resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
 			lookups.Add(1)
-			return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, nil
+			return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, 0, nil
 		}
 		t.Cleanup(func() { resolveIPViaDialer = old })
 		wantTarget = "203.0.113.9:443"

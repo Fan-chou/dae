@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -648,7 +649,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 	selectCancel()
 	if err != nil {
 		if shouldCacheUdpEndpointCreateFailure(err) {
-			p.cacheFailureLocked(key, createOption.Log)
+			p.cacheFailureLocked(key, createOption.Log, err)
 		}
 		return nil, err
 	}
@@ -683,7 +684,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 			}
 		}
 		if shouldCacheUdpEndpointCreateFailure(err) {
-			p.cacheFailureLocked(key, createOption.Log)
+			p.cacheFailureLocked(key, createOption.Log, err)
 		}
 		return nil, err
 	}
@@ -805,14 +806,25 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	return true
 }
 
-func (p *UdpEndpointPool) cacheFailureLocked(key UdpEndpointKey, log *logrus.Logger) {
+func isUdpEndpointTimeoutFailure(err error) bool {
+	return err != nil && stderrors.Is(err, netutils.ErrResolveTimeout)
+}
+
+func udpEndpointCreateFailureTTL(err error) time.Duration {
+	if isUdpEndpointTimeoutFailure(err) {
+		return consts.UdpEndpointFailureCacheTimeoutTTL
+	}
+	return consts.UdpEndpointFailureCacheTTL
+}
+
+func (p *UdpEndpointPool) cacheFailureLocked(key UdpEndpointKey, log *logrus.Logger, err error) {
 	failedUe := &UdpEndpoint{
 		log:     log,
 		poolRef: p,
 		poolKey: key,
 	}
 	failedUe.failed.Store(true)
-	failedUe.expiresAtNano.Store(time.Now().Add(2 * time.Second).UnixNano())
+	failedUe.expiresAtNano.Store(time.Now().Add(udpEndpointCreateFailureTTL(err)).UnixNano())
 
 	shard := p.shardFor(key)
 	shard.mu.Lock()

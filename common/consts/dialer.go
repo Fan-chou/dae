@@ -49,10 +49,31 @@ const (
 	DefaultDialTimeout = 8 * time.Second
 	// ResolveDNSTimeout is the budget for a node resolve_dns lookup.
 	// It is independent of DefaultDialTimeout so a slow DNS query cannot
-	// starve the subsequent proxy handshake.
-	ResolveDNSTimeout = 3 * time.Second
-	// ResolveDNSCacheTTL is how long a successful resolve_dns pin is reused.
-	ResolveDNSCacheTTL = 30 * time.Second
+	// starve the subsequent proxy handshake. Sized for a US-node RTT plus a
+	// couple of UDP retries, not a full 3s stall on the first packet.
+	ResolveDNSTimeout = 800 * time.Millisecond
+	// ResolveDNSUDPResendInterval is how often a UDP resolve_dns query is
+	// resent while waiting for an answer. Must be well below ResolveDNSTimeout
+	// so a lost packet can retry inside the budget.
+	ResolveDNSUDPResendInterval = 400 * time.Millisecond
+	// ResolveDNSCacheTTLMin / Max clamp a successful pin to the answer TTL.
+	ResolveDNSCacheTTLMin = 30 * time.Second
+	ResolveDNSCacheTTLMax = 2 * time.Minute
+	// ResolveDNSCacheTTL is the pin lifetime when the answer has no usable TTL.
+	ResolveDNSCacheTTL = ResolveDNSCacheTTLMin
+	// ResolveDNSStaleTTL is how long an expired pin may still be served while a
+	// background refresh runs. First packets after TTL expiry keep using the
+	// old IP instead of blocking on resolve_dns.
+	ResolveDNSStaleTTL = 5 * time.Minute
+	// UdpEndpointFailureCacheTTL is the default UDP 4-tuple negative cache
+	// after a cacheable create/dial failure.
+	UdpEndpointFailureCacheTTL = 2 * time.Second
+	// UdpEndpointFailureCacheTimeoutTTL is the negative cache for resolve_dns
+	// lookup timeouts (netutils.ErrResolveTimeout). The caller already waited
+	// ResolveDNSTimeout; a further 2s blackhole on the next datagram is worse
+	// than a short retry. Handshake/select deadlines (DefaultDialTimeout) stay
+	// on UdpEndpointFailureCacheTTL.
+	UdpEndpointFailureCacheTimeoutTTL = 300 * time.Millisecond
 )
 
 // L4ProtoStr represents a layer 4 protocol as a string.

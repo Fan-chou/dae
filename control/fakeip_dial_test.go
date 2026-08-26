@@ -11,10 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/common/netutils"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -279,8 +282,8 @@ func TestEnsureUdpDialTargetIPResolveDNSWinsOverDnsCache(t *testing.T) {
 	cp.dialMode = consts.DialMode_DomainPlus
 	seedDnsCacheA(t, cp, "chatgpt.com", netip.MustParseAddr("1.1.1.1"))
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -373,13 +376,13 @@ func TestApplyProxyResolveDNSPinsIPViaSelectedDialer(t *testing.T) {
 	var gotType uint16
 	var gotNetwork string
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, time.Duration, error) {
 		gotDialer = dialer
 		gotDNS = resolver
 		gotHost = host
 		gotType = typ
 		gotNetwork = network
-		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -409,8 +412,8 @@ func TestApplyProxyResolveDNSFailureDoesNotFallBackToDomain(t *testing.T) {
 	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
 	cp.dialMode = consts.DialMode_DomainPlus
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
-		return nil, fmt.Errorf("resolver down")
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		return nil, 0, fmt.Errorf("resolver down")
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -435,9 +438,9 @@ func TestChooseProxyDialerRejectsIdentifiedQuicBeforeResolveDNS(t *testing.T) {
 	cp.dialMode = consts.DialMode_DomainPlus
 	var lookups atomic.Int32
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
 		lookups.Add(1)
-		return nil, fmt.Errorf("resolver down")
+		return nil, 0, fmt.Errorf("resolver down")
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -495,12 +498,12 @@ func TestApplyProxyResolveDNSFallsBackToOtherFamily(t *testing.T) {
 
 	var types []uint16
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, time.Duration, error) {
 		types = append(types, typ)
 		if typ == dnsmessage.TypeA {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return []netip.Addr{netip.MustParseAddr("2001:db8::9")}, nil
+		return []netip.Addr{netip.MustParseAddr("2001:db8::9")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -535,13 +538,13 @@ func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
 	var types []uint16
 	var gotNetwork string
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, time.Duration, error) {
 		types = append(types, typ)
 		gotNetwork = network
 		if typ == dnsmessage.TypeAAAA {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, nil
+		return []netip.Addr{netip.MustParseAddr("203.0.113.9")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -576,9 +579,9 @@ func TestApplyProxyResolveDNSLookupOmitsIPVersion(t *testing.T) {
 
 	var gotNetwork string
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, time.Duration, error) {
 		gotNetwork = network
-		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -607,9 +610,9 @@ func TestApplyProxyResolveDNSCacheHit(t *testing.T) {
 
 	var calls int
 	old := resolveIPViaDialer
-	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, error) {
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
 		calls++
-		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
 	}
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
@@ -636,6 +639,215 @@ func TestApplyProxyResolveDNSCacheHit(t *testing.T) {
 	}
 }
 
+func TestProxyResolveDNSPinKeyLowercasesDomain(t *testing.T) {
+	d := newTestEndpointDialer()
+	dns := netip.MustParseAddrPort("8.8.8.8:53")
+	a := proxyResolveDNSPinKey(d, dns, "ChatGPT.COM.", false)
+	b := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	if a != b {
+		t.Fatal("pin key must ignore case and trailing dot")
+	}
+}
+
+func TestPrefetchProxyResolveDNSSkipsWithoutResolveDNSNode(t *testing.T) {
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
+	cp.prefetchProxyResolveDNS("chatgpt.com", false, netip.MustParseAddrPort("192.0.2.10:40000"), [6]uint8{}, 0, [16]uint8{})
+	n := 0
+	cp.resolveDNSPins.prefetch.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	if n != 0 {
+		t.Fatalf("scheduled %d prefetch(es), want 0 without resolve_dns", n)
+	}
+}
+
+func TestClampResolveDNSPinTTL(t *testing.T) {
+	if got := clampResolveDNSPinTTL(0); got != consts.ResolveDNSCacheTTLMin {
+		t.Fatalf("zero = %v, want min", got)
+	}
+	if got := clampResolveDNSPinTTL(10 * time.Second); got != consts.ResolveDNSCacheTTLMin {
+		t.Fatalf("below min = %v", got)
+	}
+	if got := clampResolveDNSPinTTL(2 * time.Minute); got != 2*time.Minute {
+		t.Fatalf("mid = %v", got)
+	}
+	if got := clampResolveDNSPinTTL(time.Hour); got != consts.ResolveDNSCacheTTLMax {
+		t.Fatalf("above max = %v", got)
+	}
+}
+
+func TestApplyProxyResolveDNSStoresAnswerTTL(t *testing.T) {
+	d := newTestEndpointDialer()
+	dns := netip.MustParseAddrPort("8.8.8.8:53")
+	d.SetResolveDNS(dns)
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 2 * time.Minute, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	cp.resolveDNSPins.mu.Lock()
+	ent := cp.resolveDNSPins.entries[key]
+	cp.resolveDNSPins.mu.Unlock()
+	remain := time.Until(ent.expires)
+	if remain < time.Minute || remain > 2*time.Minute+time.Second {
+		t.Fatalf("pin remain = %v, want ~2m", remain)
+	}
+	staleRemain := time.Until(ent.staleUntil)
+	wantStale := remain + consts.ResolveDNSStaleTTL
+	if staleRemain < wantStale-time.Second || staleRemain > wantStale+time.Second {
+		t.Fatalf("stale remain = %v, want ~%v", staleRemain, wantStale)
+	}
+}
+
+func TestApplyProxyResolveDNSSingleflight(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	param := &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	}
+	errCh := make(chan error, 8)
+	for range 8 {
+		go func() {
+			_, err := cp.chooseProxyDialer(context.Background(), param)
+			errCh <- err
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lookup did not start")
+	}
+	close(release)
+	for range 8 {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolve calls = %d, want 1", got)
+	}
+}
+
+func TestApplyProxyResolveDNSPrefetchJoinsInFlight(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	src := netip.MustParseAddrPort("192.0.2.10:40000")
+	cp.prefetchProxyResolveDNS("ChatGPT.COM", false, src, [6]uint8{}, 0, [16]uint8{})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prefetch did not start lookup")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+			Outbound: consts.OutboundUserDefinedMin,
+			Domain:   "chatgpt.com",
+			Src:      src,
+			Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+			Network:  "udp",
+		})
+		done <- err
+	}()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (prefetch joined)", got)
+	}
+}
+
+func TestChooseProxyDialerTCPPrefetchesUDPResolveDNS(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("8.8.8.8:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
+	var calls atomic.Int32
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		calls.Add(1)
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, 0, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 2*time.Second, "tcp prefetch lookup", func() bool { return calls.Load() >= 1 })
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "104.18.32.1:443" {
+		t.Fatalf("DialTarget = %q", res.DialTarget)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolve calls = %d, want 1 after TCP prefetch", got)
+	}
+}
+
 func assertMagicIPVersion(t *testing.T, network, want string) {
 	t.Helper()
 	magic, err := netproxy.ParseMagicNetwork(network)
@@ -644,5 +856,194 @@ func assertMagicIPVersion(t *testing.T, network, want string) {
 	}
 	if magic.IPVersion != want {
 		t.Fatalf("network %q IP version = %q, want %q", network, magic.IPVersion, want)
+	}
+}
+
+func TestResolveDNSPinLookupServesStale(t *testing.T) {
+	var c proxyResolveDNSPinCache
+	key := "k"
+	now := time.Now()
+	c.entries = map[string]proxyResolveDNSPin{
+		key: {
+			ip:         netip.MustParseAddr("1.1.1.1"),
+			expires:    now.Add(-time.Second),
+			staleUntil: now.Add(time.Minute),
+		},
+	}
+	ip, stale, ok := c.lookupFreshOrStale(key, now)
+	if !ok || !stale || ip.String() != "1.1.1.1" {
+		t.Fatalf("got ip=%v stale=%v ok=%v", ip, stale, ok)
+	}
+}
+
+func TestResolveDNSPinLookupDropsAfterStaleWindow(t *testing.T) {
+	var c proxyResolveDNSPinCache
+	key := "k"
+	now := time.Now()
+	c.entries = map[string]proxyResolveDNSPin{
+		key: {
+			ip:         netip.MustParseAddr("1.1.1.1"),
+			expires:    now.Add(-time.Minute),
+			staleUntil: now.Add(-time.Millisecond),
+		},
+	}
+	if ip, stale, ok := c.lookupFreshOrStale(key, now); ok {
+		t.Fatalf("got ip=%v stale=%v, want miss", ip, stale)
+	}
+	if _, ok := c.entries[key]; ok {
+		t.Fatal("expired stale entry should be deleted")
+	}
+}
+
+func TestApplyProxyResolveDNSServeStaleWhileRefresh(t *testing.T) {
+	d := newTestEndpointDialer()
+	dns := netip.MustParseAddrPort("8.8.8.8:53")
+	d.SetResolveDNS(dns)
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	now := time.Now()
+	old := netip.MustParseAddr("1.1.1.1")
+	cp.resolveDNSPins.mu.Lock()
+	cp.resolveDNSPins.entries = map[string]proxyResolveDNSPin{
+		key: {
+			ip:         old,
+			expires:    now.Add(-time.Second),
+			staleUntil: now.Add(time.Minute),
+		},
+	}
+	cp.resolveDNSPins.mu.Unlock()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	prev := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, time.Minute, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = prev })
+
+	done := make(chan struct{})
+	var res *proxyDialResult
+	var err error
+	go func() {
+		res, err = cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+			Outbound: consts.OutboundUserDefinedMin,
+			Domain:   "chatgpt.com",
+			Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+			Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+			Network:  "udp",
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("serve-stale blocked on refresh")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "1.1.1.1:443" {
+		t.Fatalf("DialTarget = %q, want stale 1.1.1.1:443", res.DialTarget)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale refresh did not start")
+	}
+	close(release)
+	waitForCondition(t, 2*time.Second, "stale pin refresh", func() bool {
+		cp.resolveDNSPins.mu.Lock()
+		ent := cp.resolveDNSPins.entries[key]
+		cp.resolveDNSPins.mu.Unlock()
+		return ent.ip.String() == "104.18.32.1" && !time.Now().After(ent.expires)
+	})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolve calls = %d, want 1", got)
+	}
+}
+
+func TestApplyProxyResolveDNSServeStaleRefreshFailureKeepsPin(t *testing.T) {
+	d := newTestEndpointDialer()
+	dns := netip.MustParseAddrPort("8.8.8.8:53")
+	d.SetResolveDNS(dns)
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	now := time.Now()
+	old := netip.MustParseAddr("1.1.1.1")
+	staleUntil := now.Add(time.Minute)
+	cp.resolveDNSPins.mu.Lock()
+	cp.resolveDNSPins.entries = map[string]proxyResolveDNSPin{
+		key: {
+			ip:         old,
+			expires:    now.Add(-time.Second),
+			staleUntil: staleUntil,
+		},
+	}
+	cp.resolveDNSPins.mu.Unlock()
+
+	var calls atomic.Int32
+	prev := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		calls.Add(1)
+		return nil, 0, netutils.ErrResolveTimeout
+	}
+	t.Cleanup(func() { resolveIPViaDialer = prev })
+
+	param := &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	}
+	res, err := cp.chooseProxyDialer(context.Background(), param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "1.1.1.1:443" {
+		t.Fatalf("DialTarget = %q, want stale 1.1.1.1:443", res.DialTarget)
+	}
+
+	waitForCondition(t, 2*time.Second, "failed refresh clears refreshing", func() bool {
+		if calls.Load() < 1 {
+			return false
+		}
+		cp.resolveDNSPins.mu.Lock()
+		ent := cp.resolveDNSPins.entries[key]
+		cp.resolveDNSPins.mu.Unlock()
+		return ent.ip == old && !ent.refreshing && ent.staleUntil.Equal(staleUntil)
+	})
+
+	firstCalls := calls.Load()
+	res, err = cp.chooseProxyDialer(context.Background(), param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "1.1.1.1:443" {
+		t.Fatalf("after failed refresh DialTarget = %q", res.DialTarget)
+	}
+	waitForCondition(t, 2*time.Second, "stale hit retries refresh", func() bool {
+		return calls.Load() > firstCalls
+	})
+}
+
+func TestUdpEndpointCreateFailureTTL(t *testing.T) {
+	if got := udpEndpointCreateFailureTTL(netutils.ErrResolveTimeout); got != consts.UdpEndpointFailureCacheTimeoutTTL {
+		t.Fatalf("timeout sentinel = %v", got)
+	}
+	wrapped := fmt.Errorf("resolve chatgpt.com via 8.8.8.8:53: %w", netutils.ErrResolveTimeout)
+	if got := udpEndpointCreateFailureTTL(wrapped); got != consts.UdpEndpointFailureCacheTimeoutTTL {
+		t.Fatalf("wrapped timeout = %v", got)
+	}
+	if got := udpEndpointCreateFailureTTL(context.DeadlineExceeded); got != consts.UdpEndpointFailureCacheTTL {
+		t.Fatalf("handshake deadline = %v, want 2s", got)
+	}
+	if got := udpEndpointCreateFailureTTL(fmt.Errorf("connection refused")); got != consts.UdpEndpointFailureCacheTTL {
+		t.Fatalf("other failure = %v", got)
 	}
 }

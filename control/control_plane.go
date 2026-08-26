@@ -1567,6 +1567,7 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 		MaxCacheSize:       c.dnsMaxCacheSize,
 		IpVersionPrefer:    c.dnsIpVersionPrefer,
 		FakeIPPolicy:       c.fakeIPPolicy,
+		PrefetchResolveDNS: c.prefetchResolveDNSFromDNS,
 	}
 }
 

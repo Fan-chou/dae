@@ -86,6 +86,38 @@ func TestResolveNetipFragmentedTCPResponse(t *testing.T) {
 	}
 }
 
+func TestResolveNetipTTLUsesMinAnswerTTL(t *testing.T) {
+	serverAddr := startTCPDNSServer(t, func(req *dnsmessage.Msg, conn net.Conn) error {
+		resp := new(dnsmessage.Msg)
+		resp.SetReply(req)
+		resp.Answer = append(resp.Answer,
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{Name: req.Question[0].Name, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 120},
+				A:   []byte{203, 0, 113, 7},
+			},
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{Name: req.Question[0].Name, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 45},
+				A:   []byte{203, 0, 113, 8},
+			},
+		)
+		return writeTCPDNSResponse(conn, resp, false)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	addrs, ttl, err := ResolveNetipTTL(ctx, stdNetDialer{}, serverAddr, "example.com", dnsmessage.TypeA, "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addrs) != 2 {
+		t.Fatalf("addrs = %d, want 2", len(addrs))
+	}
+	if ttl != 45*time.Second {
+		t.Fatalf("ttl = %v, want 45s", ttl)
+	}
+}
+
 func startTCPDNSServer(t *testing.T, handler func(req *dnsmessage.Msg, conn net.Conn) error) netip.AddrPort {
 	t.Helper()
 
