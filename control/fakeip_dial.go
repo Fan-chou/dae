@@ -326,6 +326,12 @@ func isDirectResolveDNSDial(res *proxyDialResult) bool {
 	return res.Outbound != nil && strings.EqualFold(res.Outbound.Name, consts.OutboundDirect.String())
 }
 
+func resolveDNSLookupNetwork(mark uint32, mptcp bool) string {
+	// No IPVersion: the family would force the outer hop to the node
+	// (SS/stickyip), not the resolver address. Health checks do the same.
+	return common.MagicNetwork("udp", mark, mptcp)
+}
+
 func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialParam, res *proxyDialResult) error {
 	if res == nil || p == nil || p.Network != "udp" {
 		return nil
@@ -357,10 +363,9 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 	}
 	dnsCtx, cancel := context.WithTimeout(ctx, consts.ResolveDNSTimeout)
 	defer cancel()
-	lookupNet := res.Network
-	if lookupNet == "" {
-		lookupNet = "udp"
-	}
+	// Do not copy res.Network or the resolver family: both would pin the
+	// outer hop to the node (SS/stickyip). The DNS target is dns.String().
+	lookupNet := resolveDNSLookupNetwork(res.Mark, c.mptcp)
 	store := c.fakeIPStore()
 	var lastErr error
 	for _, qtype := range qtypes {

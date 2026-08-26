@@ -399,7 +399,7 @@ func TestApplyProxyResolveDNSPinsIPViaSelectedDialer(t *testing.T) {
 	if res.DialTarget != "104.18.32.1:443" || !res.IsDialIp {
 		t.Fatalf("DialTarget = (%q, %v), want pinned 104.18.32.1:443", res.DialTarget, res.IsDialIp)
 	}
-	assertMagicIPVersion(t, gotNetwork, "4")
+	assertMagicIPVersion(t, gotNetwork, "")
 	assertMagicIPVersion(t, res.Network, "4")
 }
 
@@ -561,10 +561,41 @@ func TestApplyProxyResolveDNSIPv6DestFallsBackToA(t *testing.T) {
 	if res.DialTarget != "203.0.113.9:443" || !res.IsDialIp {
 		t.Fatalf("DialTarget = (%q, %v), want pinned A", res.DialTarget, res.IsDialIp)
 	}
-	assertMagicIPVersion(t, gotNetwork, "6")
+	assertMagicIPVersion(t, gotNetwork, "")
 	assertMagicIPVersion(t, res.Network, "6")
 	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_6 {
 		t.Fatalf("selection IP version = %v, want 6", res.SelectionNetworkTypeObj)
+	}
+}
+
+func TestApplyProxyResolveDNSLookupOmitsIPVersion(t *testing.T) {
+	d := newTestEndpointDialer()
+	d.SetResolveDNS(netip.MustParseAddrPort("[2001:db8::53]:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.dialMode = consts.DialMode_DomainPlus
+
+	var gotNetwork string
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(ctx context.Context, dialer netproxy.Dialer, resolver netip.AddrPort, host string, typ uint16, network string) ([]netip.Addr, error) {
+		gotNetwork = network
+		return []netip.Addr{netip.MustParseAddr("104.18.32.1")}, nil
+	}
+	t.Cleanup(func() { resolveIPViaDialer = old })
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Domain:   "chatgpt.com",
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("198.51.100.20:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMagicIPVersion(t, gotNetwork, "")
+	assertMagicIPVersion(t, res.Network, "4")
+	if res.DialTarget != "104.18.32.1:443" {
+		t.Fatalf("DialTarget = %q", res.DialTarget)
 	}
 }
 
