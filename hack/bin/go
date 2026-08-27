@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Policy wrapper: strip ephemeral sandbox GOCACHE, then exec the real go.
+# Put this directory first on PATH (direnv, VS Code terminal, Cursor hook).
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)"
+export KDAE_ROOT="$ROOT"
+# shellcheck disable=SC1091
+. "$ROOT/hack/env.sh"
+
+if [ -x "${GOROOT:-}/bin/go" ]; then
+	exec "$GOROOT/bin/go" "$@"
+fi
+
+self_dir="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+PATH="$(printf '%s' "$PATH" | awk -v RS=: -v ORS=: -v skip="$self_dir" '$0 != skip {print}' | sed 's/:$//')"
+export PATH
+real="$(command -v go)" || {
+	echo "kdae hack/bin/go: real go not found on PATH" >&2
+	exit 127
+}
+if [ "$(readlink -f "$real" 2>/dev/null || printf '%s' "$real")" = "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
+	echo "kdae hack/bin/go: refusing to re-exec the wrapper" >&2
+	exit 127
+fi
+exec "$real" "$@"

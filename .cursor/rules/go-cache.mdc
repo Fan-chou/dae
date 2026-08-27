@@ -1,0 +1,20 @@
+---
+description: Pin Go module/build caches out of Cursor sandbox /tmp paths
+alwaysApply: true
+---
+
+# Durable Go caches
+
+Cursor sandboxes set `GOCACHE` to `/tmp/cursor-sandbox-cache/<session>/`, which is wiped every run. Do not call the system `go` with that value left in the environment.
+
+- Prefer `make test`, `make dae`, or `make print-go-env`.
+- For a raw `go` command, prepend repo `hack/bin` or source env first:
+
+```bash
+export PATH="$PWD/hack/bin:$PATH"
+# or
+. hack/env.sh
+go test -tags dae_stub_ebpf ./...
+```
+
+Never set `GOCACHE` under `/tmp` or `cursor-sandbox-cache`. Machine defaults are `$HOME/go-cache` and `$HOME/go-mod`.

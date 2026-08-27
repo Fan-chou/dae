@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": ".cursor/hooks/pin-go-cache.py",
+        "matcher": "Shell",
+        "timeout": 5
+      }
+    ]
+  }
+}

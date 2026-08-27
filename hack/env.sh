@@ -5,8 +5,8 @@
 # Direct `go test` / `go build` (not going through make) still pick up the
 # sandbox GOCACHE override; this undoes that for the current shell.
 
-# This file lives at <repo>/hack/env.sh. git works when sourced from bash or zsh.
-_kdae_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+# This file lives at <repo>/hack/env.sh. KDAE_ROOT wins; git works from bash or zsh.
+_kdae_root="${KDAE_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 
 _kdae_writable_dir() {
 	mkdir -p "$1" 2>/dev/null || return 1

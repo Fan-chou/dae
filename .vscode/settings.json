@@ -1,0 +1,15 @@
+{
+  "go.alternateTools": {
+    "go": "${workspaceFolder}/hack/bin/go"
+  },
+  "go.toolsEnvVars": {
+    "GOTOOLCHAIN": "local"
+  },
+  "go.testEnvVars": {
+    "GOTOOLCHAIN": "local"
+  },
+  "terminal.integrated.env.linux": {
+    "PATH": "${workspaceFolder}/hack/bin:${env:PATH}",
+    "GOTOOLCHAIN": "local"
+  }
+}
