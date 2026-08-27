@@ -75,6 +75,7 @@ jobs:
       GOAMD64: ${{ matrix.goamd64 }}
       GORISCV64: ${{ matrix.goriscv64 }}
       CGO_ENABLED: 0
+      GOTOOLCHAIN: local
 
     steps:
       - name: Checkout codebase
@@ -109,9 +110,9 @@ jobs:
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
       - name: Set up Go 1.27
-        uses: actions/setup-go@v6
+        uses: ./.github/actions/setup-kdae-go
         with:
-          go-version: 1.27
+          go-version: "1.27"
 
       - name: Install Dependencies
         run: |
@@ -121,9 +122,7 @@ jobs:
       - name: Get project dependencies
         run: |
           git submodule update --init --recursive
-          GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
-          find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
-          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
+          go mod download -modcacherw
 
       - name: Build dae
         run: |
@@ -138,8 +137,11 @@ jobs:
           make
           cp ./install/dae.service ./build/
           cp ./example.dae ./build/
-          curl -L -o ./build/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          curl -L -o ./build/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+      - name: Geo datasets
+        uses: ./.github/actions/cache-geo-dat
+        with:
+          dest: build
 
       - name: Smoking test
         if: matrix.goarch == 'amd64' && matrix.goamd64 == 'v1'

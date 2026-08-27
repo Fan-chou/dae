@@ -26,6 +26,8 @@ jobs:
     name: BPF Unit Test
     runs-on: ubuntu-latest
     continue-on-error: true
+    env:
+      GOTOOLCHAIN: local
     strategy:
       matrix:
         env:
@@ -42,6 +44,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Set up Go 1.27
+        uses: ./.github/actions/setup-kdae-go
+        with:
+          go-version: "1.27"
+
       - name: Install Dependencies
         env: ${{ matrix.env }}
         run: |
@@ -52,4 +59,6 @@ jobs:
         env: ${{ matrix.env }}
         run: |
           git submodule update --init
-          sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          sudo --preserve-env=PATH,HOME,GOROOT,GOPATH,GOMODCACHE,GOCACHE,GOTOOLCHAIN,GOEXPERIMENT \
+            CLANG=clang-$VERSION make ebpf-test \
+            || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)

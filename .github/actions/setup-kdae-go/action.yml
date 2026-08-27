@@ -1,0 +1,21 @@
+name: Setup kdae Go
+description: Install Go and reuse the shared module/build cache. Pin GOTOOLCHAIN so the runner does not download another toolchain.
+
+inputs:
+  go-version:
+    description: Go version to install
+    required: false
+    default: "1.27"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: true
+        cache-dependency-path: go.sum
+    - name: Pin GOTOOLCHAIN
+      shell: bash
+      run: echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"

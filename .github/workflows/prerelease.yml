@@ -58,6 +58,7 @@ jobs:
       GOAMD64: ${{ matrix.goamd64 }}
       GORISCV64: ${{ matrix.goriscv64 }}
       CGO_ENABLED: 0
+      GOTOOLCHAIN: local
 
     steps:
       - name: Checkout codebase
@@ -84,19 +85,9 @@ jobs:
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
       - name: Set up Go 1.27
-        uses: actions/setup-go@v6
+        uses: ./.github/actions/setup-kdae-go
         with:
-          go-version: 1.27
-
-      - name: Go cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          go-version: "1.27"
 
       - name: Install Dependencies
         run: |
@@ -106,9 +97,7 @@ jobs:
       - name: Get project dependencies
         run: |
           git submodule update --init --recursive
-          GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
-          find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
-          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
+          go mod download -modcacherw
 
       - name: Create directory for placing archives & packages temporarily
         run: mkdir -p ./bundled/
@@ -116,8 +105,12 @@ jobs:
       - name: Create full source archive
         if: matrix.goarch == 'arm64'
         run: |
-          zip -9vr ./bundled/dae-full-src.zip . -x .git/\* bundled/\*
-          tar -I 'xz -9' -cvf ./bundled/dae-full-src.tar.xz --exclude .git --exclude bundled .
+          mkdir -p go-mod
+          cp -a "$(go env GOMODCACHE)/cache" go-mod/cache
+          sed -i.bak 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
+          zip -9vr ./bundled/dae-full-src.zip . -x .git/\* bundled/\* Makefile.bak
+          tar -I 'xz -9' -cvf ./bundled/dae-full-src.tar.xz --exclude .git --exclude bundled --exclude Makefile.bak .
+          mv Makefile.bak Makefile
 
       - name: Build dae
         run: |
@@ -133,8 +126,14 @@ jobs:
           install -Dm644 ./install/dae.service -t ./pkgdir/usr/lib/systemd/system/
           install -Dm640 ./example.dae -t ./pkgdir/etc/dae/
           install -d ./pkgdir/usr/share/dae/
-          curl -L -o ./pkgdir/usr/share/dae/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          curl -L -o ./pkgdir/usr/share/dae/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+      - name: Geo datasets
+        uses: ./.github/actions/cache-geo-dat
+        with:
+          dest: pkgdir/usr/share/dae
+
+      - name: Stage zip payload
+        run: |
           install -D pkgdir/usr/share/dae/geo{ip,site}.dat install/{dae.service,empty.dae} example.dae -t ./zip/
           install -D pkgdir/usr/bin/dae ./zip/dae-$ASSET_NAME
 

@@ -10,7 +10,7 @@ OBJECT_PATH="${OUT_DIR}/static/tproxy_${BPF_ENDIAN_TARGET}.o"
 
 if [[ "${EUID}" -ne 0 ]]; then
   if command -v sudo >/dev/null 2>&1; then
-    exec sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOEXPERIMENT,CLANG,LLVM_OBJDUMP,BPF_ENDIAN_TARGET,MAX_MATCH_SET_LEN "$0" "$@"
+    exec sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOROOT,GOTOOLCHAIN,GOEXPERIMENT,CLANG,LLVM_OBJDUMP,BPF_ENDIAN_TARGET,MAX_MATCH_SET_LEN "$0" "$@"
   fi
   echo "root privileges are required to load eBPF programs" >&2
   exit 1

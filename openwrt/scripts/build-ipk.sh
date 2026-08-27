@@ -20,9 +20,11 @@ PKGVER="${VERSION}-${RELEASE}"
 export GOROOT=${GOROOT:-/root/sdk/go1.27.0}
 export PATH="$GOROOT/bin:$PATH"
 export GOTOOLCHAIN=${GOTOOLCHAIN:-local}
-export GOMODCACHE=${GOMODCACHE:-/root/go-mod}
-export GOTMPDIR=${GOTMPDIR:-/root/go-tmp}
-export GOCACHE=${GOCACHE:-/root/go-cache}
+# Reuse the machine Go caches (do not grow a second copy under /root/go-mod
+# vs $GOPATH/pkg/mod). Callers can still override any of these.
+export GOMODCACHE=${GOMODCACHE:-$(go env GOMODCACHE)}
+export GOTMPDIR=${GOTMPDIR:-$(go env GOTMPDIR)}
+export GOCACHE=${GOCACHE:-$(go env GOCACHE)}
 export GOOS=linux
 export GOARCH=amd64
 export CGO_ENABLED=0
@@ -150,7 +152,13 @@ if ! command -v "$PNPM" >/dev/null 2>&1; then
 	echo "pnpm is required to build kdae-ui (set PNPM=... if it is not on PATH)" >&2
 	exit 1
 fi
-(cd "$ROOT/web" && "$PNPM" build)
+(
+	cd "$ROOT/web"
+	if [ ! -d node_modules ]; then
+		"$PNPM" install --frozen-lockfile --prefer-offline
+	fi
+	"$PNPM" build
+)
 ui_data=$(mktemp -d)
 mkdir -p "$ui_data/www/kdae-ui/assets" "$ui_data/www/cgi-bin"
 install -m 0644 "$ROOT/web/dist/index.html" "$ui_data/www/kdae-ui/"

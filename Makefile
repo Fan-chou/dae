@@ -30,7 +30,18 @@ endif
 
 GOARCH ?= $(shell go env GOARCH)
 
-# Do NOT remove the line below. This line is for CI.
+include hack/go-cache.mk
+
+.PHONY: print-go-env
+print-go-env:
+	@echo "export GOCACHE=$(GOCACHE)"; \
+	echo "export GOMODCACHE=$$(go env GOMODCACHE)"; \
+	echo "export GOTMPDIR=$$(go env GOTMPDIR)"; \
+	echo "export GOPATH=$$(go env GOPATH)"
+
+# Offline source archives (release tarballs) ship ./go-mod/cache. Uncomment
+# when building from that archive; CI seed/PR builds must not use this — they
+# share ~/go/pkg/mod via setup-go's cache instead.
 #export GOMODCACHE=$(PWD)/go-mod
 
 # Get version from .git.
@@ -45,7 +56,7 @@ endif
 
 BUILD_ARGS := -trimpath -ldflags "-s -w -X github.com/daeuniverse/dae/cmd.Version=$(VERSION) -X github.com/daeuniverse/dae/common/consts.MaxMatchSetLen_=$(MAX_MATCH_SET_LEN)" $(BUILD_ARGS)
 
-.PHONY: clean-ebpf ebpf ebpf-sync ebpf-sync-check ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae dae-rule-sync submodule submodules
+.PHONY: clean-ebpf ebpf ebpf-config ebpf-sync ebpf-sync-check ebpf-test ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae dae-rule-sync submodule submodules test test-race print-go-env
 
 ## Begin Dae Build
 dae: export GOOS=linux
@@ -84,6 +95,19 @@ submodule submodules: $(submodule_paths)
 ## End Git Submodules
 
 ## Begin Ebpf
+EBPF_CONFIG_FILE := .ebpf.config
+EBPF_CONTROL_STAMP := .ebpf.control.stamp
+EBPF_TEST_STAMP := .ebpf.test.stamp
+EBPF_CONTROL_SOURCES := control/control.go control/kern/tproxy.c control/kern/ebpf_sync_defs.h \
+	trace/trace.go trace/kern/trace.c \
+	$(wildcard control/kern/headers/*.h) $(wildcard trace/kern/headers/*.h)
+EBPF_TEST_SOURCES := control/bpf_bug_verification_test.go \
+	control/kern/tests/bpf_test.go control/kern/tests/bpf_test.c control/kern/tests/bpf_test.h \
+	$(wildcard control/kern/headers/*.h)
+ifeq ($(FORCE_EBPF),y)
+	EBPF_FORCE_DEPS := clean-ebpf
+endif
+
 clean-ebpf:
 	@rm -f control/bpf_bpf*.go && \
 			rm -f control/bpf_bpf*.o
@@ -93,6 +117,7 @@ clean-ebpf:
 			rm -f trace/bpf_*_bpf*.o
 	@rm -f control/kern/tests/bpftest_bpf*.go && \
 			rm -f control/kern/tests/bpftest_bpf*.o
+	@rm -f $(EBPF_CONTROL_STAMP) $(EBPF_TEST_STAMP) $(EBPF_CONFIG_FILE)
 fmt:
 	go fmt ./...
 
@@ -106,23 +131,48 @@ ebpf-sync:
 ebpf-sync-check: ebpf-sync
 	git diff --exit-code -- common/consts/ebpf_generated.go control/kern/ebpf_sync_defs.h
 
+ebpf-config:
+	@printf '%s\n' "$(CLANG)" "$(CFLAGS)" "$(TARGET)" "$(STRIP_FLAG)" "$(MAX_MATCH_SET_LEN)" > $(EBPF_CONFIG_FILE).tmp
+	@if [ ! -f $(EBPF_CONFIG_FILE) ] || ! cmp -s $(EBPF_CONFIG_FILE) $(EBPF_CONFIG_FILE).tmp; then \
+		mv $(EBPF_CONFIG_FILE).tmp $(EBPF_CONFIG_FILE); \
+	else \
+		rm -f $(EBPF_CONFIG_FILE).tmp; \
+	fi
+
+$(EBPF_CONFIG_FILE):
+	@$(MAKE) --no-print-directory ebpf-config
+
+$(EBPF_CONTROL_STAMP): $(EBPF_CONTROL_SOURCES) $(EBPF_CONFIG_FILE)
+	@unset GOOS && \
+	unset GOARCH && \
+	unset GOARM && \
+	echo $(STRIP_FLAG) && \
+	go generate ./control/control.go && \
+	if go generate ./trace/trace.go; then \
+		echo trace > $(BUILD_TAGS_FILE); \
+	else \
+		echo > $(BUILD_TAGS_FILE); \
+	fi
+	@touch $@
+
+$(EBPF_TEST_STAMP): $(EBPF_TEST_SOURCES) $(EBPF_CONFIG_FILE)
+	@unset GOOS && \
+	unset GOARCH && \
+	unset GOARM && \
+	echo $(STRIP_FLAG) && \
+	go generate ./control/bpf_bug_verification_test.go && \
+	go generate ./control/kern/tests/bpf_test.go
+	@touch $@
+
 # $BPF_CLANG is used in go:generate invocations.
 ebpf: export BPF_CLANG := $(CLANG)
 ebpf: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf: export BPF_CFLAGS := $(CFLAGS)
 ebpf: export BPF_TARGET := $(TARGET)
 ebpf: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf: ebpf-sync submodule clean-ebpf
-	@unset GOOS && \
-    unset GOARCH && \
-    unset GOARM && \
-    echo $(STRIP_FLAG) && \
-    go generate ./control/control.go && \
-    if go generate ./trace/trace.go; then \
-		echo trace > $(BUILD_TAGS_FILE); \
-	else \
-		echo > $(BUILD_TAGS_FILE); \
-	fi
+ebpf: $(EBPF_FORCE_DEPS) ebpf-sync submodule ebpf-config
+	@if [ ! -f control/bpf_bpfel.go ] || [ ! -f control/bpf_bpfeb.go ]; then rm -f $(EBPF_CONTROL_STAMP); fi
+	@$(MAKE) --no-print-directory $(EBPF_CONTROL_STAMP)
 
 EBPF_LINT_SOURCES := control/kern/tproxy.c control/kern/tests/bpf_test.c trace/kern/trace.c
 EBPF_LINT_IGNORE := COMMIT_COMMENT_SYMBOL,NOT_UNIFIED_DIFF,COMMIT_LOG_LONG_LINE,LONG_LINE_COMMENT,VOLATILE,ASSIGN_IN_IF,PREFER_DEFINED_ATTRIBUTE_MACRO,CAMELCASE,LEADING_SPACE,OPEN_ENDED_LINE,SPACING,BLOCK_COMMENT_STYLE
@@ -130,67 +180,37 @@ EBPF_LINT_IGNORE := COMMIT_COMMENT_SYMBOL,NOT_UNIFIED_DIFF,COMMIT_LOG_LONG_LINE,
 ebpf-lint:
 	./scripts/checkpatch.pl --no-tree --strict --no-summary --show-types --color=always $(EBPF_LINT_SOURCES) --ignore $(EBPF_LINT_IGNORE)
 
+ifeq ($(TESTCACHE),clean)
+	EBPF_TESTCACHE_DEPS := clean-testcache
+endif
+.PHONY: clean-testcache
+clean-testcache:
+	go clean -testcache
+
 ebpf-test: export BPF_CLANG := $(CLANG)
 ebpf-test: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf-test: export BPF_CFLAGS := $(CFLAGS)
 ebpf-test: export BPF_TARGET := $(TARGET)
 ebpf-test: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test: ebpf-sync submodule clean-ebpf
-	@unset GOOS && \
-    unset GOARCH && \
-    unset GOARM && \
-    echo $(STRIP_FLAG) && \
-    go generate ./control/bpf_bug_verification_test.go && \
-    go generate ./control/kern/tests/bpf_test.go && \
-    go clean -testcache && \
-    go test -v -tags dae_bpf_tests ./control/kern/tests/...
+ebpf-test: $(EBPF_FORCE_DEPS) $(EBPF_TESTCACHE_DEPS) ebpf-sync submodule ebpf-config
+	@if [ ! -f control/kern/tests/bpftest_bpfel.go ] && [ ! -f control/bpftest_bpfel.go ]; then rm -f $(EBPF_TEST_STAMP); fi
+	@$(MAKE) --no-print-directory $(EBPF_TEST_STAMP)
+	go test -v -tags dae_bpf_tests ./control/kern/tests/...
 
-ebpf-test-tagged: export BPF_CLANG := $(CLANG)
-ebpf-test-tagged: export BPF_STRIP_FLAG := $(STRIP_FLAG)
-ebpf-test-tagged: export BPF_CFLAGS := $(CFLAGS)
-ebpf-test-tagged: export BPF_TARGET := $(TARGET)
-ebpf-test-tagged: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-tagged: ebpf-sync submodule clean-ebpf
-	@unset GOOS && \
-    unset GOARCH && \
-    unset GOARM && \
-    echo $(STRIP_FLAG) && \
-    go generate ./control/bpf_bug_verification_test.go && \
-    go generate ./control/kern/tests/bpf_test.go && \
-    go clean -testcache && \
-    go test -v -tags dae_bpf_tests ./control/kern/tests/...
+ebpf-test-tagged: ebpf-test
 
-ebpf-test-debug: export BPF_CLANG := $(CLANG)
-ebpf-test-debug: export BPF_STRIP_FLAG := $(STRIP_FLAG)
-ebpf-test-debug: export BPF_CFLAGS := $(CFLAGS) -D__BPF_TEST_ENABLE_DEBUG
-ebpf-test-debug: export BPF_TARGET := $(TARGET)
-ebpf-test-debug: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-debug: ebpf-sync submodule clean-ebpf
-	@unset GOOS && \
-    unset GOARCH && \
-    unset GOARM && \
-    echo $(STRIP_FLAG) && \
-    go generate ./control/bpf_bug_verification_test.go && \
-    go generate ./control/kern/tests/bpf_test.go && \
-    go clean -testcache && \
-    go test -v -tags dae_bpf_tests ./control/kern/tests/...
+ebpf-test-debug:
+	$(MAKE) FORCE_EBPF=y TESTCACHE=clean CFLAGS="$(CFLAGS) -D__BPF_TEST_ENABLE_DEBUG" ebpf-test
 
-ebpf-test-debug-tagged: export BPF_CLANG := $(CLANG)
-ebpf-test-debug-tagged: export BPF_STRIP_FLAG := $(STRIP_FLAG)
-ebpf-test-debug-tagged: export BPF_CFLAGS := $(CFLAGS) -D__BPF_TEST_ENABLE_DEBUG
-ebpf-test-debug-tagged: export BPF_TARGET := $(TARGET)
-ebpf-test-debug-tagged: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-debug-tagged: ebpf-sync submodule clean-ebpf
-	@unset GOOS && \
-    unset GOARCH && \
-    unset GOARM && \
-    echo $(STRIP_FLAG) && \
-    go generate ./control/bpf_bug_verification_test.go && \
-    go generate ./control/kern/tests/bpf_test.go && \
-    go clean -testcache && \
-    go test -v -tags dae_bpf_tests ./control/kern/tests/...
+ebpf-test-debug-tagged: ebpf-test-debug
 
 ebpf-audit:
 	./scripts/ebpf-audit.sh
+
+test:
+	go test -tags dae_stub_ebpf ./...
+
+test-race:
+	go test -race -tags dae_stub_ebpf -timeout 30m ./control/... ./component/... ./cmd/...
 
 ## End Ebpf

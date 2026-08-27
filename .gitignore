@@ -18,6 +18,10 @@ node_modules/
 web/dist/
 *.log
 .build_tags
+.ebpf.config
+.ebpf.control.stamp
+.ebpf.test.stamp
+.geo-cache/
 .checkpatch-camelcase.git.
 venv
 CLAUDE.md

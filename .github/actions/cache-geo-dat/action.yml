@@ -1,0 +1,37 @@
+name: Cache geo datasets
+description: Restore or download geoip.dat and geosite.dat once per week instead of on every matrix job.
+
+inputs:
+  dest:
+    description: Directory to place geoip.dat and geosite.dat
+    required: false
+    default: build
+
+runs:
+  using: composite
+  steps:
+    - name: Week key
+      id: week
+      shell: bash
+      run: echo "week=$(date -u +%Y-W%V)" >> "$GITHUB_OUTPUT"
+    - name: Restore geo cache
+      uses: actions/cache@v5
+      with:
+        path: .geo-cache
+        key: geo-dat-${{ steps.week.outputs.week }}
+        restore-keys: |
+          geo-dat-
+    - name: Materialize geo datasets
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .geo-cache "${{ inputs.dest }}"
+        if [ ! -s .geo-cache/geoip.dat ]; then
+          curl -fsSL -o .geo-cache/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+        fi
+        if [ ! -s .geo-cache/geosite.dat ]; then
+          curl -fsSL -o .geo-cache/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+        fi
+        cp -f .geo-cache/geoip.dat .geo-cache/geosite.dat "${{ inputs.dest }}/"
