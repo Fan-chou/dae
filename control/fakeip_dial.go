@@ -33,6 +33,80 @@ func (c *ControlPlane) destIsFakeIP(addr netip.Addr) bool {
 	return store != nil && store.Contains(addr)
 }
 
+// fakeIPDialSkipResolve reports whether a decisive FakeIP match can dial
+// without looking up the real dest IP. Block and a user group whose current
+// leaf is a proxy node only need the name. Builtin direct and a group that
+// currently selects a direct leaf still need a real address (system resolve
+// of domain:port can bounce back into the FakeIP pool).
+func fakeIPDialSkipResolve(m *RoutingMatcher, outbound consts.OutboundIndex) bool {
+	if outbound == consts.OutboundBlock {
+		return true
+	}
+	return m.fakeIPOutboundIsProxy(outbound)
+}
+
+func (c *ControlPlane) fakeIPShouldPinRealDest(outbound consts.OutboundIndex) bool {
+	if outbound == consts.OutboundDirect {
+		return true
+	}
+	if outbound.IsReserved() {
+		return false
+	}
+	if c == nil || c.routingMatcher == nil {
+		return false
+	}
+	return !c.routingMatcher.fakeIPOutboundIsProxy(outbound)
+}
+
+func (c *ControlPlane) routeFakeIP(
+	ctx context.Context,
+	src, dst netip.AddrPort,
+	domain string,
+	l4proto consts.L4ProtoType,
+	routingResult *bpfRoutingResult,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, realIP netip.Addr, err error) {
+	if c == nil || c.routingMatcher == nil {
+		return 0, 0, false, netip.Addr{}, fmt.Errorf("nil routing matcher")
+	}
+	if routingResult == nil {
+		routingResult = &bpfRoutingResult{}
+	}
+	var ipVersion consts.IpVersionType
+	if dst.Addr().Is4() || dst.Addr().Is4In6() {
+		ipVersion = consts.IpVersion_4
+	} else {
+		ipVersion = consts.IpVersion_6
+	}
+	var mac16 [16]uint8
+	copy(mac16[10:], routingResult.Mac[:])
+	bSrc := src.Addr().As16()
+	bDst := dst.Addr().As16()
+	outboundIndex, mark, must, needsDestIP, err := c.routingMatcher.MatchDeferringDestIP(
+		bSrc,
+		bDst,
+		src.Port(),
+		dst.Port(),
+		ipVersion,
+		l4proto,
+		domain,
+		routingResult.Pname,
+		routingResult.Dscp,
+		mac16,
+	)
+	if err != nil {
+		return 0, 0, false, netip.Addr{}, err
+	}
+	if !needsDestIP && fakeIPDialSkipResolve(c.routingMatcher, outboundIndex) {
+		return outboundIndex, mark, must, netip.Addr{}, nil
+	}
+	realIP, realErr := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+	if realErr != nil {
+		return 0, 0, false, netip.Addr{}, realErr
+	}
+	outboundIndex, mark, must, err = c.Route(src, netip.AddrPortFrom(realIP, dst.Port()), domain, l4proto, routingResult)
+	return outboundIndex, mark, must, realIP, err
+}
+
 // realIPForFakeIPRoute looks up the on-wire destination for FakeIP rematch.
 // DnsCache keeps the real A/AAAA; the client dest (28.x / 198.18) must not
 // feed geoip/ip(). Cache miss re-resolves; still missing is a hard error.
@@ -83,7 +157,7 @@ func (c *ControlPlane) realIPFromDnsCache(domain string, preferV6 bool) netip.Ad
 	}
 	var addrs []netip.Addr
 	for _, qtype := range qtypes {
-		addrs = append(addrs, ipsFromAnswers(dns.LookupCacheAnswers(domain, qtype))...)
+		addrs = append(addrs, dns.freshAnswerIPs(domain, qtype)...)
 	}
 	ip, err := pickResolvedDialIP(addrs, preferV6, c.fakeIPStore())
 	if err != nil {
@@ -178,6 +252,13 @@ func (c *ControlPlane) ensureUdpDialTargetIP(ctx context.Context, p *proxyDialPa
 	dest := p.Dest.Addr()
 	fake := dest.IsValid() && c.destIsFakeIP(dest)
 	domain := udpDialDomain(res)
+	// FakeIP direct pin: keep the resolved real IP. Rewriting to domain:port
+	// would let a direct leaf resolve via the system and bounce into 28.x.
+	if res.PinnedFakeIPRealDest {
+		if _, err := parseDialTargetIP(res.DialTarget); err == nil {
+			return nil
+		}
+	}
 	if domain != "" {
 		c.setUdpDialTargetDomain(res, domain, p.Dest.Port())
 		return nil

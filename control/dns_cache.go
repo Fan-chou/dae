@@ -320,6 +320,36 @@ func (c *DnsCache) Clone() *DnsCache {
 
 }
 
+// cloneWithDeadlines publishes a new wrapper with updated deadlines.
+// Answer/NS/Extra, DomainBitmap, and packed bytes are shared; they must not
+// be mutated after the original entry was published.
+func (c *DnsCache) cloneWithDeadlines(deadline, originalDeadline time.Time) *DnsCache {
+	if c == nil {
+		return nil
+	}
+	next := &DnsCache{
+		RouteOwnerKey:        c.RouteOwnerKey,
+		RouteProjectionEpoch: c.RouteProjectionEpoch,
+		DomainBitmap:         c.DomainBitmap,
+		Answer:               c.Answer,
+		NS:                   c.NS,
+		Extra:                c.Extra,
+		Deadline:             deadline,
+		OriginalDeadline:     originalDeadline,
+	}
+	if packedPtr := c.packedResponse.Load(); packedPtr != nil {
+		next.packedResponse.Store(packedPtr)
+		next.packedResponseTTL.Store(c.packedResponseTTL.Load())
+		next.packedResponseCreatedAt.Store(c.packedResponseCreatedAt.Load())
+	}
+	next.deadlineNano.Store(deadline.UnixNano())
+	next.lastAccessNano.Store(c.lastAccessNano.Load())
+	next.lastRouteSyncNano.Store(c.lastRouteSyncNano.Load())
+	next.lastBpfDataHash.Store(c.lastBpfDataHash.Load())
+	next.refreshing.Store(c.refreshing.Load())
+	return next
+}
+
 // CloneForReload creates a new generation-local cache wrapper for reload.
 //
 // WARNING: Answer, NS, and Extra slices share memory with the original cache.

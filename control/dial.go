@@ -46,8 +46,13 @@ type proxyDialResult struct {
 	SniffedDomain string
 	// StickySite is the fallback/url_test pin key. It may be a dest IP when
 	// the flow has no sniffed name; it must not replace SniffedDomain.
-	StickySite              string
-	IsDialIp                bool
+	StickySite string
+	IsDialIp   bool
+	// PinnedFakeIPRealDest is set when FakeIP rematch replaced the dest with
+	// a resolved real IP for direct (or a direct leaf). UDP must keep that
+	// IP; rewriting it to domain:port would let the system resolver bounce
+	// back into the FakeIP pool.
+	PinnedFakeIPRealDest    bool
 	OrigNetworkType         string
 	SelectionNetworkType    string
 	OrigNetworkTypeObj      *dialer.NetworkType
@@ -138,6 +143,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		outboundIndex = consts.OutboundControlPlaneRouting
 	}
 
+	pinnedFakeIPRealDest := false
 	if outboundIndex == consts.OutboundControlPlaneRouting {
 		routingResult := &bpfRoutingResult{
 			Mark:     mark,
@@ -147,21 +153,19 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			Dscp:     p.Dscp,
 		}
 		var newMark uint32
+		var realIP netip.Addr
 		proto := consts.L4ProtoType_TCP
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
 		}
-		routeDst := dst
 		if fakeDest {
-			realIP, realErr := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
-			if realErr != nil {
-				return nil, realErr
+			outboundIndex, newMark, must, realIP, err = c.routeFakeIP(ctx, src, dst, domain, proto, routingResult)
+			if err != nil {
+				return nil, err
 			}
-			routeDst = netip.AddrPortFrom(realIP, dst.Port())
-		}
-		if outboundIndex, newMark, must, err = c.Route(
+		} else if outboundIndex, newMark, must, err = c.Route(
 			src,
-			routeDst,
+			dst,
 			domain,
 			proto,
 			routingResult,
@@ -171,6 +175,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		mark = newMark
 		// Reset dialTarget.
 		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
+		if fakeDest && realIP.IsValid() && c.fakeIPShouldPinRealDest(outboundIndex) {
+			dst = netip.AddrPortFrom(realIP, dst.Port())
+			dialTarget = dst.String()
+			dialIp = true
+			pinnedFakeIPRealDest = true
+		}
 		c.log.Tracef("outbound rerouted: %v => %v",
 			consts.OutboundControlPlaneRouting.String(),
 			outboundIndex.String(),
@@ -206,8 +216,10 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 
 	// For UDP, ensure dialer's address family matches client's to prevent
 	// "non-IPv4/IPv6 address" errors when writing responses.
+	// FakeIP direct pin uses the resolved real family so ipversion() and the
+	// WAN dest follow the real A/AAAA, not the client's FakeIP v4 socket.
 	selectionNetworkType := networkType
-	if p.Network == "udp" {
+	if p.Network == "udp" && !pinnedFakeIPRealDest {
 		if clientIpVersion := consts.IpVersionFromAddr(src.Addr()); clientIpVersion != networkType.IpVersion {
 			selectionNetworkType = &dialer.NetworkType{
 				L4Proto:         networkType.L4Proto,
@@ -268,6 +280,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		Mark:                    mark,
 		Must:                    must,
 		IsDialIp:                strictIpVersion,
+		PinnedFakeIPRealDest:    pinnedFakeIPRealDest,
 		OrigNetworkType:         networkType.StringWithoutDns(),
 		SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),
 		OrigNetworkTypeObj:      networkType,

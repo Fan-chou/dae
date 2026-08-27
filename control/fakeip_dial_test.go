@@ -27,18 +27,42 @@ import (
 
 func seedDnsCacheA(t *testing.T, cp *ControlPlane, domain string, ip netip.Addr) {
 	t.Helper()
+	seedDnsCacheIP(t, cp, domain, ip)
+}
+
+func seedDnsCacheIP(t *testing.T, cp *ControlPlane, domain string, ip netip.Addr) {
+	t.Helper()
 	ctrl := newTestDnsController()
-	rr := &dnsmessage.A{
-		Hdr: dnsmessage.RR_Header{
-			Name:   dnsmessage.CanonicalName(domain),
-			Rrtype: dnsmessage.TypeA,
-			Class:  dnsmessage.ClassINET,
-			Ttl:    60,
-		},
-		A: ip.AsSlice(),
+	if ip.Is6() && !ip.Is4In6() {
+		rr := &dnsmessage.AAAA{
+			Hdr: dnsmessage.RR_Header{
+				Name:   dnsmessage.CanonicalName(domain),
+				Rrtype: dnsmessage.TypeAAAA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    60,
+			},
+			AAAA: ip.AsSlice(),
+		}
+		ctrl.dnsCache.Store(ctrl.cacheKey(domain, dnsmessage.TypeAAAA), &DnsCache{Answer: []dnsmessage.RR{rr}})
+	} else {
+		rr := &dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   dnsmessage.CanonicalName(domain),
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    60,
+			},
+			A: ip.AsSlice(),
+		}
+		ctrl.dnsCache.Store(ctrl.cacheKey(domain, dnsmessage.TypeA), &DnsCache{Answer: []dnsmessage.RR{rr}})
 	}
-	ctrl.dnsCache.Store(ctrl.cacheKey(domain, dnsmessage.TypeA), &DnsCache{Answer: []dnsmessage.RR{rr}})
 	cp.controlPlaneDNSRuntime = controlPlaneDNSRuntime{dnsController: ctrl}
+}
+
+func attachTestDirectOutbound(cp *ControlPlane) {
+	g := newTestFixedOutboundGroup(newTestEndpointDialer())
+	g.Name = consts.OutboundDirect.String()
+	cp.outbounds[consts.OutboundDirect] = g
 }
 
 func TestRealIPForFakeIPRouteUsesCachedAnswer(t *testing.T) {
@@ -104,24 +128,207 @@ fallback: direct
 	}
 }
 
-func TestChooseProxyDialerFakeIPRefusesWhenRealIPIsDirect(t *testing.T) {
+func TestChooseProxyDialerFakeIPDirectPinsRealIP(t *testing.T) {
 	store, fake := newTestFakeIPStore(t, "cn.example")
 	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
 	attachFakeIPStore(cp, store)
+	attachTestDirectOutbound(cp)
 	cp.routingMatcher = testFakeIPMatcher(t, `
 ip(203.0.113.0/24) -> direct
 fallback: proxy
 `, []string{"proxy"})
-	seedDnsCacheA(t, cp, "cn.example", netip.MustParseAddr("203.0.113.10"))
+	real := netip.MustParseAddr("203.0.113.10")
+	seedDnsCacheA(t, cp, "cn.example", real)
 
-	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
 		Outbound: consts.OutboundControlPlaneRouting,
 		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
 		Dest:     netip.AddrPortFrom(fake, 443),
 		Network:  "tcp",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OutboundIndex != consts.OutboundDirect {
+		t.Fatalf("outbound = %v, want direct", res.OutboundIndex)
+	}
+	if res.DialTarget != "203.0.113.10:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want real IP dial", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestChooseProxyDialerFakeIPDirectUsesRealIPFamily(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "v6only.example")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	attachTestDirectOutbound(cp)
+	cp.routingMatcher = testFakeIPMatcher(t, `
+ipversion(4) -> proxy
+fallback: direct
+`, []string{"proxy"})
+	real := netip.MustParseAddr("2001:db8::9")
+	seedDnsCacheIP(t, cp, "v6only.example", real)
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 443),
+		Domain:   "v6only.example",
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OutboundIndex != consts.OutboundDirect {
+		t.Fatalf("outbound = %v, want direct (real dest is v6)", res.OutboundIndex)
+	}
+	if res.DialTarget != "[2001:db8::9]:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want real AAAA", res.DialTarget, res.IsDialIp)
+	}
+	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_6 {
+		t.Fatalf("selection IP version = %v, want 6", res.SelectionNetworkTypeObj)
+	}
+}
+
+func TestChooseProxyDialerFakeIPDirectUsesRealIPFamilyUDP(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "v6only.example")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	attachTestDirectOutbound(cp)
+	cp.routingMatcher = testFakeIPMatcher(t, `
+ipversion(4) -> proxy
+fallback: direct
+`, []string{"proxy"})
+	real := netip.MustParseAddr("2001:db8::9")
+	seedDnsCacheIP(t, cp, "v6only.example", real)
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 443),
+		Domain:   "v6only.example",
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OutboundIndex != consts.OutboundDirect {
+		t.Fatalf("outbound = %v, want direct (real dest is v6)", res.OutboundIndex)
+	}
+	if res.DialTarget != "[2001:db8::9]:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want real AAAA", res.DialTarget, res.IsDialIp)
+	}
+	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_6 {
+		t.Fatalf("selection IP version = %v, want 6", res.SelectionNetworkTypeObj)
+	}
+}
+
+func TestChooseProxyDialerUDPIPDialAlignsClientFamily(t *testing.T) {
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundUserDefinedMin,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.MustParseAddrPort("[2001:db8::80]:443"),
+		Network:  "udp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "[2001:db8::80]:443" || !res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want dest IP", res.DialTarget, res.IsDialIp)
+	}
+	if res.SelectionNetworkTypeObj == nil || res.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_4 {
+		t.Fatalf("selection IP version = %v, want 4 (client family)", res.SelectionNetworkTypeObj)
+	}
+}
+
+func TestFakeIPDialSkipResolve(t *testing.T) {
+	if !fakeIPDialSkipResolve(nil, consts.OutboundBlock) {
+		t.Fatal("block skips resolve")
+	}
+	if fakeIPDialSkipResolve(nil, consts.OutboundDirect) {
+		t.Fatal("builtin direct must resolve")
+	}
+	if !fakeIPDialSkipResolve(nil, consts.OutboundUserDefinedMin) {
+		t.Fatal("nil matcher treats user groups as proxy")
+	}
+	directLeaf := &RoutingMatcher{fakeIPLeafIsProxy: func(consts.OutboundIndex) bool { return false }}
+	if fakeIPDialSkipResolve(directLeaf, consts.OutboundUserDefinedMin) {
+		t.Fatal("direct leaf must resolve")
+	}
+	proxyLeaf := &RoutingMatcher{fakeIPLeafIsProxy: func(consts.OutboundIndex) bool { return true }}
+	if !fakeIPDialSkipResolve(proxyLeaf, consts.OutboundUserDefinedMin) {
+		t.Fatal("proxy leaf may skip")
+	}
+}
+
+func TestChooseProxyDialerFakeIPGroupLeafDirectNeedsRealIP(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "x.ss2.us")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	cp.dialMode = consts.DialMode_DomainPlus
+	cp.routingMatcher = testFakeIPMatcher(t, `
+domain(suffix: ss2.us) -> proxy
+fallback: direct
+`, []string{"proxy"})
+	cp.routingMatcher.fakeIPLeafIsProxy = func(consts.OutboundIndex) bool { return false }
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 80),
+		Domain:   "x.ss2.us",
+		Network:  "tcp",
+	})
 	if err == nil {
-		t.Fatal("expected refuse FakeIP via direct")
+		t.Fatal("expected real-IP lookup when the matched group leaf is direct")
+	}
+}
+
+func TestChooseProxyDialerFakeIPDomainProxySkipsDNS(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "x.ss2.us")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	cp.dialMode = consts.DialMode_DomainPlus
+	cp.routingMatcher = testFakeIPMatcher(t, `
+domain(suffix: ss2.us) -> proxy
+ip(203.0.113.0/24) -> direct
+fallback: direct
+`, []string{"proxy"})
+
+	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 80),
+		Domain:   "x.ss2.us",
+		Network:  "tcp",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DialTarget != "x.ss2.us:80" || res.IsDialIp {
+		t.Fatalf("DialTarget = (%q, %v), want domain dial without DNS", res.DialTarget, res.IsDialIp)
+	}
+}
+
+func TestChooseProxyDialerFakeIPIpRuleStillNeedsRealIP(t *testing.T) {
+	store, fake := newTestFakeIPStore(t, "only-ip.example")
+	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
+	attachFakeIPStore(cp, store)
+	cp.routingMatcher = testFakeIPMatcher(t, `
+ip(203.0.113.0/24) -> proxy
+fallback: direct
+`, []string{"proxy"})
+
+	_, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{
+		Outbound: consts.OutboundControlPlaneRouting,
+		Src:      netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dest:     netip.AddrPortFrom(fake, 443),
+		Domain:   "only-ip.example",
+		Network:  "tcp",
+	})
+	if err == nil {
+		t.Fatal("expected real-IP lookup when the first hit needs dest ip()")
 	}
 }
 

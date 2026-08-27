@@ -12,9 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	dnsmessage "github.com/miekg/dns"
 )
+
+// lookupSystemDns is the AsIs destination for internal EnsureReal queries,
+// which have no client packet. Tests replace it.
+var lookupSystemDns = netutils.SystemDns
 
 type dnsControllerRuntimeState struct {
 	routing               *dns.Dns
@@ -255,20 +261,377 @@ func (c *DnsController) LookupCacheAnswers(qname string, qtype uint16) []dnsmess
 	return answers
 }
 
+func (c *DnsController) cacheHasRealIP(qname string, qtype uint16) bool {
+	preferV6 := qtype == dnsmessage.TypeAAAA
+	store := c.fakeIPAnswerStore()
+	for _, cache := range c.lookupDnsCacheEntries(qname, qtype) {
+		ip, err := pickResolvedDialIP(ipsFromAnswers(cache.Answer), preferV6, store)
+		if err == nil && ip.IsValid() {
+			return true
+		}
+	}
+	return false
+}
+
+const ensureRealAnswersMissTTL = 2 * time.Second
+
+type ensureRealMissEntry struct {
+	until time.Time
+	err   error
+}
+
+func ensureRealFlightKey(cacheKey string) string {
+	return "ensure-real:" + cacheKey
+}
+
+func dnsCacheFresh(cache *DnsCache, now time.Time) bool {
+	if cache == nil {
+		return false
+	}
+	if n := cache.deadlineNano.Load(); n > 0 {
+		return now.UnixNano() < n
+	}
+	if cache.Deadline.IsZero() {
+		return true
+	}
+	return now.Before(cache.Deadline)
+}
+
+func dnsCacheFreshUpstream(cache *DnsCache, now time.Time) bool {
+	if cache == nil {
+		return false
+	}
+	if !cache.OriginalDeadline.IsZero() {
+		return now.Before(cache.OriginalDeadline)
+	}
+	return dnsCacheFresh(cache, now)
+}
+
+func (c *DnsController) lookupDnsCacheEntries(qname string, qtype uint16) []*DnsCache {
+	if c == nil || c.dnsControllerStore == nil {
+		return nil
+	}
+	key := c.cacheKey(qname, qtype)
+	prefix := key + "|"
+	var caches []*DnsCache
+	if v, ok := c.dnsCache.Load(key); ok {
+		if cache, _ := v.(*DnsCache); cache != nil {
+			caches = append(caches, cache)
+		}
+	}
+	c.dnsCache.Range(func(k, value any) bool {
+		ks, ok := k.(string)
+		if !ok || !strings.HasPrefix(ks, prefix) {
+			return true
+		}
+		cache, _ := value.(*DnsCache)
+		if cache == nil {
+			return true
+		}
+		caches = append(caches, cache)
+		return true
+	})
+	return caches
+}
+
+func (c *DnsController) freshAnswerIPs(qname string, qtype uint16) []netip.Addr {
+	if c == nil || c.dnsControllerStore == nil {
+		return nil
+	}
+	now := time.Now()
+	var addrs []netip.Addr
+	for _, cache := range c.lookupDnsCacheEntries(qname, qtype) {
+		if !dnsCacheFreshUpstream(cache, now) {
+			continue
+		}
+		addrs = append(addrs, ipsFromAnswers(cache.Answer)...)
+	}
+	return addrs
+}
+
+func (c *DnsController) fakeIPAnswerStore() *FakeIPStore {
+	if p := c.fakeIPPolicy(); p != nil {
+		return p.store
+	}
+	return nil
+}
+
+// cacheNeedsRealRefresh is true when EnsureRealAnswers should query upstream.
+// A real A/AAAA or NODATA still inside the upstream TTL is served from cache.
+// Past that TTL, or FakeIP-only leftovers, we look up again.
+func (c *DnsController) cacheNeedsRealRefresh(qname string, qtype uint16) bool {
+	preferV6 := qtype == dnsmessage.TypeAAAA
+	store := c.fakeIPAnswerStore()
+	now := time.Now()
+	hasFreshFakeOnly := false
+	hasFreshEmpty := false
+	expiredReal := false
+	for _, cache := range c.lookupDnsCacheEntries(qname, qtype) {
+		addrs := ipsFromAnswers(cache.Answer)
+		ip, err := pickResolvedDialIP(addrs, preferV6, store)
+		hasReal := err == nil && ip.IsValid()
+		fresh := dnsCacheFreshUpstream(cache, now)
+		if hasReal {
+			if fresh {
+				return false
+			}
+			expiredReal = true
+			continue
+		}
+		if !fresh {
+			continue
+		}
+		if len(addrs) > 0 {
+			hasFreshFakeOnly = true
+			continue
+		}
+		hasFreshEmpty = true
+	}
+	if hasFreshFakeOnly || expiredReal {
+		return true
+	}
+	return !hasFreshEmpty
+}
+
+func (c *DnsController) loadEnsureRealMiss(cacheKey string) (error, bool) {
+	if c == nil || c.dnsControllerStore == nil || cacheKey == "" {
+		return nil, false
+	}
+	v, ok := c.ensureRealMiss.Load(cacheKey)
+	if !ok {
+		return nil, false
+	}
+	ent, ok := v.(ensureRealMissEntry)
+	if !ok || time.Now().After(ent.until) {
+		c.ensureRealMiss.Delete(cacheKey)
+		return nil, false
+	}
+	return ent.err, true
+}
+
+func (c *DnsController) storeEnsureRealMiss(cacheKey string, err error) {
+	if c == nil || c.dnsControllerStore == nil || cacheKey == "" || err == nil {
+		return
+	}
+	c.ensureRealMiss.Store(cacheKey, ensureRealMissEntry{
+		until: time.Now().Add(ensureRealAnswersMissTTL),
+		err:   err,
+	})
+}
+
+func dnsAnswerIPSet(answers []dnsmessage.RR) map[netip.Addr]struct{} {
+	out := make(map[netip.Addr]struct{})
+	for _, rr := range answers {
+		ip, ok := dnsAnswerIP(rr)
+		if !ok || !ip.IsValid() {
+			continue
+		}
+		out[ip] = struct{}{}
+	}
+	return out
+}
+
+func dnsAnswerIPsEqual(a, b []dnsmessage.RR) bool {
+	left := dnsAnswerIPSet(a)
+	right := dnsAnswerIPSet(b)
+	if len(left) != len(right) {
+		return false
+	}
+	for ip := range left {
+		if _, ok := right[ip]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *DnsController) existingAnswerRRs(qname string, qtype uint16) []dnsmessage.RR {
+	var answers []dnsmessage.RR
+	for _, cache := range c.lookupDnsCacheEntries(qname, qtype) {
+		if cache == nil {
+			continue
+		}
+		answers = append(answers, cache.Answer...)
+	}
+	return answers
+}
+
+func (c *DnsController) ensureRealStoreKey(qname string, qtype uint16, responseCacheKey string) string {
+	base := c.cacheKey(qname, qtype)
+	if _, ok := c.dnsCache.Load(base); ok {
+		return base
+	}
+	if responseCacheKey != "" {
+		return responseCacheKey
+	}
+	return base
+}
+
+func (c *DnsController) queryAndMaybeStoreRealAnswers(ctx context.Context, qname string, qtype uint16) error {
+	rt := c.runtime()
+	if rt == nil || rt.routing == nil {
+		return fmt.Errorf("dns routing is not configured")
+	}
+	qname = dnsmessage.CanonicalName(qname)
+	upstreamIndex, upstream, err := rt.routing.RequestSelect(ctx, qname, qtype)
+	if err != nil {
+		return err
+	}
+	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
+		return fmt.Errorf("dns request rejected")
+	}
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion(qname, qtype)
+	msg.RecursionDesired = true
+	data, err := msg.Pack()
+	if err != nil {
+		return err
+	}
+	req, err := c.ensureRealUpstreamRequest(upstream)
+	if err != nil {
+		return err
+	}
+	resolution, err := c.resolveDNSUpstream(ctx, 0, req, data, upstream)
+	if err != nil {
+		return err
+	}
+	if resolution == nil || resolution.response == nil {
+		return fmt.Errorf("empty DNS response")
+	}
+	resp := resolution.response
+	if resp.Rcode != dnsmessage.RcodeSuccess {
+		return dnsResponseRcodeError(resp.Rcode)
+	}
+	if len(c.lookupDnsCacheEntries(qname, qtype)) > 0 && dnsAnswerIPsEqual(c.existingAnswerRRs(qname, qtype), resp.Answer) {
+		c.refreshExistingDnsCacheTTL(qname, qtype, dnsMessageAnswerTTL(resp))
+		return nil
+	}
+	baseKey := c.cacheKey(qname, qtype)
+	storeKey := c.ensureRealStoreKey(qname, qtype, c.responseCacheKey(baseKey, req, upstreamIndex, upstream))
+	return c.NormalizeAndCacheDnsResp_(resp, storeKey)
+}
+
+// ensureRealUpstreamRequest synthesizes a dest for AsIs. Named upstreams
+// do not need a client packet; AsIs does (resolveDNSUpstream uses realDst).
+func (c *DnsController) ensureRealUpstreamRequest(upstream *dns.Upstream) (*udpRequest, error) {
+	if upstream != nil {
+		return nil, nil
+	}
+	dst, err := lookupSystemDns()
+	if err != nil {
+		return nil, fmt.Errorf("asis DNS lookup requires a destination: %w", err)
+	}
+	if !dst.IsValid() {
+		return nil, fmt.Errorf("asis DNS lookup requires a destination")
+	}
+	return &udpRequest{realDst: dst}, nil
+}
+
+func dnsResponseRcodeError(rcode int) error {
+	if name := dnsmessage.RcodeToString[rcode]; name != "" {
+		return fmt.Errorf("DNS %s", name)
+	}
+	return fmt.Errorf("DNS rcode %d", rcode)
+}
+
+func dnsMessageAnswerTTL(msg *dnsmessage.Msg) uint32 {
+	if msg == nil || len(msg.Answer) == 0 {
+		return minFirefoxCacheTtl
+	}
+	ttl := msg.Answer[0].Header().Ttl
+	if ttl > 31536000 {
+		return 31536000
+	}
+	if ttl == 0 {
+		return minFirefoxCacheTtl
+	}
+	return ttl
+}
+
+func (c *DnsController) refreshExistingDnsCacheTTL(qname string, qtype uint16, ttl uint32) {
+	now := time.Now()
+	host := strings.TrimSuffix(dnsmessage.CanonicalName(qname), ".")
+	originalDeadline := now.Add(time.Duration(ttl) * time.Second)
+	deadline := originalDeadline
+	if rt := c.runtime(); rt != nil {
+		if fixedTtl, ok := rt.fixedDomainTtl[host]; ok {
+			deadline = now.Add(time.Duration(fixedTtl) * time.Second)
+		}
+	}
+	c.forEachDnsCacheEntry(qname, qtype, func(key string, cache *DnsCache) {
+		if cache == nil {
+			return
+		}
+		next := cache.cloneWithDeadlines(deadline, originalDeadline)
+		if next == nil {
+			return
+		}
+		if next.RouteOwnerKey == "" {
+			next.RouteOwnerKey = key
+		}
+		// Swap the published object so Deadline/OriginalDeadline are never
+		// written in place. CAS loses to a concurrent full replace, which
+		// already carries its own TTL.
+		_ = c.dnsCache.CompareAndSwap(key, cache, next)
+	})
+	c.rememberDnsKnowledge(c.cacheKey(qname, qtype), originalDeadline, false)
+}
+
+func (c *DnsController) forEachDnsCacheEntry(qname string, qtype uint16, fn func(key string, cache *DnsCache)) {
+	if c == nil || c.dnsControllerStore == nil || fn == nil {
+		return
+	}
+	key := c.cacheKey(qname, qtype)
+	prefix := key + "|"
+	if v, ok := c.dnsCache.Load(key); ok {
+		if cache, _ := v.(*DnsCache); cache != nil {
+			fn(key, cache)
+		}
+	}
+	c.dnsCache.Range(func(k, value any) bool {
+		ks, ok := k.(string)
+		if !ok || !strings.HasPrefix(ks, prefix) {
+			return true
+		}
+		cache, _ := value.(*DnsCache)
+		if cache != nil {
+			fn(ks, cache)
+		}
+		return true
+	})
+}
+
 func (c *DnsController) EnsureRealAnswers(ctx context.Context, qname string, qtype uint16) error {
 	if c == nil || qname == "" {
 		return fmt.Errorf("dns controller is not ready")
 	}
-	if len(c.LookupCacheAnswers(qname, qtype)) > 0 {
+	c.requireStore()
+	if !c.cacheNeedsRealRefresh(qname, qtype) {
 		return nil
 	}
-	if ctx == nil {
-		ctx = c.baseContext()
+	cacheKey := c.cacheKey(qname, qtype)
+	if err, ok := c.loadEnsureRealMiss(cacheKey); ok {
+		return err
 	}
-	msg := new(dnsmessage.Msg)
-	msg.SetQuestion(dnsmessage.CanonicalName(qname), qtype)
-	msg.RecursionDesired = true
-	return c.handleWithResponseWriter_(ctx, msg, nil, false, nil, 0, nil, "", "")
+	_, err, _ := c.sf.Do(ensureRealFlightKey(cacheKey), func() (any, error) {
+		if !c.cacheNeedsRealRefresh(qname, qtype) {
+			c.ensureRealMiss.Delete(cacheKey)
+			return nil, nil
+		}
+		if err, ok := c.loadEnsureRealMiss(cacheKey); ok {
+			return nil, err
+		}
+		workCtx, cancel := c.newWorkContext(5 * time.Second)
+		defer cancel()
+		err := c.queryAndMaybeStoreRealAnswers(workCtx, qname, qtype)
+		if err != nil {
+			c.storeEnsureRealMiss(cacheKey, err)
+			return nil, err
+		}
+		c.ensureRealMiss.Delete(cacheKey)
+		return nil, nil
+	})
+	return err
 }
 
 func (c *DnsController) runtime() *dnsControllerRuntimeState {

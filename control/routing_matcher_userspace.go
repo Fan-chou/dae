@@ -257,6 +257,37 @@ func (m *RoutingMatcher) Match(
 	return outbound, mark, must, err
 }
 
+// MatchDeferringDestIP is Match with dest ip()/geoip left UNKNOWN.
+func (m *RoutingMatcher) MatchDeferringDestIP(
+	sourceAddr [16]uint8,
+	destAddr [16]uint8,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	dscp uint8,
+	mac [16]uint8,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, err error) {
+	facts, err := m.newFacts(
+		sourceAddr,
+		destAddr,
+		sourcePort,
+		destPort,
+		ipVersion,
+		l4proto,
+		domain,
+		processName,
+		dscp,
+		mac,
+	)
+	if err != nil {
+		return 0, 0, false, false, err
+	}
+	return m.matchFactsDeferringDestIP(facts)
+}
+
 // identityRoutingMatch is MAC / source / port / process / DSCP / L4: known only
 // on a real connection, not at DNS time.
 func identityRoutingMatch(matchType consts.MatchType) bool {
@@ -275,6 +306,15 @@ func identityRoutingMatch(matchType consts.MatchType) bool {
 func destRoutingMatch(matchType consts.MatchType) bool {
 	switch matchType {
 	case consts.MatchType_IpSet, consts.MatchType_DomainSet, consts.MatchType_IpVersion, consts.MatchType_Fallback:
+		return true
+	default:
+		return false
+	}
+}
+
+func destIPRoutingMatch(matchType consts.MatchType) bool {
+	switch matchType {
+	case consts.MatchType_IpSet, consts.MatchType_IpVersion:
 		return true
 	default:
 		return false
@@ -385,6 +425,81 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 			badRule = false
 			ruleHasDest = false
 			ruleHasIdentitySkip = false
+		}
+	}
+	return 0, 0, false, false, fmt.Errorf("no match set hit")
+}
+
+func (m *RoutingMatcher) evalDeferringDestIP(index int, match compiledRoutingMatch, facts *routingMatcherFacts) (fakeIPKleene, error) {
+	if destIPRoutingMatch(match.matchType) {
+		return fakeIPKleeneUnknown, nil
+	}
+	hit, err := m.matchCompiledMatch(index, match, facts)
+	if err != nil {
+		return 0, err
+	}
+	if hit {
+		return fakeIPKleeneTrue, nil
+	}
+	return fakeIPKleeneFalse, nil
+}
+
+// matchFactsDeferringDestIP is first-match routing with dest ip()/geoip/
+// ipversion() UNKNOWN. Domain, sip, mac, port, l4proto, and fallback are evaluated.
+// A TRUE hit is returned with needsDestIP=false. A rule that cannot be
+// decided without dest IP returns needsDestIP=true so the caller can
+// resolve and rematch.
+//
+// AND/OR short-circuit matches matchFacts: a FALSE conjunct or a TRUE
+// disjunct stops evaluating the rest of that rule so a later ip() cannot
+// turn a decided rule into UNKNOWN (and force a DNS lookup).
+func (m *RoutingMatcher) matchFactsDeferringDestIP(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, err error) {
+	if m == nil {
+		return 0, 0, false, false, fmt.Errorf("nil routing matcher")
+	}
+	matches := m.compiledMatches
+	if len(matches) == 0 {
+		return 0, 0, false, false, fmt.Errorf("no compiled routing match set")
+	}
+
+	subrule := fakeIPKleeneFalse
+	rule := fakeIPKleeneTrue
+	for i, match := range matches {
+		// FALSE && x = FALSE; TRUE || x = TRUE. Skip x so an UNKNOWN
+		// dest-IP term cannot poison a rule that is already decided.
+		if rule != fakeIPKleeneFalse && subrule != fakeIPKleeneTrue {
+			val, evalErr := m.evalDeferringDestIP(i, match, &facts)
+			if evalErr != nil {
+				return 0, 0, false, false, evalErr
+			}
+			subrule = fakeIPKleeneOr(subrule, val)
+		}
+		outbound := match.outbound
+		if outbound != consts.OutboundLogicalOr {
+			if match.not {
+				subrule = fakeIPKleeneNot(subrule)
+			}
+			rule = fakeIPKleeneAnd(rule, subrule)
+			subrule = fakeIPKleeneFalse
+		}
+		if outbound&consts.OutboundLogicalMask != consts.OutboundLogicalMask {
+			if outbound == consts.OutboundMustRules {
+				switch rule {
+				case fakeIPKleeneUnknown:
+					return 0, 0, false, true, nil
+				case fakeIPKleeneTrue:
+					must = true
+				}
+				rule = fakeIPKleeneTrue
+				continue
+			}
+			switch rule {
+			case fakeIPKleeneUnknown:
+				return 0, 0, false, true, nil
+			case fakeIPKleeneTrue:
+				return outbound, match.mark, match.must || must, false, nil
+			}
+			rule = fakeIPKleeneTrue
 		}
 	}
 	return 0, 0, false, false, fmt.Errorf("no match set hit")

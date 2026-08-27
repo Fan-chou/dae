@@ -103,6 +103,9 @@ type dnsControllerStore struct {
 	cacheProjectionMu sync.RWMutex // Serializes cache membership with BPF projection callbacks.
 	dnsForwarderCache sync.Map     // map[dnsForwarderKey]*cachedDnsForwarder
 	sf                singleflight.Group
+	// ensureRealMiss damps EnsureRealAnswers upstream errors (NODATA is
+	// stored in dnsCache; this map is only for lookup failures).
+	ensureRealMiss sync.Map // map[string]ensureRealMissEntry
 
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
