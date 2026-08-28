@@ -32,9 +32,11 @@ type udpIngressTask struct {
 	lConn        *net.UDPConn
 	pktBuf       pool.PB
 	admission    *routingEpochIngressGate
+	bindQ        *UdpTaskQueue
 	realDst      netip.AddrPort
 	convergeSrc  netip.AddrPort
 	flowDecision UdpFlowDecision
+	nbytes       int
 }
 
 var udpIngressTaskPool = sync.Pool{
@@ -54,7 +56,8 @@ func (t *udpIngressTask) Run() {
 	// not see the task before its deferred cleanup completes).
 	defer udpIngressTaskPool.Put(t)
 	defer data.Put()
-	defer t.admission.release()
+	defer t.admission.release(t.nbytes)
+	defer t.noteQueueComplete()
 	var routingResult *bpfRoutingResult
 	var freshRoutingResult *bpfRoutingResult
 
@@ -235,6 +238,8 @@ func (t *udpIngressTask) Run() {
 			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowHandlePktEpochWarn(time.Now()) {
 				c.log.Warnln("handlePkt:", e)
 			}
+		} else if stderrors.Is(e, ErrUnnamedFakeIP) {
+			c.logUnnamedFakeIP("udp", convergeSrc, realDst, e)
 		} else {
 			c.log.Warnln("handlePkt:", e)
 		}
@@ -255,4 +260,48 @@ func (t *udpIngressTask) Run() {
 			}
 		}
 	}
+}
+
+func (t *udpIngressTask) queuedBytes() int {
+	if t == nil {
+		return 0
+	}
+	return t.nbytes
+}
+
+func (t *udpIngressTask) bindQueue(q *UdpTaskQueue) {
+	if t == nil || q == nil {
+		return
+	}
+	t.bindQ = q
+	if t.nbytes > 0 {
+		q.flowBytes.Add(int64(t.nbytes))
+	}
+}
+
+func (t *udpIngressTask) noteQueueComplete() {
+	if t == nil || t.bindQ == nil {
+		return
+	}
+	if t.nbytes > 0 {
+		t.bindQ.flowBytes.Add(-int64(t.nbytes))
+	}
+	t.bindQ = nil
+}
+
+func (t *udpIngressTask) discard() {
+	if t == nil {
+		return
+	}
+	t.noteQueueComplete()
+	if t.pktBuf != nil {
+		t.pktBuf.Put()
+		t.pktBuf = nil
+	}
+	if t.admission != nil {
+		t.admission.release(t.nbytes)
+		t.admission = nil
+	}
+	*t = udpIngressTask{}
+	udpIngressTaskPool.Put(t)
 }

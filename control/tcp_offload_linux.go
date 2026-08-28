@@ -499,17 +499,15 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		if n == 0 {
-			// Idle watchdog (relayCore parity): any traffic in either direction
-			// refreshes lastProgress; a fully idle offloaded relay is reclaimed.
+			// Refresh lastProgress from tcp_info so the backlog fuse still
+			// sees real traffic. Do not force-close a fully idle offload:
+			// kernel TCP keepalive reaps vanished peers.
 			if time.Since(lastPoll) >= tcpOffloadIdlePollInterval {
 				lastPoll = time.Now()
 				if rx, ok := s.rxTotalOK(); ok {
 					if rx != lastRxTotal {
 						lastRxTotal = rx
 						lastProgress = time.Now()
-					} else if time.Since(lastProgress) > relayIdleTimeout {
-						s.forceClose()
-						return 0, 0, nil
 					}
 				}
 			}

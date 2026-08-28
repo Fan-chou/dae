@@ -59,6 +59,9 @@ func (c *ControlPlane) initFakeIP(
 	} else {
 		store.ApplyRanges(inet4, inet6)
 	}
+	if warn := store.LoadWarning(); warn != nil && log != nil {
+		log.WithError(warn).Warn("fakeip store snapshot reset")
+	}
 
 	filter, err := buildFakeIPFilterMatcher(log, locationFinder, fake, hostnamesFromNodeList(tagToNodeList))
 	if err != nil {

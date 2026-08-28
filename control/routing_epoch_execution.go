@@ -33,34 +33,62 @@ type incomingConnectionLease struct {
 
 const routingEpochIngressClosed uint64 = 1 << 63
 
+// System UDP ingress cap shared by the ordered convoy and DirectGoroutine
+// (SIP/RTP/STUN) bypass. Sized against a 230 MiB GOMEMLIMIT (~7%).
+const (
+	udpIngressSystemMaxBytes   = 16 << 20
+	udpIngressSystemMaxPackets = 8192
+)
+
+var udpIngressSystemDrop atomic.Uint64
+
 // routingEpochIngressGate accounts for packets that have already been read
 // from a listener but have not reached their asynchronous UDP task yet. Its
 // atomic fast path keeps ordinary packet ingress independent of the control
 // plane drain mutex while allowing retirement to close admission exactly once.
 type routingEpochIngressGate struct {
-	state   atomic.Uint64
-	waitMu  sync.Mutex
-	drained chan struct{}
+	state       atomic.Uint64
+	queuedBytes atomic.Int64
+	waitMu      sync.Mutex
+	drained     chan struct{}
 }
 
-func (g *routingEpochIngressGate) tryAcquire() bool {
+func (g *routingEpochIngressGate) tryAcquire(nbytes int) bool {
 	if g == nil {
 		return true
+	}
+	if nbytes < 0 {
+		nbytes = 0
 	}
 	for {
 		state := g.state.Load()
 		if state&routingEpochIngressClosed != 0 {
 			return false
 		}
+		packets := state &^ routingEpochIngressClosed
+		if packets >= udpIngressSystemMaxPackets {
+			udpIngressSystemDrop.Add(1)
+			return false
+		}
+		if g.queuedBytes.Load()+int64(nbytes) > udpIngressSystemMaxBytes {
+			udpIngressSystemDrop.Add(1)
+			return false
+		}
 		if g.state.CompareAndSwap(state, state+1) {
+			if nbytes > 0 {
+				g.queuedBytes.Add(int64(nbytes))
+			}
 			return true
 		}
 	}
 }
 
-func (g *routingEpochIngressGate) release() {
+func (g *routingEpochIngressGate) release(nbytes int) {
 	if g == nil {
 		return
+	}
+	if nbytes > 0 {
+		g.queuedBytes.Add(-int64(nbytes))
 	}
 	if g.state.Add(^uint64(0)) != routingEpochIngressClosed {
 		return

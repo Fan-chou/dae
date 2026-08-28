@@ -79,14 +79,29 @@ func TestUdpTaskPoolPreservesPerFlowOrderAcrossOverflow(t *testing.T) {
 
 	key := udpTaskPoolTestKey()
 	recorder := &orderRecorder{}
-	total := UdpTaskQueueLength + 64
+	// Stay under the 160-slot cap so this test still checks FIFO across the
+	// channel-to-overflow transition rather than drop-oldest.
+	total := UdpTaskQueueLength + 16
+	started := make(chan struct{})
+	hold := make(chan struct{})
 
-	for i := range total {
+	require.True(t, pool.EmitTask(key, udpTaskFunc(func() {
+		close(started)
+		<-hold
+		recorder.record(0)
+	})))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("convoy never started the blocking task")
+	}
+	for i := 1; i < total; i++ {
 		index := i
 		require.True(t, pool.EmitTask(key, udpTaskFunc(func() {
 			recorder.record(index)
 		})), "EmitTask rejected task %d below any capacity limit", i)
 	}
+	close(hold)
 
 	recorder.waitForCount(t, total)
 	got := recorder.snapshot()
@@ -104,7 +119,7 @@ func TestUdpTaskPoolKeepsFlowsIndependent(t *testing.T) {
 
 	first := &orderRecorder{}
 	second := &orderRecorder{}
-	total := UdpTaskQueueLength + 32
+	total := UdpTaskQueueLength + 16
 
 	for i := range total {
 		index := i
@@ -197,4 +212,49 @@ func TestUdpTaskPoolConcurrentSubmitAndClose(t *testing.T) {
 
 	require.False(t, pool.EmitTask(udpTaskPoolTestKey(), udpTaskFunc(func() {})),
 		"EmitTask accepted work after Close")
+}
+
+// TestUdpTaskPoolDropOldestKeepsNewestInOrder blocks the convoy on the first
+// task, overfills the 160-slot bound, and checks that the oldest queued
+// packets are discarded while the newest stay in submission order.
+func TestUdpTaskPoolDropOldestKeepsNewestInOrder(t *testing.T) {
+	pool := NewUdpTaskPool()
+	t.Cleanup(func() { pool.Close() })
+
+	key := udpTaskPoolTestKey()
+	recorder := &orderRecorder{}
+	started := make(chan struct{})
+	hold := make(chan struct{})
+	queuedCap := UdpTaskQueueLength + UdpTaskOverflowMax
+	extra := 10
+	last := queuedCap + extra
+
+	droppedBefore := udpIngressDropOldest.Load()
+	require.True(t, pool.EmitTask(key, udpTaskFunc(func() {
+		close(started)
+		<-hold
+		recorder.record(0)
+	})))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("convoy never started the blocking task")
+	}
+	for i := 1; i <= last; i++ {
+		index := i
+		require.True(t, pool.EmitTask(key, udpTaskFunc(func() {
+			recorder.record(index)
+		})))
+	}
+	require.Equal(t, uint64(extra), udpIngressDropOldest.Load()-droppedBefore,
+		"drop-oldest should discard exactly the overflow")
+	close(hold)
+
+	want := make([]int, 0, 1+queuedCap)
+	want = append(want, 0)
+	for i := extra + 1; i <= last; i++ {
+		want = append(want, i)
+	}
+	recorder.waitForCount(t, len(want))
+	require.Equal(t, want, recorder.snapshot())
 }

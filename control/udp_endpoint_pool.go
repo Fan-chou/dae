@@ -37,6 +37,7 @@ const (
 	udpEndpointJanitorMaxInterval    = 30 * time.Second
 	udpEndpointPendingReplyPeerLimit = 8
 	udpEndpointReplyCacheSlots       = 4
+	udpEndpointRetryMinRemaining     = 200 * time.Millisecond
 )
 
 type UdpHandler func(ue *UdpEndpoint, data []byte, from netip.AddrPort) error
@@ -624,6 +625,22 @@ func (p *UdpEndpointPool) Get(key UdpEndpointKey) (udpEndpoint *UdpEndpoint, ok 
 	return ue, ok
 }
 
+// udpCreateBudgetInheritedFromParent reports whether createCtx's deadline is
+// the caller's remaining time rather than DefaultDialTimeout. context.WithTimeout
+// takes the earlier of parent and the 8s cap, so a parent deadline at or before
+// create's is inherited; a later parent leaves the 8s self-cap in force.
+func udpCreateBudgetInheritedFromParent(baseCtx, createCtx context.Context) bool {
+	parentDL, ok := baseCtx.Deadline()
+	if !ok {
+		return false
+	}
+	createDL, createOK := createCtx.Deadline()
+	if !createOK {
+		return true
+	}
+	return !parentDL.After(createDL)
+}
+
 // createEndpointLocked dials and registers a new UdpEndpoint under the caller's shard lock.
 // The caller MUST hold the shard mutex for key before calling this function.
 func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption *UdpEndpointOptions) (*UdpEndpoint, error) {
@@ -642,48 +659,56 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 		baseCtx = context.Background()
 	}
 
-	// Select and dial use separate DefaultDialTimeout budgets so a
-	// resolve_dns lookup inside GetDialOption cannot starve the handshake.
-	selectCtx, selectCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-	dialOption, err := createOption.GetDialOption(selectCtx)
-	selectCancel()
+	// One end-to-end budget for select, dial, and a leftover retry.
+	// resolve_dns already has its own 800ms cap; a second DefaultDialTimeout
+	// per stage used to stretch a black-hole create to ~32s.
+	createCtx, createCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
+	defer createCancel()
+	deadline, hasDeadline := createCtx.Deadline()
+	// Distinguish a caller-imposed deadline from this create's own 8s cap.
+	// Parent exhaustion must not penalize a newly selected dialer; a first
+	// dial that burns the full DefaultDialTimeout still should.
+	parentExhausted := func() bool {
+		return udpCreateBudgetInheritedFromParent(baseCtx, createCtx) && createCtx.Err() != nil
+	}
+	retryRemaining := func() time.Duration {
+		if !hasDeadline {
+			return 0
+		}
+		return time.Until(deadline)
+	}
+
+	dialOption, err := createOption.GetDialOption(createCtx)
 	if err != nil {
-		if shouldCacheUdpEndpointCreateFailure(err) {
+		if shouldCacheUdpEndpointCreateFailure(err) && !parentExhausted() {
 			p.cacheFailureLocked(key, createOption.Log, err)
 		}
 		return nil, err
 	}
-	dialCtx, dialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-	defer dialCancel()
-	dialCtx = netproxy.ContextWithUDPReplyAddr(dialCtx, dialOption.Target, key.Dst)
+	dialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
 	udpConn, err := dialOption.Dialer.DialContext(dialCtx, dialOption.Network, dialOption.Target)
 	if err != nil {
-		reportUdpEndpointDialCreateFailure(key, dialOption, err)
-		if shouldForceMarkUnavailableOnProxyDialError(err) {
-			// Use a fresh timeout context for the retry to avoid inheriting a
-			// nearly-expired deadline from the first dial attempt. When the first
-			// dial consumes most of DefaultDialTimeout (e.g. network unreachable
-			// after a long timeout), the second dial would otherwise immediately
-			// fail with context.DeadlineExceeded and incorrectly penalize the new
-			// dialer selected by GetDialOption.
-			retrySelectCtx, retrySelectCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-			retryOption, retryErr := createOption.GetDialOption(retrySelectCtx)
-			retrySelectCancel()
+		if !parentExhausted() {
+			reportUdpEndpointDialCreateFailure(key, dialOption, err)
+		}
+		if !parentExhausted() && shouldForceMarkUnavailableOnProxyDialError(err) &&
+			retryRemaining() >= udpEndpointRetryMinRemaining {
+			retryOption, retryErr := createOption.GetDialOption(createCtx)
 			if retryErr == nil {
 				dialOption = retryOption
-				retryDialCtx, retryDialCancel := context.WithTimeout(baseCtx, consts.DefaultDialTimeout)
-				retryDialCtx = netproxy.ContextWithUDPReplyAddr(retryDialCtx, dialOption.Target, key.Dst)
+				retryDialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
 				udpConn, err = dialOption.Dialer.DialContext(retryDialCtx, dialOption.Network, dialOption.Target)
-				retryDialCancel()
 				if err == nil {
 					goto dialSuccess
 				}
-				reportUdpEndpointDialCreateFailure(key, dialOption, err)
+				if !parentExhausted() {
+					reportUdpEndpointDialCreateFailure(key, dialOption, err)
+				}
 			} else {
 				err = retryErr
 			}
 		}
-		if shouldCacheUdpEndpointCreateFailure(err) {
+		if shouldCacheUdpEndpointCreateFailure(err) && !parentExhausted() {
 			p.cacheFailureLocked(key, createOption.Log, err)
 		}
 		return nil, err
@@ -795,6 +820,9 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	// endpoint creation failure. Caching it per flow key can explode memory
 	// under unhealthy-node bursts without preventing any extra dial attempts.
 	if stderrors.Is(err, outbound.ErrNoAliveDialer) || stderrors.Is(err, ErrQuicAdministrativelyProhibited) {
+		return false
+	}
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	if isTransientLocalUdpDialCreateError(err) {

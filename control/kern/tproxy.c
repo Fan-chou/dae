@@ -1455,6 +1455,11 @@ enum route_state_flags {
 	ROUTE_STATE_GOOD_SUBRULE = 1U << 1,
 	ROUTE_STATE_MUST = 1U << 2,
 	ROUTE_STATE_DNS_QUERY = 1U << 3,
+	// Sticky for the whole route() call: a domain bitmap bit was 1.
+	// Ambiguous shared-IP projections can only fabricate extra 1s, so a
+	// 1 is the untrusted signal; a 0 is always safe. Identity rules that
+	// never consult the bitmap must not be lifted to userspace.
+	ROUTE_STATE_SAW_DOMAIN_BIT = 1U << 4,
 };
 
 struct wan_egress_route_scratch {
@@ -1776,8 +1781,10 @@ static __always_inline int route_match_domain_set(struct route_ctx *ctx,
 		ctx->domain_word_cached = true;
 	}
 
-	if ((ctx->domain_word_bits >> (index % 32)) & 1)
+	if ((ctx->domain_word_bits >> (index % 32)) & 1) {
 		ctx->route_state |= ROUTE_STATE_GOOD_SUBRULE;
+		ctx->route_state |= ROUTE_STATE_SAW_DOMAIN_BIT;
+	}
 	return 0;
 }
 
@@ -1983,7 +1990,11 @@ route_finalize_match(struct route_ctx *ctx, const struct match_set *match_set)
 					// domain-derived must_direct: the merged bitmap
 					// may hit another owner's must rule. Userspace
 					// recomputes must after sniffing the real name.
-					if (ctx->domain_ambiguous)
+					// Only lift when this route() actually saw a
+					// domain bit; sip/mac/dscp hits stay in-kernel.
+					if (ctx->domain_ambiguous &&
+					    (ctx->route_state &
+					     ROUTE_STATE_SAW_DOMAIN_BIT))
 						outbound =
 							OUTBOUND_CONTROL_PLANE_ROUTING;
 					ctx->result =

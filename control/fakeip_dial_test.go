@@ -409,6 +409,9 @@ func TestRewriteFakeIPDialTargetUnnamedRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unnamed FakeIP error")
 	}
+	if !errors.Is(err, ErrUnnamedFakeIP) {
+		t.Fatalf("err = %v, want ErrUnnamedFakeIP", err)
+	}
 }
 
 func TestUdpDialTargetPrefersSelected(t *testing.T) {

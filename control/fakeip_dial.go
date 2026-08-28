@@ -112,7 +112,7 @@ func (c *ControlPlane) routeFakeIP(
 // feed geoip/ip(). Cache miss re-resolves; still missing is a hard error.
 func (c *ControlPlane) realIPForFakeIPRoute(ctx context.Context, domain string, fake netip.Addr) (netip.Addr, error) {
 	if domain == "" {
-		return netip.Addr{}, fmt.Errorf("unnamed FakeIP %s", fake)
+		return netip.Addr{}, unnamedFakeIPError(fake)
 	}
 	preferV6 := fake.Is6() && !fake.Is4In6()
 	if ip := c.realIPFromDnsCache(domain, preferV6); ip.IsValid() {
@@ -193,7 +193,7 @@ func (c *ControlPlane) resolveFakeIPDomain(domain string, dst netip.Addr) (strin
 	}
 	name, ok := store.LookBack(dst)
 	if !ok {
-		return "", fmt.Errorf("unnamed FakeIP %s", dst)
+		return "", unnamedFakeIPError(dst)
 	}
 	return strings.TrimSuffix(name, "."), nil
 }
@@ -223,7 +223,7 @@ func (c *ControlPlane) rewriteFakeIPDialTarget(domain string, dst netip.AddrPort
 		return dialTarget, dialIp, nil
 	}
 	if domain == "" {
-		return "", false, fmt.Errorf("unnamed FakeIP %s", dst.Addr())
+		return "", false, unnamedFakeIPError(dst.Addr())
 	}
 	return net.JoinHostPort(domain, strconv.Itoa(int(dst.Port()))), false, nil
 }

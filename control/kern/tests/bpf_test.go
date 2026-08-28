@@ -145,6 +145,23 @@ func clearHashMap(t *testing.T, m *ebpf.Map) {
 	}
 }
 
+// resetSharedBpfTestMaps drops leftover routing projections, conntrack, and
+// LPM entries between program-set runs. Combined Test() reuses one collection.
+func resetSharedBpfTestMaps(t *testing.T, obj *bpftestObjects) {
+	t.Helper()
+	clearHashMap(t, obj.MacAssocMap)
+	clearHashMap(t, obj.IpMacAssocMap)
+	clearHashMap(t, obj.DomainRoutingMap)
+	clearHashMap(t, obj.ConnStateMap)
+	clearHashMap(t, obj.RoutingHandoffMap)
+	clearHashMap(t, obj.RedirectTrack)
+	clearHashMap(t, obj.FakeipLpmMap)
+	clearHashMap(t, obj.UnusedLpmType)
+	if err := obj.ActiveRoutingEpochMap.Update(uint32(0), uint32(0), ebpf.UpdateAny); err != nil {
+		t.Fatalf("failed to reset active routing epoch: %v", err)
+	}
+}
+
 func markAllOutboundsAlive(t *testing.T, obj *bpftestObjects) {
 	aliveVal := uint32(1)
 
@@ -190,6 +207,7 @@ func runProgramSetByID(t *testing.T, id string) {
 			t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 		}
 	}
+	resetSharedBpfTestMaps(t, obj)
 
 	data := make([]byte, 4096-256-320)
 	ctx := make([]byte, 256)
@@ -410,8 +428,11 @@ func Test(t *testing.T) {
 				t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 			}
 		}
-		clearHashMap(t, obj.MacAssocMap)
-		clearHashMap(t, obj.IpMacAssocMap)
+		// Restore ALIVE without KERNEL_DIRECT. LanUdpKernelDirect* setups
+		// write 1|2 and never restore; leftover KERNEL_DIRECT folds later
+		// WAN UDP USER_DEFINED_MIN into DIRECT.
+		markAllOutboundsAlive(t, obj)
+		resetSharedBpfTestMaps(t, obj)
 
 		t.Logf("Running test: %s\n", progset.id)
 		// create ctx with the max allowed size(4k - head room - tailroom)
@@ -472,6 +493,10 @@ func TestWanEgressUdpRedirectTrack(t *testing.T) {
 	runProgramSetByID(t, "WanEgressUdpRedirectTrack")
 }
 
+func TestWanEgressUdpFirstFragmentListener(t *testing.T) {
+	runProgramSetByID(t, "WanEgressUdpFirstFragmentListener")
+}
+
 func TestWanEgressFakeipForwardDrop(t *testing.T) {
 	runProgramSetByID(t, "WanEgressFakeipForwardDrop")
 }
@@ -502,4 +527,16 @@ func TestWanUdpKernelDirectGroupSkipsUserspace(t *testing.T) {
 
 func TestWanTcpKernelDirectGroupSkipsUserspace(t *testing.T) {
 	runProgramSetByID(t, "WanTcpKernelDirectGroupSkipsUserspace")
+}
+
+func TestSipMustDirectDomainAmbiguous(t *testing.T) {
+	runProgramSetByID(t, "SipMustDirectDomainAmbiguous")
+}
+
+func TestSipAndDomainAmbiguous(t *testing.T) {
+	runProgramSetByID(t, "SipAndDomainAmbiguous")
+}
+
+func TestNotDomainAmbiguousFalsePositive(t *testing.T) {
+	runProgramSetByID(t, "NotDomainAmbiguousFalsePositive")
 }

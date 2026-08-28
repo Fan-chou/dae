@@ -17,11 +17,9 @@ import (
 
 const (
 	relayHalfCloseTimeout = 10 * time.Second
-	// relayIdleTimeout bounds how long a relay may sit with zero traffic in
-	// both directions before it is force-closed. A half-open peer (vanished
-	// without FIN/RST) otherwise parks the directional read forever and the
-	// relay leaks. Any traffic in either direction refreshes lastActive, so
-	// long-lived but active connections (SSH, gaming) are never touched.
+	// relayIdleTimeout is the optional application-idle bound used only when
+	// a relayCore sets idleTimeout > 0 (tests). Production idleTimeout is 0:
+	// vanished TCP peers are reaped by kernel keepalive, not this watchdog.
 	relayIdleTimeout = 5 * time.Minute
 	// relayIdleCheckInterval is the watchdog cadence for idle reclamation.
 	relayIdleCheckInterval = 30 * time.Second
@@ -61,7 +59,7 @@ func newRelayCore(lConn, rConn netproxy.Conn, engine relayCopyEngine, leftRecord
 		right:            rConn,
 		copyEngine:       engine,
 		halfCloseTimeout: relayHalfCloseTimeout,
-		idleTimeout:      relayIdleTimeout,
+		idleTimeout:      0, // 0 disables application-idle force-close
 		idleCheckPeriod:  relayIdleCheckInterval,
 		leftRecord:       leftRecord,
 		rightRecord:      rightRecord,
@@ -110,25 +108,12 @@ func (c *relayCore) run(ctx context.Context) error {
 		}
 	}()
 
-	// Idle watchdog: half-open peers (vanished without FIN/RST) never return
-	// from their directional read, so without a bound the relay goroutine pair
-	// leaks. Any traffic in either direction refreshes lastActiveNano; only a
-	// fully idle relay is reclaimed.
-	//
-	// The watchdog deliberately ignores ctx cancellation: when a control-plane
-	// reload retires a generation, ctx is canceled and the ctx-watcher above
-	// calls forceClose. But for QUIC streams (hy2/tuic), SetReadDeadline and
-	// even Close/CancelRead may not synchronously unblock a pending Read in
-	// quic-go. If the watchdog also exited on ctx.Done, no one would remain to
-	// reap the relay once the QUIC Read eventually returns. By staying alive
-	// on its own idle timer, the watchdog guarantees that even a stuck relay
-	// is force-closed again once it goes idle, and that run() does not return
-	// until both directions have actually finished.
+	// The watchdog stays alive after ctx cancel so quic-go (hy2/tuic) Reads
+	// that ignore a single SetReadDeadline/Close still get repeated nudges.
+	// Application-idle force-close is optional (idleTimeout > 0); production
+	// leaves it off and relies on kernel TCP keepalive.
 	c.lastActiveNano.Store(time.Now().UnixNano())
 	idleTimeout := c.idleTimeout
-	if idleTimeout <= 0 {
-		idleTimeout = relayIdleTimeout
-	}
 	checkPeriod := c.idleCheckPeriod
 	if checkPeriod <= 0 {
 		checkPeriod = relayIdleCheckInterval
@@ -156,7 +141,7 @@ func (c *relayCore) run(ctx context.Context) error {
 					nudgeReads()
 					continue
 				}
-				if time.Since(time.Unix(0, c.lastActiveNano.Load())) > idleTimeout {
+				if idleTimeout > 0 && time.Since(time.Unix(0, c.lastActiveNano.Load())) > idleTimeout {
 					// Idle beyond the bound: reclaim the relay. forceClose
 					// unblocks both directional reads via deadline + Close.
 					cancel()

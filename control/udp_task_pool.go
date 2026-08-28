@@ -20,7 +20,13 @@ const (
 	// chosen as a safe ceiling that is still 25× larger than the typical sniff
 	// window but reduces per-flow channel allocation by 32× vs the old 4096.
 	UdpTaskQueueLength = 128
+	// UdpTaskOverflowMax is extra FIFO slots after the channel fills.
+	// Oldest packet is dropped when this is exceeded.
+	UdpTaskOverflowMax     = 32
+	udpTaskPerFlowMaxBytes = 256 << 10
 )
+
+var udpIngressDropOldest atomic.Uint64
 
 var (
 	// UdpTaskPoolAgingTime is the idle timeout before a queue is garbage collected.
@@ -51,6 +57,7 @@ type UdpTaskQueue struct {
 	wake      chan struct{}
 	overflow  []UdpTask
 	enqueueMu sync.Mutex
+	flowBytes atomic.Int64
 
 	// 8-byte fields
 	agingTime time.Duration
@@ -77,6 +84,17 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
 
+	n := udpTaskQueuedBytes(task)
+	for q.wouldExceedLocked(n) {
+		if !q.dropOldestLocked() {
+			udpTaskDiscard(task)
+			return
+		}
+	}
+	if rt, ok := task.(udpResourceTask); ok {
+		rt.bindQueue(q)
+	}
+
 	if q.overflowMode {
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
@@ -97,6 +115,66 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) {
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
+	}
+}
+
+func (q *UdpTaskQueue) wouldExceedLocked(extraBytes int) bool {
+	pending := len(q.ch) + len(q.overflow)
+	if pending >= UdpTaskQueueLength+UdpTaskOverflowMax {
+		return true
+	}
+	if extraBytes > 0 && q.flowBytes.Load()+int64(extraBytes) > udpTaskPerFlowMaxBytes {
+		return true
+	}
+	return false
+}
+
+func (q *UdpTaskQueue) dropOldestLocked() bool {
+	// Oldest is the channel head (true FIFO). overflow[0] is only used when
+	// the channel is empty. Dropping under enqueueMu; convoy's channel
+	// receive is exclusive with this non-blocking take.
+	select {
+	case old := <-q.ch:
+		udpIngressDropOldest.Add(1)
+		udpTaskDiscard(old)
+		return true
+	default:
+	}
+	if len(q.overflow) == 0 {
+		return false
+	}
+	old := q.overflow[0]
+	q.overflow[0] = nil
+	q.overflow = q.overflow[1:]
+	q.overflowLen.Store(int32(len(q.overflow)))
+	if len(q.overflow) == 0 {
+		q.overflowMode = false
+	}
+	udpIngressDropOldest.Add(1)
+	udpTaskDiscard(old)
+	return true
+}
+
+type udpResourceTask interface {
+	queuedBytes() int
+	bindQueue(*UdpTaskQueue)
+	discard()
+}
+
+func udpTaskQueuedBytes(task UdpTask) int {
+	if rt, ok := task.(udpResourceTask); ok {
+		return rt.queuedBytes()
+	}
+	return 0
+}
+
+func udpTaskDiscard(task UdpTask) {
+	if task == nil {
+		return
+	}
+	if rt, ok := task.(udpResourceTask); ok {
+		rt.discard()
+		return
 	}
 }
 

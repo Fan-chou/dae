@@ -109,6 +109,7 @@ type FakeIPStore struct {
 	maxLive  int
 	maxBytes int
 	diskOK   bool
+	loadWarn error
 }
 
 func NewFakeIPStore(dir string, maxEntries int) *FakeIPStore {
@@ -157,9 +158,11 @@ func (s *FakeIPStore) Open(inet4, inet6 netip.Prefix) error {
 	}
 	s.resetMemoryLocked(inet4, inet6)
 	loadErr := s.loadLocked()
+	s.loadWarn = nil
 	if loadErr != nil {
 		s.quarantineDiskLocked()
 		s.resetMemoryLocked(inet4, inet6)
+		s.loadWarn = fmt.Errorf("fakeip store load failed; quarantined as *.corrupt-* under %s and reset: %w", s.dir, loadErr)
 	}
 	if err := s.openWalLocked(); err != nil {
 		return err
@@ -218,6 +221,15 @@ func (s *FakeIPStore) Ready() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.ready && !s.closed
+}
+
+func (s *FakeIPStore) LoadWarning() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.loadWarn
 }
 
 func (s *FakeIPStore) Prefixes() (active []netip.Prefix, retired []netip.Prefix) {

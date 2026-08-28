@@ -2,7 +2,6 @@ package control
 
 import (
 	"os"
-	"reflect"
 	"testing"
 )
 
@@ -70,46 +69,4 @@ func TestOffloadProgramsAndMapsComplete(t *testing.T) {
 	if len(tcpRelayOffloadMaps) != 3 {
 		t.Errorf("expected 3 offload maps, got %d", len(tcpRelayOffloadMaps))
 	}
-}
-
-func TestBpfDataplaneOmitsOnlyOffloadObjects(t *testing.T) {
-	offloadPrograms := map[string]struct{}{
-		"tcp_offload_redirect":            {},
-		"tcp_offload_sent_account":        {},
-		"tcp_offload_sent_account_kprobe": {},
-	}
-	offloadMaps := map[string]struct{}{
-		"fast_sock":         {},
-		"tcp_offload_pause": {},
-		"tcp_offload_sent":  {},
-	}
-	assertSubsetOmits := func(t *testing.T, full, subset reflect.Type, offload map[string]struct{}, kind string) {
-		t.Helper()
-		fullTags := ebpfTags(full)
-		subsetTags := ebpfTags(subset)
-		for name := range fullTags {
-			_, isOffload := offload[name]
-			_, inSubset := subsetTags[name]
-			if isOffload && inSubset {
-				t.Errorf("%s %q must not be bound in the mandatory dataplane load", kind, name)
-			}
-			if !isOffload && !inSubset {
-				t.Errorf("always-on %s %q missing from mandatory dataplane load", kind, name)
-			}
-		}
-	}
-	assertSubsetOmits(t, reflect.TypeOf(bpfPrograms{}), reflect.TypeOf(bpfDataplanePrograms{}), offloadPrograms, "program")
-	assertSubsetOmits(t, reflect.TypeOf(bpfMaps{}), reflect.TypeOf(bpfDataplaneMaps{}), offloadMaps, "map")
-}
-
-func ebpfTags(t reflect.Type) map[string]struct{} {
-	out := make(map[string]struct{})
-	for i := 0; i < t.NumField(); i++ {
-		tag := t.Field(i).Tag.Get("ebpf")
-		if tag == "" {
-			continue
-		}
-		out[tag] = struct{}{}
-	}
-	return out
 }

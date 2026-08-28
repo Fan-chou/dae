@@ -271,6 +271,63 @@ setup_domain_ambiguous_lan_ingress(struct __sk_buff *skb, __u8 outbound,
 	return ret;
 }
 
+// Dest 198.51.100.20 as used by the domain-routing packet generators.
+static __always_inline int
+put_dest_domain_projection(__u32 slot, __u32 bitmap, __u8 ambiguous)
+{
+	struct routing_epoch_ip ip_key = {};
+	struct domain_routing *projection;
+	__u32 scratch_key = 0;
+
+	if (slot >= ROUTING_EPOCH_SLOT_NUM)
+		return TC_ACT_SHOT;
+	ip_key.slot = slot;
+	ip_key.addr[2] = bpf_htonl(0xffff);
+	ip_key.addr[3] = bpf_htonl(0xc6336414);
+	projection = bpf_map_lookup_elem(&test_domain_routing_scratch_map,
+					 &scratch_key);
+	if (!projection)
+		return TC_ACT_SHOT;
+	__builtin_memset(projection, 0, sizeof(*projection));
+	projection->bitmap[0] = bitmap;
+	projection->ambiguous = ambiguous;
+	return bpf_map_update_elem(&domain_routing_map, &ip_key, projection,
+				   BPF_ANY);
+}
+
+static __always_inline int put_sip_222_lpm(void)
+{
+	struct lpm_key lpm_key = {
+		.prefixlen = 128,
+	};
+	__u32 lpm_value = bpf_ntohl(0x01000000);
+
+	// 192.168.124.222/32 as IPv4-mapped, same layout as source_ipset_match.
+	lpm_key.data[2] = bpf_ntohl(0xffff);
+	lpm_key.data[3] = bpf_ntohl(0xc0a87cde);
+	if (bpf_map_update_elem(&unused_lpm_type, &lpm_key, &lpm_value,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	return 0;
+}
+
+static __always_inline int
+run_lan_ingress_epoch_zero(struct __sk_buff *skb)
+{
+	__u32 zero = 0;
+	__u32 active_slot = 0;
+	int ret;
+
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero, &active_slot,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero, &zero,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
 static __always_inline int
 check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 				__u32 expected_status_code,
@@ -826,7 +883,17 @@ int testpktgen_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 SEC("tc/setup/wan_egress_udp_redirect_track")
 int testsetup_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 {
-	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	struct match_set fallback_rule = {};
+	__u32 rules_len = 1;
+
+	fallback_rule.type = MatchType_Fallback;
+	fallback_rule.outbound = OUTBOUND_USER_DEFINED_MIN;
+	if (bpf_map_update_elem(&routing_map, &zero_key, &fallback_rule,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&routing_meta_map, &zero_key, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
 	bpf_tail_call(skb, &entry_call_map, 0);
 	return TC_ACT_OK;
 }
@@ -1527,6 +1594,159 @@ int testcheck_domain_routing_ambiguous_must_direct(struct __sk_buff *skb)
 		routing_epoch_slot_encode(0));
 }
 
+SEC("tc/pktgen/sip_must_direct_domain_ambiguous")
+int testpktgen_sip_must_direct_domain_ambiguous(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,124,222), IPV4(198,51,100,20),
+			    19233, 80);
+}
+
+SEC("tc/setup/sip_must_direct_domain_ambiguous")
+int testsetup_sip_must_direct_domain_ambiguous(struct __sk_buff *skb)
+{
+	struct match_set sip_rule = {};
+	__u32 rules_len = 2;
+
+	// sip(192.168.124.222) -> must_direct, dest IP is domain-ambiguous.
+	sip_rule.type = MatchType_SourceIpSet;
+	sip_rule.outbound = OUTBOUND_DIRECT;
+	sip_rule.must = 1;
+	if (bpf_map_update_elem(&routing_map, &zero_key, &sip_rule, BPF_ANY))
+		return TC_ACT_SHOT;
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	if (bpf_map_update_elem(&routing_meta_map, &zero_key, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (put_sip_222_lpm())
+		return TC_ACT_SHOT;
+	// Bitmap bit 0 is set so a DomainSet at index 0 would hit; this rule
+	// never evaluates DomainSet, so the flow must stay kernel-direct.
+	if (put_dest_domain_projection(0, 1, 1))
+		return TC_ACT_SHOT;
+	return run_lan_ingress_epoch_zero(skb);
+}
+
+SEC("tc/check/sip_must_direct_domain_ambiguous")
+int testcheck_sip_must_direct_domain_ambiguous(struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+	struct conn_state *conn_state;
+
+	// Kernel direct does not publish routing_handoff; conn_state is enough.
+	if (check_tcp_conn_state_ipv4_tcp(skb, TC_ACT_OK,
+					  IPV4(192,168,124,222),
+					  IPV4(198,51,100,20), 19233, 80,
+					  OUTBOUND_DIRECT, 0, true))
+		return TC_ACT_SHOT;
+	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,124,222));
+	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(198,51,100,20));
+	key.sport = bpf_htons(19233);
+	key.dport = bpf_htons(80);
+	key.l4proto = IPPROTO_TCP;
+	conn_state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!conn_state ||
+	    conn_state->routing_epoch_slot != routing_epoch_slot_encode(0))
+		return TC_ACT_SHOT;
+	if (bpf_map_lookup_elem(&routing_handoff_map, &key))
+		return TC_ACT_SHOT;
+	return TC_ACT_OK;
+}
+
+SEC("tc/pktgen/sip_and_domain_ambiguous")
+int testpktgen_sip_and_domain_ambiguous(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,124,222), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/sip_and_domain_ambiguous")
+int testsetup_sip_and_domain_ambiguous(struct __sk_buff *skb)
+{
+	struct match_set sip_rule = {};
+	struct match_set domain_rule = {};
+	__u32 rules_len = 3;
+
+	sip_rule.type = MatchType_SourceIpSet;
+	sip_rule.outbound = OUTBOUND_LOGICAL_AND;
+	if (bpf_map_update_elem(&routing_map, &zero_key, &sip_rule, BPF_ANY))
+		return TC_ACT_SHOT;
+	domain_rule.type = MatchType_DomainSet;
+	domain_rule.outbound = OUTBOUND_USER_DEFINED_MIN;
+	if (bpf_map_update_elem(&routing_map, &one_key, &domain_rule, BPF_ANY))
+		return TC_ACT_SHOT;
+	{
+		struct match_set fallback_rule = {};
+
+		fallback_rule.type = MatchType_Fallback;
+		fallback_rule.outbound = OUTBOUND_DIRECT;
+		fallback_rule.must = 1;
+		if (bpf_map_update_elem(&routing_map, &two_key, &fallback_rule,
+					BPF_ANY))
+			return TC_ACT_SHOT;
+	}
+	if (bpf_map_update_elem(&routing_meta_map, &zero_key, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (put_sip_222_lpm())
+		return TC_ACT_SHOT;
+	// DomainSet sits at match index 1.
+	if (put_dest_domain_projection(0, 1U << 1, 1))
+		return TC_ACT_SHOT;
+	return run_lan_ingress_epoch_zero(skb);
+}
+
+SEC("tc/check/sip_and_domain_ambiguous")
+int testcheck_sip_and_domain_ambiguous(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,124,222),
+		IPV4(198,51,100,20), 19233, 443,
+		OUTBOUND_CONTROL_PLANE_ROUTING,
+		routing_epoch_slot_encode(0));
+}
+
+SEC("tc/pktgen/not_domain_ambiguous_false_positive")
+int testpktgen_not_domain_ambiguous_false_positive(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/not_domain_ambiguous_false_positive")
+int testsetup_not_domain_ambiguous_false_positive(struct __sk_buff *skb)
+{
+	struct match_set domain_rule = {};
+	__u32 rules_len = 2;
+
+	// !domain(...) -> must_direct; merged bitmap bit is a false positive.
+	domain_rule.type = MatchType_DomainSet;
+	domain_rule.not = 1;
+	domain_rule.outbound = OUTBOUND_DIRECT;
+	domain_rule.must = 1;
+	if (bpf_map_update_elem(&routing_map, &zero_key, &domain_rule,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN + 2, false);
+	if (bpf_map_update_elem(&routing_meta_map, &zero_key, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (put_dest_domain_projection(0, 1, 1))
+		return TC_ACT_SHOT;
+	return run_lan_ingress_epoch_zero(skb);
+}
+
+SEC("tc/check/not_domain_ambiguous_false_positive")
+int testcheck_not_domain_ambiguous_false_positive(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		IPV4(198,51,100,20), 19233, 443,
+		OUTBOUND_CONTROL_PLANE_ROUTING,
+		routing_epoch_slot_encode(0));
+}
+
 SEC("tc/pktgen/lan_ingress_tcp_ipv6_dscp_conn_state")
 int testpktgen_lan_ingress_tcp_ipv6_dscp_conn_state(struct __sk_buff *skb)
 {
@@ -1656,7 +1876,20 @@ int testpktgen_wan_egress_udp_first_fragment_listener(struct __sk_buff *skb)
 SEC("tc/setup/wan_egress_udp_first_fragment_listener")
 int testsetup_wan_egress_udp_first_fragment_listener(struct __sk_buff *skb)
 {
-	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	struct match_set fallback_rule = {};
+	__u32 rules_len = 1;
+
+	// Fallback must occupy slot 0. The Go harness sets routing_meta to 5
+	// and zeroes slots; a leftover DomainSet (type 0) at index 0 would
+	// otherwise run before fallback and steal the verdict.
+	fallback_rule.type = MatchType_Fallback;
+	fallback_rule.outbound = OUTBOUND_USER_DEFINED_MIN;
+	if (bpf_map_update_elem(&routing_map, &zero_key, &fallback_rule,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&routing_meta_map, &zero_key, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
 	bpf_tail_call(skb, &entry_call_map, 0);
 	return TC_ACT_OK;
 }

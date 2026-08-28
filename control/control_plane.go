@@ -2720,8 +2720,14 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// Keep the ControlPlane lifecycle context so shutdown/reload can cancel
 				// in-flight connection handling. Dial timeout is applied independently
 				// inside RouteDialTcp and is not reduced by sniffing time.
+				src := common.ConvergeAddrPort(lconn.RemoteAddr().(*net.TCPAddr).AddrPort())
+				dst := common.ConvergeAddrPort(lconn.LocalAddr().(*net.TCPAddr).AddrPort())
 				if err := c.handleConn(c.ctx, lconn, ownership); err != nil {
-					c.log.Warnln("handleConn:", err)
+					if stderrors.Is(err, ErrUnnamedFakeIP) {
+						c.logUnnamedFakeIP("tcp", src, dst, err)
+					} else {
+						c.log.Warnln("handleConn:", err)
+					}
 				}
 			}(lconn)
 		}
@@ -2742,7 +2748,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 			// Debug:
 			// t := time.Now()
-			if !c.udpIngressAdmission.tryAcquire() {
+			if !c.udpIngressAdmission.tryAcquire(len(pktBuf)) {
 				pktBuf.Put()
 				return
 			}
@@ -2758,6 +2764,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			task.realDst = realDst
 			task.convergeSrc = convergeSrc
 			task.flowDecision = flowDecision
+			task.nbytes = len(pktBuf)
+			task.bindQ = nil
 
 			// Session FIFO now takes precedence for generic UDP forwarding.
 			// Ordered ingress keeps same-flow packets in the order they were read
@@ -2773,7 +2781,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// Rejected: the pool does not own the buffer or the
 				// admission, so release both inline and return the task to the
 				// pool (it was never queued, so Run() will not run).
-				c.udpIngressAdmission.release()
+				c.udpIngressAdmission.release(len(pktBuf))
 				pktBuf.Put()
 				udpIngressTaskPool.Put(task)
 			}

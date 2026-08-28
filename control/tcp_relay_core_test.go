@@ -80,6 +80,36 @@ func TestRelayIdleWatchdogKeepsActiveRelay(t *testing.T) {
 	cancel()
 }
 
+// Default idleTimeout is 0: a fully idle relay must not be reclaimed.
+func TestRelayIdleWatchdogDisabledLeavesIdleRelay(t *testing.T) {
+	l := &blockingMockConn{}
+	r := &blockingMockConn{}
+	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	if rc.idleTimeout != 0 {
+		t.Fatalf("idleTimeout = %s, want 0 (disabled)", rc.idleTimeout)
+	}
+	rc.idleCheckPeriod = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- rc.run(ctx) }()
+
+	time.Sleep(400 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("idle relay was reclaimed with idleTimeout=0: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not return after ctx cancel")
+	}
+}
+
 // activeMockConn produces a steady stream of reads so the relay is never idle.
 type activeMockConn struct {
 	closed atomic.Bool
