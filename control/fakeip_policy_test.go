@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	dnsmessage "github.com/miekg/dns"
 )
@@ -317,4 +318,55 @@ fallback: direct
 	if !ok || ip != got6 {
 		t.Fatalf("packed AAAA = %v, want %v", msg.Answer, got6)
 	}
+}
+
+func TestRewriteMsgSkipsFakeWhenDestCIDRIsDirect(t *testing.T) {
+	store := NewFakeIPStore(t.TempDir(), 8)
+	v4 := netip.MustParsePrefix("198.18.0.0/24")
+	if err := store.Open(v4, netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	m := testFakeIPMatcher(t, `
+domain(suffix: example.com) && ip(203.0.113.0/24) -> CN_CN
+domain(suffix: example.com) -> AI
+fallback: direct
+`, []string{"CN_CN", "AI"})
+	m.fakeIPLeafIsProxy = func(idx consts.OutboundIndex) bool {
+		return idx != consts.OutboundUserDefinedMin
+	}
+	p := NewFakeIPPolicy(config.FakeIP{Enable: true, Ttl: 60}, store, m, nil, 1)
+
+	real := net.ParseIP("203.0.113.1").To4()
+	a := new(dnsmessage.Msg)
+	a.SetQuestion("www.example.com.", dnsmessage.TypeA)
+	a.Response = true
+	a.Rcode = dnsmessage.RcodeSuccess
+	a.Answer = []dnsmessage.RR{&dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{Name: "www.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+		A:   real,
+	}}
+	if err := p.RewriteMsg(a, netip.Addr{}, [6]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Answer) != 1 {
+		t.Fatalf("answers = %v, want real A kept", a.Answer)
+	}
+	ip, ok := dnsAnswerIP(a.Answer[0])
+	if !ok || ip.String() != "203.0.113.1" {
+		t.Fatalf("got %v, want real 203.0.113.1 (CN dest must not FakeIP)", a.Answer)
+	}
+
+	proxy := new(dnsmessage.Msg)
+	proxy.SetQuestion("www.example.com.", dnsmessage.TypeA)
+	proxy.Response = true
+	proxy.Rcode = dnsmessage.RcodeSuccess
+	proxy.Answer = []dnsmessage.RR{&dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{Name: "www.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+		A:   net.ParseIP("198.51.100.1").To4(),
+	}}
+	if err := p.RewriteMsg(proxy, netip.Addr{}, [6]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	mustFakeA(t, proxy, v4)
 }

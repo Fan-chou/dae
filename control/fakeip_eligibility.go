@@ -127,7 +127,7 @@ func (m *RoutingMatcher) fakeIPEvalSip(match compiledRoutingMatch, src netip.Add
 	}
 }
 
-func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, domainBitmap []uint32, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte) (val fakeIPKleene, known bool) {
+func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, domainBitmap []uint32, ipVersion *consts.IpVersionType, src, dest netip.Addr, mac [6]byte) (val fakeIPKleene, known bool) {
 	switch match.matchType {
 	case consts.MatchType_DomainSet:
 		hit := domainBitmap != nil &&
@@ -142,6 +142,14 @@ func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, 
 			return fakeIPKleeneUnknown, true
 		}
 		if *ipVersion&consts.IpVersionType(match.mask) > 0 {
+			return fakeIPKleeneTrue, true
+		}
+		return fakeIPKleeneFalse, true
+	case consts.MatchType_IpSet:
+		if !dest.IsValid() {
+			return fakeIPKleeneUnknown, true
+		}
+		if m.fakeIPLpmHit(match.lpmIndex, fakeIPAddrBin(dest)) {
 			return fakeIPKleeneTrue, true
 		}
 		return fakeIPKleeneFalse, true
@@ -162,14 +170,54 @@ func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, 
 
 // FakeIPEligibility walks traffic routing with Kleene three-value first-match.
 // Rules without domain() are skipped. l4proto/dport/sport are FALSE (continue).
-// DNS sip/mac are evaluated from this query when present; dest ip() stays
-// UNKNOWN. A hit user group follows the live selection leaf: direct/block is
-// DIRECT, a node is PROXY.
+// DNS sip/mac are evaluated from this query when present. dest ip() uses real
+// A/AAAA answers when provided; missing dest stays UNKNOWN. Multiple dests:
+// any PROXY wins, all DIRECT is DIRECT, Direct+Unknown stays UNKNOWN (ShouldFake
+// only fakes PROXY). A hit user group follows the live selection leaf: direct/block
+// is DIRECT, a node is PROXY. Do not call Select() here.
 func (m *RoutingMatcher) FakeIPEligibility(domain string, ipVersion *consts.IpVersionType) FakeIPEligibility {
-	return m.FakeIPEligibilityFor(domain, ipVersion, netip.Addr{}, [6]byte{})
+	return m.FakeIPEligibilityFor(domain, ipVersion, netip.Addr{}, [6]byte{}, nil)
 }
 
-func (m *RoutingMatcher) FakeIPEligibilityFor(domain string, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte) FakeIPEligibility {
+func (m *RoutingMatcher) FakeIPEligibilityFor(domain string, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte, dests []netip.Addr) FakeIPEligibility {
+	var valid []netip.Addr
+	for _, dest := range dests {
+		if dest.IsValid() {
+			valid = append(valid, dest)
+		}
+	}
+	if len(valid) <= 1 {
+		var dest netip.Addr
+		if len(valid) == 1 {
+			dest = valid[0]
+		}
+		return m.fakeIPEligibilityWalk(domain, ipVersion, src, mac, dest)
+	}
+
+	var anyProxy, sawDirect, sawUnknown bool
+	for _, dest := range valid {
+		switch m.fakeIPEligibilityWalk(domain, ipVersion, src, mac, dest) {
+		case FakeIPEligibilityProxy:
+			anyProxy = true
+		case FakeIPEligibilityDirect:
+			sawDirect = true
+		default:
+			sawUnknown = true
+		}
+	}
+	if anyProxy {
+		return FakeIPEligibilityProxy
+	}
+	if sawUnknown {
+		return FakeIPEligibilityUnknown
+	}
+	if sawDirect {
+		return FakeIPEligibilityDirect
+	}
+	return FakeIPEligibilityDirect
+}
+
+func (m *RoutingMatcher) fakeIPEligibilityWalk(domain string, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte, dest netip.Addr) FakeIPEligibility {
 	if m == nil || len(m.compiledMatches) == 0 {
 		return FakeIPEligibilityDirect
 	}
@@ -185,7 +233,7 @@ func (m *RoutingMatcher) FakeIPEligibilityFor(domain string, ipVersion *consts.I
 	subruleHasDomain := false
 
 	for i, match := range matches {
-		raw, _ := m.fakeIPEvalKnown(match, i, domainBitmap, ipVersion, src, mac)
+		raw, _ := m.fakeIPEvalKnown(match, i, domainBitmap, ipVersion, src, dest, mac)
 		subruleVal = fakeIPKleeneOr(subruleVal, raw)
 		if fakeIPMatchIsDomain(match.matchType) {
 			subruleHasDomain = true

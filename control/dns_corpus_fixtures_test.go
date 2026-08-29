@@ -482,15 +482,15 @@ func tcpUdpFallbackFixture() DnsCorpusFixture {
 	}
 }
 
-// tcpUdpBlackholeFallbackFixture pins UDP black-hole fallback: the UDP
-// attempt exhausts its full timeout budget without a response (silent packet
-// loss), and the same request must still succeed over TCP. The TCP fallback
-// gets a fresh per-attempt budget instead of inheriting the request context's
-// shorter deadline, which previously expired before the fallback could run.
+// tcpUdpBlackholeFallbackFixture pins UDP black-hole behaviour under the
+// shared 5s work budget: silent UDP loss exhausts the parent, TCP fallback
+// is not given a fresh 8s, and the request fails instead of stacking 16s.
 func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
+	var udpCalls atomic.Int32
+	var tcpCalls atomic.Int32
 	return DnsCorpusFixture{
 		Name:        "tcp_udp_blackhole_fallback",
-		Description: "UDP black hole (silent drop) still reaches TCP fallback",
+		Description: "UDP black hole exhausts the 5s work budget and does not stack a TCP 8s",
 		BuildConfig: func() *config.Dns {
 			return &config.Dns{
 				Upstream: []config.KeyableString{
@@ -523,16 +523,14 @@ func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
 		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
 			switch dialArg.l4proto {
 			case consts.L4ProtoStr_UDP:
-				// Simulate a silent packet-loss black hole: block until the
-				// attempt budget expires, returning no response.
+				udpCalls.Add(1)
 				return &stubDnsForwarder{forward: func(ctx context.Context, _ []byte) (*dnsmessage.Msg, error) {
 					<-ctx.Done()
 					return nil, ctx.Err()
 				}}, nil
 			case consts.L4ProtoStr_TCP:
+				tcpCalls.Add(1)
 				return &stubDnsForwarder{forward: func(ctx context.Context, _ []byte) (*dnsmessage.Msg, error) {
-					// Real transports fail immediately on an expired context;
-					// the fallback only succeeds with a fresh per-attempt budget.
 					if err := ctx.Err(); err != nil {
 						return nil, err
 					}
@@ -544,20 +542,18 @@ func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
 		},
 		Cases: []DnsCorpusCase{
 			{
-				Name: "udp_blackhole_recovers_via_tcp",
+				Name: "udp_blackhole_does_not_stack_tcp_budget",
 				Query: func() *dnsmessage.Msg {
 					return corpusDnsQuery(0x1006, "tcp-fallback.test.", dnsmessage.TypeA)
 				},
-				Expected: DnsCorpusExpected{
-					HasRcode:       true,
-					Rcode:          dnsmessage.RcodeSuccess,
-					HasAnswerCount: true,
-					AnswerCount:    1,
-					AnswerIPv4:     "198.51.100.53",
-					HasAnswerTTL:   true,
-					AnswerTTLMin:   1,
-					AnswerTTLMax:   60,
-					WireHex:        "1006818000010001000000000c7463702d66616c6c6261636b047465737400000100010c7463702d66616c6c6261636b04746573740000010001000000000004c6336435",
+				ExpectError: true,
+				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
+					if got := udpCalls.Load(); got != 1 {
+						t.Fatalf("UDP forward calls = %d, want 1", got)
+					}
+					if got := tcpCalls.Load(); got != 0 {
+						t.Fatalf("TCP forward calls = %d, want 0 (parent budget exhausted)", got)
+					}
 				},
 			},
 		},

@@ -51,7 +51,7 @@ func (p *FakeIPPolicy) Enabled() bool {
 	return p != nil && p.enabled && p.store != nil && p.store.Ready()
 }
 
-func (p *FakeIPPolicy) ShouldFake(qname string, qtype uint16, src netip.Addr, mac [6]byte) bool {
+func (p *FakeIPPolicy) ShouldFake(qname string, qtype uint16, src netip.Addr, mac [6]byte, dests []netip.Addr) bool {
 	if !p.Enabled() {
 		return false
 	}
@@ -70,7 +70,7 @@ func (p *FakeIPPolicy) ShouldFake(qname string, qtype uint16, src netip.Addr, ma
 		v := consts.IpVersion_6
 		ipVersion = &v
 	}
-	switch p.matcher.FakeIPEligibilityFor(strings.TrimSuffix(qname, "."), ipVersion, src, mac) {
+	switch p.matcher.FakeIPEligibilityFor(strings.TrimSuffix(qname, "."), ipVersion, src, mac, dests) {
 	case FakeIPEligibilityProxy:
 		return true
 	default:
@@ -79,11 +79,14 @@ func (p *FakeIPPolicy) ShouldFake(qname string, qtype uint16, src netip.Addr, ma
 }
 
 func (p *FakeIPPolicy) PackedOrReal(qname string, qtype uint16, realPacked []byte, src netip.Addr, mac [6]byte) ([]byte, error) {
-	if !p.ShouldFake(qname, qtype, src, mac) {
+	if !p.Enabled() {
 		return realPacked, nil
 	}
 	msg := new(dnsmessage.Msg)
-	if err := msg.Unpack(realPacked); err != nil || !p.shouldRewrite(msg, qtype) {
+	if err := msg.Unpack(realPacked); err != nil {
+		return realPacked, nil
+	}
+	if !p.ShouldFake(qname, qtype, src, mac, fakeIPMsgAddrs(msg)) || !p.shouldRewrite(msg, qtype) {
 		return realPacked, nil
 	}
 	return p.packedAnswer(qname, qtype)
@@ -94,7 +97,7 @@ func (p *FakeIPPolicy) RewriteMsg(msg *dnsmessage.Msg, src netip.Addr, mac [6]by
 		return nil
 	}
 	q := msg.Question[0]
-	if !p.ShouldFake(q.Name, q.Qtype, src, mac) {
+	if !p.ShouldFake(q.Name, q.Qtype, src, mac, fakeIPMsgAddrs(msg)) {
 		return nil
 	}
 	if !p.shouldRewrite(msg, q.Qtype) {
@@ -257,6 +260,21 @@ func fakeIPMsgHasIP(msg *dnsmessage.Msg, ipv6 bool) bool {
 		}
 	}
 	return false
+}
+
+func fakeIPMsgAddrs(msg *dnsmessage.Msg) []netip.Addr {
+	if msg == nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, rr := range msg.Answer {
+		ip, ok := dnsAnswerIP(rr)
+		if !ok || !ip.IsValid() {
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
 }
 
 func fakeIPDialRejected(store *FakeIPStore, addr netip.Addr) error {

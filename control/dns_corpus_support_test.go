@@ -55,6 +55,9 @@ type DnsCorpusCase struct {
 	PreState   func(t *testing.T, ctrl *DnsController)
 	PostAssert func(t *testing.T, ctrl *DnsController, response *dnsmessage.Msg)
 	Expected   DnsCorpusExpected
+	// ExpectError means HandleWithResponseWriter_ must fail (no client
+	// response). Used when the shared 5s work budget is exhausted.
+	ExpectError bool
 }
 
 // DnsCorpusExpected describes the observable response shape. HasRcode and
@@ -152,7 +155,17 @@ func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 			if query == nil {
 				t.Fatalf("%s: nil Query in case %s", fixture.Name, tc.Name)
 			}
-			if err := ctrl.HandleWithResponseWriter_(context.Background(), query, req, writer); err != nil {
+			err := ctrl.HandleWithResponseWriter_(context.Background(), query, req, writer)
+			if tc.ExpectError {
+				if err == nil {
+					t.Fatalf("HandleWithResponseWriter_ succeeded, want error")
+				}
+				if tc.PostAssert != nil {
+					tc.PostAssert(t, ctrl, writer.Message())
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("HandleWithResponseWriter_ error = %v", err)
 			}
 			msg := writer.Message()

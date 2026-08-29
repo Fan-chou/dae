@@ -475,7 +475,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		waitMs := int(tcpOffloadEpollWaitCap.Milliseconds())
-		if !firstClose.IsZero() {
+		if !firstClose.IsZero() && relayHalfCloseTimeout > 0 {
 			remaining := relayHalfCloseTimeout - time.Since(firstClose)
 			if remaining <= 0 {
 				s.forceClose()
@@ -511,7 +511,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 					}
 				}
 			}
-			if !firstClose.IsZero() && time.Since(firstClose) >= relayHalfCloseTimeout {
+			if halfCloseForceClose(firstClose, relayHalfCloseTimeout, time.Now()) {
 				s.forceClose()
 				return 0, 0, nil
 			}

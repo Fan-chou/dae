@@ -526,7 +526,7 @@ func (c *DnsController) dialSend(
 		if len(respMsg.Question) > 0 {
 			q := respMsg.Question[0]
 			src, mac := fakeIPClientFromReq(req)
-			if policy := c.fakeIPPolicy(); policy != nil && policy.ShouldFake(q.Name, q.Qtype, src, mac) {
+			if policy := c.fakeIPPolicy(); policy != nil && policy.ShouldFake(q.Name, q.Qtype, src, mac, fakeIPMsgAddrs(respMsg)) {
 				fakeNow = true
 			}
 		}

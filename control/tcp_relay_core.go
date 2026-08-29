@@ -16,7 +16,12 @@ import (
 )
 
 const (
-	relayHalfCloseTimeout = 10 * time.Second
+	// relayHalfCloseTimeout bounds how long a half-closed TCP relay waits
+	// for the peer after CloseWrite. 0 disables the bound: production must
+	// not cut a server that still has data to send tens of seconds after the
+	// client finished. Reload still cancels via ctx. Tests may set
+	// halfCloseTimeout > 0 on a relayCore.
+	relayHalfCloseTimeout = time.Duration(0)
 	// relayIdleTimeout is the optional application-idle bound used only when
 	// a relayCore sets idleTimeout > 0 (tests). Production idleTimeout is 0:
 	// vanished TCP peers are reaped by kernel keepalive, not this watchdog.
@@ -168,9 +173,9 @@ func (c *relayCore) run(ctx context.Context) error {
 			// unblock pending reads/writes in the peer direction.
 			cancel()
 			forceClose()
-		} else {
-			// Graceful half-close: bound the peer's pending read on dir.dst
-			// (which is the source of the opposite direction).
+		} else if c.halfCloseTimeout > 0 {
+			// Test-only half-close bound. Production halfCloseTimeout is 0:
+			// do not SetReadDeadline after CloseWrite.
 			_ = dir.dst.SetReadDeadline(time.Now().Add(c.halfCloseTimeout))
 		}
 
@@ -196,6 +201,16 @@ func (c *relayCore) run(ctx context.Context) error {
 	first := <-results
 	second := <-results
 	return mergeRelayErrors(first.err, second.err)
+}
+
+// halfCloseForceClose reports whether a one-sided TCP close has waited
+// long enough to force-close the peer. timeout <= 0 disables the bound so
+// production Go relay and sockmap keep reading until FIN/RST or ctx cancel.
+func halfCloseForceClose(firstClose time.Time, timeout time.Duration, now time.Time) bool {
+	if timeout <= 0 || firstClose.IsZero() {
+		return false
+	}
+	return !now.Before(firstClose.Add(timeout))
 }
 
 // mergeRelayErrors combines errors from both relay directions.

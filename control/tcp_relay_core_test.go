@@ -222,3 +222,202 @@ func TestRelayWatchdogSurvivesCtxCancel(t *testing.T) {
 		t.Fatal("relay leaked: run() did not return after ctx cancel + delayed Read release")
 	}
 }
+
+func TestRelayProductionHalfCloseTimeoutIsZero(t *testing.T) {
+	rc := newRelayCore(&blockingMockConn{}, &blockingMockConn{}, defaultRelayCopyEngine{}, nil, nil)
+	if rc.halfCloseTimeout != 0 {
+		t.Fatalf("halfCloseTimeout = %s, want 0 (disabled in production)", rc.halfCloseTimeout)
+	}
+	if relayHalfCloseTimeout != 0 {
+		t.Fatalf("relayHalfCloseTimeout = %s, want 0 (sockmap must not 10s force-close)", relayHalfCloseTimeout)
+	}
+}
+
+func TestHalfCloseForceCloseDisabled(t *testing.T) {
+	now := time.Now()
+	first := now.Add(-20 * time.Second)
+	if halfCloseForceClose(first, 0, now) {
+		t.Fatal("timeout 0 must never force-close")
+	}
+	if !halfCloseForceClose(first, 10*time.Second, now) {
+		t.Fatal("timeout 10s after 20s must force-close")
+	}
+	if halfCloseForceClose(time.Time{}, 10*time.Second, now) {
+		t.Fatal("zero firstClose must not force-close")
+	}
+}
+
+type eofOnceThenBlockConn struct {
+	blockingMockConn
+	eofOnce atomic.Bool
+}
+
+func (m *eofOnceThenBlockConn) Read(b []byte) (int, error) {
+	if m.eofOnce.CompareAndSwap(false, true) {
+		return 0, io.EOF
+	}
+	return m.blockingMockConn.Read(b)
+}
+
+type deadlineWatchConn struct {
+	blockingMockConn
+	deadlines atomic.Int32
+}
+
+func (m *deadlineWatchConn) SetReadDeadline(t time.Time) error {
+	if !t.IsZero() {
+		m.deadlines.Add(1)
+	}
+	return nil
+}
+
+func TestRelayHalfCloseDisabledDoesNotSetReadDeadline(t *testing.T) {
+	left := &eofOnceThenBlockConn{}
+	right := &deadlineWatchConn{}
+	rc := newRelayCore(left, right, defaultRelayCopyEngine{}, nil, nil)
+	if rc.halfCloseTimeout != 0 {
+		t.Fatalf("halfCloseTimeout = %s, want 0", rc.halfCloseTimeout)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- rc.run(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	if got := right.deadlines.Load(); got != 0 {
+		t.Fatalf("SetReadDeadline called %d times after CloseWrite, want 0", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not return after ctx cancel")
+	}
+}
+
+type netproxyTCPConn struct {
+	*net.TCPConn
+}
+
+func (c *netproxyTCPConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	n, err := c.TCPConn.Read(p)
+	return n, netip.AddrPort{}, err
+}
+
+func (c *netproxyTCPConn) WriteTo(p []byte, addr string) (int, error) {
+	return c.TCPConn.Write(p)
+}
+
+func TestRelayHalfCloseDisabledDeliversDelayedPeerWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 20s half-close delivery test in short mode")
+	}
+
+	clientLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientLn.Close()
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverLn.Close()
+
+	leftCh := make(chan *net.TCPConn, 1)
+	go func() {
+		c, accErr := clientLn.Accept()
+		if accErr != nil {
+			leftCh <- nil
+			return
+		}
+		leftCh <- c.(*net.TCPConn)
+	}()
+	serverCh := make(chan *net.TCPConn, 1)
+	go func() {
+		c, accErr := serverLn.Accept()
+		if accErr != nil {
+			serverCh <- nil
+			return
+		}
+		serverCh <- c.(*net.TCPConn)
+	}()
+
+	appClient, err := net.Dial("tcp", clientLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer appClient.Close()
+	relayRightRaw, err := net.Dial("tcp", serverLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayRightRaw.Close()
+
+	relayLeft := <-leftCh
+	if relayLeft == nil {
+		t.Fatal("accept left")
+	}
+	defer relayLeft.Close()
+	appServer := <-serverCh
+	if appServer == nil {
+		t.Fatal("accept server")
+	}
+	defer appServer.Close()
+
+	rc := newRelayCore(
+		&netproxyTCPConn{TCPConn: relayLeft},
+		&netproxyTCPConn{TCPConn: relayRightRaw.(*net.TCPConn)},
+		defaultRelayCopyEngine{},
+		nil,
+		nil,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- rc.run(ctx) }()
+
+	if _, err := appClient.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	if err := appClient.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make([]byte, 4)
+	if err := appServer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(appServer, got); err != nil {
+		t.Fatalf("server did not receive request: %v", err)
+	}
+	if string(got) != "ping" {
+		t.Fatalf("server got %q, want ping", got)
+	}
+
+	time.Sleep(20 * time.Second)
+	if _, err := appServer.Write([]byte("pong")); err != nil {
+		t.Fatal(err)
+	}
+	if err := appServer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := appClient.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 4)
+	if _, err := io.ReadFull(appClient, resp); err != nil {
+		t.Fatalf("client did not receive delayed response after CloseWrite: %v", err)
+	}
+	if string(resp) != "pong" {
+		t.Fatalf("client got %q, want pong", resp)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not return")
+	}
+}

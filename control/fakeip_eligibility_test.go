@@ -66,6 +66,61 @@ fallback: direct
 	}
 }
 
+func TestFakeIPEligibility_DomainAndIPCidrWithDestIsProxy(t *testing.T) {
+	m := testFakeIPMatcher(t, `
+domain(suffix: example.com) && ip(203.0.113.0/24) -> AI
+fallback: direct
+`, []string{"AI"})
+	dest := netip.MustParseAddr("203.0.113.1")
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{dest}); got != FakeIPEligibilityProxy {
+		t.Fatalf("got %v, want PROXY (real dest hits the CIDR)", got)
+	}
+	miss := netip.MustParseAddr("198.51.100.1")
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{miss}); got != FakeIPEligibilityDirect {
+		t.Fatalf("got %v, want DIRECT (dest misses CIDR, fallback direct)", got)
+	}
+}
+
+func TestFakeIPEligibility_CNDestIsDirectAnyProxyWins(t *testing.T) {
+	m := testFakeIPMatcher(t, `
+domain(suffix: example.com) && ip(203.0.113.0/24) -> CN_CN
+domain(suffix: example.com) -> AI
+fallback: direct
+`, []string{"CN_CN", "AI"})
+	m.fakeIPLeafIsProxy = func(idx consts.OutboundIndex) bool {
+		return idx != consts.OutboundUserDefinedMin
+	}
+	cn := netip.MustParseAddr("203.0.113.1")
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{cn}); got != FakeIPEligibilityDirect {
+		t.Fatalf("got %v, want DIRECT (CN_CN leaf is direct)", got)
+	}
+	proxyIP := netip.MustParseAddr("198.51.100.1")
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{proxyIP}); got != FakeIPEligibilityProxy {
+		t.Fatalf("got %v, want PROXY (dest misses CN CIDR, domain-only AI is a node)", got)
+	}
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{cn, proxyIP}); got != FakeIPEligibilityProxy {
+		t.Fatalf("got %v, want PROXY (any dest that routes to a node)", got)
+	}
+}
+
+func TestFakeIPEligibility_DirectAndUnknownIsUnknown(t *testing.T) {
+	m := testFakeIPMatcher(t, `
+domain(suffix: example.com) && ip(203.0.113.0/24) && dscp(0x10) -> AI
+fallback: direct
+`, []string{"AI"})
+	miss := netip.MustParseAddr("198.51.100.1")
+	hit := netip.MustParseAddr("203.0.113.1")
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{miss}); got != FakeIPEligibilityDirect {
+		t.Fatalf("got %v, want DIRECT (dest misses CIDR)", got)
+	}
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{hit}); got != FakeIPEligibilityUnknown {
+		t.Fatalf("got %v, want UNKNOWN (dscp stays unknown at DNS time)", got)
+	}
+	if got := m.FakeIPEligibilityFor("www.example.com", ipv4Ver(), netip.Addr{}, [6]byte{}, []netip.Addr{miss, hit}); got != FakeIPEligibilityUnknown {
+		t.Fatalf("got %v, want UNKNOWN (Direct+Unknown must not FakeIP)", got)
+	}
+}
+
 func TestFakeIPEligibility_DomainAndUDPThenDomainIsProxy(t *testing.T) {
 	m := testFakeIPMatcher(t, `
 domain(suffix: openai.com) && l4proto(udp) && dport(443) -> block
@@ -95,11 +150,11 @@ domain(suffix: openai.com) -> direct
 fallback: Apple_Proxy
 `, []string{"AI", "Apple_Proxy"})
 	src := netip.MustParseAddr("192.0.2.1")
-	if got := m.FakeIPEligibilityFor("api.openai.com", ipv4Ver(), src, [6]byte{}); got != FakeIPEligibilityProxy {
+	if got := m.FakeIPEligibilityFor("api.openai.com", ipv4Ver(), src, [6]byte{}, nil); got != FakeIPEligibilityProxy {
 		t.Fatalf("got %v, want PROXY (DNS sip proves the rule)", got)
 	}
 	other := netip.MustParseAddr("192.0.2.8")
-	if got := m.FakeIPEligibilityFor("api.openai.com", ipv4Ver(), other, [6]byte{}); got != FakeIPEligibilityDirect {
+	if got := m.FakeIPEligibilityFor("api.openai.com", ipv4Ver(), other, [6]byte{}, nil); got != FakeIPEligibilityDirect {
 		t.Fatalf("got %v, want DIRECT (other sip misses, domain-only is direct)", got)
 	}
 }
@@ -111,11 +166,11 @@ domain(suffix: apple.com) -> Apple_Apple
 fallback: direct
 `, []string{"Cherry_Apple", "Apple_Apple"})
 	from202 := netip.MustParseAddr("192.168.124.202")
-	if got := m.FakeIPEligibilityFor("init.itunes.apple.com", ipv4Ver(), from202, [6]byte{}); got != FakeIPEligibilityProxy {
+	if got := m.FakeIPEligibilityFor("init.itunes.apple.com", ipv4Ver(), from202, [6]byte{}, nil); got != FakeIPEligibilityProxy {
 		t.Fatalf("got %v, want PROXY (match_mac CIDR still matches DNS sip)", got)
 	}
 	from220 := netip.MustParseAddr("192.168.124.220")
-	if got := m.FakeIPEligibilityFor("init.itunes.apple.com", ipv4Ver(), from220, [6]byte{}); got != FakeIPEligibilityProxy {
+	if got := m.FakeIPEligibilityFor("init.itunes.apple.com", ipv4Ver(), from220, [6]byte{}, nil); got != FakeIPEligibilityProxy {
 		t.Fatalf("got %v, want PROXY (miss 202, later domain-only Apple_Apple is still a node)", got)
 	}
 }

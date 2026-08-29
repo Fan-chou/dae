@@ -51,6 +51,17 @@ func (c *DnsController) newWorkContext(timeout time.Duration) (context.Context, 
 	return context.WithTimeout(c.baseContext(), timeout)
 }
 
+// childTimeout caps an attempt at max without stripping the parent deadline
+// or cancel. context.WithTimeout already takes the earlier of parent remaining
+// and max; a cancelled parent stays cancelled so reload/shutdown can stop
+// in-flight DNS instead of starting a fresh 8s budget.
+func childTimeout(parent context.Context, max time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, max)
+}
+
 func (c *DnsController) forwardWithFallback(
 	ctx context.Context, // Request-scoped context from dialSend/handler
 	req *udpRequest,
@@ -58,12 +69,10 @@ func (c *DnsController) forwardWithFallback(
 	primaryDialArg *dialArgument,
 	data []byte,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
-	// Per-attempt timeout: each attempt gets the full DefaultDialTimeout budget.
-	// WithoutCancel strips the parent (singleflight work context) deadline, which
-	// is shorter than DefaultDialTimeout; otherwise a UDP black-hole timeout would
-	// exhaust the parent context and the TCP fallback would start already expired.
-	attemptCtx := context.WithoutCancel(ctx)
-	primaryCtx, primaryCancel := context.WithTimeout(attemptCtx, consts.DefaultDialTimeout)
+	// UDP and TCP share the parent work budget (typically 5s, itself bound
+	// to lifecycleCtx). Do not WithoutCancel: a UDP black hole must not get
+	// a fresh 8s, and TCP fallback must not stack another 8s after that.
+	primaryCtx, primaryCancel := childTimeout(ctx, consts.DefaultDialTimeout)
 	defer primaryCancel()
 
 	respMsg, err = c.forwardWithDialArg(primaryCtx, upstream, primaryDialArg, data)
@@ -74,8 +83,12 @@ func (c *DnsController) forwardWithFallback(
 	primaryErr := err
 
 	// For tcp+udp upstream, perform immediate same-request fallback:
-	// prefer UDP, fallback to TCP on failure.
+	// prefer UDP, fallback to TCP on failure. Remaining parent time is
+	// shared; an already-expired parent skips the second attempt.
 	if upstream == nil || upstream.Scheme != dns.UpstreamScheme_TCP_UDP || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
+		return nil, primaryDialArg, primaryErr
+	}
+	if ctx.Err() != nil {
 		return nil, primaryDialArg, primaryErr
 	}
 
@@ -98,7 +111,7 @@ func (c *DnsController) forwardWithFallback(
 		}).Debugln("DNS fallback to TCP after UDP failure")
 	}
 
-	fallbackCtx, fallbackCancel := context.WithTimeout(attemptCtx, consts.DefaultDialTimeout)
+	fallbackCtx, fallbackCancel := childTimeout(ctx, consts.DefaultDialTimeout)
 	defer fallbackCancel()
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
