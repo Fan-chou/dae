@@ -1363,7 +1363,7 @@ func (g *DialerGroup) selectWithExclusionResultCore(networkType *dialer.NetworkT
 	if !strictIpVersion && errors.Is(err, ErrNoAliveDialer) {
 		nt := *networkType
 		nt.IpVersion = (consts.IpVersion_X - networkType.IpVersion.ToIpVersionType()).ToIpVersionStr()
-		return g._select(&nt, state, policy, skip)
+		d, latency, selectedNetworkType, stable, err = g._select(&nt, state, policy, skip)
 	}
 	if err == nil {
 		return d, latency, selectedNetworkType, stable, nil
