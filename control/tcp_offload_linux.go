@@ -119,11 +119,6 @@ type tcpRelayOffloadSession struct {
 
 	forceCloseOnce sync.Once
 	closeOnce      sync.Once
-
-	// epollArmed is true while both fds are in the session epoll set.
-	// Run is the only writer, so a plain bool is enough. Fuse recovery
-	// must not EPOLL_CTL_ADD an already-armed fd (EEXIST is not fatal).
-	epollArmed bool
 }
 
 func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64)) (offloaded bool, reason string, err error) {
@@ -419,45 +414,14 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 	}
 	defer func() { _ = unix.Close(epfd) }()
 
-	fds := []struct {
-		fd    int
-		index int32
-	}{
-		{fd: s.leftFD, index: 0},
-		{fd: s.rightFD, index: 1},
-	}
-	addFds := func() error {
-		if s.epollArmed {
-			return nil
-		}
-		for _, reg := range fds {
-			event := &unix.EpollEvent{
-				Events: unix.EPOLLRDHUP | unix.EPOLLHUP | unix.EPOLLERR | unix.EPOLLIN,
-				Fd:     reg.index,
-			}
-			if err := epollCtlAddIgnoreExist(epfd, reg.fd, event); err != nil {
-				return fmt.Errorf("epoll_ctl add fd %d: %w", reg.fd, err)
-			}
-		}
-		s.epollArmed = true
-		return nil
-	}
-	delFds := func() {
-		if !s.epollArmed {
-			return
-		}
-		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.leftFD, nil)
-		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.rightFD, nil)
-		s.epollArmed = false
-	}
-	if err := addFds(); err != nil {
+	poller := tcpOffloadPoller{epfd: epfd, fds: [2]int{s.leftFD, s.rightFD}}
+	if err := poller.arm(); err != nil {
 		s.forceClose()
 		return 0, 0, err
 	}
 
 	var (
 		events       [2]unix.EpollEvent
-		closedMask   uint8
 		firstClose   time.Time
 		lastProgress = time.Now()
 		lastPoll     = time.Now()
@@ -489,10 +453,13 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 				// Drop the fds from epoll while the kernel drains the
 				// already-redirected skbs; level-triggered IN would
 				// busy-loop otherwise.
-				delFds()
+				if err := poller.disarm(); err != nil {
+					s.forceClose()
+					return 0, 0, err
+				}
 			} else if lift || (!s.fuseDrainUntil.IsZero() && time.Now().After(s.fuseDrainUntil)) {
 				s.fuseDrainUntil = time.Time{}
-				if err := addFds(); err != nil {
+				if err := poller.arm(); err != nil {
 					s.forceClose()
 					return 0, 0, err
 				}
@@ -544,40 +511,34 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		for i := 0; i < n; i++ {
-			if events[i].Events&unix.EPOLLIN != 0 {
-				// SK_PASS fallback: the verdict program passes data through
-				// while the backlog fuse is engaged, so data sits in the
-				// kernel receive queue and must be forwarded from
-				// userspace. tcp_info receive counters already cover these
-				// bytes for final accounting.
-				closed, err := s.relayPassData(events[i].Fd, &lastProgress)
-				if closed {
-					switch events[i].Fd {
-					case 0:
-						closedMask |= 1
-					case 1:
-						closedMask |= 2
-					}
-				}
-				if err != nil {
-					s.forceClose()
-					return 0, 0, fmt.Errorf("relay pass data: %w", err)
-				}
-			}
-			if events[i].Events&(unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) == 0 {
+			index := events[i].Fd
+			if poller.closed&(1<<uint(index)) != 0 {
 				continue
 			}
-			switch events[i].Fd {
-			case 0:
-				closedMask |= 1
-			case 1:
-				closedMask |= 2
+			// RDHUP can arrive with more than one buffer of queued data.
+			// Keep reading until EOF, rather than retiring on the event flag.
+			if events[i].Events&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) == 0 {
+				continue
+			}
+			closed, err := s.relayPassData(index, &lastProgress)
+			if err != nil {
+				s.forceClose()
+				return 0, 0, fmt.Errorf("relay pass data: %w", err)
+			}
+			if closed {
+				// EOF remains level-triggered forever. Remove only this read
+				// watcher; the socket still receives writes from its peer.
+				if err := poller.closeRead(index); err != nil {
+					s.forceClose()
+					return 0, 0, err
+				}
 			}
 		}
-		if closedMask == 0x3 {
+
+		if poller.closed == 0x3 {
 			return 0, 0, nil
 		}
-		if firstClose.IsZero() && closedMask != 0 {
+		if firstClose.IsZero() && poller.closed != 0 {
 			firstClose = time.Now()
 		}
 	}
@@ -608,19 +569,20 @@ func (s *tcpRelayOffloadSession) relayPassData(index int32, lastProgress *time.T
 		return false, nil // transiently empty; level-triggered epoll re-reports
 	}
 	if n > 0 {
-		if _, werr := dst.Write(buf[:n]); werr != nil {
-			if errors.Is(werr, syscall.EPIPE) || errors.Is(werr, syscall.ECONNRESET) {
-				return true, nil
-			}
+		written, werr := dst.Write(buf[:n])
+		if werr != nil {
 			return false, werr
+		}
+		if written != n {
+			return false, io.ErrShortWrite
 		}
 		s.fusePassBytes += uint64(n)
 		*lastProgress = time.Now()
 	}
 	if err != nil {
-		// Close races surface as read failures on the fallback path; the
-		// half-close bookkeeping below owns that teardown.
-		if errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		// Only EOF is an orderly read-half close. Reset/write failures must
+		// terminate the session instead of retiring the wrong direction.
+		if errors.Is(err, io.EOF) {
 			return true, nil
 		}
 		return false, err
