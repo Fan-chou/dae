@@ -543,16 +543,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.minLatency.dialer = dialer
 			a.minLatency.sortingLatency = sortingLatency
 		}
-		if wasNoAliveDialer && a.minLatency.dialer != nil {
-			// Not alive -> alive: mirror the has-latency branch above so the
-			// group-level callback (which drives the kernel outbound
-			// connectivity map) learns about traffic-driven revival. Without
-			// this, a revived data-UDP domain leaves the map at 0 and the
-			// kernel keeps dropping new flows routed to this group.
-			a.mu.Unlock()
-			a.aliveChangeCallback(true)
-			a.mu.Lock()
-		}
+
 		if a.log.IsLevelEnabled(logrus.InfoLevel) {
 			a.log.WithFields(logrus.Fields{
 				"group":   a.dialerGroupName,

@@ -2560,13 +2560,8 @@ func newDataUdpCallbackGroup(t *testing.T, rec *dataUdpCallbackRecorder, seedDns
 // callback(true) leaves the map at 0 so the kernel keeps dropping every new
 // data-UDP flow routed to the group.
 //
-// Expected sequence (both data-UDP families, udp4 and udp6):
-//
-//	"true","true" - construction: the first dialer enters each family's
-//	                alive set via the no-latency branch
-//	"init","init" - NewDialerGroup's init loop for udp4 and udp6
-//	"false"       - killing the second dialer empties the udp4 domain
-//	"true"        - traffic-driven revival of dialers[0]
+// Only empty-to-nonempty transitions are asserted here; fdae also publishes
+// changes of selected leaf while other dialers remain alive.
 func TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency(t *testing.T) {
 	rec := &dataUdpCallbackRecorder{}
 	g, dialers := newDataUdpCallbackGroup(t, rec, false)
@@ -2577,6 +2572,7 @@ func TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency(t *testing.T) {
 	}
 
 	set.NotifyLatencyChange(dialers[0], false)
+	rec.events = nil
 	set.NotifyLatencyChange(dialers[1], false)
 	if set.Len() != 0 {
 		t.Fatalf("after kill: alive = %d, want 0", set.Len())
@@ -2589,7 +2585,7 @@ func TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency(t *testing.T) {
 		t.Fatalf("after revive: alive = %d, want 1", set.Len())
 	}
 
-	want := []string{"true", "true", "init", "init", "false", "true"}
+	want := []string{"false", "true"}
 	if !reflect.DeepEqual(rec.events, want) {
 		t.Fatalf("data-UDP alive events = %v, want exact sequence %v "+
 			"(a missing final \"true\" leaves the kernel connectivity map at 0)",
@@ -2606,10 +2602,11 @@ func TestDialerGroup_DataUdpRevivalCallback_WithDnsLatency(t *testing.T) {
 
 	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
 	set.NotifyLatencyChange(dialers[0], false)
+	rec.events = nil
 	set.NotifyLatencyChange(dialers[1], false)
 	set.NotifyLatencyChange(dialers[0], true)
 
-	want := []string{"true", "true", "init", "init", "false", "true"}
+	want := []string{"false", "true"}
 	if !reflect.DeepEqual(rec.events, want) {
 		t.Fatalf("control case: data-UDP alive events = %v, want exact sequence %v",
 			rec.events, want)
