@@ -2,6 +2,19 @@
 
 本轮在 `tmp/upstream-sync/{dae,outbound,quic-go}` 三个独立仓库的 `sync/kdae-20260905` 分支完成本地集成。没有推送，没有访问 192.168.124.223。原工作目录中的用户改动不纳入、不覆盖。
 
+
+## 后续发布与工作区合并（2026-09-06）
+
+以下覆盖本文此前“未推送、只在集成目录”的阶段性状态：
+
+- 经用户明确授权，已推送 `Fan-chou/quic-go` 的 `sync/kdae-20260905`，提交 `fbf90cb0a47d2143d85ecd05e9e329a3e9210e5b`。
+- 已推送 `Fan-chou/outbound` 的同名分支，提交 `7924dc9e33741422d4c501d37add61a33dd1b80d`；其 go.mod 固定上述远端 quic-go，不含本地 replace。
+- 集成提交 `79362d29` 已快进合回当前工作区 fdae。原有 config/desc.go 和 OpenWrt 示例中的 pprof 未提交改动保留。
+- 按用户要求撤回中间的本地路径提交 `38ea20ca`，最终工作区直接固定两个已发布的 Fan-chou fork 版本，不再依赖 tmp 集成目录。
+- outbound 固定版本：`v0.0.0-sticky-ip.0.20260905155845-7924dc9e3374`。
+- quic-go 固定版本：`v0.0.0-20260831031827-fbf90cb0a47d`。
+- 已验证远端模块可下载，outbound 使用远端 quic-go 的 HY2/TUIC/AnyTLS 测试通过。fdae 没有推送，223 没有访问或修改。
+
 ## 固定版本及历史处理
 
 - dae 从 fdae `4002f708` 开始；上游目标 `fb840869`。历史 squash 对照基准 `cda30d78`，不是 Git 共同祖先。

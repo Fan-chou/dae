@@ -8,7 +8,7 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260826103900-082691dabd12
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260905155845-7924dc9e3374
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -114,12 +114,11 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Local sync candidate: quic-go fbf90cb0, descended from fdae pin 8cfce08b.
-// Replace with a published fork pin only after explicit push approval.
-replace github.com/olicesx/quic-go => ../quic-go
+// Published Fan-chou sync: quic-go fbf90cb0, descended from fdae pin 8cfce08b.
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d
 
 //replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
-// Local outbound merge retains fdae reply identity and interleaved defrag.
-replace github.com/daeuniverse/outbound => ../outbound
+// Published outbound merge retains fdae reply identity and interleaved defrag.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260905155845-7924dc9e3374
