@@ -58,7 +58,13 @@ type Global struct {
 	AdminListen string `mapstructure:"admin_listen"`
 	// AdminSecret is the Bearer token required by the management API.
 	// The API stays disabled when this is empty, even if admin_listen is set.
-	AdminSecret         string        `mapstructure:"admin_secret"`
+	AdminSecret string `mapstructure:"admin_secret"`
+	// AutoSniffPunt injects kernel-space-only sniff-punt lines for
+	// device-scoped whitelist shapes (selector && domain -> group with a
+	// later selector -> direct/block fallback) so the whitelist still
+	// applies when the client's DNS bypasses dae. Requires sniffing to be
+	// enabled (sniffing_timeout > 0 and dial_mode != ip).
+	AutoSniffPunt       bool          `mapstructure:"auto_sniff_punt" default:"false"`
 	Mptcp               bool          `mapstructure:"mptcp" default:"false"`
 	BootstrapResolver   string        `mapstructure:"bootstrap_resolver"`
 	FallbackResolver    string        `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
@@ -92,17 +98,6 @@ func ParseFunctionOrString(fs FunctionOrString) (*config_parser.Function, error)
 	}
 }
 
-// FunctionOrStringToFunction converts a function-or-string config value into a
-// function. It preserves the historical panic-on-invalid-input API for external
-// callers; new internal call sites should use ParseFunctionOrString.
-func FunctionOrStringToFunction(fs FunctionOrString) *config_parser.Function {
-	f, err := ParseFunctionOrString(fs)
-	if err != nil {
-		panic(err)
-	}
-	return f
-}
-
 type FunctionListOrString any
 
 // ParseFunctionListOrString converts a config value that may be either a string
@@ -118,18 +113,6 @@ func ParseFunctionListOrString(fs FunctionListOrString) ([]*config_parser.Functi
 	default:
 		return nil, fmt.Errorf("unsupported function-list-or-string value type: %T", fs)
 	}
-}
-
-// FunctionListOrStringToFunctionList converts a function-list-or-string config
-// value into a function list. It preserves the historical panic-on-invalid-input
-// API for external callers; new internal call sites should use
-// ParseFunctionListOrString.
-func FunctionListOrStringToFunctionList(fs FunctionListOrString) []*config_parser.Function {
-	f, err := ParseFunctionListOrString(fs)
-	if err != nil {
-		panic(err)
-	}
-	return f
 }
 
 type Group struct {

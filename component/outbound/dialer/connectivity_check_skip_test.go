@@ -32,10 +32,10 @@ func udp6DnsNetworkType() *NetworkType {
 }
 
 func TestParseTcpCheckOption_V4OnlyPinnedIPsOmitIp6(t *testing.T) {
-	opt, err := ParseTcpCheckOption(context.Background(), []string{
+	opt, err := parseTcpCheckOption(context.Background(), []string{
 		"http://cp.cloudflare.com/generate_204",
 		"1.1.1.1",
-	}, "HEAD", "udp")
+	}, "HEAD", "udp", nil, nil)
 	if err != nil {
 		t.Fatalf("ParseTcpCheckOption() error = %v", err)
 	}

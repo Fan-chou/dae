@@ -111,6 +111,7 @@ type Dialer struct {
 	httpClients  map[string]*http.Client
 	httpClientMu sync.Mutex
 
+	// failCount is guarded by collectionFineMu (markUnavailableInternal/markAvailable/RestoreHealthSnapshot).
 	failCount        [8]int
 	trafficFailCount [8]atomic.Int32
 
@@ -197,17 +198,32 @@ type NodeHealthSlotSnapshot struct {
 	Degraded            bool
 }
 
+// SystemDNSResolver provides generation-scoped bootstrap DNS state.
+type SystemDNSResolver interface {
+	SystemDNS() (netip.AddrPort, error)
+	TryUpdateElapse(time.Duration) error
+}
+
 type GlobalOption struct {
 	D.ExtraOption
-	Log               *logrus.Logger
-	DaeDNS            *daedns.Router
-	TcpCheckOptionRaw TcpCheckOptionRaw // Lazy parse
-	CheckDnsOptionRaw CheckDnsOptionRaw // Lazy parse
-	CheckInterval     time.Duration
-	CheckTolerance    time.Duration
-	CheckDnsTcp       bool
-	SoMarkFromDae     uint32
-	Mptcp             bool
+	Log *logrus.Logger
+	// DaeDNS optionally wraps node dialers for dae-DNS-backed resolution.
+	// It is nulled by retireForEstablishedFlows (under metadataMu) when the
+	// owning generation retires. Readers such as the dialer registration path
+	// access it without metadataMu; that is safe because retirement strictly
+	// post-dates dialer construction, so a reader either sees the live router
+	// or has already finished constructing against it.
+	DaeDNS               *daedns.Router
+	DirectDialer         netproxy.Dialer
+	FullconeDirectDialer netproxy.Dialer
+	SystemDNSResolver    SystemDNSResolver
+	TcpCheckOptionRaw    TcpCheckOptionRaw // Lazy parse
+	CheckDnsOptionRaw    CheckDnsOptionRaw // Lazy parse
+	CheckInterval        time.Duration
+	CheckTolerance       time.Duration
+	CheckDnsTcp          bool
+	SoMarkFromDae        uint32
+	Mptcp                bool
 	// TransportCacheNamespace isolates process-global transport caches
 	// across reload generations so a replacement control plane never reuses
 	// transports bound to the previous generation's dialer lifecycle.
@@ -276,9 +292,15 @@ func NewGlobalOption(global *config.Global, log *logrus.Logger) *GlobalOption {
 	}
 }
 
-// NewDialer is for register in general.
-func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
-	return NewDialerContext(context.Background(), dialer, option, iOption, property)
+// SetRuntimeDependencies installs generation-scoped direct and DNS dependencies.
+func (o *GlobalOption) SetRuntimeDependencies(directDialer, fullconeDirectDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) {
+	o.DirectDialer = directDialer
+	o.FullconeDirectDialer = fullconeDirectDialer
+	o.SystemDNSResolver = systemDNSResolver
+	o.TcpCheckOptionRaw.DirectDialer = directDialer
+	o.TcpCheckOptionRaw.SystemDNSResolver = systemDNSResolver
+	o.CheckDnsOptionRaw.DirectDialer = directDialer
+	o.CheckDnsOptionRaw.SystemDNSResolver = systemDNSResolver
 }
 
 // NewDialerContext is for internal use with lifecycle management.
@@ -864,23 +886,6 @@ func (d *Dialer) incrementBackoffLevelByIndex(protoIdx int) {
 	d.ensureRecoveryManager().incrementBackoffLevelByIndex(protoIdx)
 }
 
-func (d *Dialer) GetBackoffLevel(proto consts.L4ProtoStr) int {
-	protoIdx := d.protoIdx(proto)
-	return d.getBackoffLevelByIndex(protoIdx)
-}
-
-func (d *Dialer) getBackoffLevelByIndex(protoIdx int) int {
-	return d.ensureRecoveryManager().getBackoffLevelByIndex(protoIdx)
-}
-
-// GetBackoffPenalty returns a latency penalty for nodes in recovery for a specific protocol.
-// Penalty = current backoff duration / 20.
-// This ensures recently recovered nodes are deprioritized until stable.
-func (d *Dialer) GetBackoffPenalty(proto consts.L4ProtoStr) time.Duration {
-	protoIdx := d.protoIdx(proto)
-	return d.getBackoffPenaltyByIndex(protoIdx)
-}
-
 func (d *Dialer) getBackoffPenaltyForType(typ *NetworkType) time.Duration {
 	if typ == nil {
 		return 0
@@ -1030,4 +1035,8 @@ func (d *Dialer) GetHttpClient(idx int, ip netip.Addr, soMark uint32, mptcp bool
 	}
 	d.httpClients[key] = cli
 	return cli
+}
+
+func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
+	return NewDialerContext(context.Background(), dialer, option, iOption, property)
 }

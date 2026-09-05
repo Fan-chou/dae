@@ -11,7 +11,7 @@ func TestReadConfigExpandsHardenedNativeRuleProvider(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "rules.yaml"), []byte("payload:\n  - example.com\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	configPath := filepath.Join(dir, "dae.conf")
+	configPath := filepath.Join(dir, "config.dae")
 	configBody := `global {}
 rule_provider {
   local {
@@ -47,7 +47,7 @@ func TestReadConfigUsesFileProviderLastGoodAfterSourceDisappears(t *testing.T) {
 	if err := os.WriteFile(providerPath, []byte("payload:\n  - first.example\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(provider) error = %v", err)
 	}
-	configPath := filepath.Join(dir, "dae.conf")
+	configPath := filepath.Join(dir, "config.dae")
 	configBody := `global {}
 rule_provider {
   local {

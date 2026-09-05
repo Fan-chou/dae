@@ -21,7 +21,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"github.com/olicesx/quic-go"
+	quic "github.com/olicesx/quic-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -39,24 +39,25 @@ func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	return left == right
 }
 
-// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
+// FlowBinding returns the immutable route and egress selections made when the
+// endpoint was created. Production code reads only Route.Mark (via
+// replySoMark); the full binding is a verification surface for tests.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
 	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
 	}
-	egress := UdpEgressBinding{
-		Dialer:        ue.Dialer,
-		Outbound:      ue.Outbound,
-		Target:        ue.DialTarget,
-		Network:       ue.flowNetwork,
-		NetworkType:   ue.endpointNetworkType,
-		SniffedDomain: ue.SniffedDomain,
-		IsDialIp:      ue.flowBindingDialIP,
+	return UdpFlowBinding{
+		Route: ue.flowRouteBinding,
+		Egress: UdpEgressBinding{
+			Dialer:        ue.Dialer,
+			Outbound:      ue.Outbound,
+			Target:        ue.DialTarget,
+			Network:       ue.flowNetwork,
+			NetworkType:   ue.endpointNetworkType,
+			SniffedDomain: ue.SniffedDomain,
+			IsDialIp:      ue.flowBindingDialIP,
+		},
 	}
-	if ue.flowEgressOverride != nil {
-		egress = *ue.flowEgressOverride
-	}
-	return UdpFlowBinding{Route: ue.flowRouteBinding, Egress: egress}
 }
 
 func (ue *UdpEndpoint) replySoMark() uint32 {
@@ -74,10 +75,6 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowNetwork = binding.Egress.Network
 	ue.flowBindingDialIP = binding.Egress.IsDialIp
 	ue.flowBindingSet = true
-	if got := ue.FlowBinding().Egress; got != binding.Egress {
-		override := binding.Egress
-		ue.flowEgressOverride = &override
-	}
 }
 
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
@@ -456,34 +453,16 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 	go func() { _ = ue.Close() }()
 }
 
-// retireFromReplySender evicts the endpoint from the reply sender. Push mode
-// only marks the endpoint dead: Close() there waits on replyQueueDone, which
-// only this sender closes, so markRetiredFromReceiver hands the actual
-// teardown to a fresh goroutine that waits for this sender to drain. ReadFrom
-// mode has no shared queue, so Close() is safe on this stack and required to
-// release the conn — the read loop's defer only waits on its local senderDone.
-func (ue *UdpEndpoint) retireFromReplySender() {
-	ue.replyQueueMu.Lock()
-	// A failed RegisterPacketReceiver tears the shared queue down
-	// (replyQueueClosed) and then falls back to the ReadFrom loop. The
-	// leftover replyQueueDone must not keep us on the push-mode path:
-	// ReadFrom's sender has to Close() the conn itself.
-	pushMode := ue.replyQueueDone != nil && !ue.replyQueueClosed
-	ue.replyQueueMu.Unlock()
-	if pushMode {
-		ue.markRetiredFromReceiver()
-		return
-	}
-	ue.retire()
-}
-
 // udpEndpointWriteTimeout bounds how long one proxy-side write may block. A
 // UDP datagram normally leaves the socket immediately, but many proxies carry
 // UDP over a TCP transport whose peer can stop ACKing; without a deadline one
 // stalled upstream parks its calling goroutine forever, and under a shared
-// dispatcher a handful of stalled flows would park every worker. A write that
-// hits the deadline errors out and retires the endpoint, which is the correct
-// outcome for a transport that has stopped draining.
+// dispatcher a handful of stalled flows would park every worker. Hitting the
+// deadline means the transport stopped draining: handleWriteError retires the
+// endpoint immediately (fail fast). QUIC-backed transports never arm this
+// deadline: their fork-level SetWriteDeadline delegates to SetDeadline, which
+// closes the whole session instead of aborting the write, so a merely-full
+// datagram queue must be absorbed as a dropped datagram instead.
 const udpEndpointWriteTimeout = 10 * time.Second
 
 // writeSoftErrorThreshold bounds consecutive tolerated transport write errors
@@ -591,13 +570,17 @@ func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
 	return realDst.String()
 }
 
+// sendStaleTimeout preserves fdae's game-only rebuild policy.
+func (ue *UdpEndpoint) sendStaleTimeout() time.Duration { return ue.staleRebuildTimeout() }
+
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
-	// QUIC-backed transports (hysteria2/tuic) expose a transport-lifecycle
-	// channel: connection death is signalled via TransportDone and retired by
-	// the pool watcher. Their datagram send queue fills under backpressure,
-	// which is a normal congestion signal rather than a dead peer — arming a
-	// write deadline here tears the session down on a merely-full queue where
-	// a proxy would simply delay the write and keep the connection alive.
+	// QUIC-backed transports (hysteria2/tuic) never arm the deadline. Their
+	// fork-level SetWriteDeadline delegates to SetDeadline, which is a
+	// session-close timer (time.AfterFunc -> conn.Close) rather than a write
+	// abort, so a deadline on a merely-full datagram queue would kill the
+	// whole hy2/tuic session. Connection death there is signalled via
+	// TransportDone and retired by the pool watcher; a full send queue is
+	// congestion and is absorbed as a dropped datagram by handleWriteError.
 	if endpointTransportDoneChannel(ue) != nil {
 		return
 	}
@@ -650,7 +633,8 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// inter-round reaps. The check uses the newer of lastSend/lastReply, so
 	// a live server reply during a client loading screen never rebuilds.
 	// This runs before the write refreshes lastSendNano, firing only on the
-	// first packet after the silence.
+	// first packet after the silence. Sniffed QUIC/H3 flows use a longer
+	// window so DASH/HLS segment gaps do not look like a new round.
 	if ue.hasReply.Load() {
 		if timeout := ue.staleRebuildTimeout(); timeout > 0 {
 			lastSend := ue.lastSendNano.Load()
@@ -719,11 +703,9 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	return n, nil
 }
 
-// handleWriteError applies the endpoint's write-error policy shared by the
-// synchronous WriteTo path and the asynchronous batched-flush path: hard
-// failures retire the endpoint immediately, transient errors are tolerated
-// up to a threshold. Returns the error to propagate (nil is never returned;
-// tolerated errors are wrapped).
+// handleWriteError preserves fdae's bounded transient-error tolerance and
+// immediate datagram queue-timeout retirement. A non-QUIC write deadline
+// also retires the stalled endpoint, matching the new deadline mechanism.
 func (ue *UdpEndpoint) handleWriteError(err error) error {
 	// Connection-refused is a hard failure: evict the bad upstream now.
 	if ue.isConnectionRefused(err) {
@@ -736,7 +718,7 @@ func (ue *UdpEndpoint) handleWriteError(err error) error {
 	// the soft-error counter is reset by any enqueue (which is not a peer
 	// ACK), so a half-dead transport could otherwise dodge the threshold
 	// forever by the occasional enqueue that never reaches the peer.
-	if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+	if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) || stderrors.Is(err, os.ErrDeadlineExceeded) {
 		ue.retire()
 		return err
 	}
@@ -1026,50 +1008,18 @@ func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) 
 	return &result, true
 }
 
-func (ue *UdpEndpoint) GetCachedRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
-	ttl := UdpRoutingResultCacheTtl
-	if ttl <= 0 {
-		return nil, false
-	}
-
-	ue.routingMu.RLock()
-	defer ue.routingMu.RUnlock()
-
-	if !ue.hasRoutingCache {
-		return nil, false
-	}
-	if ue.routingCacheProto != l4proto || ue.routingCacheDst != dst {
-		return nil, false
-	}
-	if time.Since(ue.routingCacheAt) > ttl {
-		return nil, false
-	}
-
-	result := ue.routingCache
-	return &result, true
-}
-
 func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uint8, result *bpfRoutingResult) {
 	if result == nil {
-		return
-	}
-	if UdpRoutingResultCacheTtl <= 0 {
 		return
 	}
 
 	ue.routingMu.Lock()
 	ue.routingCacheDst = dst
 	ue.routingCacheProto = l4proto
-	ue.routingCacheAt = time.Now()
 	ue.routingCache = *result
 	ue.hasRoutingCache = true
 	ue.routingMu.Unlock()
 }
-
-// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
-// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
-// only populated when UDP routing depends on packet metadata that userspace
-// cannot safely infer from payload reuse alone.
 
 // endpointSurvivesDialerInvalidation reports whether an endpoint should remain
 // reusable after its dialer transitions to not alive.
@@ -1084,7 +1034,10 @@ func (p *UdpEndpointPool) endpointSurvivesDialerInvalidation(ue *UdpEndpoint) bo
 }
 
 func (ue *UdpEndpoint) survivesDialerHealthInvalidation() bool {
-	return ue.hasSent.Load() || ue.hasReply.Load() || ue.initialWritesPending.Load() != 0
+	if ue.hasSent.Load() || ue.hasReply.Load() || ue.initialWritesPending.Load() != 0 {
+		return true
+	}
+	return ue.writeBatch != nil && ue.writeBatch.hasUnflushedFirst()
 }
 
 // retireIfUnforwardedForDialerHealth retires only an endpoint that is still

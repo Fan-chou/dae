@@ -7,7 +7,6 @@ package control
 
 import (
 	"encoding/binary"
-	"fmt"
 	"maps"
 	"net/netip"
 	"sync"
@@ -390,6 +389,7 @@ type PacketSniffer struct {
 	// Mutex for protecting sniffing operations
 	Mu sync.Mutex
 
+	// All fields below are guarded by Mu, same discipline as ObserveQuicInitial.
 	// Soft negative cache for UDP sniffing: after repeated no-SNI attempts
 	// (timeouts / need-more / not-applicable), bypass sniffing temporarily.
 	noSniStreak      int
@@ -429,6 +429,8 @@ func (ps *PacketSniffer) IsExpired(nowNano int64) bool {
 	return expiresAt > 0 && nowNano >= expiresAt
 }
 
+// ShouldBypassSniff reports whether sniffing is currently soft-bypassed for
+// this flow. The caller must hold ps.Mu.
 func (ps *PacketSniffer) ShouldBypassSniff(now time.Time) bool {
 	return now.Before(ps.bypassSniffUntil)
 }
@@ -453,6 +455,8 @@ func (ps *PacketSniffer) closeLocked() error {
 	return err
 }
 
+// RecordSniffNoSni advances the no-SNI streak and arms the temporary bypass
+// once the threshold is reached. The caller must hold ps.Mu.
 func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 	ps.noSniStreak++
 	if ps.noSniStreak >= udpSniffNoSniThreshold {
@@ -461,6 +465,8 @@ func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 	}
 }
 
+// RecordSniffSuccess clears the no-SNI streak and any armed bypass. The
+// caller must hold ps.Mu.
 func (ps *PacketSniffer) RecordSniffSuccess() {
 	ps.noSniStreak = 0
 	ps.bypassSniffUntil = time.Time{}
@@ -534,17 +540,16 @@ func parseQuicInitialFingerprint(data []byte) (sig quicInitialFingerprint, ok bo
 }
 
 // PacketSnifferPool is a full-cone udp conn pool.
-// Uses sync.Map for lock-free concurrent access.
+// Lookups use sync.Map; creation misses coordinate with Reset.
 type PacketSnifferPool struct {
 	pool         sync.Map
 	flowFamilies sync.Map
-	// createMu serializes insert/replace so GetOrCreate never returns a
-	// sniffer that is not the current pool member. handlePkt only sniffs
-	// when GetOrCreate's result still equals Get(key).
-	createMu    sync.Mutex
-	janitorOnce sync.Once
-	janitorStop chan struct{}
-	janitorDone chan struct{}
+	janitorOnce  sync.Once
+	janitorStop  chan struct{}
+	janitorDone  chan struct{}
+	resetMu      sync.RWMutex
+	resetEpoch   atomic.Uint64
+	createMu     sync.Mutex
 }
 
 type PacketSnifferOptions struct {
@@ -604,17 +609,6 @@ func (ref *packetSnifferFlowFamilyRef) rangeMembers(fn func(PacketSnifferKey, *P
 	}
 }
 
-func (ref *packetSnifferFlowFamilyRef) takeMembers() map[PacketSnifferKey]*PacketSniffer {
-	if ref == nil {
-		return nil
-	}
-	ref.mu.Lock()
-	members := ref.members
-	ref.members = nil
-	ref.mu.Unlock()
-	return members
-}
-
 // PacketSnifferKey identifies a QUIC sniffing session by 5-tuple + DCID.
 // Each QUIC connection has a unique Destination Connection ID, so we group
 // by DCID to separate different QUIC connections on the same UDP flow.
@@ -664,17 +658,28 @@ func NewPacketSnifferPool() *PacketSnifferPool {
 // Called on reload to prevent stale sniffers from using pre-reload state.
 // Uses LoadAndDelete for atomic removal that races safely with concurrent GetOrCreate.
 func (p *PacketSnifferPool) Reset() {
+	p.resetMu.Lock()
+	p.resetEpoch.Add(1) // Odd while a reset is in progress.
+	defer func() {
+		p.resetEpoch.Add(1)
+		p.resetMu.Unlock()
+	}()
+
 	// Two-phase deletion: collect keys first, then delete
 	var keys []any
 	p.pool.Range(func(key, value any) bool {
 		keys = append(keys, key)
 		return true
 	})
-	for _, key := range keys {
-		if value, ok := p.pool.LoadAndDelete(key); ok {
+	for _, rawKey := range keys {
+		key := rawKey.(PacketSnifferKey)
+		family := p.loadFlowFamily(key)
+		if value, ok := p.pool.LoadAndDelete(rawKey); ok {
 			ps := value.(*PacketSniffer)
-			p.deleteFlowFamilyMember(key.(PacketSnifferKey), ps)
-			p.releaseFlowFamily(key.(PacketSnifferKey))
+			if family != nil {
+				family.deleteMember(key, ps)
+				p.releaseFlowFamilyRef(key, family)
+			}
 			_ = ps.Close()
 		}
 	}
@@ -700,18 +705,6 @@ func (p *PacketSnifferPool) Close() {
 		<-p.janitorDone
 	}
 	p.Reset()
-}
-
-func (p *PacketSnifferPool) Remove(key PacketSnifferKey, sniffer *PacketSniffer) (err error) {
-	// Use CompareAndDelete for atomic CAS semantics (Go 1.20+ best practice)
-	if !p.pool.CompareAndDelete(key, sniffer) {
-		_ = sniffer.Close()
-		return fmt.Errorf("target udp endpoint is not in the pool")
-	}
-	p.deleteFlowFamilyMember(key, sniffer)
-	p.releaseFlowFamily(key)
-	_ = sniffer.Close()
-	return nil
 }
 
 func (p *PacketSnifferPool) Get(key PacketSnifferKey) *PacketSniffer {
@@ -800,13 +793,23 @@ func (p *PacketSnifferPool) RemoveFlowFamilySessions(key PacketSnifferKey) int {
 		return 0
 	}
 
-	removed := 0
-	for entryKey, entrySniffer := range family.takeMembers() {
-		if p.pool.CompareAndDelete(entryKey, entrySniffer) {
-			p.releaseFlowFamily(entryKey)
-			_ = entrySniffer.Close()
-			removed++
+	// Keep membership removal and pool CAS under the same family lock used by
+	// janitor reinsertion. Failed CAS entries are owned by their remover.
+	family.mu.Lock()
+	members := family.members
+	family.members = nil
+	for entryKey, entrySniffer := range members {
+		if !p.pool.CompareAndDelete(entryKey, entrySniffer) {
+			delete(members, entryKey)
 		}
+	}
+	family.mu.Unlock()
+
+	removed := 0
+	for entryKey, entrySniffer := range members {
+		p.releaseFlowFamilyRef(entryKey, family)
+		_ = entrySniffer.Close()
+		removed++
 	}
 	return removed
 }
@@ -826,6 +829,8 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *Pack
 		}
 	}
 
+	p.resetMu.RLock()
+	defer p.resetMu.RUnlock()
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
 
@@ -953,8 +958,70 @@ func (p *PacketSnifferPool) startJanitor() {
 						ps := value.(*PacketSniffer)
 						if ps.IsExpired(nowNano) {
 							consecutiveFresh = 0
+							snifferKey := key.(PacketSnifferKey)
+							observedResetEpoch := p.resetEpoch.Load()
+							family := p.loadFlowFamily(snifferKey)
+							if family != nil {
+								// Serialize deletion/reinsertion with takeMembers so a
+								// concurrent family removal cannot lose this member.
+								family.mu.Lock()
+							}
+							// Use CompareAndDelete for atomic CAS - only delete if still the same expired sniffer
+							if !p.pool.CompareAndDelete(key, ps) {
+								if family != nil {
+									family.mu.Unlock()
+								}
+								return true
+							}
+
+							// Wait for an in-flight sniff section, then take a
+							// fresh TTL sample. RefreshTtl itself is atomic; the
+							// packet path's post-lock map check is the final guard
+							// against using a concurrently retired sniffer.
+							ps.Mu.Lock()
+							stillExpired := ps.IsExpired(nowNano)
+							ps.Mu.Unlock()
+
+							resetStable := observedResetEpoch&1 == 0 &&
+								p.resetEpoch.Load() == observedResetEpoch
+							if !stillExpired && resetStable {
+								if _, loaded := p.pool.LoadOrStore(key, ps); !loaded {
+									if family != nil {
+										if family.members == nil {
+											family.members = make(map[PacketSnifferKey]*PacketSniffer)
+										}
+										family.members[snifferKey] = ps
+									}
+									// Close the last race where Reset starts after
+									// the first epoch check but before reinsertion.
+									if p.resetEpoch.Load() == observedResetEpoch {
+										if family != nil {
+											family.mu.Unlock()
+										}
+										return true
+									}
+									if !p.pool.CompareAndDelete(key, ps) {
+										// Reset now owns cleanup.
+										if family != nil {
+											family.mu.Unlock()
+										}
+										return true
+									}
+								}
+							}
+
+							// Release the family object captured with ps. Releasing
+							// by key here could decrement a post-Reset replacement.
+							if family != nil {
+								if current, ok := family.members[snifferKey]; ok && current == ps {
+									delete(family.members, snifferKey)
+								}
+								family.mu.Unlock()
+								p.releaseFlowFamilyRef(snifferKey, family)
+							}
+							_ = ps.Close()
 							expiredFound++
-							_ = p.retireExpiredPacketSniffer(key, ps, nowNano)
+							// Continue scanning - there might be more expired items
 							return true
 						}
 						consecutiveFresh++
@@ -990,12 +1057,6 @@ func (p *PacketSnifferPool) startJanitor() {
 	})
 }
 
-// IsQuicDcidFailed checks if a DCID has been marked as failed due to sniffing timeout.
-// Failed DCIDs bypass sniffing entirely and use IP routing directly.
-func IsQuicDcidFailed(key PacketSnifferKey) bool {
-	return IsQuicDcidFailedAt(key, time.Now())
-}
-
 func IsQuicDcidFailedAt(key PacketSnifferKey, now time.Time) bool {
 	cache := getFailedQuicDcidCache()
 	if cache == nil {
@@ -1023,20 +1084,6 @@ func ClearFailedQuicDcids() {
 		return
 	}
 	cache.Clear()
-}
-
-// HealthCheckSuccessCallback is a callback function that can be set to
-// be notified when health check succeeds. This allows clearing the failed
-// DCID cache when network conditions improve.
-var HealthCheckSuccessCallback func()
-
-// NotifyHealthCheckSuccess should be called when a health check succeeds.
-// This clears the failed QUIC DCID cache to allow retrying sniffing.
-func NotifyHealthCheckSuccess() {
-	ClearFailedQuicDcids()
-	if HealthCheckSuccessCallback != nil {
-		HealthCheckSuccessCallback()
-	}
 }
 
 func (p *PacketSnifferPool) loadFlowFamily(key PacketSnifferKey) *packetSnifferFlowFamilyRef {
@@ -1098,14 +1145,13 @@ func (p *PacketSnifferPool) retainFlowFamilyRef(key PacketSnifferKey) *packetSni
 }
 
 func (p *PacketSnifferPool) releaseFlowFamily(key PacketSnifferKey) {
-	if p == nil || !key.HasCacheableDcid() {
+	p.releaseFlowFamilyRef(key, p.loadFlowFamily(key))
+}
+
+func (p *PacketSnifferPool) releaseFlowFamilyRef(key PacketSnifferKey, ref *packetSnifferFlowFamilyRef) {
+	if p == nil || ref == nil || !key.HasCacheableDcid() {
 		return
 	}
-	value, ok := p.flowFamilies.Load(key.FlowFamilyKey())
-	if !ok {
-		return
-	}
-	ref := value.(*packetSnifferFlowFamilyRef)
 	for {
 		refs := ref.refs.Load()
 		switch {

@@ -6,7 +6,6 @@
 package control
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -26,6 +25,34 @@ type RoutingMatcher struct {
 	// fakeIPLeafIsProxy reports whether a user-defined outbound currently
 	// selects a proxy node. Nil treats every user group as PROXY (unit tests).
 	fakeIPLeafIsProxy func(consts.OutboundIndex) bool
+
+	// needs records which fact strings any compiled rule can consume, so the
+	// hot path skips building 128-char binary keys nothing will ever read.
+	needs routingMatcherNeeds
+}
+
+type routingMatcherNeeds struct {
+	ipSetBin     bool
+	sourceIPSetB bool
+	macBin       bool
+	domainBitmap bool
+}
+
+func computeRoutingMatcherNeeds(matches []compiledRoutingMatch) routingMatcherNeeds {
+	var n routingMatcherNeeds
+	for _, m := range matches {
+		switch m.matchType {
+		case consts.MatchType_IpSet:
+			n.ipSetBin = true
+		case consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac:
+			n.sourceIPSetB = true
+		case consts.MatchType_Mac:
+			n.macBin = true
+		case consts.MatchType_DomainSet:
+			n.domainBitmap = true
+		}
+	}
+	return n
 }
 
 // routingMatcherPredicateGroupSpan maps one immutable policy predicate group
@@ -95,7 +122,7 @@ func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
 
 	switch compiled.matchType {
 	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
-		compiled.lpmIndex = binary.LittleEndian.Uint32(match.Value[:4])
+		compiled.lpmIndex = nativeBpfABI.uint32(match.Value[:4])
 	case consts.MatchType_Port, consts.MatchType_SourcePort:
 		compiled.portStart, compiled.portEnd = ParsePortRange(match.Value[:])
 	case consts.MatchType_IpVersion, consts.MatchType_L4Proto:
@@ -142,19 +169,16 @@ func (m *RoutingMatcher) newFacts(
 	}
 
 	facts := routingMatcherFacts{
-		sourceAddr:     sourceAddr,
-		destAddr:       destAddr,
-		sourcePort:     sourcePort,
-		destPort:       destPort,
-		ipVersion:      ipVersion,
-		l4proto:        l4proto,
-		domain:         domain,
-		pname:          processName,
-		dscp:           dscp,
-		mac:            mac,
-		ipSetBin:       trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(destAddr), 128)),
-		sourceIPSetBin: trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(sourceAddr), 128)),
-		macBin:         trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(mac), 128)),
+		sourceAddr: sourceAddr,
+		destAddr:   destAddr,
+		sourcePort: sourcePort,
+		destPort:   destPort,
+		ipVersion:  ipVersion,
+		l4proto:    l4proto,
+		domain:     domain,
+		pname:      processName,
+		dscp:       dscp,
+		mac:        mac,
 	}
 	if m.lookupMacAssoc != nil {
 		mac6 := mac6FromRoutedMac(mac)
@@ -162,7 +186,18 @@ func (m *RoutingMatcher) newFacts(
 			facts.macAssocBins = m.lookupMacAssoc(mac6)
 		}
 	}
-	if domain != "" && m.domainMatcher != nil {
+	// Gated on the compiled rule inventory: Prefix2bin128 churns a 128-byte
+	// string per call, so skip keys that no rule reads.
+	if m.needs.ipSetBin {
+		facts.ipSetBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(destAddr), 128))
+	}
+	if m.needs.sourceIPSetB {
+		facts.sourceIPSetBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(sourceAddr), 128))
+	}
+	if m.needs.macBin {
+		facts.macBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(mac), 128))
+	}
+	if m.needs.domainBitmap && domain != "" && m.domainMatcher != nil {
 		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
 	}
 	return facts, nil
@@ -418,6 +453,14 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 					must = true
 					ruleHasDest = false
 					ruleHasIdentitySkip = false
+					continue
+				}
+				if outbound == consts.OutboundControlPlaneRouting {
+					// Implicit sniff-punt lines exist only in the kernel-space
+					// projection: once a connection has been punted and
+					// sniffed, userspace must re-route over the remaining
+					// rules as if this line did not exist.
+					badRule = false
 					continue
 				}
 				return outbound, match.mark, match.must || must, ruleHasIdentitySkip, nil

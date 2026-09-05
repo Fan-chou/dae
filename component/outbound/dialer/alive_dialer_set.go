@@ -108,10 +108,6 @@ func NewAliveDialerSet(
 	return a
 }
 
-func (a *AliveDialerSet) GetRand() *Dialer {
-	return a.GetRandExcluded(nil)
-}
-
 func (a *AliveDialerSet) GetRandExcluded(excluded *Dialer) *Dialer {
 	if excluded == nil {
 		return a.GetRandSkipping(nil)
@@ -333,6 +329,11 @@ func (a *AliveDialerSet) unscoredMinLatencyLocked(skip map[*Dialer]struct{}, uns
 }
 
 func (a *AliveDialerSet) printLatencies() {
+	if !a.log.IsLevelEnabled(logrus.InfoLevel) {
+		// The caller logs at Info; skip building the sorted snapshot
+		// (which walks every entry) when it would be discarded anyway.
+		return
+	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Group '%v' [%v]:\n", a.dialerGroupName, a.CheckTyp.String())
 	var alive []*struct {

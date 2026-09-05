@@ -56,11 +56,6 @@ type activeRetirementTask struct {
 	done       chan struct{}
 }
 
-// reloadFailureCompletionHook is an internal observability seam used by
-// lifecycle tests. The production default is a no-op and does not affect
-// reload state transitions.
-var reloadFailureCompletionHook = func() {}
-
 func newReloadManager(reloadReqs chan reloadRequest, runStateChanges chan struct{}, sigs <-chan os.Signal) *reloadManager {
 	m := &reloadManager{
 		reloadReqs:      reloadReqs,
@@ -281,7 +276,6 @@ func (m *reloadManager) finishReloadFailure() {
 	m.reloading.Store(false)
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
-	reloadFailureCompletionHook()
 }
 
 // failPublishedReloadAttempt reports a recoverable post-handoff failure to

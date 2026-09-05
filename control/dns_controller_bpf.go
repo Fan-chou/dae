@@ -389,6 +389,20 @@ func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
 // via bpfUpdateStop, which is closed during DnsController.Close().
 func (c *DnsController) bpfUpdateWorker() {
 	defer c.bpfUpdateWg.Done()
+	// Snapshot all lifecycle channels under the mutexes that guard their
+	// fields. Close may nil the fields after the graceful timeout while a
+	// stuck worker is still selecting on them; reading them once here keeps
+	// later receives race-free and preserves the stop signal.
+	c.bpfUpdateStopMu.Lock()
+	bpfUpdateCh := c.bpfUpdateCh
+	bpfUpdateStop := c.bpfUpdateStop
+	c.bpfUpdateStopMu.Unlock()
+	c.bpfRetryMu.Lock()
+	bpfRetryWake := c.bpfRetryWake
+	c.bpfRetryMu.Unlock()
+	if bpfUpdateCh == nil || bpfUpdateStop == nil {
+		return
+	}
 	retries := newBpfProjectionRetryScheduler()
 	retryTimer := time.NewTimer(time.Hour)
 	if !retryTimer.Stop() {
@@ -443,10 +457,10 @@ func (c *DnsController) bpfUpdateWorker() {
 
 	for {
 		select {
-		case task := <-c.bpfUpdateCh:
+		case task := <-bpfUpdateCh:
 			c.processBpfUpdateTask(task, false)
-			c.drainBpfUpdateTasks(false)
-		case <-c.bpfRetryWake:
+			c.drainBpfUpdateTasks(bpfUpdateCh, false)
+		case <-bpfRetryWake:
 			tasks, overflow := c.takeBpfProjectionRetryIntents()
 			if overflow {
 				scheduleReconcile(time.Now())
@@ -478,8 +492,8 @@ func (c *DnsController) bpfUpdateWorker() {
 				}
 			}
 			resetRetryTimer()
-		case <-c.bpfUpdateStop:
-			c.drainBpfUpdateTasks(true)
+		case <-bpfUpdateStop:
+			c.drainBpfUpdateTasks(bpfUpdateCh, true)
 			return
 		}
 	}
@@ -490,10 +504,10 @@ const bpfUpdateDrainBatch = 64
 // drainBpfUpdateTasks processes a bounded primary-task batch. Returning to the
 // worker select between batches prevents a sustained cache-write stream from
 // starving delayed retries or shutdown.
-func (c *DnsController) drainBpfUpdateTasks(draining bool) {
+func (c *DnsController) drainBpfUpdateTasks(bpfUpdateCh <-chan *bpfUpdateTask, draining bool) {
 	for range bpfUpdateDrainBatch {
 		select {
-		case task := <-c.bpfUpdateCh:
+		case task := <-bpfUpdateCh:
 			c.processBpfUpdateTask(task, draining)
 		default:
 			return

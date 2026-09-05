@@ -440,7 +440,7 @@ SEC("tc/check/dport_mismatch")
 int testcheck_dport_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -484,7 +484,7 @@ SEC("tc/check/ipset_match")
 int testcheck_ipset_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(100,64,0,2),
 				      19233, 80);
 }
@@ -572,7 +572,7 @@ SEC("tc/check/source_ipset_match")
 int testcheck_source_ipset_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,50,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -690,7 +690,7 @@ SEC("tc/check/sport_mismatch")
 int testcheck_sport_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -845,7 +845,7 @@ int testsetup_wan_egress_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb
 SEC("tc/check/wan_egress_tcp_non_syn_stateless_passthrough")
 int testcheck_wan_egress_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
 }
 
 SEC("tc/pktgen/wan_egress_tcp_syn_redirect_track")
@@ -1342,7 +1342,7 @@ SEC("tc/check/wan_udp_kernel_direct_group_skips_userspace")
 int testcheck_wan_udp_kernel_direct_group_skips_userspace(
 	struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
 }
 
 SEC("tc/pktgen/wan_tcp_kernel_direct_group_skips_userspace")
@@ -1371,7 +1371,7 @@ SEC("tc/check/wan_tcp_kernel_direct_group_skips_userspace")
 int testcheck_wan_tcp_kernel_direct_group_skips_userspace(
 	struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
 }
 
 SEC("tc/pktgen/lan_ingress_udp_first_fragment_listener")
@@ -1936,7 +1936,7 @@ int testsetup_wan_egress_udp_non_initial_fragment_passthrough(struct __sk_buff *
 SEC("tc/check/wan_egress_udp_non_initial_fragment_passthrough")
 int testcheck_wan_egress_udp_non_initial_fragment_passthrough(struct __sk_buff *skb)
 {
-	return check_status_and_mark(skb, TC_ACT_OK, 0);
+	return check_status_and_mark(skb, DAE_TC_CONTINUE, 0);
 }
 
 SEC("tc/pktgen/wan_egress_direct_mark_reroute")
@@ -2111,7 +2111,7 @@ SEC("tc/check/l4proto_mismatch")
 int testcheck_l4proto_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2183,7 +2183,7 @@ SEC("tc/check/ipversion_mismatch")
 int testcheck_ipversion_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2296,7 +2296,7 @@ SEC("tc/check/mac_mismatch")
 int testcheck_mac_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2410,7 +2410,7 @@ SEC("tc/check/dscp_mismatch")
 int testcheck_dscp_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
@@ -2447,7 +2447,7 @@ SEC("tc/check/dscp_ipv6_mismatch")
 int testcheck_dscp_ipv6_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv6_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      0x20010db8, 0, 0, 0x10,
 				      0x26064700, 0, 0, 0x1111,
 				      19233, 79);
@@ -2688,7 +2688,7 @@ SEC("tc/check/and_mismatch")
 int testcheck_and_mismatch(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 2333);
 }
@@ -2725,7 +2725,7 @@ SEC("tc/check/not_match")
 int testcheck_not_match(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -2777,7 +2777,7 @@ SEC("tc/check/source_ipset_match_mac_assoc")
 int testcheck_source_ipset_match_mac_assoc(struct __sk_buff *skb)
 {
 	return check_routing_ipv4_tcp(skb,
-				      TC_ACT_OK,
+				      DAE_TC_CONTINUE,
 				      IPV4(192,168,51,1), IPV4(1,1,1,1),
 				      19233, 80);
 }
@@ -2951,4 +2951,105 @@ SEC("tc/check/lan_fakeip_nonsyn_stateless_tproxy")
 int testcheck_lan_fakeip_nonsyn_stateless_tproxy(struct __sk_buff *skb)
 {
 	return check_redirect_non_syn_tcp(skb);
+}
+
+struct ab_test_ah_hdr {
+	__u8 nexthdr;
+	__u8 payload_len;
+	__be16 reserved;
+	__be32 spi;
+	__be32 seq_no;
+};
+
+SEC("tc/ab_test/control_plane_custom_mark")
+int test_ab_control_plane_custom_mark(struct __sk_buff *skb)
+{
+	struct pid_pname *p = NULL;
+
+	skb->mark = 0x100;
+	if (pid_is_control_plane(skb, &p))
+		return 1;
+
+	skb->mark = 0x200;
+	if (!pid_is_control_plane(skb, &p))
+		return 2;
+
+	skb->mark = 0x201;
+	if (pid_is_control_plane(skb, &p))
+		return 3;
+
+	return 0;
+}
+
+SEC("tc/ab_test/ipv6_ah_udp_parse")
+int test_ab_ipv6_ah_udp_parse(struct __sk_buff *skb)
+{
+	const __u32 packet_len = FAST_PATH_PACKET_SIZE;
+	const __u32 ah_offset = ETH_HLEN + IP6_HLEN;
+	const __u32 udp_offset = ah_offset + sizeof(struct ab_test_ah_hdr);
+
+	if (bpf_skb_change_tail(skb, packet_len, 0))
+		return 1;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (data + packet_len > data_end)
+		return 2;
+
+	struct ethhdr *eth = data;
+	struct ipv6hdr *ip6 = data + ETH_HLEN;
+	struct ab_test_ah_hdr *ah = data + ah_offset;
+	struct udphdr *udp = data + udp_offset;
+
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+	set_ipv6_header_dscp(ip6, 0);
+	ip6->payload_len = bpf_htons(packet_len - ETH_HLEN - IP6_HLEN);
+	ip6->nexthdr = IPPROTO_AH;
+	ip6->hop_limit = 64;
+	ip6->saddr.in6_u.u6_addr32[3] = bpf_htonl(1);
+	ip6->daddr.in6_u.u6_addr32[3] = bpf_htonl(2);
+
+	ah->nexthdr = IPPROTO_UDP;
+	ah->payload_len = 1;
+	ah->spi = bpf_htonl(1);
+	ah->seq_no = bpf_htonl(1);
+
+	udp->source = bpf_htons(23456);
+	udp->dest = bpf_htons(34567);
+	udp->len = bpf_htons(packet_len - udp_offset);
+
+	struct parse_transport_ctx *ctx =
+		bpf_map_lookup_elem(&parse_ctx_scratch_map, &zero_key);
+	if (!ctx)
+		return 3;
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+
+	if (parse_transport(skb, ETH_HLEN, ctx) != 0)
+		return 4;
+	if (ctx->l4proto != IPPROTO_UDP ||
+	    ctx->listener_l4proto != IPPROTO_UDP)
+		return 5;
+	if (ctx->udph.source != bpf_htons(23456) ||
+	    ctx->udph.dest != bpf_htons(34567))
+		return 6;
+
+	return 0;
+}
+
+#define AB_TEST_HOST_UDP_PORT 54321
+
+SEC("tc/ab_test/lan_ingress_udp_host_listener_pktgen")
+int test_ab_lan_ingress_udp_host_listener_pktgen(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(skb,
+					   IPV4(192,168,0,1), IPV4(1,1,1,1),
+					   24567, AB_TEST_HOST_UDP_PORT, 0);
+}
+
+SEC("tc/ab_test/lan_ingress_udp_host_listener")
+int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, true);
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
 }

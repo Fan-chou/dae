@@ -18,7 +18,6 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
 )
 
@@ -116,7 +115,7 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 func (c *ControlPlane) lookupRealDomainCache(domain string) (known bool, real bool) {
 	// Read-mostly fast path.
 	c.muRealDomainSet.RLock()
-	hit := c.realDomainSet.TestString(domain)
+	_, hit := c.realDomainSet[domain]
 	c.muRealDomainSet.RUnlock()
 	if hit {
 		return true, true
@@ -167,7 +166,11 @@ func (c *ControlPlane) probeAndUpdateRealDomain(domain string) bool {
 	defer cancel()
 
 	if len(c.bootstrapResolvers) == 0 {
-		// Fail closed when no bootstrap resolver is configured.
+		// Fail closed when no bootstrap resolver is configured — and memoize
+		// the failure in the negative cache, otherwise every connection to
+		// every unknown domain respawns a goroutine+singleflight probe that
+		// can never succeed.
+		c.realDomainNegSet.Store(domain, time.Now().Add(realDomainNegativeCacheTTL).UnixNano())
 		return false
 	}
 
@@ -188,7 +191,7 @@ func (c *ControlPlane) probeAndUpdateRealDomain(domain string) bool {
 	}
 
 	c.muRealDomainSet.Lock()
-	c.realDomainSet.AddString(domain)
+	c.rememberRealDomain(domain)
 	c.muRealDomainSet.Unlock()
 	c.realDomainNegSet.Delete(domain)
 	return true
@@ -212,7 +215,7 @@ func (c *ControlPlane) resolveIp46WithBootstrapResolvers(
 	var lastNoRecordErr4 error
 	var lastNoRecordErr6 error
 	for _, resolver := range c.bootstrapResolvers {
-		ip46, err4, err6 := resolve(ctx, direct.SymmetricDirect, resolver, host, network, race)
+		ip46, err4, err6 := resolve(ctx, c.directDialer, resolver, host, network, race)
 		if ip46 == nil {
 			ip46 = &netutils.Ip46{}
 		}

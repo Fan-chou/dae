@@ -107,16 +107,8 @@ func (m *SessionManager) snapshotFlowRuntimes() (tcp []*FlowRuntime, udp []*UDPF
 	if m == nil {
 		return nil, nil
 	}
-	m.mu.RLock()
-	tcp = make([]*FlowRuntime, 0, len(m.flows))
-	for _, flow := range m.flows {
-		tcp = append(tcp, flow)
-	}
-	udp = make([]*UDPFlowRuntime, 0, len(m.udpFlows))
-	for _, flow := range m.udpFlows {
-		udp = append(udp, flow)
-	}
-	m.mu.RUnlock()
+	m.flows.Range(func(_, value any) bool { tcp = append(tcp, value.(*FlowRuntime)); return true })
+	m.udpFlows.Range(func(_, value any) bool { udp = append(udp, value.(*UDPFlowRuntime)); return true })
 	return tcp, udp
 }
 

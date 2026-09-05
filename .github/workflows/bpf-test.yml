@@ -5,6 +5,11 @@ on:
     paths:
       - "**/*.c"
       - "**/*.h"
+      - "control/**/*.go"
+      - "pkg/ebpf_internal/**"
+      - "trace/**"
+      - "scripts/ebpf-audit.sh"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/bpf-test.yml"
@@ -15,6 +20,11 @@ on:
     paths:
       - "**/*.c"
       - "**/*.h"
+      - "control/**/*.go"
+      - "pkg/ebpf_internal/**"
+      - "trace/**"
+      - "scripts/ebpf-audit.sh"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/bpf-test.yml"
@@ -53,7 +63,7 @@ jobs:
         env: ${{ matrix.env }}
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y clang-$VERSION llvm-$VERSION
+          sudo apt-get install -y clang-$VERSION llvm-$VERSION iproute2 iputils-ping
 
       - name: Run BPF tests
         env: ${{ matrix.env }}

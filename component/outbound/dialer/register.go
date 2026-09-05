@@ -19,10 +19,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func NewFromLink(gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
-	return NewFromLinkContext(context.Background(), gOption, iOption, link, subscriptionTag)
-}
-
 func NewFromLinkContext(ctx context.Context, gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
 	// Each dialer owns an independent sticky-IP cache. A shared cache keyed by
 	// proxy address would be thrashed by per-dialer health-check cycles when
@@ -40,7 +36,11 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	if err != nil {
 		return nil, err
 	}
-	baseDialer := newDefaultNetworkDialer(direct.SymmetricDirect, gOption.SoMarkFromDae, gOption.Mptcp)
+	baseDirectDialer := gOption.DirectDialer
+	if baseDirectDialer == nil {
+		baseDirectDialer = direct.SymmetricDirect
+	}
+	baseDialer := newDefaultNetworkDialer(baseDirectDialer, gOption.SoMarkFromDae, gOption.Mptcp)
 	scopedBaseDialer := scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
 
 	// First, create the protocol dialer with direct dialer to get the property
@@ -308,4 +308,8 @@ func normalizeShadowTLSSIP003Plugin(plugin string) (string, bool) {
 		return plugin, false
 	}
 	return strings.Join(fields, ";"), true
+}
+
+func NewFromLink(gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
+	return NewFromLinkContext(context.Background(), gOption, iOption, link, subscriptionTag)
 }

@@ -18,9 +18,11 @@
 #include "headers/bpf_helpers.h"
 /* bpf_tracing.h (kprobe arg accessors) needs a target arch; mirror the
  * vmlinux.h fallback (x86) unless the build already selects one. */
-#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm64) && \
-	!defined(__TARGET_ARCH_riscv) && !defined(__TARGET_ARCH_loongarch) && \
-	!defined(__TARGET_ARCH_powerpc)
+#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm) && \
+	!defined(__TARGET_ARCH_arm64) && !defined(__TARGET_ARCH_riscv) && \
+	!defined(__TARGET_ARCH_loongarch) &&                              \
+	!defined(__TARGET_ARCH_powerpc) && !defined(__TARGET_ARCH_s390) && \
+	!defined(__TARGET_ARCH_mips)
 #define __TARGET_ARCH_x86
 #endif
 #include "headers/bpf_tracing.h"
@@ -40,6 +42,9 @@
 // #define unlikely(x) x
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
+// TC_ACT_UNSPEC and TCX_NEXT are both -1: the shared continuation action for
+// classic cls_bpf and TCX multiprogram attachment.
+#define DAE_TC_CONTINUE TC_ACT_UNSPEC
 #ifndef BIT
 #define BIT(nr) (1UL << (nr))
 #endif
@@ -699,7 +704,20 @@ build_routing_meta(__u8 outbound, __u32 mark, __u8 must, __u8 dscp)
 static __always_inline void
 publish_routing_meta(union routing_meta *dst, union routing_meta meta)
 {
-	/* Publish routing only after side fields (mac/pname/pid) are ready. */
+	/* Publish routing only after side fields (mac/pname/pid) are ready.
+	 *
+	 * barrier() is a COMPILER-ONLY fence: it orders the generated machine
+	 * code but emits no CPU fence, so the store-release guarantee is
+	 * architecture-dependent. On strongly ordered targets (x86 TSO) the
+	 * prior writes to mac/pname/pid are observed before has_routing=1.
+	 * On weakly ordered targets a reader that observes has_routing=1 may
+	 * briefly read stale side fields. This is an accepted trade-off: the
+	 * side fields are advisory per-flow metadata consumed through the
+	 * conn_state cache domain, the window is a single first-packet
+	 * publication, and a full __sync_synchronize() fence in this hot path
+	 * would need verification across the whole kernel matrix before it
+	 * could be considered.
+	 */
 	barrier();
 	*(volatile __u64 *)&dst->raw = meta.raw;
 }
@@ -952,10 +970,24 @@ static __always_inline bool is_extension_header(__u8 nexthdr)
 	case IPPROTO_ROUTING:
 	case IPPROTO_FRAGMENT:
 	case IPPROTO_DSTOPTS:
+	case IPPROTO_AH:
+	case IPPROTO_MH:
 		return true;
 	default:
 		return false;
 	}
+}
+
+/* Total length in bytes of a walkable IPv6 extension header. AH (RFC 4302)
+ * encodes its length in 4-octet units excluding the first 8 octets:
+ * (payload_len + 2) * 4. Every other extension header (incl. MH) uses
+ * 8-octet units, which is what ipv6_optlen computes.
+ */
+static __always_inline __u32 ipv6_exthdr_len(__u8 nexthdr, __u8 len_field)
+{
+	if (nexthdr == IPPROTO_AH)
+		return (__u32)(len_field + 2) * 4;
+	return ipv6_optlen(len_field);
 }
 
 #define PARSE_FRAGMENT 2
@@ -1149,8 +1181,10 @@ parse_transport_fast(struct __sk_buff *skb, __u32 link_h_len,
 			if ((void *)(ext_hdr + 2) > data_end)
 				return -1;
 
+			__u8 cur_hdr = nexthdr;
+
 			nexthdr = ext_hdr[0];
-			offset += ipv6_optlen(ext_hdr[1]);
+			offset += ipv6_exthdr_len(cur_hdr, ext_hdr[1]);
 			*l4proto = nexthdr;
 		}
 
@@ -1315,6 +1349,8 @@ parse_transport_slow(struct __sk_buff *skb, __u32 link_h_len,
 			if (!is_extension_header(nexthdr))
 				break;
 
+			__u8 cur_hdr = nexthdr;
+
 			ret = bpf_skb_load_bytes(skb, offset, &nexthdr, 1);
 			if (ret)
 				return -EFAULT;
@@ -1326,7 +1362,7 @@ parse_transport_slow(struct __sk_buff *skb, __u32 link_h_len,
 			if (ret)
 				return -EFAULT;
 
-			__u32 ext_len = ipv6_optlen(hdr_ext_len);
+			__u32 ext_len = ipv6_exthdr_len(cur_hdr, hdr_ext_len);
 
 			offset += ext_len;
 		}
@@ -2751,7 +2787,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
@@ -2764,7 +2800,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
-	return TC_ACT_PIPE;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/lan_egress_l2")
@@ -3014,8 +3050,13 @@ lan_new_flow_route:;
 			tuple_size = sizeof(tuple.ipv6);
 		}
 
+		/* Look up in the netns of the hook (the LAN-side host netns):
+		 * dae_netns_id would search dae's own netns, which can only ever
+		 * match dae sockets and makes the local-service branch below
+		 * unreachable. -1 selects "the netns of ctx".
+		 */
 		sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
-				       PARAM.dae_netns_id, 0);
+				       (__u64)(s32)-1, 0);
 		if (sk) {
 			if (!bpf_sock_is_dae_socket(sk)) {
 				bpf_sk_release(sk);
@@ -3187,11 +3228,14 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 	}
 	if (p)
 		*p = NULL;
-	if (PARAM.dae_socket_mark && skb->mark == PARAM.dae_socket_mark)
-		return true;
-	if ((skb->mark & 0x100) == 0x100)
-		return true;
-	return false;
+	/* Fallback for sockets that missed cookie_pid_map (e.g. non-handshake
+	 * packets). Preserve the default reserved-bit behavior, but treat a
+	 * custom so_mark_from_dae as the exact fwmark value configured by the
+	 * user rather than silently turning it into a mask.
+	 */
+	if (PARAM.dae_socket_mark && PARAM.dae_socket_mark != 0x100)
+		return skb->mark == PARAM.dae_socket_mark;
+	return (skb->mark & 0x100) == 0x100;
 }
 
 static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_len)
@@ -3246,7 +3290,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
@@ -3259,7 +3303,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
-	return TC_ACT_PIPE;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/wan_ingress_l2")
@@ -3274,12 +3318,43 @@ int tproxy_wan_ingress_l3(struct __sk_buff *skb)
 	return do_tproxy_wan_ingress(skb, 0);
 }
 
+static __always_inline int
+do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
+{
+	int ret = do_tproxy_wan_ingress(skb, link_h_len);
+
+	if (ret != DAE_TC_CONTINUE)
+		return ret;
+	return do_tproxy_lan_ingress(skb, link_h_len);
+}
+
+SEC("tc/wan_lan_ingress_l2")
+int tproxy_wan_lan_ingress_l2(struct __sk_buff *skb)
+{
+	return do_tproxy_wan_lan_ingress(skb, 14);
+}
+
+SEC("tc/wan_lan_ingress_l3")
+int tproxy_wan_lan_ingress_l3(struct __sk_buff *skb)
+{
+	return do_tproxy_wan_lan_ingress(skb, 0);
+}
+
 // Routing and redirect the packet back.
 // We cannot modify the dest address here. So we cooperate with wan_ingress.
 static __noinline bool
 wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 		      __be16 dport)
 {
+	/* Reserved outbounds (must_rules, control-plane routing, logical
+	 * markers) have no connectivity entries: the map below is sized for
+	 * user-defined ids only, so a reserved id would read a zeroed entry
+	 * and silently drop the flow. This includes the control-plane punt
+	 * outbound used by implicit sniff-punt rules; DNS bypasses below for
+	 * the same reason. */
+	if (outbound >= OUTBOUND_MUST_RULES)
+		return true;
+
 	/* DNS must always reach control plane; userspace handles fallback. */
 	if (dport == bpf_htons(53))
 		return true;
@@ -3326,7 +3401,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			scratch->flag[1] = IpVersionType_6;
 		scratch->flag[6] = tuples->dscp;
 		if (pid_is_control_plane(skb, &pid_pname))
-			return TC_ACT_OK;
+			return DAE_TC_CONTINUE;
 		if (pid_pname)
 			__builtin_memcpy(&scratch->flag[2], pid_pname->pname,
 					 TASK_COMM_LEN);
@@ -3388,7 +3463,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (!tcp_conn) {
 			if (outbound == OUTBOUND_DIRECT && mark == 0)
-				return TC_ACT_OK;
+				return DAE_TC_CONTINUE;
 			return TC_ACT_SHOT;
 		}
 
@@ -3410,7 +3485,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 
 		if (!tcp_conn || !tcp_conn->meta.data.has_routing)
-			return TC_ACT_OK;
+			return DAE_TC_CONTINUE;
 
 		outbound = tcp_conn->meta.data.outbound;
 		mark = tcp_conn->meta.data.mark;
@@ -3428,7 +3503,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		bpf_printk("GO OUTBOUND_DIRECT");
 #endif
 		skb->mark = mark;
-		return TC_ACT_OK;
+		return DAE_TC_CONTINUE;
 	} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("SHOT OUTBOUND_BLOCK");
@@ -3491,7 +3566,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 		scratch->flag[1] = IpVersionType_6;
 	scratch->flag[6] = tuples->dscp;
 	if (pid_is_control_plane(skb, &pid_pname))
-		return TC_ACT_OK;
+		return DAE_TC_CONTINUE;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen(&tuples->five, false,
@@ -3499,7 +3574,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 					       0, NULL, 0,
 					       ROUTING_EPOCH_SLOT_UNKNOWN);
 		if (udp_conn_state && udp_conn_state->is_wan_ingress_direction)
-			return TC_ACT_OK;
+			return DAE_TC_CONTINUE;
 
 		if (udp_conn_state && udp_conn_state->meta.data.has_routing) {
 			outbound = udp_conn_state->meta.data.outbound;
@@ -3584,7 +3659,7 @@ fast_path_skip_routing:
 #endif
 
 	if (!wan_egress_needs_control_plane(outbound, mark))
-		return TC_ACT_OK;
+		return DAE_TC_CONTINUE;
 	else if (unlikely(outbound == OUTBOUND_BLOCK))
 		return TC_ACT_SHOT;
 
@@ -3613,6 +3688,9 @@ fast_path_skip_routing:
 }
 
 // Per-CPU scratch to stay under 512-byte stack limit across the call chain.
+//
+// Pass-through returns DAE_TC_CONTINUE, not TC_ACT_OK, so later programs see
+// the packet under both classic cls_bpf and TCX multiprogram attachment.
 static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
 	/* Forwarded LAN→WAN frames have ingress_ifindex != 0 and used to skip
@@ -3623,7 +3701,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 		return TC_ACT_SHOT;
 
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return TC_ACT_OK;
+		return DAE_TC_CONTINUE;
 
 	__u32 scratch_key = 0;
 	struct parsed_packet *pkt =
@@ -3641,7 +3719,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 			bpf_printk("wan_egress parse error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		return TC_ACT_OK;
+		return DAE_TC_CONTINUE;
 	}
 
 	if (pkt->l4proto == IPPROTO_TCP)
@@ -3650,7 +3728,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 	if (pkt->l4proto == IPPROTO_UDP)
 		return do_tproxy_wan_egress_udp(skb, link_h_len, &pkt->tuples,
 						&pkt->ethh, &pkt->udph);
-	return TC_ACT_OK;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/wan_egress_l2")
@@ -3663,6 +3741,28 @@ SEC("tc/wan_egress_l3")
 int tproxy_wan_egress_l3(struct __sk_buff *skb)
 {
 	return do_tproxy_wan_egress(skb, 0);
+}
+
+static __always_inline int
+do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
+{
+	int ret = do_tproxy_lan_egress(skb, link_h_len);
+
+	if (ret != DAE_TC_CONTINUE)
+		return ret;
+	return do_tproxy_wan_egress(skb, link_h_len);
+}
+
+SEC("tc/lan_wan_egress_l2")
+int tproxy_lan_wan_egress_l2(struct __sk_buff *skb)
+{
+	return do_tproxy_lan_wan_egress(skb, 14);
+}
+
+SEC("tc/lan_wan_egress_l3")
+int tproxy_lan_wan_egress_l3(struct __sk_buff *skb)
+{
+	return do_tproxy_lan_wan_egress(skb, 0);
 }
 
 SEC("tc/dae0peer_ingress")
@@ -4004,6 +4104,8 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 	return 1;
 }
 
+#include "include/tcp_offload.h"
+
 // tcp_offload_redirect is the stream-verdict (RX path) program for the
 // fast_sock SOCKHASH. When a socket registered by the Go control plane
 // receives data, this program redirects it to the peer relay socket's egress
@@ -4028,7 +4130,7 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 	// bits on little-endian targets (convert_skb_access LSH 16);
 	// local_port is host byte order.
 	peer_key.l4proto = IPPROTO_TCP;
-	peer_key.sport = skb->remote_port >> 16;
+	peer_key.sport = tcp_offload_remote_port(skb->remote_port);
 	peer_key.dport = bpf_htons((__u16)skb->local_port);
 	if (skb->family == AF_INET) {
 		peer_key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -4070,8 +4172,10 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
 /* tcp_offload_sent_account records, per reversed four-tuple, the bytes that
  * skb_send_sock pushes into a peer socket's send path. The key layout
  * must match tcp_offload_redirect's peer_key so the Go session can look up
- * both directions with its registered keys. fentry keeps the per-packet
- * cost below the kprobe trap overhead on the hot redirect path.
+ * both directions with its registered keys. Userspace picks the attach
+ * site per kernel (see tcp_offload_hook.go): fentry on the outer wrapper
+ * when only it is verified, or the kprobe variant on the shared inner
+ * __skb_send_sock when LTO can bypass the wrapper.
  *
  * NOTE: the hook must sit on skb_send_sock, not skb_send_sock_locked.
  * The sockmap verdict egress path is sk_psock_verdict_apply ->
@@ -4082,6 +4186,10 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * v6.12 and v6.17 sources). Both functions are identical one-line
  * tail-call wrappers into __skb_send_sock with the same first four
  * arguments, so the BPF_PROG signature below is unchanged.
+ *
+ * A successful attach does not prove this wrapper executes. LTO kernels
+ * can bypass it and call __skb_send_sock directly; the E2E sent/inflow
+ * assertions must still pass before relying on accounting on that kernel.
  *
  * An earlier EBUSY when attaching to skb_send_sock on 6.12/6.17/6.18 was
  * an attachment-conflict signal, not a function-shape artifact: the
@@ -4111,44 +4219,10 @@ static __always_inline void
 tcp_offload_sent_account_body(struct sk_buff *skb, int len)
 {
 	struct tuples_key key = {};
-	struct iphdr ip4;
-	struct tcphdr tcp;
-	__u16 nh;
-	unsigned char *head, *data;
 	__u64 *v;
 
-	nh = BPF_CORE_READ(skb, network_header);
-	head = BPF_CORE_READ(skb, head);
-	data = head + nh;
-	if (bpf_probe_read_kernel(&ip4, sizeof(ip4), data))
+	if (!tcp_offload_skb_key(skb, &key))
 		return;
-
-	key.l4proto = IPPROTO_TCP;
-	if (ip4.version == 4) {
-		__u16 th_off = ip4.ihl * 4;
-
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + th_off))
-			return;
-		key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.sip.u6_addr32[3] = ip4.saddr;
-		key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.dip.u6_addr32[3] = ip4.daddr;
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else if (ip4.version == 6) {
-		struct ipv6hdr ip6;
-
-		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), data))
-			return;
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + sizeof(ip6)))
-			return;
-		__builtin_memcpy(&key.sip, &ip6.saddr, IPV6_BYTE_LENGTH);
-		__builtin_memcpy(&key.dip, &ip6.daddr, IPV6_BYTE_LENGTH);
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else {
-		return;
-	}
 
 	v = bpf_map_lookup_elem(&tcp_offload_sent, &key);
 	if (v) {

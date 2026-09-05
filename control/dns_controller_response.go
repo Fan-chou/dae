@@ -34,6 +34,61 @@ func dnsUDPResponseSizeLimit(req *dnsmessage.Msg) int {
 	return limit
 }
 
+type dnsUDPResponseWriter struct {
+	dnsmessage.ResponseWriter
+	limit int
+}
+
+func (w *dnsUDPResponseWriter) WriteMsg(msg *dnsmessage.Msg) error {
+	if msg.Len() > w.limit {
+		// Truncate changes sections and compression; cached and singleflight
+		// payloads must stay intact for clients that retry over TCP.
+		msg = msg.Copy()
+		truncateDNSMessage(msg, w.limit)
+	}
+	return w.ResponseWriter.WriteMsg(msg)
+}
+
+// questionEchoMatches reports whether an upstream response echoes the
+// request question. Transaction IDs are only 16 bits, so ID equality alone
+// cannot prove a response belongs to a request: a hijacked upstream, a
+// cross-talked connection, or an off-path spoofer that collides with the ID
+// must not reach the response cache or the client (RFC 5452). The question
+// section is the mandatory second factor; compliant upstreams echo it
+// verbatim, including on CNAME-chased and pipelined replies.
+func questionEchoMatches(req dnsmessage.Question, resp *dnsmessage.Msg) bool {
+	if len(resp.Question) == 0 {
+		return false
+	}
+	rq := resp.Question[0]
+	// CanonicalName lowercases and FQDN-terminates, giving the
+	// case-insensitive name equality DNS requires.
+	return req.Qtype == rq.Qtype && req.Qclass == rq.Qclass &&
+		dnsmessage.CanonicalName(req.Name) == dnsmessage.CanonicalName(rq.Name)
+}
+
+// truncateDNSMessage requires exclusive ownership of msg and its records.
+func truncateDNSMessage(msg *dnsmessage.Msg, limit int) {
+	msg.Truncate(limit)
+	opt := msg.IsEdns0()
+	if opt == nil || msg.Len() <= limit {
+		return
+	}
+
+	// Truncate retains the entire OPT even when its options exceed the
+	// budget. Keep its header and every complete option that still fits;
+	// omitted options require TCP retry just like omitted resource records.
+	options := opt.Option
+	opt.Option = nil
+	for _, option := range options {
+		opt.Option = append(opt.Option, option)
+		if msg.Len() > limit {
+			opt.Option = opt.Option[:len(opt.Option)-1]
+			msg.Truncated = true
+		}
+	}
+}
+
 // truncateDNSResponse returns packed unchanged if it fits within limit;
 // otherwise it returns a truncated repack with the TC bit set (RFC 1035
 // section 4.2.1) so the client retries over TCP. On unpack/pack failure the
@@ -46,7 +101,7 @@ func truncateDNSResponse(packed []byte, limit int) []byte {
 	if err := msg.Unpack(packed); err != nil {
 		return packed
 	}
-	msg.Truncate(limit)
+	truncateDNSMessage(&msg, limit)
 	if data, err := msg.Pack(); err == nil {
 		return data
 	}
@@ -132,12 +187,13 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 	return nil
 }
 
-// sendDnsErrorResponse_ is the shared implementation for both sendRejectWithResponseWriter_
-// and sendRefusedWithResponseWriter_. It sets the common response fields, logs at trace
-// level, and sends the response via responseWriter or UDP.
+// sendDnsErrorResponse_ is the shared implementation for the reject/refused/
+// truncated control responses. It sets the common response fields, logs at
+// trace level, and sends the response via responseWriter or UDP.
 func (c *DnsController) sendDnsErrorResponse_(
 	dnsMessage *dnsmessage.Msg,
 	rcode int,
+	truncated bool,
 	traceMsg string,
 	req *udpRequest,
 	responseWriter dnsmessage.ResponseWriter,
@@ -146,7 +202,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 	dnsMessage.Rcode = rcode
 	dnsMessage.Response = true
 	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = false
+	dnsMessage.Truncated = truncated
 	dnsMessage.Compress = true
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
@@ -166,6 +222,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
+	data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
 	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return err
 	}
@@ -174,54 +231,31 @@ func (c *DnsController) sendDnsErrorResponse_(
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, "Refused due to concurrency limit", req, responseWriter)
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, false, "Refused due to concurrency limit", req, responseWriter)
 }
 
+// sendDnsTruncatedResponse_ sends a TC=1 success response for oversized answers.
 func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
-	dnsMessage.Answer = nil
-	dnsMessage.Rcode = dnsmessage.RcodeSuccess
-	dnsMessage.Response = true
-	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = true
-	dnsMessage.Compress = true
-	if c.log.IsLevelEnabled(logrus.TraceLevel) {
-		c.log.WithFields(logrus.Fields{
-			"question": dnsMessage.Question,
-		}).Traceln("Truncated")
-	}
-	if responseWriter != nil {
-		return responseWriter.WriteMsg(dnsMessage)
-	}
-	if req == nil || req.lConn == nil {
-		return nil
-	}
-	// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
-	bufPtr := dnsResponseBufPool.Get().(*[]byte)
-	defer dnsResponseBufPool.Put(bufPtr)
-	data, err := dnsMessage.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
-		return err
-	}
-	return nil
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, true, "Truncated", req, responseWriter)
 }
 
 // sendRejectWithResponseWriter_ send empty answer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, "Reject", req, responseWriter)
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, false, "Reject", req, responseWriter)
 }
 
 // applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.
 // When ip_version_prefer is set and a non-preferred A/AAAA response is received,
-// wait briefly (50ms) for the preferred response to arrive before using this one.
+// wait briefly (50ms) for the preferred response to arrive before proceeding.
 //
 // This function handles two scenarios:
 // 1. Non-preferred response arrives (e.g., A when prefer=6): Register wait and wait for preferred
 // 2. Preferred response arrives (e.g., AAAA when prefer=6): Notify any waiting requests
 //
-// The function returns the response to use (preferred if arrived during wait, otherwise original).
+// The original response is always returned unchanged. The wait only delays
+// when the caller releases this response downstream, giving a preferred
+// response a chance to arrive first; the preferred message itself is never
+// substituted here.
 func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage.Msg {
 	c.requireStore()
 	// Fast path: preference not enabled
@@ -265,7 +299,7 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 		preferred := wait.waitFor()
 
 		// Clean up wait registry
-		c.prefWaitRegistry.remove(qname)
+		c.prefWaitRegistry.remove(wait)
 
 		if preferred {
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {

@@ -23,6 +23,21 @@ import (
 
 // batchRecorder implements PacketConn + PacketBatchWriter and records every
 // batch (with deep-copied payloads so reuse of the aggregator buffer is safe).
+func TestUDPWriteBatchRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv(udpWriteBatchOptInEnv, "")
+	if udpWriteBatchOptedIn() {
+		t.Fatal("batching enabled without explicit opt-in")
+	}
+	t.Setenv(udpWriteBatchOptInEnv, "1")
+	if !udpWriteBatchOptedIn() {
+		t.Fatal("batching disabled with explicit opt-in")
+	}
+	t.Setenv(udpWriteBatchOptInEnv, "true")
+	if udpWriteBatchOptedIn() {
+		t.Fatal("ambiguous opt-in value enabled batching")
+	}
+}
+
 type batchRecorder struct {
 	mu      sync.Mutex
 	batches [][]netproxy.BatchItem
@@ -288,7 +303,7 @@ func TestAggregatorClosed(t *testing.T) {
 }
 
 // TestAggregatorErrorClassified: a failed WriteBatch is routed through
-// handleWriteError (soft-error counter increments, endpoint not retired).
+// handleWriteError (classified as a tolerated drop, endpoint not retired).
 func TestAggregatorErrorClassified(t *testing.T) {
 	rec := &batchRecorder{err: errors.New("boom")}
 	ue := newBatchTestEndpoint(rec)
@@ -301,9 +316,6 @@ func TestAggregatorErrorClassified(t *testing.T) {
 	}
 	if rec.batchCount() < 1 {
 		t.Fatal("expected flush attempt on full batch")
-	}
-	if n := ue.writeSoftErrorCount.Load(); n != 1 {
-		t.Fatalf("expected soft-error counter 1 after failed flush, got %d", n)
 	}
 	if ue.dead.Load() {
 		t.Fatal("tolerated flush error must not retire the endpoint")

@@ -6,7 +6,7 @@
 package control
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"runtime"
@@ -134,14 +134,6 @@ func prefixesEqual(a, b []netip.Prefix) bool {
 	return true
 }
 
-func NewRoutingMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, outboundName2Id map[string]uint8, bpf *bpfObjects, fallback config.FunctionOrString) (b *RoutingMatcherBuilder, err error) {
-	program, err := routing.NewNormalizedProgram(rules, fallback)
-	if err != nil {
-		return nil, err
-	}
-	return NewRoutingMatcherBuilderFromProgram(log, program, outboundName2Id, bpf)
-}
-
 func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.NormalizedProgram, outboundName2Id map[string]uint8, bpf *bpfObjects) (b *RoutingMatcherBuilder, err error) {
 	if program == nil {
 		return nil, fmt.Errorf("routing program is nil")
@@ -213,6 +205,11 @@ func (b *RoutingMatcherBuilder) outboundToId(outbound string) (uint8, error) {
 		outboundId = uint8(consts.OutboundLogicalAnd)
 	case consts.OutboundMustRules.String():
 		outboundId = uint8(consts.OutboundMustRules)
+	case consts.OutboundControlPlaneRouting.String():
+		// Implicit sniff-punt lines steer unknown-domain traffic of a device
+		// whitelist to userspace for sniffed-domain re-routing. They carry no
+		// group and must never register as a health-checked reference.
+		outboundId = uint8(consts.OutboundControlPlaneRouting)
 	default:
 		var ok bool
 		outboundId, ok = b.outboundName2Id[outbound]
@@ -309,7 +306,7 @@ func (b *RoutingMatcherBuilder) addSourceMac(f *config_parser.Function, macAddrs
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], uint32(lpmTrieIndex))
+	nativeBpfABI.putUint32(set.Value[:], uint32(lpmTrieIndex))
 	compiled := newCompiledRoutingBase(consts.MatchType_Mac, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = uint32(lpmTrieIndex)
 	b.appendRule(set, compiled)
@@ -348,7 +345,7 @@ func (b *RoutingMatcherBuilder) addIp(f *config_parser.Function, values []netip.
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], lpmTrieIndex)
+	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
 	compiled := newCompiledRoutingBase(consts.MatchType_IpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
@@ -432,7 +429,7 @@ func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
-	binary.LittleEndian.PutUint32(set.Value[:], lpmTrieIndex)
+	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
 	compiled := newCompiledRoutingBase(matchType, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
@@ -583,11 +580,13 @@ func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 	return nil
 }
 
-// globalNextLpmIndex allocates local LPM indexes across builds. It reduces
-// reuse when a slot is rebuilt and preserves the legacy slot-zero allocation
-// behavior. BuildKernspace is expected to run serially; atomic protects
-// against accidental concurrent invocation.
-var globalNextLpmIndex atomic.Uint32
+// globalNextLpmIndex allocates local LPM indexes across builds, reducing
+// reuse when a slot is rebuilt. BuildKernspace is expected to run serially;
+// lpmBuildMu makes that ownership explicit for the shared map and ring.
+var (
+	globalNextLpmIndex atomic.Uint32
+	lpmBuildMu         sync.Mutex
+)
 
 func routingEpochSlotBase(slot uint32) (uint32, error) {
 	if !validRoutingEpochSlot(slot) {
@@ -638,12 +637,12 @@ func rewriteKernRulesWithRingLpmIndex(rules []bpfMatchSet, allocStartIdx uint32,
 		matchType := consts.MatchType(rule.Type)
 		switch matchType {
 		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
-			oldLpmIndex := binary.LittleEndian.Uint32(rule.Value[:4])
+			oldLpmIndex := nativeBpfABI.uint32(rule.Value[:4])
 			if oldLpmIndex >= lpmCount {
 				return nil, fmt.Errorf("bad lpm index in rule[%d]: %d >= %d", i, oldLpmIndex, lpmCount)
 			}
 			newLpmIndex := (allocStartIdx + oldLpmIndex) % maxEntries
-			binary.LittleEndian.PutUint32(kernRules[i].Value[:4], newLpmIndex)
+			nativeBpfABI.putUint32(kernRules[i].Value[:4], newLpmIndex)
 		}
 	}
 	return kernRules, nil
@@ -670,6 +669,12 @@ func buildRoutingKernspaceForSlot(
 	if len(rules) > consts.MaxMatchSetLen {
 		return nil, fmt.Errorf("too many routing rules: %d > %d", len(rules), consts.MaxMatchSetLen)
 	}
+
+	// The ring cursor and the map-of-maps are shared by all generations that
+	// use this datapath. Serialize builders so a rollback cannot restore over
+	// another build's newly installed entries.
+	lpmBuildMu.Lock()
+	defer lpmBuildMu.Unlock()
 
 	lpmCount := uint32(len(simulatedLpmTries))
 	if lpmCount > 0 {
@@ -740,6 +745,54 @@ func buildRoutingKernspaceForSlot(
 		}
 	}
 
+	// Keep the previous inner map for every slot touched by this build. A
+	// failed build may be rebuilding an existing slot, so deleting a reserved
+	// key would destroy the previous generation's routing state.
+	lpmBackups := make(map[uint32]*ebpf.Map, len(results))
+	defer func() {
+		for _, inner := range lpmBackups {
+			_ = inner.Close()
+		}
+	}()
+	if lpmCount > 0 {
+		if bpf.LpmArrayMap == nil {
+			return nil, fmt.Errorf("nil lpm_array_map")
+		}
+		for _, r := range results {
+			mapIndex := slotBase + r.lpmIndex
+			var inner *ebpf.Map
+			lookupErr := bpf.LpmArrayMap.Lookup(mapIndex, &inner)
+			if lookupErr != nil {
+				if !errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+					return nil, fmt.Errorf("snapshot lpm_array_map[%d]: %w", mapIndex, lookupErr)
+				}
+				continue
+			}
+			if inner != nil {
+				lpmBackups[mapIndex] = inner
+			}
+		}
+	}
+
+	installedLpmIndices := make([]uint32, 0, len(results))
+	var installedLpmMu sync.Mutex
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, mapIndex := range installedLpmIndices {
+			if inner, ok := lpmBackups[mapIndex]; ok {
+				if restoreErr := bpf.LpmArrayMap.Update(mapIndex, inner, ebpf.UpdateAny); restoreErr != nil {
+					log.Warnf("restore lpm_array_map[%d] after failed build: %v", mapIndex, restoreErr)
+				}
+				continue
+			}
+			if delErr := bpf.LpmArrayMap.Delete(mapIndex); delErr != nil && !errors.Is(delErr, ebpf.ErrKeyNotExist) {
+				log.Warnf("roll back lpm_array_map[%d] after failed build: %v", mapIndex, delErr)
+			}
+		}
+	}()
+
 	// Create and update LPM maps in parallel
 	if numWorkers > 1 && len(results) > 1 {
 		// Parallel path
@@ -784,6 +837,9 @@ func buildRoutingKernspaceForSlot(
 					mu.Unlock()
 					return
 				}
+				installedLpmMu.Lock()
+				installedLpmIndices = append(installedLpmIndices, mapIndex)
+				installedLpmMu.Unlock()
 				_ = m.Close()
 			}(i)
 		}
@@ -804,6 +860,7 @@ func buildRoutingKernspaceForSlot(
 				_ = m.Close()
 				return nil, fmt.Errorf("update: %w", err)
 			}
+			installedLpmIndices = append(installedLpmIndices, mapIndex)
 			_ = m.Close()
 		}
 	}
@@ -822,6 +879,69 @@ func buildRoutingKernspaceForSlot(
 	for i := range routingsKeys {
 		routingsKeys[i] += slotBase
 	}
+	if bpf.RoutingMap == nil || bpf.RoutingMetaMap == nil {
+		return nil, fmt.Errorf("routing maps are not initialized")
+	}
+
+	type routingMapBackup struct {
+		key     uint32
+		value   bpfMatchSet
+		present bool
+	}
+	routingBackups := make([]routingMapBackup, len(routingsKeys))
+	for i, key := range routingsKeys {
+		var value bpfMatchSet
+		lookupErr := bpf.RoutingMap.Lookup(key, &value)
+		switch {
+		case lookupErr == nil:
+			routingBackups[i] = routingMapBackup{key: key, value: value, present: true}
+		case errors.Is(lookupErr, ebpf.ErrKeyNotExist):
+			routingBackups[i] = routingMapBackup{key: key}
+		default:
+			return nil, fmt.Errorf("snapshot routing_map[%d]: %w", key, lookupErr)
+		}
+	}
+	var previousRoutingMeta uint32
+	metaLookupErr := bpf.RoutingMetaMap.Lookup(slot, &previousRoutingMeta)
+	metaPresent := metaLookupErr == nil
+	if metaLookupErr != nil && !errors.Is(metaLookupErr, ebpf.ErrKeyNotExist) {
+		return nil, fmt.Errorf("snapshot routing_meta_map[%d]: %w", slot, metaLookupErr)
+	}
+
+	routingWriteStarted := false
+	defer func() {
+		if err == nil || !routingWriteStarted {
+			return
+		}
+		var rollbackErrs []error
+		// Hide partially written rules while the old values are restored.
+		if restoreErr := bpf.RoutingMetaMap.Update(slot, 0, ebpf.UpdateAny); restoreErr != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("clear routing_meta_map[%d]: %w", slot, restoreErr))
+		}
+		for _, backup := range routingBackups {
+			if backup.present {
+				if restoreErr := bpf.RoutingMap.Update(backup.key, backup.value, ebpf.UpdateAny); restoreErr != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("restore routing_map[%d]: %w", backup.key, restoreErr))
+				}
+				continue
+			}
+			if restoreErr := bpf.RoutingMap.Delete(backup.key); restoreErr != nil && !errors.Is(restoreErr, ebpf.ErrKeyNotExist) {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("delete routing_map[%d]: %w", backup.key, restoreErr))
+			}
+		}
+		if metaPresent {
+			if restoreErr := bpf.RoutingMetaMap.Update(slot, previousRoutingMeta, ebpf.UpdateAny); restoreErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("restore routing_meta_map[%d]: %w", slot, restoreErr))
+			}
+		} else if restoreErr := bpf.RoutingMetaMap.Delete(slot); restoreErr != nil && !errors.Is(restoreErr, ebpf.ErrKeyNotExist) {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("delete routing_meta_map[%d]: %w", slot, restoreErr))
+		}
+		if len(rollbackErrs) > 0 {
+			err = errors.Join(err, errors.Join(rollbackErrs...))
+		}
+	}()
+
+	routingWriteStarted = true
 	if _, err = BpfMapBatchUpdate(bpf.RoutingMap, routingsKeys, kernRules, &ebpf.BatchOptions{
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {
@@ -844,24 +964,6 @@ func buildRoutingKernspaceForSlot(
 	}
 
 	return usedIndices, nil
-}
-
-func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (usedIndices []uint32, err error) {
-	return b.BuildKernspaceForSlot(log, 0)
-}
-
-// BuildKernspaceForSlot constructs routing data in one kernel routing epoch
-// slot. Match-set LPM indexes remain slot-local; only BPF map keys receive the
-// slot offset.
-func (b *RoutingMatcherBuilder) BuildKernspaceForSlot(log *logrus.Logger, slot uint32) (usedIndices []uint32, err error) {
-	if b == nil {
-		return nil, fmt.Errorf("nil routing matcher builder")
-	}
-	return buildRoutingKernspaceForSlot(log, b.bpf, b.rules, b.simulatedLpmTries, len(b.lpmDedup), slot)
-}
-
-func (s *routingKernspaceSnapshot) BuildKernspace(log *logrus.Logger, bpf *bpfObjects) (usedIndices []uint32, err error) {
-	return s.BuildKernspaceForSlot(log, bpf, 0)
 }
 
 // BuildKernspaceForSlot constructs this immutable routing snapshot in one
@@ -958,6 +1060,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		lpmMatcher:      lpmMatcher,
 		domainMatcher:   domainMatcher,
 		compiledMatches: compiledMatches,
+		needs:           computeRoutingMatcherNeeds(compiledMatches),
 		predicateGroups: append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
 	}
 
@@ -971,4 +1074,12 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	b.lpmDedup = nil
 
 	return matcher, nil
+}
+
+func NewRoutingMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, outboundName2Id map[string]uint8, bpf *bpfObjects, fallback config.FunctionOrString) (b *RoutingMatcherBuilder, err error) {
+	program, err := routing.NewNormalizedProgram(rules, fallback)
+	if err != nil {
+		return nil, err
+	}
+	return NewRoutingMatcherBuilderFromProgram(log, program, outboundName2Id, bpf)
 }

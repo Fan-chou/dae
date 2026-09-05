@@ -102,6 +102,22 @@ func retryPreviousRoutingEpochCleanup(
 	)
 }
 
+type routingEpochActiveSlotSnapshot struct {
+	slot             uint32
+	cachedAtUnixNano int64
+	valid            bool
+	publishing       bool
+}
+
+type routingEpochActiveSlotCacheEntry struct {
+	core     *controlPlaneCore
+	previous *routingEpochActiveSlotSnapshot
+}
+
+type routingEpochActiveSlotCachePublication struct {
+	entries []routingEpochActiveSlotCacheEntry
+}
+
 func validRoutingEpochSlot(slot uint32) bool {
 	return slot < routingEpochSlotCount
 }
@@ -120,31 +136,130 @@ func (c *controlPlaneCore) hasStagedRoutingEpochLocked(slot uint32, epoch uint64
 	return c.routingEpochStaged && c.routingEpochStagedSlot == slot && c.routingEpochStagedEpoch == epoch
 }
 
+func (c *controlPlaneCore) cacheActiveRoutingEpochSlot(observed *routingEpochActiveSlotSnapshot, slot uint32) bool {
+	if observed != nil && observed.publishing {
+		return false
+	}
+	return c.routingEpochActiveSlotCache.CompareAndSwap(observed, &routingEpochActiveSlotSnapshot{
+		slot:             slot,
+		cachedAtUnixNano: time.Now().UnixNano(),
+		valid:            true,
+	})
+}
+
+func (c *controlPlaneCore) publishActiveRoutingEpochSlotCache(slot uint32) {
+	c.routingEpochActiveSlotCache.Store(&routingEpochActiveSlotSnapshot{
+		slot:             slot,
+		cachedAtUnixNano: time.Now().UnixNano(),
+		valid:            true,
+	})
+}
+
+func (c *controlPlaneCore) invalidateActiveRoutingEpochSlotCache() *routingEpochActiveSlotSnapshot {
+	// Swap in a unique token so a lookup that began before invalidation cannot
+	// successfully compare-and-swap its stale result after the selector flips.
+	return c.routingEpochActiveSlotCache.Swap(&routingEpochActiveSlotSnapshot{publishing: true})
+}
+
+func beginRoutingEpochActiveSlotCachePublication(primary *controlPlaneCore, peers ...*controlPlaneCore) routingEpochActiveSlotCachePublication {
+	publication := routingEpochActiveSlotCachePublication{
+		entries: make([]routingEpochActiveSlotCacheEntry, 0, 1+len(peers)),
+	}
+	add := func(core *controlPlaneCore) {
+		if core == nil {
+			return
+		}
+		for _, entry := range publication.entries {
+			if entry.core == core {
+				return
+			}
+		}
+		publication.entries = append(publication.entries, routingEpochActiveSlotCacheEntry{
+			core:     core,
+			previous: core.invalidateActiveRoutingEpochSlotCache(),
+		})
+	}
+	add(primary)
+	for _, peer := range peers {
+		add(peer)
+	}
+	return publication
+}
+
+func (p routingEpochActiveSlotCachePublication) publish(slot uint32) {
+	for _, entry := range p.entries {
+		entry.core.publishActiveRoutingEpochSlotCache(slot)
+	}
+}
+
+func (p routingEpochActiveSlotCachePublication) restore() {
+	for _, entry := range p.entries {
+		entry.core.routingEpochActiveSlotCache.Store(entry.previous)
+	}
+}
+
 func (c *controlPlaneCore) readActiveRoutingEpochSlot() (uint32, error) {
 	if c == nil {
 		return 0, nil
 	}
-	if c.routingEpochActiveSlotCachedValid.Load() {
-		// delta >= 0 guards against wall-clock rollback (NTP step) widening the stale window.
-		if delta := time.Now().UnixNano() - c.routingEpochActiveSlotCachedAt.Load(); delta >= 0 && delta < int64(routingEpochActiveSlotCacheTTL) {
-			return c.routingEpochActiveSlotCached.Load(), nil
+	for {
+		observed := c.routingEpochActiveSlotCache.Load()
+		nowNano := time.Now().UnixNano()
+		if observed != nil && observed.valid {
+			// delta >= 0 guards against wall-clock rollback (NTP step) widening the stale window.
+			if delta := nowNano - observed.cachedAtUnixNano; delta >= 0 && delta < int64(routingEpochActiveSlotCacheTTL) {
+				return observed.slot, nil
+			}
 		}
+		bpf := c.PeekBpf()
+		if !c.hasRoutingEpochMaps(bpf) {
+			return 0, nil
+		}
+		var slot uint32
+		if err := bpf.ActiveRoutingEpochMap.Lookup(uint32(0), &slot); err != nil {
+			return 0, fmt.Errorf("lookup active routing epoch slot: %w", err)
+		}
+		if !validRoutingEpochSlot(slot) {
+			return 0, fmt.Errorf("active routing epoch slot %d is invalid", slot)
+		}
+		if observed != nil && observed.publishing {
+			// A selector update owns the cache token. Return the map result for
+			// this call, but do not make it outlive the in-progress cutover.
+			return slot, nil
+		}
+		if c.cacheActiveRoutingEpochSlot(observed, slot) {
+			return slot, nil
+		}
+		// A selector publisher replaced the cache token while the map lookup
+		// was in flight. Retry instead of letting the stale lookup overwrite
+		// the publisher's slot.
 	}
-	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
-		return 0, nil
+}
+
+func (c *ControlPlane) publishRoutingEpoch() error {
+	if c == nil || c.core == nil || !c.core.routingEpochEnabled() {
+		return nil
 	}
-	var slot uint32
-	if err := bpf.ActiveRoutingEpochMap.Lookup(uint32(0), &slot); err != nil {
-		return 0, fmt.Errorf("lookup active routing epoch slot: %w", err)
+	c.routingEpochPeerMu.RLock()
+	defer c.routingEpochPeerMu.RUnlock()
+	var peerCore *controlPlaneCore
+	if c.routingEpochPeer != nil {
+		peerCore = c.routingEpochPeer.core
 	}
-	if !validRoutingEpochSlot(slot) {
-		return 0, fmt.Errorf("active routing epoch slot %d is invalid", slot)
+	return c.core.PublishRoutingEpoch(peerCore)
+}
+
+func (c *ControlPlane) rollbackRoutingEpoch() error {
+	if c == nil || c.core == nil {
+		return nil
 	}
-	c.routingEpochActiveSlotCached.Store(slot)
-	c.routingEpochActiveSlotCachedAt.Store(time.Now().UnixNano())
-	c.routingEpochActiveSlotCachedValid.Store(true)
-	return slot, nil
+	c.routingEpochPeerMu.RLock()
+	defer c.routingEpochPeerMu.RUnlock()
+	var peerCore *controlPlaneCore
+	if c.routingEpochPeer != nil {
+		peerCore = c.routingEpochPeer.core
+	}
+	return c.core.RollbackRoutingEpoch(peerCore)
 }
 
 // PrepareRoutingEpoch reserves the route-plan slot used by this control-plane
@@ -233,7 +348,13 @@ func (c *controlPlaneCore) StageRoutingEpoch() error {
 // PublishRoutingEpoch atomically changes the slot consulted by route(). Call
 // it only after the selected slot's rules, LPM tries, and domain projection
 // have all been prepared.
-func (c *controlPlaneCore) PublishRoutingEpoch() error {
+//
+// ROUTING-EPOCH-1 contract: reload orchestration is the single writer for a linked
+// pair. Per-core routingEpochMu does not serialize a concurrent publisher on
+// the peer, so any future parallel publication must add lifecycle-level
+// serialization around the complete selector/cache transaction. See the
+// ROUTING-EPOCH-1 section in docs/weak-memory-publication-audit.md.
+func (c *controlPlaneCore) PublishRoutingEpoch(peerCaches ...*controlPlaneCore) error {
 	if c == nil {
 		return nil
 	}
@@ -249,16 +370,18 @@ func (c *controlPlaneCore) PublishRoutingEpoch() error {
 	if !validRoutingEpochSlot(slot) || epoch == 0 || !c.hasStagedRoutingEpochLocked(slot, epoch) {
 		return fmt.Errorf("routing epoch slot %d with policy epoch %d has not been staged", slot, epoch)
 	}
+	publication := beginRoutingEpochActiveSlotCachePublication(c, peerCaches...)
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), slot, ebpf.UpdateAny); err != nil {
+		publication.restore()
 		return fmt.Errorf("publish routing epoch slot %d: %w", slot, err)
 	}
-	c.routingEpochActiveSlotCachedValid.Store(false)
+	publication.publish(slot)
 	return nil
 }
 
 // RollbackRoutingEpoch restores the slot that was active when this generation
 // began preparation. It does not mutate either plan's maps.
-func (c *controlPlaneCore) RollbackRoutingEpoch() error {
+func (c *controlPlaneCore) RollbackRoutingEpoch(peerCaches ...*controlPlaneCore) error {
 	if c == nil {
 		return nil
 	}
@@ -276,10 +399,12 @@ func (c *controlPlaneCore) RollbackRoutingEpoch() error {
 	if !validRoutingEpochSlot(previous) {
 		return nil
 	}
+	publication := beginRoutingEpochActiveSlotCachePublication(c, peerCaches...)
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), previous, ebpf.UpdateAny); err != nil {
+		publication.restore()
 		return fmt.Errorf("rollback routing epoch slot %d: %w", previous, err)
 	}
-	c.routingEpochActiveSlotCachedValid.Store(false)
+	publication.publish(previous)
 	return nil
 }
 
@@ -303,6 +428,13 @@ func clearPreviousRoutingEpochMaps(bpf *bpfObjects, previous uint32) error {
 
 // finalizePreviousRoutingEpoch releases the inactive domain projection after
 // the previous generation has drained and rollback is no longer possible.
+//
+// ROUTING-EPOCH-2 contract: userspace retirement is currently the only
+// quiescence barrier before old-slot cleanup. There is no proven kernel grace
+// period covering a TC invocation that sampled the old selector before the
+// flip. Do not move this cleanup earlier or make it concurrent with cutover
+// without supported-kernel evidence that those invocations have quiesced. See
+// the ROUTING-EPOCH-2 section in docs/weak-memory-publication-audit.md.
 func (c *controlPlaneCore) finalizePreviousRoutingEpoch() error {
 	return c.finalizePreviousRoutingEpochWithCleanup(clearPreviousRoutingEpochMaps)
 }
@@ -369,29 +501,6 @@ func (c *controlPlaneCore) finalizePreviousRoutingEpochWithCleanup(cleanup routi
 		c.domainRoutingProjectionMu[previous].Unlock()
 		return cleanupErr
 	}
-}
-
-// RoutingEpochForSlot returns metadata for diagnostics and replay. It never
-// participates in a forwarding decision.
-func (c *controlPlaneCore) RoutingEpochForSlot(slot uint32) (routing.PolicyEpoch, bool, error) {
-	if c == nil || !validRoutingEpochSlot(slot) {
-		return 0, false, nil
-	}
-	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
-		return 0, false, nil
-	}
-	var epoch uint64
-	if err := bpf.RoutingEpochMap.Lookup(slot, &epoch); err != nil {
-		if stderrors.Is(err, ebpf.ErrKeyNotExist) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("lookup routing epoch slot %d: %w", slot, err)
-	}
-	if epoch == 0 {
-		return 0, false, nil
-	}
-	return routing.PolicyEpoch(epoch), true, nil
 }
 
 func (c *controlPlaneCore) domainRoutingTrackerForSlot(slot uint32) *domainRoutingTracker {

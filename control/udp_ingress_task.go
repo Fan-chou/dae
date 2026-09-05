@@ -20,6 +20,82 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// cachedRoutingLookup is the per-packet routing-cache probe. Endpoint
+// pointers live only for this packet; they are never stored on UdpFlowDecision.
+type cachedRoutingLookup struct {
+	bound       *bpfRoutingResult
+	bindingHit  bool
+	owner       *UdpEndpoint
+	prefetch    *UdpEndpoint
+	prefetchKey UdpEndpointKey
+	prefetchOK  bool
+}
+
+// lookupCachedRoutingBinding resolves the flow's bound routing result from the
+// routing-cache endpoints referenced by the flow decision: the primary cached
+// endpoint first, then the symmetric fallback endpoint when the primary's
+// binding missed. owner is the last endpoint Get actually found (primary, or
+// fallback if primary was absent) so Run can UpdateCachedRoutingResult without
+// a second pool lookup. prefetch is the primary endpoint only when its bound
+// result hit AND its pool key is the same key handlePkt would Get first
+// without a cross-probe; a binding miss must not prefetch, because handlePkt
+// still has to probe the live NAT key independently.
+func lookupCachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) cachedRoutingLookup {
+	out := cachedRoutingLookup{}
+	primaryKey := flowDecision.CachedRoutingEndpointKey()
+	if ue, ok := DefaultUdpEndpointPool.Get(primaryKey); ok {
+		out.owner = ue
+		if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+			out.bound = bound
+			out.bindingHit = true
+			if canPrefetchCachedEndpoint(flowDecision, primaryKey) {
+				out.prefetch = ue
+				out.prefetchKey = primaryKey
+				out.prefetchOK = true
+			}
+			return out
+		}
+		// Binding miss: keep owner for a later cache write, but still try
+		// the fallback endpoint in case it holds the dst+proto binding.
+	}
+	if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
+		if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
+			out.owner = ue
+			if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+				out.bound = bound
+				out.bindingHit = true
+				if canPrefetchCachedEndpoint(flowDecision, fallbackKey) {
+					out.prefetch = ue
+					out.prefetchKey = fallbackKey
+					out.prefetchOK = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// canPrefetchCachedEndpoint reports whether handlePkt's first Get uses key
+// with no required src-only/symmetric cross-probe. Prefetch is only valid
+// for this packet and only when that first lookup would be a pure hit.
+//
+// The NAT cross-probe in handlePkt runs only after a first-Get miss. A
+// prefetch of the same first key therefore cannot skip a required probe:
+// if the first Get would have missed, prefetchOK is already false because
+// this function requires firstKey == key. Sniff-eligible ordinary UDP
+// starts at the symmetric key, so a FullCone cache hit never prefetches.
+func canPrefetchCachedEndpoint(flowDecision UdpFlowDecision, key UdpEndpointKey) bool {
+	emptyScope := udpEndpointRouteScope{}
+	firstKey := flowDecision.EndpointKeyForInitialLookupWithScope(emptyScope, false)
+	return firstKey == key
+}
+
+// routingCacheOwnerEndpoint finds the endpoint that owns the flow's cached
+// routing result: the primary cached endpoint if present, else the fallback.
+func routingCacheOwnerEndpoint(flowDecision UdpFlowDecision) *UdpEndpoint {
+	return lookupCachedRoutingBinding(flowDecision, netip.AddrPort{}).owner
+}
+
 // udpIngressTask is the pooled owned form of the per-packet ingress task
 // that used to be an escaping closure inside processPacket. Under saturated
 // UDP load the closure was ~200-300B allocated per packet (~20% of the
@@ -37,11 +113,31 @@ type udpIngressTask struct {
 	convergeSrc  netip.AddrPort
 	flowDecision UdpFlowDecision
 	nbytes       int
+	// dispatchSem, when non-nil, is the direct-dispatch concurrency slot this
+	// task holds; Run releases it together with the other resources. It must
+	// be assigned on every pool checkout (nil for queued dispatch) so a stale
+	// pointer left by a previous use can never release a slot that was never
+	// acquired.
+	dispatchSem chan struct{}
 }
 
 var udpIngressTaskPool = sync.Pool{
 	New: func() any { return &udpIngressTask{} },
 }
+
+// releaseDispatchSem returns the direct-dispatch concurrency slot, if any.
+// It must run before the task object returns to the pool.
+func (t *udpIngressTask) releaseDispatchSem() {
+	if sem := t.dispatchSem; sem != nil {
+		<-sem
+	}
+}
+
+// Discard releases the packet resources without executing the task. It is
+// used when queue teardown (convoy panic recovery or pool Close) strands
+// tasks that never ran: their buffer, admission ticket, and pooled object
+// must still be returned, in the same order Run's defers would.
+func (t *udpIngressTask) Discard() { t.discard() }
 
 // Run executes the ingress packet handling. The buffer and admission gate
 // are released and the task is returned to the pool in all paths.
@@ -52,12 +148,19 @@ func (t *udpIngressTask) Run() {
 	convergeSrc := t.convergeSrc
 	flowDecision := t.flowDecision
 
-	// Release order: buffer, admission, then the task itself (the pool must
-	// not see the task before its deferred cleanup completes).
-	defer udpIngressTaskPool.Put(t)
+	// Defers run in LIFO order: dispatch slot, admission, buffer, then the
+	// task itself (the pool must not see the task before its deferred cleanup
+	// completes, and the dispatch slot must be read before the task returns
+	// to the pool). The final defer zeroes the task before Put so no stale
+	// field can leak into the next checkout, matching Discard.
+	defer func() {
+		*t = udpIngressTask{}
+		udpIngressTaskPool.Put(t)
+	}()
 	defer data.Put()
 	defer t.admission.release(t.nbytes)
 	defer t.noteQueueComplete()
+	defer t.releaseDispatchSem()
 	var routingResult *bpfRoutingResult
 	var freshRoutingResult *bpfRoutingResult
 
@@ -78,9 +181,11 @@ func (t *udpIngressTask) Run() {
 						"src":        convergeSrc.String(),
 						"dst":        realDst.String(),
 						"listenAddr": listenAddr,
-					}).Trace("Skipping DNS fast path for local traffic to our own DNS listener")
+					}).Trace("Local traffic to our own DNS listener; handling via DNS fast path instead of NAT-tracking")
 				}
-				return
+				// Fall through: kernel already TC_ACT_OKs unmarked local
+				// sockets, but a packet that reached TProxy must still be
+				// answered. Dropping here black-holes 127.0.0.1:53.
 			}
 		}
 
@@ -107,12 +212,19 @@ func (t *udpIngressTask) Run() {
 			if dnsRoutingResult.Mark == 0 {
 				dnsRoutingResult.Mark = handler.soMarkFromDae
 			}
+			// Account the query like the ordinary UDP paths do; the
+			// ingress plane owns the packet, so its recorders are used
+			// (matching what the removed udp.go fast path recorded).
+			c.recordUploadTraffic(int64(len(data)))
 			req := &udpRequest{
 				realSrc:       convergeSrc,
 				realDst:       realDst,
 				src:           convergeSrc,
 				lConn:         t.lConn,
 				routingResult: dnsRoutingResult,
+
+				uploadRecord:   c.runtimeUploadRecorder(),
+				downloadRecord: c.runtimeDownloadRecorder(),
 			}
 
 			dnsController := handler.ActiveDnsController()
@@ -155,7 +267,7 @@ func (t *udpIngressTask) Run() {
 						"error":    e.Error(),
 					}).Warn("DNS ingress fast path failed; sending SERVFAIL response")
 				}
-				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
+				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, false, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
 					if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
 						handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
 							"src": convergeSrc.String(),
@@ -176,20 +288,11 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
+	var cacheLookup cachedRoutingLookup
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
-		if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-			if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-				routingResult = bound
-			}
-		}
-		if routingResult == nil {
-			if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-				if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-					if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-						routingResult = bound
-					}
-				}
-			}
+		cacheLookup = lookupCachedRoutingBinding(flowDecision, realDst)
+		if cacheLookup.bindingHit {
+			routingResult = cacheLookup.bound
 		}
 	}
 
@@ -231,7 +334,7 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
-	if e := c.handlePkt(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false); e != nil {
+	if e := c.handlePktWithPrefetch(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false, cacheLookup.prefetch, cacheLookup.prefetchKey, cacheLookup.prefetchOK); e != nil {
 		// Rate-limit the expected reload-window routing-epoch
 		// ownership loss; other handlePkt errors still log always.
 		if stderrors.Is(e, errRoutingEpochOwnerUnavailable) {
@@ -247,17 +350,12 @@ func (t *udpIngressTask) Run() {
 	}
 
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
-		updatedCache := false
-		if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-			ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-			updatedCache = true
+		owner := cacheLookup.owner
+		if owner == nil {
+			owner = routingCacheOwnerEndpoint(flowDecision)
 		}
-		if !updatedCache {
-			if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-				if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-					ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-				}
-			}
+		if owner != nil {
+			owner.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
 		}
 	}
 }
@@ -293,6 +391,7 @@ func (t *udpIngressTask) discard() {
 	if t == nil {
 		return
 	}
+	t.releaseDispatchSem()
 	t.noteQueueComplete()
 	if t.pktBuf != nil {
 		t.pktBuf.Put()

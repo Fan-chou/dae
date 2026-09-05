@@ -96,6 +96,12 @@ func (s *Sniffer) reset(stream bool, r io.Reader, conn net.Conn, data []byte, ti
 	s.needMore = false
 	s.quicReasm.Reset()
 	s.quicNextRead = 0
+	// quicPlaintexts is deliberately NOT released here: reset() runs on pool
+	// checkout, and every pooled sniffer reaches it only via Close (or
+	// CompactPacketState), which already Put each plaintext and cleared the
+	// slice under readMu. Releasing here as well would double-Put buffers, so
+	// reset() must never be used on a sniffer that was not closed first;
+	// the nil assignment is purely defensive.
 	s.quicPlaintexts = nil
 	// readResultCh is allocated lazily on the first async read so the common
 	// deadline-sync path (production TCP) pays no channel allocation here.
@@ -457,8 +463,18 @@ func (s *Sniffer) Close() (err error) {
 		// touches s.buf and s.quicPlaintexts under the same lock.
 		s.readMu.Lock()
 		if s.buf != nil {
-			pool.PutBuffer(s.buf)
-			s.buf = nil
+			if s.readerLingering {
+				// The lingering async reader still holds this bytes.Buffer and
+				// may write into it after Close returns (it never takes
+				// readMu). Recycle neither the buffer nor the struct; dropping
+				// only the struct would let the stale write corrupt the next
+				// connection that checks the buffer out of the pool. GC
+				// claims both once the reader exits.
+				s.buf = nil
+			} else {
+				pool.PutBuffer(s.buf)
+				s.buf = nil
+			}
 		}
 		for _, p := range s.quicPlaintexts {
 			p.Put()

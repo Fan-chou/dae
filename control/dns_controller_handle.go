@@ -97,7 +97,7 @@ func (c *DnsController) forwardWithFallback(
 
 	fallbackDialArg, chooseErr := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), &fallbackUpstream)
 	if chooseErr != nil {
-		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %v", primaryErr, chooseErr)
+		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %w", primaryErr, chooseErr)
 	}
 	if fallbackDialArg == nil || fallbackDialArg.l4proto != consts.L4ProtoStr_TCP {
 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select returned invalid network", primaryErr)
@@ -116,7 +116,7 @@ func (c *DnsController) forwardWithFallback(
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
 	if err != nil {
-		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %v", primaryErr, err)
+		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %w", primaryErr, err)
 	}
 
 	return respMsg, fallbackDialArg, nil
@@ -128,6 +128,9 @@ func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg,
 
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	c.requireStore()
+	if responseWriter != nil && !dnsResponseWriterUsesTCP(responseWriter) {
+		responseWriter = &dnsUDPResponseWriter{ResponseWriter: responseWriter, limit: dnsUDPResponseSizeLimit(dnsMessage)}
+	}
 	var upstreamIndex consts.DnsRequestOutboundIndex
 	var upstream *dns.Upstream
 
@@ -173,37 +176,15 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		}
 		responseCacheKey = c.responseCacheKey(baseCacheKey, req, upstreamIndex, upstream)
 
-		if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
-			c.RemoveDnsRespCacheFamily(baseCacheKey)
-			return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		if handled, herr := c.serveRejectWithWriter_(dnsMessage, req, responseWriter, baseCacheKey, upstreamIndex); handled {
+			return herr
 		}
 
-		// Check cache after routing (non-reject case)
-		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
-			// Cache hit - return immediately without singleflight
-			// OPTIMISTIC CACHE: resp may be stale, trigger background refresh if needed
-			if needRefresh {
-				// Background refresh - don't block the current request
-				go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
-			}
-
-			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
-				return err
-			}
-			// Log cache hit with dest addr for CI compatibility.
-			// Format includes "-> dest:port" so CI grep can verify routing.
-			if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 && req != nil {
-				q := dnsMessage.Question[0]
-				c.log.WithFields(logrus.Fields{
-					"network": "udp(dns)",
-					"_qname":  strings.ToLower(q.Name),
-					"qtype":   QtypeToString(q.Qtype),
-				}).Debugf("%v <-> %v (cache)",
-					RefineSourceToShow(req.realSrc, req.realDst.Addr()),
-					RefineAddrPortToShow(req.realDst),
-				)
-			}
-			return nil
+		// Check cache after routing (non-reject case). Cache hits return
+		// immediately without singleflight; stale entries background-refresh.
+		if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
+			responseCacheKey, upstreamIndex, upstream); handled {
+			return herr
 		}
 
 		// Cache miss - use singleflight to coalesce concurrent requests
@@ -262,6 +243,12 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		if len(data) >= 2 {
 			binary.BigEndian.PutUint16(data[:2], dnsMessage.Id)
 		}
+		// Apply the client's UDP size limit (512 or its EDNS0 advertisement)
+		// with the TC bit so an oversized reply triggers a TCP retry instead
+		// of an unsendable datagram; every other UDP send path already does.
+		// truncateDNSResponse unpacks into a fresh message, so the shared
+		// singleflight result is never mutated.
+		data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
 		if req == nil || req.lConn == nil {
 			return fmt.Errorf("dns request connection is nil for singleflight response")
 		}
@@ -271,7 +258,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		return nil
 	}
 
-	return c.handleWithResponseWriterInternal(ctx, dnsMessage, req, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
+	return c.handleWithResponseWriter_(ctx, dnsMessage, req, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
 }
 
 func (c *DnsController) resolveForSingleflight(
@@ -317,49 +304,56 @@ func (c *DnsController) resolveForSingleflight(
 	return respMsg, nil
 }
 
-// handleWithResponseWriterInternal handles DNS requests with response writer.
-// When ip_version_prefer is set, it implements RFC 8305 Happy Eyeballs
-// Resolution Delay: wait briefly for preferred response type before responding.
-//
-// Renamed from HandleWithResponseWriter_ to internal to avoid recursion loop with SF.
-func (c *DnsController) handleWithResponseWriterInternal(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream, responseCacheKey string, baseCacheKey string) (err error) {
-	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
+// serveRejectWithWriter_ applies a routing-reject verdict if one was selected.
+func (c *DnsController) serveRejectWithWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest,
+	responseWriter dnsmessage.ResponseWriter, baseCacheKey string,
+	upstreamIndex consts.DnsRequestOutboundIndex,
+) (bool, error) {
+	if upstreamIndex != consts.DnsRequestOutboundIndex_Reject {
+		return false, nil
+	}
+	c.RemoveDnsRespCacheFamily(baseCacheKey)
+	return true, c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+}
+
+// serveFromRespCacheWithRefresh_ answers from the response cache when present,
+// scheduling optimistic background refreshes for stale entries.
+func (c *DnsController) serveFromRespCacheWithRefresh_(dnsMessage *dnsmessage.Msg, req *udpRequest,
+	responseWriter dnsmessage.ResponseWriter, responseCacheKey string,
+	upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream,
+) (bool, error) {
+	resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false)
+	if resp == nil {
+		return false, nil
+	}
+	if needRefresh {
+		go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
+	}
+	if err := c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
+		return true, err
+	}
+	if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
-		c.log.Tracef("Received UDP(DNS) %v <-> %v: %v %v",
-			RefineSourceToShow(req.realSrc, req.realDst.Addr()), req.realDst.String(), strings.ToLower(q.Name), QtypeToString(q.Qtype),
-		)
+		l := c.log.WithFields(logrus.Fields{
+			"_qname": strings.ToLower(q.Name),
+			"qtype":  QtypeToString(q.Qtype),
+		})
+		if req != nil {
+			l = l.WithFields(logrus.Fields{
+				"network": "udp(dns)",
+				"source":  RefineSourceToShow(req.realSrc, req.realDst.Addr()),
+				"dest":    RefineAddrPortToShow(req.realDst),
+			})
+		}
+		l.Debug("cache hit")
 	}
-
-	if dnsMessage.Response {
-		return fmt.Errorf("DNS request expected but DNS response received")
-	}
-
-	// Get qtype for preference handling (RFC 8305 Happy Eyeballs).
-	var qtype uint16
-	if len(dnsMessage.Question) != 0 {
-		qtype = dnsMessage.Question[0].Qtype
-	}
-
-	// Fast path: no ip_version_prefer set, bypass all preference logic
-	if c.currentQtypePrefer() == 0 {
-		return c.handleWithResponseWriter_(ctx, dnsMessage, req, true, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
-	}
-
-	// Only A and AAAA responses participate in preference waiting. The wait is
-	// applied after upstream resolution so cached/direct non-address responses
-	// keep the fast path.
-	if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
-		return c.handleWithResponseWriter_(ctx, dnsMessage, req, true, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
-	}
-
-	return c.handleWithResponseWriter_(ctx, dnsMessage, req, true, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
+	return true, nil
 }
 
 func (c *DnsController) handleWithResponseWriter_(
 	ctx context.Context,
 	dnsMessage *dnsmessage.Msg,
 	req *udpRequest,
-	needResp bool,
 	responseWriter dnsmessage.ResponseWriter,
 	upstreamIndex consts.DnsRequestOutboundIndex,
 	upstream *dns.Upstream,
@@ -394,38 +388,13 @@ func (c *DnsController) handleWithResponseWriter_(
 		responseCacheKey = c.responseCacheKey(baseCacheKey, req, upstreamIndex, upstream)
 	}
 
-	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
-		// Reject with empty answer.
-		c.RemoveDnsRespCacheFamily(baseCacheKey)
-		if !needResp {
-			return nil
-		}
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+	if handled, herr := c.serveRejectWithWriter_(dnsMessage, req, responseWriter, baseCacheKey, upstreamIndex); handled {
+		return herr
 	}
 
-	if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
-		// Send cache to client directly.
-		// OPTIMISTIC CACHE: Trigger background refresh if stale
-		if needRefresh {
-			go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
-		}
-
-		if needResp {
-			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
-				return err
-			}
-		}
-		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
-			q := dnsMessage.Question[0]
-			if req != nil {
-				c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
-					RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
-				)
-			} else {
-				c.log.Debugf("UDP(DNS) Cache: %v %v", strings.ToLower(q.Name), QtypeToString(q.Qtype))
-			}
-		}
-		return nil
+	if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
+		responseCacheKey, upstreamIndex, upstream); handled {
+		return herr
 	}
 
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -444,7 +413,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(ctx, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey)
+	return c.dialSend(ctx, req, data, dnsMessage.Id, upstream, responseWriter, responseCacheKey)
 }
 
 type dnsUpstreamResolution struct {
@@ -467,6 +436,20 @@ func (c *DnsController) resolveDNSUpstream(
 	data = append([]byte(nil), data...) // defensive copy: callers may reuse the slice across recursive retries
 	if invokingDepth >= MaxDnsLookupDepth {
 		return nil, fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
+	}
+
+	// Question echo (RFC 5452): transaction IDs are only 16 bits, so a
+	// matching ID does not prove the reply belongs to this request. Capture
+	// the request question once; every transport funnel (UDP, TCP pipeline,
+	// DoH, DoQ) converges here, so validating the reply here guards the
+	// response cache and clients from spoofed or cross-talked answers on all
+	// upstream hops including recursive fallback.
+	var reqQuestion dnsmessage.Question
+	{
+		var reqMsg dnsmessage.Msg
+		if err := reqMsg.Unpack(data); err == nil && len(reqMsg.Question) > 0 {
+			reqQuestion = reqMsg.Question[0]
+		}
 	}
 
 	upstreamName := "asis"
@@ -505,6 +488,9 @@ func (c *DnsController) resolveDNSUpstream(
 	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
 	if err != nil {
 		return nil, err
+	}
+	if reqQuestion.Name != "" && !questionEchoMatches(reqQuestion, respMsg) {
+		return nil, fmt.Errorf("upstream %v reply does not echo the request question (possible spoofing or upstream cross-talk); dropped", upstreamName)
 	}
 
 	networkType := &dialer.NetworkType{

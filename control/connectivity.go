@@ -6,8 +6,6 @@
 package control
 
 import (
-	"strconv"
-
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
@@ -25,16 +23,6 @@ const (
 	outboundConnAliveBit    = uint32(1)
 	outboundKernelDirectBit = uint32(2)
 )
-
-func FormatL4Proto(l4proto uint8) string {
-	if l4proto == consts.IPPROTO_TCP {
-		return "tcp"
-	}
-	if l4proto == consts.IPPROTO_UDP {
-		return "udp"
-	}
-	return strconv.Itoa(int(l4proto))
-}
 
 func outboundConnectivityDomainIndex(networkType *dialer.NetworkType) uint32 {
 	if networkType.L4Proto != consts.L4ProtoStr_UDP {
@@ -166,15 +154,27 @@ func (c *ControlPlane) ResumeOutboundConnectivityUpdates() {
 	if c == nil || c.core == nil {
 		return
 	}
+	c.resumeOutboundConnectivityUpdates(c.core.writeOutboundConnectivityLocked)
+}
+
+func (c *ControlPlane) resumeOutboundConnectivityUpdates(publish func(uint8, bool, *dialer.NetworkType)) {
 	c.core.resumeOutboundConnectivityUpdates(func() {
 		for outboundID, group := range c.outbounds {
 			if group == nil {
 				continue
 			}
+			// Match ordinary callback publication. Random policies and non-IP
+			// modes keep kernel admission open for userspace selection/fallback.
+			policy := group.GetSelectionPolicy()
+			publishHealth := c.dialMode == consts.DialMode_Ip &&
+				policy != consts.DialerSelectionPolicy_Random && policy != consts.DialerSelectionPolicy_Fixed
 			for _, healthKey := range dialer.StandardHealthKeys() {
 				networkType := healthKey.NetworkType()
-				alive := group.KernelOutboundAlive(networkType)
-				c.core.writeOutboundConnectivityLocked(uint8(outboundID), alive, networkType)
+				alive := true
+				if publishHealth {
+					alive = group.KernelOutboundAlive(networkType)
+				}
+				publish(uint8(outboundID), alive, networkType)
 			}
 		}
 	})

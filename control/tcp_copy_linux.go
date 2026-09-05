@@ -82,7 +82,10 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 		// use an explicit splice loop so we can account exact bytes written while
 		// staying in the kernel zero-copy path. relayCore.forceClose() will
 		// unblock blocked splice calls via SetReadDeadline(past).
-		if record == nil {
+		// The bare io.Copy shortcut is legal only when neither record nor
+		// onActive is set: io.Copy cannot refresh lastActiveNano, and the
+		// idle watchdog is armed unconditionally by relayCore.run.
+		if record == nil && onActive == nil {
 			return io.Copy(dstTCP, srcTCP)
 		}
 		return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
@@ -91,7 +94,7 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 	// Fallback: use WriterTo if available, or buffered copy
 	if dstOk {
 		if _, ok := src.(io.WriterTo); ok {
-			if record == nil {
+			if record == nil && onActive == nil {
 				return io.Copy(dstTCP, src)
 			}
 			bufPtr := relayCopyBufferPool.Get().(*[]byte)
@@ -228,6 +231,8 @@ func relayChunkedSpliceCopy(ctx context.Context, dst, src *net.TCPConn, record f
 	record = normalizeTrafficRecord(record)
 	onActive = normalizeTrafficRecord(onActive)
 	var written int64
+	// One reader reused across chunks: R never changes, only N resets.
+	lr := &io.LimitedReader{R: src}
 	for {
 		if ctx != nil {
 			select {
@@ -237,10 +242,7 @@ func relayChunkedSpliceCopy(ctx context.Context, dst, src *net.TCPConn, record f
 			}
 		}
 
-		lr := &io.LimitedReader{
-			R: src,
-			N: relaySpliceAccountingChunkSize,
-		}
+		lr.N = relaySpliceAccountingChunkSize
 		n, err := io.Copy(dst, lr)
 		if n > 0 {
 			written += n

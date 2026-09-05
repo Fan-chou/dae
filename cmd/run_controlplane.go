@@ -88,12 +88,11 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
-// normalization, subscription resolution, and reload safety checks. Keeping
-// the seam here lets failure tests exercise the real Runner preparation path
-// without replacing the default ControlPlane constructors.
-var buildControlPlaneRuntime = buildControlPlaneRuntimeDefault
-
-func buildControlPlaneRuntimeDefault(
+// normalization, subscription resolution, and reload safety checks. The
+// prepareOnly × isReloadBuild matrix folds into build options: prepared
+// candidates delay both the datapath commit and the DNS listener start, and
+// any reload build (or an inherited BPF handle) selects reload-mode flipping.
+func buildControlPlaneRuntime(
 	ctx context.Context,
 	log *logrus.Logger,
 	bpf any,
@@ -103,57 +102,15 @@ func buildControlPlaneRuntimeDefault(
 	routing *config.Routing,
 	global *config.Global,
 	dns *config.Dns,
+	directDialer netproxy.Dialer,
+	fullconeDirectDialer netproxy.Dialer,
+	systemDNSResolver *netutils.SystemDNSResolver,
 	externGeoDataDirs []string,
 	prepareOnly bool,
 	dnsRoutingUnchanged bool,
 	isReloadBuild bool,
 ) (*control.ControlPlane, error) {
-	if prepareOnly {
-		if isReloadBuild {
-			return control.NewPreparedReloadControlPlaneWithContext(
-				ctx,
-				log,
-				bpf,
-				dnsCache,
-				tagToNodeList,
-				groups,
-				routing,
-				global,
-				dns,
-				externGeoDataDirs,
-				dnsRoutingUnchanged,
-			)
-		}
-		return control.NewPreparedControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	if isReloadBuild {
-		return control.NewReloadControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	return control.NewControlPlaneWithContext(
+	return control.NewControlPlaneWithContextOptions(
 		ctx,
 		log,
 		bpf,
@@ -164,7 +121,15 @@ func buildControlPlaneRuntimeDefault(
 		global,
 		dns,
 		externGeoDataDirs,
-		dnsRoutingUnchanged,
+		control.ControlPlaneBuildOptions{
+			DelayDatapathCommit:   prepareOnly,
+			DelayDNSListenerStart: prepareOnly,
+			DNSRoutingUnchanged:   dnsRoutingUnchanged,
+			IsReload:              isReloadBuild || bpf != nil,
+			DirectDialer:          directDialer,
+			FullconeDirectDialer:  fullconeDirectDialer,
+			SystemDNSResolver:     systemDNSResolver,
+		},
 	)
 }
 
@@ -283,27 +248,35 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		}
 	}
 
-	/// Init Direct Dialers.
-	direct.InitDirectDialers(conf.Global.FallbackResolver)
-	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
+	/// Build generation-scoped direct dialers.
+	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
+	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
-	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{LocationFinder: locationFinder})
+	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
+		LocationFinder: locationFinder,
+		DirectDialer:   directDialers.Symmetric,
+	})
 	if err != nil {
 		return nil, err
+	}
+	if daeDNSRouter != nil {
+		defer func() { _ = daeDNSRouter.Close() }()
 	}
 
 	// Start timing the startup process
 	startTime := time.Now()
-	stageStart := startTime
+	// Reused across phases; each stage resets it right before its work.
+	var stageStart time.Time
 
 	// Resolve subscriptions to nodes.
 	resolvingfailed := false
 	if !conf.Global.DisableWaitingNetwork {
+		networkWaitStart := time.Now()
 		epo := 5 * time.Second
 		client := http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-					conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
+					conn, err := directDialers.Symmetric.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
 					if err != nil {
 						return nil, err
 					}
@@ -317,7 +290,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			Timeout: epo,
 		}
 		log.Infoln("Waiting for network...")
+		attempts := 0
 		for i := 0; ; i++ {
+			attempts = i + 1
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -351,6 +326,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			}
 		}
 		log.Infoln("Network online.")
+		log.Infof("Network check took %v (%d attempt(s))", time.Since(networkWaitStart), attempts)
 	}
 	if len(conf.Subscription) > 0 {
 		log.Infoln("Fetching subscriptions...")
@@ -358,13 +334,18 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	// Parallelize subscription resolution to improve startup performance.
 	// Use a semaphore to limit concurrency and avoid overwhelming the network.
 	type subscriptionResult struct {
-		tag   string
-		nodes []string
-		err   error
-		sub   config.KeyableString
+		tag     string
+		nodes   []string
+		err     error
+		sub     config.KeyableString
+		elapsed time.Duration
 	}
 	numSubscriptions := len(conf.Subscription)
 	if numSubscriptions > 0 {
+		// Reset to cover only the fetch itself; the network-wait phase above is
+		// timed separately, so slow WAN bring-up no longer shows up as
+		// "Subscriptions fetched".
+		stageStart = time.Now()
 		// Limit concurrency to 4 subscriptions at a time to avoid overwhelming network
 		maxConcurrency := min(numSubscriptions, 4)
 		sem := make(chan struct{}, maxConcurrency)
@@ -375,7 +356,8 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				sem <- struct{}{}        // Acquire semaphore
 				defer func() { <-sem }() // Release semaphore
 
-				subDialer := direct.SymmetricDirect
+				subStart := time.Now()
+				subDialer := directDialers.Symmetric
 				if daeDNSRouter != nil {
 					wrappedDialer, wrapErr := daeDNSRouter.WrapSubscriptionDialer(subDialer, string(s))
 					if wrapErr != nil {
@@ -390,10 +372,11 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				client := newHTTPClientForDialer(subDialer, 30*time.Second, conf.Global.SoMarkFromDae, conf.Global.Mptcp)
 				tag, nodes, err := subscription.ResolveSubscription(log, &client, filepath.Dir(cfgFile), string(s))
 				results <- subscriptionResult{
-					tag:   tag,
-					nodes: nodes,
-					err:   err,
-					sub:   s,
+					tag:     tag,
+					nodes:   nodes,
+					err:     err,
+					sub:     s,
+					elapsed: time.Since(subStart),
 				}
 			}(sub)
 		}
@@ -402,8 +385,10 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		for range numSubscriptions {
 			result := <-results
 			if result.err != nil {
-				log.Warnf(`failed to resolve subscription "%v": %v`, result.sub, result.err)
+				log.Warnf(`failed to resolve subscription "%v" after %v: %v`, result.sub, result.elapsed, result.err)
 				resolvingfailed = true
+			} else {
+				log.Infof(`subscription "%v" resolved %d node(s) in %v`, result.tag, len(result.nodes), result.elapsed)
 			}
 			if len(result.nodes) > 0 {
 				tagToNodeList[result.tag] = append(tagToNodeList[result.tag], result.nodes...)
@@ -475,6 +460,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		&conf.Routing,
 		&conf.Global,
 		&conf.Dns,
+		directDialers.Symmetric,
+		directDialers.Fullcone,
+		systemDNSResolver,
 		externGeoDataDirs,
 		prepareOnly,
 		dnsRoutingUnchanged,

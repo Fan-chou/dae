@@ -194,9 +194,92 @@ func (m *delayedReleaseMockConn) SetDeadline(t time.Time) error      { return ni
 func (m *delayedReleaseMockConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *delayedReleaseMockConn) SetWriteDeadline(t time.Time) error { return nil }
 
+type repeatedNudgeMockConn struct {
+	closed   atomic.Bool
+	released atomic.Bool
+	nudges   atomic.Int32
+	release  chan struct{}
+}
+
+func newRepeatedNudgeMockConn() *repeatedNudgeMockConn {
+	return &repeatedNudgeMockConn{release: make(chan struct{})}
+}
+
+func (m *repeatedNudgeMockConn) Read([]byte) (int, error) {
+	<-m.release
+	return 0, net.ErrClosed
+}
+func (m *repeatedNudgeMockConn) Write(b []byte) (int, error) { return len(b), nil }
+func (m *repeatedNudgeMockConn) ReadFrom([]byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, io.EOF
+}
+func (m *repeatedNudgeMockConn) WriteTo(p []byte, _ string) (int, error) { return len(p), nil }
+func (m *repeatedNudgeMockConn) Close() error {
+	m.closed.Store(true)
+	return nil
+}
+func (m *repeatedNudgeMockConn) SetDeadline(time.Time) error { return nil }
+func (m *repeatedNudgeMockConn) SetReadDeadline(time.Time) error {
+	if m.nudges.Add(1) >= 3 && m.closed.Load() {
+		m.releaseRead()
+	}
+	return nil
+}
+func (m *repeatedNudgeMockConn) SetWriteDeadline(time.Time) error { return nil }
+func (m *repeatedNudgeMockConn) releaseRead() {
+	if m.released.CompareAndSwap(false, true) {
+		close(m.release)
+	}
+}
+
+func TestRelayIdleWatchdogKeepsNudgingUntilReadsReturn(t *testing.T) {
+	l := newRepeatedNudgeMockConn()
+	r := newRepeatedNudgeMockConn()
+	defer l.releaseRead()
+	defer r.releaseRead()
+	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc.idleTimeout = 40 * time.Millisecond
+	rc.idleCheckPeriod = 20 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- rc.run(context.Background()) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("idle cancellation stopped nudging before reads returned")
+	}
+	if l.nudges.Load() < 3 || r.nudges.Load() < 3 {
+		t.Fatalf("insufficient read nudges: left=%d right=%d", l.nudges.Load(), r.nudges.Load())
+	}
+}
+
 // TestRelayWatchdogSurvivesCtxCancel verifies that the watchdog keeps the
 // relay alive after ctx cancellation (e.g. reload) and eventually reclaims
 // it when the QUIC-like delayed Read finally returns.
+func TestRelayCancelNudgesFasterThanIdleCadence(t *testing.T) {
+	l := newRepeatedNudgeMockConn()
+	r := newRepeatedNudgeMockConn()
+	defer l.releaseRead()
+	defer r.releaseRead()
+	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc.idleTimeout = time.Hour
+	rc.idleCheckPeriod = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- rc.run(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled relay kept the idle watchdog cadence")
+	}
+	if l.nudges.Load() < 3 || r.nudges.Load() < 3 {
+		t.Fatalf("insufficient cancel nudges: left=%d right=%d", l.nudges.Load(), r.nudges.Load())
+	}
+}
+
 func TestRelayWatchdogSurvivesCtxCancel(t *testing.T) {
 	// Conn whose Read releases 200ms after Close (simulating quic-go delay).
 	l := newDelayedReleaseMockConn(200 * time.Millisecond)
@@ -216,8 +299,8 @@ func TestRelayWatchdogSurvivesCtxCancel(t *testing.T) {
 
 	select {
 	case <-done:
-		// Success: the watchdog nudged forceClose, the delayed Reads
-		// eventually returned, and run() finished cleanly.
+		// Success: the watchdog forceClosed, the delayed Reads eventually
+		// returned, and run() finished cleanly.
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay leaked: run() did not return after ctx cancel + delayed Read release")
 	}

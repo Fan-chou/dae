@@ -8,7 +8,6 @@ package control
 import (
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/daeuniverse/outbound/pool"
 )
@@ -153,30 +152,14 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 
 	bindAddr, _ := normalizeSendPktAddrFamily(replyPeer, ue.lAddr)
 	replySoMark := ue.replySoMark()
-	key := anyfromPoolKey{lAddr: bindAddr, soMark: replySoMark}
-	var af *Anyfrom
-	if DefaultAnyfromPool != nil {
-		shard := DefaultAnyfromPool.shardForKey(key)
-		nowNano := time.Now().UnixNano()
-		shard.mu.RLock()
-		if cached, ok := shard.pool[key]; ok && cached != nil && !cached.failed.Load() && !cached.IsExpired(nowNano) {
-			af = cached
-		}
-		shard.mu.RUnlock()
-		if af != nil {
-			af.RefreshTtlWithTime(nowNano)
-		}
+	// The anyfrom cache path is only reachable inside the dae netns: outside
+	// it no cached anyfrom socket can exist and none may be created.
+	if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
+		return
 	}
-
-	if af == nil {
-		if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
-			return
-		}
-		var err error
-		af, _, err = DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
-		if err != nil {
-			return
-		}
+	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
+	if err != nil {
+		return
 	}
 
 	if ue.poolKey.Dst.Port() != 0 {
@@ -298,6 +281,10 @@ func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {
 	reply := udpEndpointReplyObjects.Get().(*udpEndpointReply)
 	reply.data = data
 	reply.from = from
+	// Clear any stale release callback explicitly instead of relying solely
+	// on recycleUdpEndpointReply's whole-struct zeroing: recycled objects must
+	// never inherit transport-owned buffer ownership from a previous use.
+	reply.release = nil
 	return reply
 }
 
@@ -322,8 +309,12 @@ func releaseUdpEndpointReplies(replies []*udpEndpointReply) {
 
 // replySender is the dedicated goroutine that drains the reply channel and
 // calls the handler (which invokes sendPkt). Running this off the read loop
-// avoids blocking the upstream protocol layer's ReceiveCh.
-func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
+// avoids blocking the upstream protocol layer's ReceiveCh. The creator binds
+// retire to this sender's lifecycle: a push sender must not synchronously call
+// Close, which waits for its done channel even after the shared queue closes.
+// A ReadFrom sender must close the conn to wake its read loop, including after
+// failed push registration has left behind a closed shared queue.
+func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}, retire func()) {
 	defer close(done)
 	batch := make([]*udpEndpointReply, 0, 8)
 	for reply := range replyCh {
@@ -351,7 +342,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retireFromReplySender()
+				retire()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.

@@ -6,7 +6,7 @@ require (
 	github.com/adrg/xdg v0.5.3
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
-	github.com/cilium/ebpf v0.20.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
 	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260826103900-082691dabd12
 	github.com/fsnotify/fsnotify v1.9.0
@@ -15,7 +15,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260824024751-8cfce08be8dc
+	github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -48,7 +48,7 @@ require (
 	github.com/bodgit/sevenzip v1.6.1 // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dgryski/go-rc2 v0.0.0-20150621095337-8a9021637152 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
@@ -64,11 +64,11 @@ require (
 	github.com/minio/minlz v1.0.1 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
+	github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd // indirect
 	github.com/onsi/ginkgo/v2 v2.28.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/sagernet/sing v0.6.0 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.0 // indirect
 	github.com/samber/lo v1.52.0 // indirect
@@ -114,14 +114,12 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Pinned to Fan-chou/quic-go 8cfce08b (fix/skipaddr-nil-write-dest on 9a83b6d8):
-// skipAddr close-queue retransmit uses the Dial remote instead of panicking
-// on a nil packet source address.
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc
+// Local sync candidate: quic-go fbf90cb0, descended from fdae pin 8cfce08b.
+// Replace with a published fork pin only after explicit push approval.
+replace github.com/olicesx/quic-go => ../quic-go
 
-//replace github.com/cilium/ebpf v0.20.0
+//replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
-// Fan-chou/outbound fix/pool-gc-stability: hy2 demux/reassembly plus
-// original-dest reply identity (082691d) for FakeIP/domain UDP sessions.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260826103900-082691dabd12
+// Local outbound merge retains fdae reply identity and interleaved defrag.
+replace github.com/daeuniverse/outbound => ../outbound

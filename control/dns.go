@@ -8,7 +8,6 @@ package control
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"math/bits"
 	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,19 +23,32 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
-	tc "github.com/daeuniverse/outbound/protocol/tuic/common"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/olicesx/quic-go"
-	"github.com/olicesx/quic-go/http3"
 	"github.com/sirupsen/logrus"
 )
 
 // responseSlot represents a pending DNS request response slot.
 // It uses a reusable one-element channel to avoid per-request channel reallocation.
+//
+// Recycling discipline: a slot checked out by RoundTrip is returned to the
+// pool by exactly one actor. RoundTrip recycles it itself when the pending
+// entry was still registered (no setter can reach the slot) or when the
+// response was already delivered (the setter finished and never touches the
+// slot again). In every other case the pending entry was claimed by
+// readLoop/closeWithErr, so recycle responsibility is transferred to that
+// setter via abandon. mu serializes set with abandon/recycle so a late
+// delivery can never leak into the slot's next pool cycle and cross-answer
+// a different request.
 type responseSlot struct {
 	result chan *dnsmessage.Msg
+
+	mu        sync.Mutex
+	settled   bool // a setter completed delivery for this checkout
+	abandoned bool // the waiter is gone; the completing setter must recycle
 }
 
 // responseSlotPool is a pool of responseSlot objects to reduce allocations.
@@ -49,31 +60,63 @@ var responseSlotPool = sync.Pool{
 	},
 }
 
-// sendHttpDNSFunc and sendStreamDNSFunc are indirections for testing only.
-// Production code always uses the default sendHttpDNS / sendStreamDNS values.
-// Tests may replace them to mock HTTP or stream DNS transport without real I/O.
-var sendHttpDNSFunc = sendHttpDNS
-var sendStreamDNSFunc = sendStreamDNS
+// sendStreamDNSFunc is an indirection for tests that replace stream DNS I/O.
+var sendStreamDNSFunc = dnstransport.SendStreamDNS
 
 func newResponseSlot() *responseSlot {
-	return responseSlotPool.Get().(*responseSlot)
+	s := responseSlotPool.Get().(*responseSlot)
+	s.mu.Lock()
+	s.settled = false
+	s.abandoned = false
+	s.mu.Unlock()
+	return s
+}
+
+// recycleLocked resets and returns the slot to the pool. It unlocks mu.
+func (s *responseSlot) recycleLocked() {
+	s.settled = false
+	s.abandoned = false
+	// Drain stale result before putting back.
+	select {
+	case <-s.result:
+	default:
+	}
+	s.mu.Unlock()
+	responseSlotPool.Put(s)
 }
 
 func putResponseSlot(slot *responseSlot) {
-	// Drain stale result before putting back.
-	select {
-	case <-slot.result:
-	default:
-	}
-	responseSlotPool.Put(slot)
+	slot.mu.Lock()
+	slot.recycleLocked()
 }
 
 func (s *responseSlot) set(msg *dnsmessage.Msg) {
+	s.mu.Lock()
+	s.settled = true
 	// Never block read loop on duplicated/late responses.
 	select {
 	case s.result <- msg:
 	default:
 	}
+	recycle := s.abandoned
+	s.abandoned = false
+	s.mu.Unlock()
+	if recycle {
+		putResponseSlot(s)
+	}
+}
+
+// abandon hands recycle responsibility to the setter that claimed the pending
+// entry. If that setter already delivered, recycle immediately; otherwise the
+// next (and only) set recycles the slot.
+func (s *responseSlot) abandon() {
+	s.mu.Lock()
+	if s.settled {
+		s.recycleLocked()
+		return
+	}
+	s.abandoned = true
+	s.mu.Unlock()
 }
 
 func (s *responseSlot) get(ctx context.Context) (*dnsmessage.Msg, error) {
@@ -193,89 +236,145 @@ func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument, log *log
 	return forwarder, nil
 }
 
+type doHSendFunc func(ctx context.Context, client *http.Client, target string, upstream *dns.Upstream, data []byte) (*dnsmessage.Msg, error)
+
 type DoH struct {
 	dns.Upstream
 	netproxy.Dialer
-	dialArgument  dialArgument
-	http3         bool
-	mu            sync.Mutex
-	closed        bool
-	client        *http.Client
-	clientFactory func() *http.Client
+	dialArgument      dialArgument
+	http3             bool
+	mu                sync.Mutex
+	closed            bool
+	client            *dnstransport.HTTPClientGeneration
+	clientGenerations map[*dnstransport.HTTPClientGeneration]struct{}
+	clientFactory     func() *http.Client
+	sendFunc          doHSendFunc
+}
+
+func (d *DoH) sendDNS(ctx context.Context, client *http.Client, data []byte) (*dnsmessage.Msg, error) {
+	if d.sendFunc != nil {
+		return d.sendFunc(ctx, client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+	}
+	return dnstransport.SendHTTPDNS(ctx, client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 }
 
 func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
-	client := d.getOrCreateClient()
-	if client == nil {
+	generation := d.getOrCreateClient()
+	if generation == nil {
 		return nil, net.ErrClosed
 	}
-	msg, err := sendHttpDNSFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
-	if err == nil {
-		return msg, nil
+	defer func() { d.releaseClient(generation) }()
+
+	msg, err := d.sendDNS(ctx, generation.Client, data)
+	if err == nil || ctx.Err() != nil || !dnstransport.ShouldReplaceHTTPClient(err) {
+		return msg, err
 	}
-	if ctx.Err() != nil {
-		return nil, err
-	}
-	// Retry on a fresh client: idle-connection eviction and underlying tunnel
-	// churn can close a connection the forwarder itself still owns. replaceClient
-	// returns nil when the forwarder is closed, preserving net.ErrClosed.
-	client = d.replaceClient(client)
-	if client == nil {
+
+	next := d.replaceClient(generation)
+	previous := generation
+	generation = next
+	d.releaseClient(previous)
+	if generation == nil {
 		return nil, net.ErrClosed
 	}
-	msg, err = sendHttpDNSFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
-	if err != nil {
-		return nil, err
-	}
-	return msg, nil
+	return d.sendDNS(ctx, generation.Client, data)
 }
 
-func (d *DoH) getOrCreateClient() *http.Client {
+func (d *DoH) ensureClientGenerationsLocked() {
+	if d.clientGenerations == nil {
+		d.clientGenerations = make(map[*dnstransport.HTTPClientGeneration]struct{})
+	}
+}
+
+func (d *DoH) newClientGeneration() *dnstransport.HTTPClientGeneration {
+	client := d.getClient()
+	if d.clientFactory != nil {
+		client = d.clientFactory()
+	}
+	return &dnstransport.HTTPClientGeneration{Client: client}
+}
+
+func (d *DoH) getOrCreateClient() *dnstransport.HTTPClientGeneration {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return nil
 	}
+	d.ensureClientGenerationsLocked()
 	if d.client == nil {
-		d.client = d.newClient()
+		d.client = d.newClientGeneration()
+		d.clientGenerations[d.client] = struct{}{}
 	}
+	d.client.Active++
 	return d.client
 }
 
-func (d *DoH) replaceClient(previous *http.Client) *http.Client {
+func (d *DoH) releaseClient(generation *dnstransport.HTTPClientGeneration) {
+	dnstransport.ReleaseHTTPClientGeneration(&d.mu, generation, func() {
+		delete(d.clientGenerations, generation)
+	})
+}
+
+func (d *DoH) replaceClient(previous *dnstransport.HTTPClientGeneration) *dnstransport.HTTPClientGeneration {
+	var closePrevious bool
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
 		return nil
 	}
+	d.ensureClientGenerationsLocked()
 	if d.client != nil && d.client != previous {
-		client := d.client
+		d.client.Active++
+		current := d.client
 		d.mu.Unlock()
-		return client
+		return current
 	}
-	oldClient := d.client
-	nextClient := d.newClient()
-	d.client = nextClient
+	next := d.newClientGeneration()
+	next.Active = 1
+	d.client = next
+	d.clientGenerations[next] = struct{}{}
+	if previous != nil {
+		previous.Retired = true
+		if previous.Active == 0 {
+			closePrevious = true
+		}
+	}
 	d.mu.Unlock()
-	if oldClient != nil {
-		oldClient.CloseIdleConnections()
+	if closePrevious {
+		previous.Close()
+		d.mu.Lock()
+		if previous.Retired && previous.Active == 0 {
+			delete(d.clientGenerations, previous)
+		}
+		d.mu.Unlock()
 	}
-	return nextClient
-}
-
-func (d *DoH) newClient() *http.Client {
-	if d.clientFactory != nil {
-		return d.clientFactory()
-	}
-	return d.getClient()
+	return next
 }
 
 func (d *DoH) getClient() *http.Client {
 	var roundTripper http.RoundTripper
 	if d.http3 {
-		roundTripper = d.getHttp3RoundTripper()
+		roundTripper = dnstransport.NewHTTP3Transport(d.Hostname, func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+			return dnstransport.DialEarlyOwned(ctx, func(ctx context.Context) (netproxy.Conn, error) {
+				return d.dialArgument.bestDialer.DialContext(
+					ctx,
+					common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
+					d.dialArgument.bestTarget.String(),
+				)
+			}, d.dialArgument.bestTarget, tlsCfg, cfg)
+		})
 	} else {
-		roundTripper = d.getHttpRoundTripper()
+		roundTripper = dnstransport.NewHTTPTransport(d.Hostname, func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := d.dialArgument.bestDialer.DialContext(
+				ctx,
+				common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+				d.dialArgument.bestTarget.String(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			return &netproxy.FakeNetConn{Conn: conn}, nil
+		})
 	}
 
 	return &http.Client{
@@ -287,66 +386,19 @@ func (d *DoH) getClient() *http.Client {
 	}
 }
 
-func (d *DoH) getHttpRoundTripper() *http.Transport {
-	httpTransport := http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig: &tls.Config{
-			ServerName:         d.Hostname,
-			InsecureSkipVerify: false,
-		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := d.dialArgument.bestDialer.DialContext(
-				ctx,
-				common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
-				d.dialArgument.bestTarget.String(),
-			)
-			if err != nil {
-				return nil, err
-			}
-			return &netproxy.FakeNetConn{Conn: conn}, nil
-		},
-	}
-
-	return &httpTransport
-}
-
-func (d *DoH) getHttp3RoundTripper() *http3.Transport {
-	roundTripper := &http3.Transport{
-		TLSClientConfig: &tls.Config{
-			ServerName:         d.Hostname,
-			NextProtos:         []string{"h3"},
-			InsecureSkipVerify: false,
-		},
-		QUICConfig: &quic.Config{},
-		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-			udpAddr := net.UDPAddrFromAddrPort(d.dialArgument.bestTarget)
-			conn, err := d.dialArgument.bestDialer.DialContext(
-				ctx,
-				common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
-				d.dialArgument.bestTarget.String(),
-			)
-			if err != nil {
-				return nil, err
-			}
-			fakePkt := netproxy.NewFakeNetPacketConn(conn.(netproxy.PacketConn), net.UDPAddrFromAddrPort(tc.GetUniqueFakeAddrPort()), udpAddr)
-			c, e := quic.DialEarly(ctx, fakePkt, udpAddr, tlsCfg, cfg)
-			return c, e
-		},
-	}
-	return roundTripper
-}
-
 func (d *DoH) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
-	if d.client != nil {
-		d.client.CloseIdleConnections()
-		d.client = nil
+	generations := make([]*dnstransport.HTTPClientGeneration, 0, len(d.clientGenerations))
+	for generation := range d.clientGenerations {
+		generation.Retired = true
+		generations = append(generations, generation)
+	}
+	d.client = nil
+	d.clientGenerations = nil
+	d.mu.Unlock()
+	for _, generation := range generations {
+		generation.Close()
 	}
 	return nil
 }
@@ -431,11 +483,17 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 		d.mu.Unlock()
 		return c, nil
 	}
+	var staleConn quic.EarlyConnection
 	if d.connection != nil {
-		_ = d.connection.CloseWithError(0, "")
+		staleConn = d.connection
 		d.connection = nil
 	}
 	d.mu.Unlock()
+	// Close the old connection outside d.mu: CloseWithError sends a
+	// CONNECTION_CLOSE frame and must not stall concurrent ForwardDNS.
+	if staleConn != nil {
+		_ = staleConn.CloseWithError(0, "")
+	}
 
 	qc, err := d.createConnection(ctx)
 	if err != nil {
@@ -447,16 +505,19 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 
 func (d *DoQ) installConnection(qc quic.EarlyConnection) (quic.EarlyConnection, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
 		return nil, net.ErrClosed
 	}
 	if d.connection != nil {
+		connection := d.connection
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
-		return d.connection, nil
+		return connection, nil
 	}
 	d.connection = qc
+	d.mu.Unlock()
 	return qc, nil
 }
 
@@ -464,39 +525,30 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 	if d.connectionFactory != nil {
 		return d.connectionFactory(ctx)
 	}
-	udpAddr := net.UDPAddrFromAddrPort(d.dialArgument.bestTarget)
-	conn, err := d.dialArgument.bestDialer.DialContext(
-		ctx,
-		common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
-		d.dialArgument.bestTarget.String(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	fakePkt := netproxy.NewFakeNetPacketConn(conn.(netproxy.PacketConn), net.UDPAddrFromAddrPort(tc.GetUniqueFakeAddrPort()), udpAddr)
 	tlsCfg := &tls.Config{
 		NextProtos:         []string{"doq"},
 		InsecureSkipVerify: false,
 		ServerName:         d.Hostname,
 	}
-	addr := net.UDPAddrFromAddrPort(d.dialArgument.bestTarget)
-	qc, err := quic.DialEarly(ctx, fakePkt, addr, tlsCfg, nil)
-	if err != nil {
-		_ = conn.Close() // Ensure underlying connection is closed
-		return nil, err
-	}
-	return qc, nil
+	return dnstransport.DialEarlyOwned(ctx, func(ctx context.Context) (netproxy.Conn, error) {
+		return d.dialArgument.bestDialer.DialContext(
+			ctx,
+			common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
+			d.dialArgument.bestTarget.String(),
+		)
+	}, d.dialArgument.bestTarget, tlsCfg, nil)
 }
 
 func (d *DoQ) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
-	if d.connection != nil {
-		err := d.connection.CloseWithError(0, "")
-		d.connection = nil
-		return err
+	conn := d.connection
+	d.connection = nil
+	d.mu.Unlock()
+	if conn != nil {
+		// CloseWithError may send a CONNECTION_CLOSE frame; keep d.mu free
+		// so concurrent ForwardDNS callers are not stalled behind it.
+		return conn.CloseWithError(0, "")
 	}
 	return nil
 }
@@ -680,10 +732,16 @@ func (d *DoTLS) getPool() *connPool {
 				InsecureSkipVerify: false,
 				ServerName:         d.Hostname,
 			})
-			if err = tlsConn.Handshake(); err != nil {
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = tlsConn.SetDeadline(deadline)
+			} else {
+				_ = tlsConn.SetDeadline(time.Now().Add(consts.DefaultDialTimeout))
+			}
+			if err = tlsConn.HandshakeContext(ctx); err != nil {
 				_ = conn.Close()
 				return nil, err
 			}
+			_ = tlsConn.SetDeadline(time.Time{})
 			return tlsConn, nil
 		})
 	})
@@ -817,6 +875,13 @@ const (
 	// Each socket serves one in-flight request at a time in this implementation, so
 	// requests beyond this budget should fail fast instead of queueing in userspace.
 	dnsUdpPoolMaxActive = 64
+	// dnsUdpMaxResponseSize sizes the DoUDP reply read buffer. DNS replies
+	// over UDP can legally reach 65507 bytes when the client advertises
+	// EDNS0; an MTU-sized buffer lets the kernel clip the datagram, and the
+	// unpack below then fails, turning large replies into hard errors rather
+	// than a TC-triggered TCP retry. The shared power-of-two buffer pool
+	// buckets this at 64KiB and caps Put() retention at the same size.
+	dnsUdpMaxResponseSize = 65536
 	// Proxy-backed UDP DNS sockets go stale more easily because they sit behind an
 	// upstream relay session rather than a raw UDP socket.
 	dnsUdpProxyPoolMaxIdleTime  = 10 * time.Second
@@ -1120,8 +1185,10 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 		return nil, err
 	}
 
-	// Wait for response
-	respBuf := pool.GetFullCap(consts.EthernetMtu)
+	// Wait for response. The buffer must cover the full UDP DNS payload
+	// range (see dnsUdpMaxResponseSize) so EDNS0-sized replies are never
+	// silently truncated by the receive buffer.
+	respBuf := pool.GetFullCap(dnsUdpMaxResponseSize)
 	defer pool.Put(respBuf)
 	const maxStaleResponses = 8
 	staleResponses := 0
@@ -1198,87 +1265,6 @@ func (d *DoUDP) Close() error {
 		return err
 	}
 	return nil
-}
-
-func sendHttpDNS(client *http.Client, target string, upstream *dns.Upstream, data []byte) (respMsg *dnsmessage.Msg, err error) {
-	serverURL := url.URL{
-		Scheme: "https",
-		Host:   target,
-		Path:   upstream.Path,
-	}
-	q := serverURL.Query()
-	// According https://datatracker.ietf.org/doc/html/rfc8484#section-4
-	// msg id should set to 0 when transport over HTTPS for cache friendly.
-	binary.BigEndian.PutUint16(data[0:2], 0)
-	q.Set("dns", base64.RawURLEncoding.EncodeToString(data))
-	serverURL.RawQuery = q.Encode()
-
-	req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-message")
-	req.Host = upstream.Hostname
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http status code: %v", resp.StatusCode)
-	}
-
-	// Verify Content-Type
-	contentType := resp.Header.Get("Content-Type")
-	if contentType != "application/dns-message" {
-		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
-	}
-
-	buf, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
-	if err != nil {
-		return nil, err
-	}
-	var msg dnsmessage.Msg
-	if err = msg.Unpack(buf); err != nil {
-		return nil, err
-	}
-	return &msg, nil
-}
-
-func sendStreamDNS(stream io.ReadWriter, data []byte) (respMsg *dnsmessage.Msg, err error) {
-	// We should write two byte length in the front of stream DNS request.
-	bReq := pool.Get(2 + len(data))
-	defer pool.Put(bReq)
-	binary.BigEndian.PutUint16(bReq, uint16(len(data)))
-	copy(bReq[2:], data)
-	_, err = stream.Write(bReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write DNS req: %w", err)
-	}
-
-	// Read two byte length.
-	if _, err = io.ReadFull(stream, bReq[:2]); err != nil {
-		return nil, fmt.Errorf("failed to read DNS resp payload length: %w", err)
-	}
-	respLen := int(binary.BigEndian.Uint16(bReq))
-	// Try to reuse the buf.
-	var buf []byte
-	if len(bReq) < respLen {
-		buf = pool.Get(respLen)
-		defer pool.Put(buf)
-	} else {
-		buf = bReq
-	}
-	var n int
-	if n, err = io.ReadFull(stream, buf[:respLen]); err != nil {
-		return nil, fmt.Errorf("failed to read DNS resp payload: %w", err)
-	}
-	var msg dnsmessage.Msg
-	if err = msg.Unpack(buf[:n]); err != nil {
-		return nil, err
-	}
-	return &msg, nil
 }
 
 type pipelinedConn struct {
@@ -1390,9 +1376,17 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 		return nil, fmt.Errorf("failed to allocate ID: %w", err)
 	}
 
-	// Get response slot from pool
+	// Get response slot from pool. The slot must be recycled exactly once per
+	// checkout: by the outer defer below when no setter can reach it, or by
+	// the setter (readLoop/closeWithErr) after the cleanup defer transfers
+	// ownership via abandon.
 	slot := newResponseSlot()
-	defer putResponseSlot(slot)
+	setterRecycles := false
+	defer func() {
+		if !setterRecycles {
+			putResponseSlot(slot)
+		}
+	}()
 
 	// Store the pending request
 	if !pc.pending[id].CompareAndSwap(nil, slot) {
@@ -1401,8 +1395,21 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 	}
 	pc.pendingCount.Add(1)
 
+	var responseDelivered bool
 	defer func() {
-		pc.pending[id].CompareAndSwap(slot, nil)
+		switch {
+		case pc.pending[id].CompareAndSwap(slot, nil):
+			// Nobody claimed the slot; the outer defer recycles it.
+		case responseDelivered:
+			// The setter already finished; nothing will touch the slot again
+			// and the outer defer recycles it.
+		default:
+			// readLoop or closeWithErr owns the slot and will (or just did)
+			// call set; transfer recycling to that setter so a late delivery
+			// cannot write into a slot that already re-entered the pool.
+			slot.abandon()
+			setterRecycles = true
+		}
 		pc.idAlloc.Release(id)
 		pc.pendingCount.Add(-1)
 	}()
@@ -1420,8 +1427,14 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 		return nil, err
 	}
 
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		deadline = time.Now().Add(consts.DefaultDialTimeout)
+	}
 	pc.writeMu.Lock()
+	_ = pc.conn.SetWriteDeadline(deadline)
 	_, err = pc.conn.Write(buf)
+	_ = pc.conn.SetWriteDeadline(time.Time{})
 	pc.writeMu.Unlock()
 
 	if err != nil {
@@ -1429,6 +1442,7 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 	}
 
 	msg, err := slot.get(ctx)
+	responseDelivered = err == nil
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			// Avoid stale-response cross-delivery after ID reuse.

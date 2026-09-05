@@ -51,18 +51,16 @@ var (
 )
 
 var (
-	UnspecifiedAddressA          = netip.MustParseAddr("0.0.0.0")
-	UnspecifiedAddressAAAA       = netip.MustParseAddr("::")
-	DnsCacheRouteRefreshInterval = 10 * time.Second // Aligned with health check granularity (default 30s)
-	dnsCacheJanitorInterval      = 30 * time.Second
-	dnsForwarderIdleTTL          = 2 * time.Minute
+	UnspecifiedAddressA     = netip.MustParseAddr("0.0.0.0")
+	UnspecifiedAddressAAAA  = netip.MustParseAddr("::")
+	dnsCacheJanitorInterval = 30 * time.Second
+	dnsForwarderIdleTTL     = 2 * time.Minute
 )
 
 type DnsControllerOption struct {
 	Log                  *logrus.Logger
 	LifecycleContext     context.Context
 	CacheAccessCallback  func(cache *DnsCache) (err error)
-	CacheRemoveCallback  func(cache *DnsCache) (err error)
 	CacheDeleteCallback  func(cacheKey string, cache *DnsCache) (err error)
 	NewCache             func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	RouteProjectionEpoch uint64
@@ -88,16 +86,12 @@ type DnsControllerOption struct {
 
 type dnsControllerStore struct {
 	// dnsCache uses sync.Map for lock-free concurrent access
-	dnsCache               sync.Map // map[string]*DnsCache
-	dnsCacheSize           atomic.Int64
-	dnsKnowledge           sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu         sync.Mutex
-	qtypePrefer            atomic.Uint32
-	optimisticCacheEnabled atomic.Bool
-	optimisticCacheTtl     atomic.Int64 // seconds, 0 means never expire
-	maxCacheSize           atomic.Int64 // maximum number of cache entries (0 = unlimited)
-	// runtimeState belongs to the shared store so long-lived workers always
-	// observe the latest reload facade instead of the facade that started them.
+	dnsCache       sync.Map // map[string]*DnsCache
+	dnsCacheSize   atomic.Int64
+	dnsKnowledge   sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu sync.Mutex
+	// runtimeState owns the complete immutable runtime and behavior snapshot so
+	// one load cannot combine fields from different reload generations.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]
 	runtimeMu         sync.RWMutex // Serializes runtime publication with reload cache projection.
 	cacheProjectionMu sync.RWMutex // Serializes cache membership with BPF projection callbacks.
@@ -109,12 +103,6 @@ type dnsControllerStore struct {
 
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
-	evictorDone  chan struct{}
-	evictorQ     chan *DnsCache
-	evictorWake  chan struct{}
-	evictorChMu  sync.RWMutex
-	evictorMu    sync.Mutex
-	evictorBuf   []*DnsCache
 	lruScratchMu sync.Mutex
 	lruScratch   []cacheEntry
 	closeOnce    sync.Once
@@ -137,6 +125,16 @@ type dnsControllerStore struct {
 	// When ip_version_prefer is set, non-preferred responses wait briefly
 	// for preferred responses to arrive (RFC 8305 Happy Eyeballs).
 	prefWaitRegistry *preferenceWaitRegistry
+
+	// handleGate accounts for request handlers that entered through the
+	// active-plane dispatch. The publication RWMutex used to be held across
+	// whole DNS queries, which let one slow upstream head-of-line block a
+	// reload publish (and every new reader queued behind it). Dispatch now
+	// releases the lock immediately after admission; Close flips the gate
+	// shut and drains the counter before forwarders are torn down, which
+	// preserves the old lifetime guarantee for in-flight queries.
+	handleClosed   atomic.Bool
+	handleInflight atomic.Int64
 }
 
 // DnsController is a lightweight generation-local facade over a shared
@@ -149,7 +147,17 @@ type DnsController struct {
 	concurrencyLimiter chan struct{}
 
 	dnsForwarderIdleTTL time.Duration
-	log                 *logrus.Logger
+	// log is assigned only at construction (NewDnsController) and never
+	// rewritten afterwards, so lock-free readers are race-free. Reloads keep
+	// it valid without reassignment: the daemon builds exactly one
+	// logrus.Logger (cmd/run.go) and mutates it in place on reload via
+	// logger.SetLogger (SetLevel/SetFormatter are mutex-safe), so the
+	// construction-time pointer stays correct across generations. Never store
+	// nil: several call sites branch on log != nil. If per-generation loggers
+	// are ever introduced (e.g. per-generation log files), convert this field
+	// to atomic.Pointer[logrus.Logger] and re-add the updateRuntime
+	// assignment.
+	log *logrus.Logger
 }
 
 func newDnsControllerStore() *dnsControllerStore {
@@ -158,9 +166,6 @@ func newDnsControllerStore() *dnsControllerStore {
 		dnsForwarderCache: sync.Map{},
 		janitorStop:       make(chan struct{}),
 		janitorDone:       make(chan struct{}),
-		evictorDone:       make(chan struct{}),
-		evictorQ:          make(chan *DnsCache, 512),
-		evictorWake:       make(chan struct{}, 1),
 		prefWaitRegistry:  newPreferenceWaitRegistry(),
 	}
 }
@@ -208,11 +213,6 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		option = &DnsControllerOption{}
 	}
 
-	prefer, optimisticCacheEnabled, optimisticCacheTtl, maxCacheSize, err := normalizeDnsRuntimeBehavior(option)
-	if err != nil {
-		return nil, err
-	}
-
 	// Set concurrency limit for DNS queries
 	// This prevents resource exhaustion from DNS query storms.
 	//
@@ -249,19 +249,14 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 
 	controller := &DnsController{
 		dnsControllerStore:  newDnsControllerStore(),
-		concurrencyLimiter:  make(chan struct{}, limit), // 0 means no limit (unbuffered channel, always non-blocking)
+		concurrencyLimiter:  make(chan struct{}, limit),
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}
-	controller.qtypePrefer.Store(uint32(prefer))
-	controller.optimisticCacheEnabled.Store(optimisticCacheEnabled)
-	controller.optimisticCacheTtl.Store(int64(optimisticCacheTtl))
-	controller.maxCacheSize.Store(int64(maxCacheSize))
 	if err := controller.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
 	controller.startDnsCacheJanitor()
-	controller.startCacheEvictor()
 	return controller, nil
 }
 
@@ -272,7 +267,6 @@ func (c *DnsController) Close() error {
 	var (
 		bpfWorkerDone <-chan struct{}
 		janitorDone   <-chan struct{}
-		evictorDone   <-chan struct{}
 	)
 
 	// Acquire lock before closeOnce to synchronize with startBpfUpdateWorker.
@@ -304,9 +298,6 @@ func (c *DnsController) Close() error {
 		if c.janitorDone != nil {
 			janitorDone = c.janitorDone
 		}
-		if c.evictorDone != nil {
-			evictorDone = c.evictorDone
-		}
 	})
 	c.bpfUpdateStopMu.Unlock()
 	// Wait for any in-flight projection callback before cache teardown. A task
@@ -316,18 +307,16 @@ func (c *DnsController) Close() error {
 	//nolint:staticcheck // The empty critical section provides the required wait barrier.
 	c.cacheProjectionMu.Unlock()
 
-	if bpfWorkerDone != nil || janitorDone != nil || evictorDone != nil {
+	if bpfWorkerDone != nil || janitorDone != nil {
 		timer := time.NewTimer(gracefulShutdownWaitTimeout)
 		defer timer.Stop()
 
-		for bpfWorkerDone != nil || janitorDone != nil || evictorDone != nil {
+		for bpfWorkerDone != nil || janitorDone != nil {
 			select {
 			case <-bpfWorkerDone:
 				bpfWorkerDone = nil
 			case <-janitorDone:
 				janitorDone = nil
-			case <-evictorDone:
-				evictorDone = nil
 			case <-timer.C:
 				if c.log != nil {
 					if bpfWorkerDone != nil {
@@ -336,19 +325,18 @@ func (c *DnsController) Close() error {
 					if janitorDone != nil {
 						c.log.Warn("DnsController.Close: timeout waiting for janitorDone")
 					}
-					if evictorDone != nil {
-						c.log.Warn("DnsController.Close: timeout waiting for evictorDone")
-					}
 				}
 				bpfWorkerDone = nil
 				janitorDone = nil
-				evictorDone = nil
 			}
 		}
 	}
 
-	errs := c.closeAllDnsForwarders()
+	// Reject new active-plane dispatches and let in-flight handlers finish
+	// before forwarders are torn down, bounded by the same graceful budget.
+	c.closeHandleGate()
 
+	errs := c.closeAllDnsForwarders()
 	// Clear dnsCache to prevent memory leak on reload.
 	// Each DnsCache entry contains DomainBitmap and Answer which can accumulate
 	// significant memory over time if not released.
@@ -363,16 +351,9 @@ func (c *DnsController) Close() error {
 		c.dnsKnowledge.Delete(key)
 		return true
 	})
-	c.evictorMu.Lock()
-	c.evictorBuf = nil
-	c.evictorMu.Unlock()
 	c.lruScratchMu.Lock()
 	c.lruScratch = nil
 	c.lruScratchMu.Unlock()
-	c.evictorChMu.Lock()
-	c.evictorWake = nil
-	c.evictorQ = nil
-	c.evictorChMu.Unlock()
 	c.bpfUpdateStopMu.Lock()
 	c.bpfUpdateCh = nil
 	c.bpfUpdateStop = nil
@@ -385,17 +366,61 @@ func (c *DnsController) Close() error {
 	return errors.Join(errs...)
 }
 
-var (
-	// Pre-computed strings for common DNS query types to reduce allocations
-	// in the hot path. Fallback to strconv.Itoa for uncommon types.
-	qtypeStrCache = map[uint16]string{
-		dnsmessage.TypeA:     "1",
-		dnsmessage.TypeNS:    "2",
-		dnsmessage.TypeCNAME: "5",
-		dnsmessage.TypePTR:   "12",
-		dnsmessage.TypeMX:    "15",
-		dnsmessage.TypeTXT:   "16",
-		dnsmessage.TypeAAAA:  "28",
-		dnsmessage.TypeSRV:   "33",
+// acquireHandleGate admits an active-plane dispatch while the controller is
+// open. The double-check makes admission atomic with Close's flip: a caller
+// racing the flip either observes closed and fails fast, or is counted
+// before closeHandleGate's drain observes it.
+func (c *DnsController) acquireHandleGate() bool {
+	if c.handleClosed.Load() {
+		return false
 	}
-)
+	c.handleInflight.Add(1)
+	if c.handleClosed.Load() {
+		c.handleInflight.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (c *DnsController) releaseHandleGate() {
+	c.handleInflight.Add(-1)
+}
+
+// closeHandleGate rejects new dispatches and waits for the in-flight ones so
+// Close does not tear forwarders down under a running handler.
+func (c *DnsController) closeHandleGate() {
+	c.handleClosed.Store(true)
+	if c.handleInflight.Load() == 0 {
+		return
+	}
+	if c.log != nil {
+		c.log.Debug("DnsController.Close: waiting for in-flight DNS request handlers")
+	}
+	timer := time.NewTimer(gracefulShutdownWaitTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for c.handleInflight.Load() > 0 {
+		select {
+		case <-timer.C:
+			if c.log != nil {
+				c.log.Warn("DnsController.Close: timeout waiting for in-flight DNS request handlers")
+			}
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// Pre-computed strings for common DNS query types to reduce allocations
+// in the hot path. Fallback to strconv.Itoa for uncommon types.
+var qtypeStrCache = map[uint16]string{
+	dnsmessage.TypeA:     "1",
+	dnsmessage.TypeNS:    "2",
+	dnsmessage.TypeCNAME: "5",
+	dnsmessage.TypePTR:   "12",
+	dnsmessage.TypeMX:    "15",
+	dnsmessage.TypeTXT:   "16",
+	dnsmessage.TypeAAAA:  "28",
+	dnsmessage.TypeSRV:   "33",
+}

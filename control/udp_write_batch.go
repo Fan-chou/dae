@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -19,15 +19,11 @@ import (
 )
 
 const (
-	// udpWriteBatchMaxItems is the number of datagrams accumulated before a
-	// batched flush. 32 amortizes the per-datagram UDP write syscall (the
-	// dominant hot-path cost under saturated multi-flow UDP: pprof showed
-	// ~31% CPU in the write syscall alone) while bounding flush latency.
+	// udpWriteBatchMaxItems bounds the explicitly enabled experimental batch.
+	// Real-kernel validation found no end-to-end throughput gain, so batching
+	// stays off unless an operator has workload-specific evidence.
 	udpWriteBatchMaxItems = 32
-	// udpWriteBatchWindow is the maximum time a datagram waits in the batch
-	// buffer before being flushed. 1ms adds a bounded tail-latency cost that
-	// is negligible for game UDP (tens of ms tolerance) but lets low-rate
-	// flows still benefit from batching.
+	// udpWriteBatchWindow is the opt-in batch's hard tail-latency budget.
 	udpWriteBatchWindow = time.Millisecond
 	// udpWriteBatchItemSize sizes the batch backing buffer (32 x MTU).
 	udpWriteBatchItemSize = consts.EthernetMtu
@@ -38,16 +34,20 @@ const (
 // direct synchronous write for that datagram.
 var errUDPWriteBatchOversized = stderrors.New("udp write batch: datagram too large")
 
+const udpWriteBatchOptInEnv = "DAE_ENABLE_UDP_WRITE_BATCH"
+
+func udpWriteBatchOptedIn() bool { return os.Getenv(udpWriteBatchOptInEnv) == "1" }
+
 // udpWriteBatchAggregator accumulates datagrams for one UdpEndpoint and
 // flushes them through the transport's batched writer (sendmmsg on direct
 // UDP, per the netproxy.PacketBatchWriter extension). Flush triggers: batch
 // full (udpWriteBatchMaxItems) or udpWriteBatchWindow timer, whichever comes
 // first. Write errors are routed through the endpoint's existing retirement
-// policy asynchronously, so the synchronous Append path stays allocation-
-// light and lock-free for the common case.
+// policy asynchronously, after releasing the endpoint-local mutex.
 //
-// Per-flow ordering is preserved: the upstream ordered dispatcher serializes
-// WriteTo calls per flow, Append preserves order, and flush drains in order.
+// Per-flow ordering is preserved: the per-flow convoy task pool funnels each
+// flow's WriteTo calls through a single producer, Append preserves order, and
+// flush drains in order.
 type udpWriteBatchAggregator struct {
 	ue *UdpEndpoint
 
@@ -57,8 +57,12 @@ type udpWriteBatchAggregator struct {
 	used  int
 	timer *time.Timer
 
-	flushing atomic.Bool
-	closed   atomic.Bool
+	closed bool // guarded by mu
+
+	// unflushedFirst is true while the first datagram of this endpoint is
+	// queued but not yet flushed. Health-invalidation must treat that as
+	// an in-flight first write, not an unused session.
+	unflushedFirst bool
 }
 
 func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
@@ -71,11 +75,12 @@ func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
 // do not fit the backing buffer (caller falls back to a direct write); other
 // errors mean the aggregator is closed.
 func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
-	if a.closed.Load() {
-		return net.ErrClosed
-	}
 	for {
 		a.mu.Lock()
+		if a.closed {
+			a.mu.Unlock()
+			return net.ErrClosed
+		}
 		if len(a.items) >= udpWriteBatchMaxItems || (a.used+len(data) > len(a.buf) && len(a.buf) > 0) {
 			a.mu.Unlock()
 			a.flush()
@@ -97,9 +102,22 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 		if len(a.items) == 1 {
 			a.timer = time.AfterFunc(udpWriteBatchWindow, a.flush)
 		}
+		if a.ue != nil && !a.ue.hasSent.Load() && !a.ue.hasReply.Load() {
+			a.unflushedFirst = true
+		}
 		a.mu.Unlock()
 		return nil
 	}
+}
+
+func (a *udpWriteBatchAggregator) hasUnflushedFirst() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	pending := a.unflushedFirst && !a.closed
+	a.mu.Unlock()
+	return pending
 }
 
 // flush drains the current batch through the batched writer. It is safe to
@@ -111,24 +129,38 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 // deliberately deferred until after the unlock — handleWriteError can retire
 // the endpoint, whose Close re-enters this aggregator via writeBatch.Close,
 // and Go's mutex is not reentrant.
+//
+// Holding mu across the syscall is a deliberate final design, not an
+// oversight. The contention domain is one endpoint only: dae's per-flow FIFO
+// ingress (UdpTaskPool) funnels each endpoint's writes through its own convoy
+// sender, so there is a single producer goroutine in the steady state, and
+// the underlying socket serializes datagrams in-kernel anyway. Slot-swap or
+// copy-out variants would relocate that same serialization into an atomic
+// handshake (or pay an extra memcpy per packet) while adding tail latency for
+// cross-batch reordering — strictly worse here. Revisit only if a future
+// consumer feeds one aggregator from many goroutines.
 func (a *udpWriteBatchAggregator) flush() {
-	if !a.flushing.CompareAndSwap(false, true) {
-		return
-	}
-	defer a.flushing.Store(false)
-
 	a.mu.Lock()
-	items := a.items
-	a.items = nil
+	// Reuse the items backing array instead of dropping it for GC: the next
+	// Append runs under this same mutex only after the transport write below
+	// completes, so nothing can observe half-reset entries. This avoids
+	// reallocating a 32-item slice on every flush window per batched endpoint.
+	var items []netproxy.BatchItem
+	if len(a.items) > 0 {
+		items = a.items
+		a.items = a.items[:0]
+	}
 	a.used = 0
 	if a.timer != nil {
 		a.timer.Stop()
 		a.timer = nil
 	}
 	if len(items) == 0 {
+		a.unflushedFirst = false
 		a.mu.Unlock()
 		return
 	}
+	a.unflushedFirst = false
 	a.ue.armWriteDeadline(time.Now())
 	bw, ok := a.ue.conn.(netproxy.PacketBatchWriter)
 	if !ok {
@@ -182,9 +214,23 @@ func (ue *UdpEndpoint) applyBatchedFlushResult(err error, sentAny bool) {
 	ue.reportLocalWriteSuccess()
 }
 
-// Close flushes any pending batch and disables further appends.
+// Close prevents future appends, waits for any active write, and flushes the
+// remaining batch before the endpoint closes its transport.
 func (a *udpWriteBatchAggregator) Close() {
-	if a.closed.CompareAndSwap(false, true) {
-		a.flush()
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return
 	}
+	a.closed = true
+	a.unflushedFirst = false
+	timer := a.timer
+	a.timer = nil
+	a.mu.Unlock()
+	if timer != nil {
+		// AfterFunc timers have a nil C. Stop(false) means the callback has
+		// started; flush and Close synchronize through a.mu instead.
+		timer.Stop()
+	}
+	a.flush()
 }

@@ -67,7 +67,7 @@ func newDelayedTestEndpointDialer(delay time.Duration, conns ...netproxy.Conn) *
 func newTestEndpointDialer(conns ...netproxy.Conn) *componentdialer.Dialer {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
-	return componentdialer.NewDialer(
+	return componentdialer.NewDialerContext(context.Background(),
 		&scriptedDialer{conns: conns},
 		&componentdialer.GlobalOption{
 			Log:           logger,
@@ -92,7 +92,7 @@ func newTestEndpointErrorDialer(protocol, address string, err error) (*component
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	underlay := &errorDialer{err: err}
-	return componentdialer.NewDialer(
+	return componentdialer.NewDialerContext(context.Background(),
 		underlay,
 		&componentdialer.GlobalOption{
 			Log:           logger,

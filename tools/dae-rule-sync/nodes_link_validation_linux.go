@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 
 	_ "github.com/daeuniverse/dae/component/outbound"
@@ -19,7 +20,7 @@ func validateMihomoLinkWithDae(link string) error {
 		ExtraOption: D.ExtraOption{TlsImplementation: "tls", UtlsImitate: "chrome_auto"},
 		Log:         logger,
 	}
-	d, err := daeDialer.NewFromLink(option, daeDialer.InstanceOption{DisableCheck: true}, link, "")
+	d, err := daeDialer.NewFromLinkContext(context.Background(), option, daeDialer.InstanceOption{DisableCheck: true}, link, "")
 	if err != nil {
 		return err
 	}

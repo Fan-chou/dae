@@ -24,9 +24,8 @@ const (
 	// SemanticRefactorFeatureRoutingEpoch lets BPF publication switch between
 	// prepared routing epoch slots during reload.
 	//
-	// It stays opt-in: making it unconditional broke proxied TCP in the kernel
-	// test (curl through the datapath got a mid-relay reset), so the slot-0
-	// overwrite path remains the default until that is understood.
+	// The CLI enables this by default. DAE_SEMANTIC_REFACTOR_FEATURES=none
+	// retains the non-overlapping slot-0 publication path for compatibility.
 	SemanticRefactorFeatureRoutingEpoch SemanticRefactorFeature = "routing-epoch"
 )
 

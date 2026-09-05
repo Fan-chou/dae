@@ -8,27 +8,54 @@ package control
 import (
 	"context"
 	stderrors "errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/sirupsen/logrus"
 )
 
-const (
-	// relayHalfCloseTimeout bounds how long a half-closed TCP relay waits
-	// for the peer after CloseWrite. 0 disables the bound: production must
-	// not cut a server that still has data to send tens of seconds after the
-	// client finished. Reload still cancels via ctx. Tests may set
-	// halfCloseTimeout > 0 on a relayCore.
-	relayHalfCloseTimeout = time.Duration(0)
-	// relayIdleTimeout is the optional application-idle bound used only when
-	// a relayCore sets idleTimeout > 0 (tests). Production idleTimeout is 0:
-	// vanished TCP peers are reaped by kernel keepalive, not this watchdog.
-	relayIdleTimeout = 5 * time.Minute
+var (
+	// relayHalfCloseTimeout bounds how long the peer of a half-closed relay
+	// may still deliver data after our side sent EOF.
+	relayHalfCloseTimeout = envOverrideDuration("DAE_TCP_RELAY_HALF_CLOSE_TIMEOUT", 0)
+	// relayIdleTimeout bounds how long a relay may sit with zero traffic in
+	// both directions before it is force-closed. A half-open peer (vanished
+	// without FIN/RST) otherwise parks the directional read forever and the
+	// relay leaks. Any traffic in either direction refreshes lastActive, so
+	// long-lived but active connections (SSH, gaming) are never touched.
+	//
+	// Applications that legitimately stay silent for long stretches (idle
+	// database CLI sessions, MQTT keepalives longer than the default, long
+	// CONNECT tunnels) can raise this via DAE_TCP_RELAY_IDLE_TIMEOUT
+	// without recompiling. It is a var rather than a const so deployments
+	// can retune reclaim pressure per environment; the config-file grammar
+	// does not carry this knob.
+	relayIdleTimeout = envOverrideDuration("DAE_TCP_RELAY_IDLE_TIMEOUT", 0)
 	// relayIdleCheckInterval is the watchdog cadence for idle reclamation.
 	relayIdleCheckInterval = 30 * time.Second
+	// relayCancelNudgeInterval only applies after cancellation. At that point,
+	// prompt teardown matters more than avoiding deadline syscalls.
+	relayCancelNudgeInterval = 100 * time.Millisecond
 )
+
+// envOverrideDuration applies an optional process-level override for tunables
+// that are not exposed through the config-file grammar. Invalid or non-positive
+// values fall back to def with a warning instead of silently misbehaving.
+func envOverrideDuration(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		logrus.StandardLogger().Warnf("invalid %s=%q, using default %s", name, raw, def)
+		return def
+	}
+	return d
+}
 
 type relayCore struct {
 	left  netproxy.Conn
@@ -44,6 +71,10 @@ type relayCore struct {
 	// lastActiveNano is the last time either direction read or wrote data.
 	// Guarded by atomic; updated by the copy engines via onActive.
 	lastActiveNano atomic.Int64
+	// halfClosed is set after one direction EOFs and CloseWrite's the peer.
+	// Remaining traffic then rolls the half-close read deadline (idle-based,
+	// not a one-shot 10s cut of a still-active download).
+	halfClosed atomic.Bool
 }
 
 type relayDirection struct {
@@ -64,7 +95,7 @@ func newRelayCore(lConn, rConn netproxy.Conn, engine relayCopyEngine, leftRecord
 		right:            rConn,
 		copyEngine:       engine,
 		halfCloseTimeout: relayHalfCloseTimeout,
-		idleTimeout:      0, // 0 disables application-idle force-close
+		idleTimeout:      relayIdleTimeout, // default 0 preserves existing fdae behavior
 		idleCheckPeriod:  relayIdleCheckInterval,
 		leftRecord:       leftRecord,
 		rightRecord:      rightRecord,
@@ -77,10 +108,9 @@ func (c *relayCore) run(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	watchDone := make(chan struct{})
-	defer close(watchDone)
-	defer cancel()
 
 	results := make(chan relayResult, 2)
+	var relayDone atomic.Bool
 	var forceCloseOnce sync.Once
 
 	// nudgeReads repeatedly pokes SetReadDeadline on both conns. quic-go
@@ -105,13 +135,10 @@ func (c *relayCore) run(ctx context.Context) error {
 		})
 	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			forceClose()
-		case <-watchDone:
-		}
-	}()
+	// LIFO on return: close watchDone before canceling the derived context,
+	// so a normally completed relay doesn't close already-finished sockets.
+	defer cancel()
+	defer close(watchDone)
 
 	// The watchdog stays alive after ctx cancel so quic-go (hy2/tuic) Reads
 	// that ignore a single SetReadDeadline/Close still get repeated nudges.
@@ -124,6 +151,7 @@ func (c *relayCore) run(ctx context.Context) error {
 		checkPeriod = relayIdleCheckInterval
 	}
 	go func() {
+		ctxDone := ctx.Done()
 		ctxCanceled := false
 		ticker := time.NewTicker(checkPeriod)
 		defer ticker.Stop()
@@ -131,14 +159,16 @@ func (c *relayCore) run(ctx context.Context) error {
 			select {
 			case <-watchDone:
 				return
-			case <-ctx.Done():
-				// ctx was canceled (e.g. reload retired the generation).
-				// forceClose was already called by the ctx-watcher, but for
-				// QUIC streams the blocked Read may not have woken up yet.
-				// Switch to nudge mode: keep poking SetReadDeadline until the
-				// relay finishes (watchDone), giving quic-go repeated chances
-				// to unblock the parked goroutine.
+			case <-ctxDone:
+				if relayDone.Load() {
+					return
+				}
+				// Close once on cancellation, then disable this closed-channel
+				// case so a stuck QUIC relay cannot spin before the next nudge.
+				forceClose()
 				ctxCanceled = true
+				ctxDone = nil
+				ticker.Reset(relayCancelNudgeInterval)
 			case <-ticker.C:
 				if ctxCanceled {
 					// Keep nudging after cancellation — quic-go may need
@@ -147,25 +177,39 @@ func (c *relayCore) run(ctx context.Context) error {
 					continue
 				}
 				if idleTimeout > 0 && time.Since(time.Unix(0, c.lastActiveNano.Load())) > idleTimeout {
-					// Idle beyond the bound: reclaim the relay. forceClose
-					// unblocks both directional reads via deadline + Close.
+					// Idle reclaim enters the same nudge mode as external
+					// cancellation; a QUIC Read may survive the first Close.
 					cancel()
 					forceClose()
-					return
+					ctxCanceled = true
+					ctxDone = nil
+					ticker.Reset(relayCancelNudgeInterval)
 				}
 			}
 		}
 	}()
 
 	runDirection := func(dir relayDirection) {
+		// Coalesce activity refreshes to ~4Hz per direction: the watchdog
+		// only needs second-level granularity, and per-chunk atomic stores
+		// on the shared lastActiveNano word showed measurable cross-core
+		// contention under multi-core relaying.
+		var lastRefreshNano int64
+		const refreshInterval = int64(250 * time.Millisecond)
 		onActive := func(_ int64) {
-			c.lastActiveNano.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			if now-lastRefreshNano < refreshInterval {
+				return
+			}
+			lastRefreshNano = now
+			c.lastActiveNano.Store(now)
+			if c.halfClosed.Load() {
+				_ = dir.src.SetReadDeadline(time.Now().Add(c.halfCloseTimeout))
+			}
 		}
 		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record, onActive)
 
-		if wc, ok := dir.dst.(WriteCloser); ok {
-			_ = wc.CloseWrite()
-		}
+		closeWriteRelayConn(dir.dst)
 
 		if err != nil {
 			// Any directional copy error is treated as terminal for this relay:
@@ -174,8 +218,11 @@ func (c *relayCore) run(ctx context.Context) error {
 			cancel()
 			forceClose()
 		} else if c.halfCloseTimeout > 0 {
-			// Test-only half-close bound. Production halfCloseTimeout is 0:
-			// do not SetReadDeadline after CloseWrite.
+			// Graceful half-close: idle-bound the peer's pending read on
+			// dir.dst (source of the opposite direction). Activity in the
+			// remaining direction rolls the deadline via onActive.
+			c.lastActiveNano.Store(time.Now().UnixNano())
+			c.halfClosed.Store(true)
 			_ = dir.dst.SetReadDeadline(time.Now().Add(c.halfCloseTimeout))
 		}
 
@@ -200,6 +247,7 @@ func (c *relayCore) run(ctx context.Context) error {
 
 	first := <-results
 	second := <-results
+	relayDone.Store(true)
 	return mergeRelayErrors(first.err, second.err)
 }
 

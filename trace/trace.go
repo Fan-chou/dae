@@ -18,10 +18,10 @@ import (
 	"os"
 	"slices"
 	"syscall"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/daeuniverse/dae/common/consts"
@@ -31,24 +31,7 @@ import (
 
 //go:generate go run -mod=mod github.com/cilium/ebpf/cmd/bpf2go -cc "$BPF_CLANG" "$BPF_STRIP_FLAG" -cflags "$BPF_CFLAGS" -tags "trace,!dae_stub_ebpf" -target "$BPF_TRACE_TARGET" -type event bpf kern/trace.c -- -I./headers
 
-var nativeEndian binary.ByteOrder
-
-func init() {
-	// Detect native endianness by writing a known uint16 value and examining the bytes.
-	// This uses unsafe.Pointer to access the raw byte representation, which is necessary
-	// for endianness detection. The pattern is well-established and safe.
-	buf := [2]byte{}
-	*(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
-
-	switch buf {
-	case [2]byte{0xCD, 0xAB}:
-		nativeEndian = binary.LittleEndian
-	case [2]byte{0xAB, 0xCD}:
-		nativeEndian = binary.BigEndian
-	default:
-		panic("Could not determine native endianness.")
-	}
-}
+var nativeEndian = internal.NativeEndian
 
 func StartTrace(ctx context.Context, ipVersion int, l4ProtoNo uint16, port int, dropOnly bool, outputFile string) (err error) {
 	kernelVersion, err := internal.KernelVersion()
@@ -99,7 +82,7 @@ func StartTrace(ctx context.Context, ipVersion int, l4ProtoNo uint16, port int, 
 func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects, err error) {
 	spec, err := loadBpf()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load BPF: %+v", err)
+		return nil, fmt.Errorf("failed to load BPF: %w", err)
 	}
 	tracingCfg := spec.Variables["tracing_cfg"]
 	if tracingCfg == nil {
@@ -116,7 +99,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 		ipVersion: uint8(ipVersion),
 		pad:       0,
 	}); err != nil {
-		return nil, fmt.Errorf("failed to rewrite constants: %+v", err)
+		return nil, fmt.Errorf("failed to rewrite constants: %w", err)
 	}
 	var opts ebpf.CollectionOptions
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
@@ -129,7 +112,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 		if errors.As(err, &ve) {
 			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
 		}
-		return nil, fmt.Errorf("failed to load BPF: %+v\n%s", err, verifierLog)
+		return nil, fmt.Errorf("failed to load BPF: %w\n%s", err, verifierLog)
 	}
 
 	return &objs, nil
@@ -140,7 +123,7 @@ func searchAvailableTargets() (targets map[string]int, kfreeSkbReasons map[uint6
 
 	btfSpec, err := btf.LoadKernelSpec()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load kernel BTF: %+v", err)
+		return nil, nil, fmt.Errorf("failed to load kernel BTF: %w", err)
 	}
 
 	if kfreeSkbReasons, err = getKFreeSKBReasons(btfSpec); err != nil {
@@ -184,7 +167,7 @@ func getKFreeSKBReasons(spec *btf.Spec) (map[uint64]string, error) {
 
 	var dropReasonsEnum *btf.Enum
 	if err := spec.TypeByName("skb_drop_reason", &dropReasonsEnum); err != nil {
-		return nil, fmt.Errorf("failed to find 'skb_drop_reason' enum: %v", err)
+		return nil, fmt.Errorf("failed to find 'skb_drop_reason' enum: %w", err)
 	}
 
 	ret := map[uint64]string{}
@@ -204,28 +187,69 @@ func attachBpfToTargets(objs *bpfObjects, targets map[string]int) (links []link.
 		links = append(links, kp)
 	}
 
-	i := 0
+	// Group target functions by the position of their sk_buff argument; all
+	// functions in a group fire the same program, so on kernels with
+	// kprobe_multi support (5.18+) the whole group is attached with a single
+	// link instead of one perf event attach per symbol.
+	progByPos := map[int]*ebpf.Program{
+		1: objs.KprobeSkb1,
+		2: objs.KprobeSkb2,
+		3: objs.KprobeSkb3,
+		4: objs.KprobeSkb4,
+		5: objs.KprobeSkb5,
+	}
+	symbolsByPos := make(map[int][]string, len(progByPos))
 	for fn, pos := range targets {
-		i++
-		fmt.Printf("attaching kprobes: %04d/%04d\r", i, len(targets))
-		var kp link.Link
-		switch pos {
-		case 1:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb1, nil)
-		case 2:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb2, nil)
-		case 3:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb3, nil)
-		case 4:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb4, nil)
-		case 5:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb5, nil)
-		}
-		if err != nil {
-			logrus.Debugf("failed to attach kprobe to %s: %+v\n", fn, err)
+		if _, ok := progByPos[pos]; !ok {
 			continue
 		}
-		links = append(links, kp)
+		symbolsByPos[pos] = append(symbolsByPos[pos], fn)
+	}
+	positions := make([]int, 0, len(symbolsByPos))
+	for pos := range symbolsByPos {
+		positions = append(positions, pos)
+	}
+	slices.Sort(positions)
+	for _, symbols := range symbolsByPos {
+		slices.Sort(symbols)
+	}
+
+	// DAE_TRACE_NO_KPROBE_MULTI=1 forces the per-symbol attach path, e.g. to
+	// compare behavior on kernels where kprobe_multi misbehaves.
+	useKprobeMulti := os.Getenv("DAE_TRACE_NO_KPROBE_MULTI") != "1"
+	if useKprobeMulti {
+		if err := features.HaveBPFLinkKprobeMulti(); err != nil {
+			logrus.Infof("kernel has no kprobe_multi support: %v; attaching %d kprobes one by one", err, len(targets))
+			useKprobeMulti = false
+		}
+	}
+
+	i, total := 0, len(targets)
+	for _, pos := range positions {
+		prog, symbols := progByPos[pos], symbolsByPos[pos]
+		if useKprobeMulti {
+			multi, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Symbols: symbols})
+			if err == nil {
+				fmt.Printf("attached %d kprobes via kprobe_multi (sk_buff arg position %d)\n", len(symbols), pos)
+				links = append(links, multi)
+				continue
+			}
+			// One unattachable symbol fails the whole group; fall back to
+			// per-symbol attachment so the rest of the group keeps working.
+			logrus.Warnf("kprobe_multi attach failed for sk_buff arg position %d (%d symbols): %+v; falling back to per-symbol attach\n",
+				pos, len(symbols), err)
+		}
+		for _, fn := range symbols {
+			i++
+			fmt.Printf("attaching kprobes: %04d/%04d\r", i, total)
+			var kp link.Link
+			kp, err = link.Kprobe(fn, prog, nil)
+			if err != nil {
+				logrus.Debugf("failed to attach kprobe to %s: %+v\n", fn, err)
+				continue
+			}
+			links = append(links, kp)
+		}
 	}
 	if len(links) == 0 {
 		return nil, fmt.Errorf("failed to attach kprobes to any target")
@@ -274,7 +298,7 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 
 	eventsReader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		return fmt.Errorf("failed to create ringbuf reader: %+v", err)
+		return fmt.Errorf("failed to create ringbuf reader: %w", err)
 	}
 	defer func() { _ = eventsReader.Close() }()
 
@@ -307,6 +331,24 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 	// a map to save slices of bpfEvent of the Skb
 	skb2symNames := make(map[uint64][]string)
 	// a map to save slices of function name called with the Skb
+	// Terminal kfree events normally delete each skb's entries. When they go
+	// missing (ringbuf sample loss above, or a failed kfree_skbmem attach),
+	// the tracking maps would grow without bound for the rest of the trace,
+	// so cap the live set and shed a quarter of it on overflow. Eviction is
+	// random (Go map order); a shed skb only loses its report, and shedding
+	// only starts once tracking is already pathological.
+	const traceMaxTrackedSkbs = 1 << 16
+	evictTrackedSkbs := func() {
+		n := len(skb2events) / 4
+		for skb := range skb2events {
+			delete(skb2events, skb)
+			delete(skb2symNames, skb)
+			n--
+			if n == 0 {
+				return
+			}
+		}
+	}
 	var readEvents uint64
 	writeEvents := func(writer io.Writer, events []bpfEvent, complete bool) {
 		for _, skbEv := range events {
@@ -398,6 +440,9 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			skb2events[event.Skb] = []bpfEvent{}
 		}
 		skb2events[event.Skb] = append(skb2events[event.Skb], event)
+		if len(skb2events) > traceMaxTrackedSkbs {
+			evictTrackedSkbs()
+		}
 
 		sym := NearestSymbol(event.Pc)
 		if skb2symNames[event.Skb] == nil {

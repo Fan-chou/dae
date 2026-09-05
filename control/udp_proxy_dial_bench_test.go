@@ -13,9 +13,8 @@ import (
 )
 
 // BenchmarkUdpProxyDial measures the cost of the proxy-dial slow path under
-// UdpEndpointPool.GetOrCreate. This is the second coverage gap the SLO gate in
-// cmd/semantic_refactor_features.go was waiting on: no existing benchmark
-// exercised DialContext through the proxy dialer under UDP traffic.
+// UdpEndpointPool.GetOrCreate: no other benchmark exercises DialContext
+// through the proxy dialer under UDP traffic.
 //
 // Two cache regimes are compared:
 //
@@ -121,3 +120,6 @@ func runUdpProxyDialBenchmark(b *testing.B, miss bool) {
 		b.Fatalf("proxy DialContext count = %d, want %d", got, wantDials)
 	}
 }
+
+// closeQuicBenchmarkEndpoint closes a benchmark endpoint with a timeout so a
+// hung Close fails the benchmark instead of deadlocking teardown.
