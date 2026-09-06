@@ -64,7 +64,7 @@ function downloadLogs(): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "kdae-logs.txt";
+  a.download = "fdae-logs.txt";
   a.click();
   URL.revokeObjectURL(url);
 }

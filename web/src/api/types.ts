@@ -58,6 +58,7 @@ export type AdminConnection = {
 };
 
 export type AdminConnectionsSnapshot = {
+  scope?: string;
   total: number;
   truncated: boolean;
   connections: AdminConnection[];

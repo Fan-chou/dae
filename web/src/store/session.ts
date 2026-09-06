@@ -5,7 +5,7 @@ import { loadPrefs, savePrefs, type UiPrefs } from "@/api/prefs";
 import { loadSrcMacHints, saveSrcMacHints } from "@/api/srcMac";
 import { loadSettings, saveSettings, type UiSettings } from "@/api/settings";
 import type { AdminConfig, AdminConnection, AdminGroup, AdminStatus, ConnectionFilter } from "@/api/types";
-import { latencyFingerprint, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, appendTrafficSample, liveSessionTraffic, type ConnectionView, type ParsedLog, type SrcMacHint, type TrafficSamplePoint } from "@/lib/format";
+import { latencyFingerprint, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, type ConnectionView, type ParsedLog, type SrcMacHint, type TrafficSamplePoint } from "@/lib/format";
 
 export const ui = reactive({
   settings: loadSettings(),
@@ -18,11 +18,17 @@ export const ui = reactive({
   connectionsTotal: 0,
   connectionsTruncated: false,
   connectionsLastPollAt: 0,
+  connectionsScope: "",
+  connectionsPending: false,
+  connectionsError: "",
   connectionFilter: { outbound: "", src: "", mac: "" } as ConnectionFilter,
   srcMacHints: loadSrcMacHints() as SrcMacHint[],
   trafficSamples: [] as TrafficSamplePoint[],
   config: { config: "", routing: "" } as AdminConfig,
   error: "",
+  refreshError: "",
+  statusError: "",
+  statusLastSuccessAt: 0,
   notice: "",
   loading: false,
   logPaused: false,
@@ -54,13 +60,18 @@ function sleep(ms: number): Promise<void> {
 
 export async function refresh(page?: string, opts?: { silent?: boolean }): Promise<void> {
   if (!ui.settings.secret) {
-    ui.error = "请先在设置里填写 admin_secret";
+    ui.refreshError = "请先在设置里填写 admin_secret";
+    ui.statusError = ui.refreshError;
     return;
   }
   if (!opts?.silent) ui.loading = true;
+  let statusReceived = false;
   try {
     const api = client();
     ui.status = await fetchStatus(api);
+    statusReceived = true;
+    ui.statusLastSuccessAt = Date.now();
+    ui.statusError = "";
     if (page === "groups" || page === "overview") {
       const body = await fetchGroups(api);
       ui.groups = body.groups || [];
@@ -72,9 +83,10 @@ export async function refresh(page?: string, opts?: { silent?: boolean }): Promi
     if (page === "config") {
       ui.config = await fetchConfig(api);
     }
-    ui.error = "";
+    ui.refreshError = "";
   } catch (err) {
-    ui.error = err instanceof Error ? err.message : String(err);
+    ui.refreshError = err instanceof Error ? err.message : String(err);
+    if (!statusReceived) ui.statusError = ui.refreshError;
   } finally {
     if (!opts?.silent) ui.loading = false;
   }
@@ -119,6 +131,8 @@ export async function checkGroupDelay(groupName: string): Promise<void> {
 }
 
 export async function reloadPlane(): Promise<void> {
+  ui.notice = "";
+  ui.error = "";
   try {
     const body = await postReload(client());
     ui.notice = body.queued ? "已排队热重载" : "重载忙，稍后再试";
@@ -141,37 +155,42 @@ export async function saveConfig(): Promise<void> {
   }
 }
 
+let connectionRequest = 0;
+let connectionContext = "";
+
 export async function refreshConnections(opts?: { silent?: boolean; outbound?: string }): Promise<void> {
-  if (!ui.settings.secret) {
-    ui.error = "请先在设置里填写 admin_secret";
-    return;
+  if (!ui.settings.secret) { ui.connectionsError = "请先在设置里填写访问密钥"; return; }
+  const filter = opts && "outbound" in opts
+    ? { outbound: String(opts.outbound || "").trim(), limit: ui.prefs.connLimit }
+    : { ...ui.connectionFilter, limit: ui.prefs.connLimit };
+  const context = JSON.stringify([ui.settings.baseUrl, ui.settings.secret, filter]);
+  if (ui.connectionsPending && context === connectionContext) return;
+  const changed = context !== connectionContext;
+  connectionContext = context;
+  const request = ++connectionRequest;
+  if (changed) {
+    ui.connectionViews = []; ui.connections = []; ui.connectionsTotal = 0;
+    ui.connectionsLastPollAt = 0; ui.connectionsTruncated = false;
   }
-  if (!opts?.silent) ui.loading = true;
+  ui.connectionsPending = true;
+  ui.connectionsError = "";
   try {
-    const outbound = opts && "outbound" in opts ? String(opts.outbound || "").trim() : ui.connectionFilter.outbound?.trim();
-    const body = await fetchConnections(client(), {
-      outbound,
-      limit: 256,
-    });
+    const body = await fetchConnections(client(), filter);
+    if (request !== connectionRequest) return;
     const now = Date.now();
+    const scopeChanged = !!body.scope && body.scope !== ui.connectionsScope;
     const elapsed = ui.connectionsLastPollAt ? now - ui.connectionsLastPollAt : 0;
     ui.connections = body.connections || [];
-    ui.connectionViews = mergeConnectionSnapshots(ui.connectionViews, ui.connections, elapsed);
+    ui.connectionViews = mergeConnectionSnapshots(scopeChanged ? [] : ui.connectionViews, ui.connections, elapsed, !body.truncated);
+    ui.connectionsScope = body.scope || "";
     ui.srcMacHints = mergeSrcMacHints(ui.srcMacHints, ui.connectionViews);
     saveSrcMacHints(ui.srcMacHints);
-    const session = liveSessionTraffic(ui.connectionViews);
-    ui.trafficSamples = appendTrafficSample(ui.trafficSamples, {
-      ts: now,
-      up: session.uploadRate,
-      down: session.downloadRate,
-    });
-    ui.connectionsTotal = body.total || 0;
+    ui.connectionsTotal = body.total ?? 0;
     ui.connectionsTruncated = !!body.truncated;
     ui.connectionsLastPollAt = now;
-    ui.error = "";
   } catch (err) {
-    ui.error = err instanceof Error ? err.message : String(err);
+    if (request === connectionRequest) ui.connectionsError = err instanceof Error ? err.message : String(err);
   } finally {
-    if (!opts?.silent) ui.loading = false;
+    if (request === connectionRequest) ui.connectionsPending = false;
   }
 }

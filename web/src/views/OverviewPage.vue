@@ -3,7 +3,7 @@ import prettyBytes from "pretty-bytes";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useDocumentVisibility, useIntervalFn, usePreferredDark } from "@vueuse/core";
 import { generation, refresh, refreshConnections, ui } from "@/store/session";
-import { rateScale, srcHost, summarizeConnections, type TrafficBucket } from "@/lib/format";
+import { bucketRateText, rateScale, srcHost, summarizeConnections, type TrafficBucket } from "@/lib/format";
 import { resolveTheme } from "@/lib/theme";
 
 type ChartHandle = {
@@ -19,11 +19,15 @@ function onResize(): void {
 }
 
 const summary = computed(() => summarizeConnections(ui.connectionViews, 12));
-const rateUp = computed(() => prettyBytes(summary.value.uploadRate || 0) + "/s");
-const rateDown = computed(() => prettyBytes(summary.value.downloadRate || 0) + "/s");
-const totalUp = computed(() => prettyBytes(summary.value.upload || 0));
-const totalDown = computed(() => prettyBytes(summary.value.download || 0));
-const rss = computed(() => prettyBytes(ui.status?.rss_bytes || 0));
+const now = ref(Date.now());
+useIntervalFn(() => { now.value = Date.now(); }, 1000);
+const statusStale = computed(() => !!ui.statusError || (!!ui.statusLastSuccessAt && now.value - ui.statusLastSuccessAt > 10000));
+const statusTime = computed(() => ui.statusLastSuccessAt ? new Date(ui.statusLastSuccessAt).toLocaleTimeString() : "尚未成功获取");
+const rateUp = computed(() => ui.status?.upload_rate == null ? "—" : prettyBytes(ui.status.upload_rate) + "/s");
+const rateDown = computed(() => ui.status?.download_rate == null ? "—" : prettyBytes(ui.status.download_rate) + "/s");
+const totalUp = computed(() => ui.status?.upload_total == null ? "—" : prettyBytes(ui.status.upload_total));
+const totalDown = computed(() => ui.status?.download_total == null ? "—" : prettyBytes(ui.status.download_total));
+const rss = computed(() => ui.status?.rss_bytes == null ? "—" : prettyBytes(ui.status.rss_bytes));
 
 function macsForSrc(host: string): string {
   const macs = new Set<string>();
@@ -49,10 +53,9 @@ function bucketLine(item: TrafficBucket): string {
     " ↓ " +
     prettyBytes(item.download) +
     " · ↑ " +
-    prettyBytes(item.uploadRate) +
-    "/s ↓ " +
-    prettyBytes(item.downloadRate) +
-    "/s"
+    bucketRateText(item, "upload", prettyBytes) +
+    " ↓ " +
+    bucketRateText(item, "download", prettyBytes)
   );
 }
 
@@ -122,6 +125,7 @@ async function renderChart(): Promise<void> {
 async function poll(silent = true): Promise<void> {
   await refresh("overview", { silent });
   await refreshConnections({ silent, outbound: "" });
+  ui.trafficSamples = ui.status?.traffic_samples || [];
   await nextTick();
   await renderChart();
 }
@@ -166,6 +170,10 @@ watch(
 </script>
 
 <template>
+  <header class="page-heading"><h1>概览</h1></header>
+  <p class="overview-freshness mb-3" :class="{ 'text-warning': statusStale }" role="status">状态最后更新：{{ statusTime }}<span v-if="statusStale"> · 数据已过期，以下状态与流量为上次成功结果</span><span v-if="ui.statusError"> · {{ ui.statusError }}</span></p>
+  <p v-if="ui.connectionsError" role="alert" class="alert alert-warning mb-4">{{ ui.connectionsError }} · 连接分布为上次成功结果</p>
+  <p v-if="ui.connectionsTruncated" class="data-note mb-4">下方来源、域名和节点分布仅基于已加载的 {{ ui.connections.length }} 条连接；顶部流量使用后端汇总。</p>
   <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">版本</div>
@@ -173,7 +181,7 @@ watch(
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">运行</div>
-      <div class="stat-value text-lg">{{ ui.status?.running ? "运行中" : "未连接" }}</div>
+      <div class="stat-value text-lg">{{ !ui.status ? "—" : statusStale ? "状态待确认" : ui.status.running ? "运行中" : "已停止" }}</div>
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">generation</div>
@@ -185,18 +193,18 @@ watch(
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">当前会话</div>
-      <div class="stat-value text-lg">{{ summary.live }}</div>
-      <div class="stat-desc">kdae 抓住的活动连接</div>
+      <div class="stat-value text-lg">{{ ui.connectionsLastPollAt ? ui.connectionsTotal : "—" }}</div>
+      <div class="stat-desc">fdae 跟踪的活动连接</div>
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
-      <div class="stat-title">上行（当前会话）</div>
+      <div class="stat-title">上行</div>
       <div class="stat-value text-lg">{{ rateUp }}</div>
-      <div class="stat-desc">累计 {{ totalUp }}</div>
+      <div class="stat-desc">运行时累计 {{ totalUp }}</div>
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
-      <div class="stat-title">下行（当前会话）</div>
+      <div class="stat-title">下行</div>
       <div class="stat-value text-lg">{{ rateDown }}</div>
-      <div class="stat-desc">累计 {{ totalDown }}</div>
+      <div class="stat-desc">运行时累计 {{ totalDown }}</div>
     </div>
     <div class="stat rounded-box bg-base-100 shadow">
       <div class="stat-title">TCP / UDP</div>
@@ -212,8 +220,8 @@ watch(
     </div>
   </div>
   <div class="mt-4 rounded-box bg-base-100 p-4 shadow">
-    <h2 class="mb-2 text-base font-semibold">速率（当前会话）</h2>
-    <p class="mb-2 text-sm opacity-70">按连接快照差分，约 2 秒一点，最多保留 5 分钟。第一次刷新速率为 0 是正常的。</p>
+    <h2 class="mb-2 text-base font-semibold">实时流量</h2>
+    <p class="mb-2 text-sm opacity-70">使用后端运行时汇总，不受连接列表显示上限影响。</p>
     <div v-if="ui.trafficSamples.length < 2" class="py-10 text-center text-sm opacity-60">采集中，请稍候…</div>
     <div v-show="ui.trafficSamples.length >= 2" ref="chartEl" class="h-44 w-full md:h-56" />
   </div>

@@ -8,8 +8,10 @@ export type ThemePref = "system" | "light" | "dark";
 
 export type UiPrefs = {
   theme: ThemePref;
+  sidebarCollapsed: boolean;
   connView: ConnViewMode;
   connInterval: number;
+  connLimit: number;
   connHiddenCols: string[];
   connExclude: string;
   connExcludeOn: boolean;
@@ -18,9 +20,11 @@ export type UiPrefs = {
 
 export const defaultPrefs: UiPrefs = {
   theme: "system",
+  sidebarCollapsed: true,
   connView: "auto",
   connInterval: 2000,
-  connHiddenCols: ["policy"],
+  connLimit: 1024,
+  connHiddenCols: ["mac", "host", "policy", "upload", "download", "start", "outbound", "dialer"],
   connExclude: "",
   connExcludeOn: false,
   groupSort: "default",
@@ -34,8 +38,10 @@ export function loadPrefs(): UiPrefs {
       saved.connView === "card" || saved.connView === "table" || saved.connView === "auto" ? saved.connView : "auto";
     return {
       theme: saved.theme === "light" || saved.theme === "dark" ? saved.theme : "system",
+      sidebarCollapsed: saved.sidebarCollapsed !== false,
       connView,
       connInterval: interval,
+      connLimit: [256, 512, 1024].includes(Number(saved.connLimit)) ? Number(saved.connLimit) : 1024,
       connHiddenCols: Array.isArray(saved.connHiddenCols) ? saved.connHiddenCols.map(String) : defaultPrefs.connHiddenCols.slice(),
       connExclude: typeof saved.connExclude === "string" ? saved.connExclude : "",
       connExcludeOn: !!saved.connExcludeOn,

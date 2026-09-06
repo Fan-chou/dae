@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import prettyBytes from "pretty-bytes";
+import UiIcon from "@/components/UiIcon.vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useDocumentVisibility, useIntervalFn } from "@vueuse/core";
 import type { AdminGroup, AdminGroupMember } from "@/api/types";
@@ -17,10 +18,17 @@ import {
   policyLabel,
   siteLocalSelectionPolicy,
   trafficForName,
+  bucketRateText,
 } from "@/lib/format";
 import { checkGroupDelay, refresh, refreshConnections, selectMember, ui } from "@/store/session";
 
 const search = ref("");
+const collapsed = ref<Record<string, boolean>>({});
+const anyExpanded = computed(() => ui.groups.some(group => !collapsed.value[group.name]));
+function toggleAll(): void {
+  const shouldCollapse = anyExpanded.value;
+  collapsed.value = Object.fromEntries(ui.groups.map(group => [group.name, shouldCollapse]));
+}
 const visibility = useDocumentVisibility();
 const { pause, resume } = useIntervalFn(
   () => {
@@ -96,6 +104,8 @@ function groupAdmission(group: AdminGroup) {
 </script>
 
 <template>
+  <header class="page-heading"><div class="heading-title"><h1>代理组</h1><span class="count-pill">{{ ui.groups.length }}</span></div><button class="btn btn-sm btn-ghost" @click="toggleAll">{{ anyExpanded ? '全部收起' : '全部展开' }}</button></header>
+  <p v-if="ui.connectionsTruncated || ui.connectionsError" class="data-note mb-4">节点流量仅基于已加载连接{{ ui.connectionsError ? "，当前刷新失败" : "，列表有截断" }}，不代表全部流量。</p>
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <input v-model="search" class="input input-bordered input-sm min-h-10 min-w-0 flex-1" placeholder="搜索组或节点" />
     <select class="select select-bordered select-sm min-h-10" :value="ui.prefs.groupSort" @change="onGroupSort">
@@ -104,34 +114,30 @@ function groupAdmission(group: AdminGroup) {
       <option value="traffic">按下行速率</option>
     </select>
   </div>
-  <div class="flex flex-col gap-4">
-    <section v-for="group in groups" :key="group.name" class="rounded-box border border-base-300 bg-base-100 p-4 shadow">
-      <div class="mb-3 flex flex-wrap items-start justify-between gap-2">
-        <div class="min-w-0">
-          <h2 class="text-base font-semibold">{{ group.name }}</h2>
-          <div class="text-sm opacity-70">
-            {{ policyLabel(group.policy) }} · 当前
-            <span class="font-semibold text-success">{{ displayedSelected(group) }}</span>
-            <span v-if="siteLocalSelectionPolicy(group.policy)" class="opacity-60">（组默认，按站点可能不同）</span>
-            <span v-if="siteLocalSelectionPolicy(group.policy)" class="opacity-80">
-              · 健康 {{ groupAdmission(group).alive }} · 变差 {{ groupAdmission(group).degraded }} · 死亡 {{ groupAdmission(group).dead }}
-            </span>
-            · {{ groupTraffic(group).count }} 连接
-            · ↓ {{ prettyBytes(groupTraffic(group).downloadRate) }}/s
-          </div>
-        </div>
-        <button class="btn btn-sm btn-outline min-h-10 shrink-0" type="button" :disabled="!!ui.checkingGroups[group.name]" @click="checkGroupDelay(group.name)">
+  <div class="proxy-groups">
+    <section v-for="group in groups" :key="group.name" class="proxy-group">
+      <div class="proxy-group-header">
+        <button class="proxy-group-toggle" :aria-label="(collapsed[group.name] ? '展开 ' : '收起 ') + group.name" :aria-expanded="!collapsed[group.name]" @click="collapsed[group.name] = !collapsed[group.name]">
+          <span class="proxy-group-name">{{ group.name }}<span class="group-member-count">{{ (group.members || []).length }}</span></span>
+          <span class="group-health" :title="'健康 ' + groupAdmission(group).alive + ' · 变差 ' + groupAdmission(group).degraded + ' · 死亡 ' + groupAdmission(group).dead"><i />{{ groupAdmission(group).alive }}/{{ (group.members || []).length }}</span>
+          <span class="proxy-group-selected" :title="displayedSelected(group)">{{ displayedSelected(group) }}<small v-if="siteLocalSelectionPolicy(group.policy)"> · 组默认</small></span>
+          <UiIcon name="chevron" class="group-chevron" :class="{ expanded: !collapsed[group.name] }" />
+        </button>
+        <button class="btn btn-sm btn-ghost group-delay" type="button" :disabled="!!ui.checkingGroups[group.name]" :aria-label="'测延迟 ' + group.name" @click="checkGroupDelay(group.name)">
           <span v-if="ui.checkingGroups[group.name]" class="loading loading-spinner loading-xs" />
-          {{ ui.checkingGroups[group.name] ? "测速中" : "测延迟" }}
+          <UiIcon v-else name="refresh" />{{ ui.checkingGroups[group.name] ? "测速中" : "测延迟" }}
         </button>
       </div>
-      <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
+      <div v-show="!collapsed[group.name]" class="proxy-group-content">
+        <div class="proxy-group-meta"><span>{{ policyLabel(group.policy) }}</span><span>{{ groupTraffic(group).count }} 连接 · ↓ {{ ui.connectionsLastPollAt ? bucketRateText(groupTraffic(group), "download", prettyBytes) : "—" }}</span></div>
+        <p v-if="siteLocalSelectionPolicy(group.policy)" class="group-policy-note">按站点选择，实际使用的节点可能不同。</p>
+      <div v-show="!collapsed[group.name]" class="proxy-members">
         <button
           v-for="member in membersOf(group)"
           :key="member.name"
           type="button"
-          class="min-h-16 rounded-box border bg-base-200 p-3 text-left transition"
-          :class="cardClass(group, member)"
+          class="proxy-member"
+          :class="[cardClass(group, member), { 'is-selected': isCurrent(group, member) }]"
           @click="onSelect(group, member)"
         >
           <div class="flex items-start justify-between gap-1">
@@ -144,8 +150,9 @@ function groupAdmission(group: AdminGroup) {
             <span :class="latencyClass(member.alive, member.latency_ms)">{{ latencyText(member.alive, member.latency_ms) }}</span>
             <span class="opacity-70">{{ memberTraffic(member).count }}</span>
           </div>
-          <div class="mt-0.5 text-xs opacity-70">↓ {{ prettyBytes(memberTraffic(member).downloadRate) }}/s</div>
+          <div class="mt-0.5 text-xs opacity-70">↓ {{ ui.connectionsLastPollAt ? bucketRateText(memberTraffic(member), "download", prettyBytes) : "—" }}</div>
         </button>
+      </div>
       </div>
     </section>
   </div>

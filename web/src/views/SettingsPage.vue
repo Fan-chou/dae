@@ -30,7 +30,7 @@ function onTheme(event: Event): void {
     <section class="rounded-box border border-base-300 bg-base-100 p-6 shadow">
       <h1 class="text-lg font-semibold">本地设置</h1>
       <p class="mt-2 text-sm leading-relaxed opacity-70">
-        面板只打 kdae <code class="rounded bg-base-200 px-1 py-0.5">/v1</code>，不是 Clash API。HTTPS 下默认走同源反代。密钥只存在浏览器本地。
+        面板连接 fdae <code class="rounded bg-base-200 px-1 py-0.5">/v1</code>，不是 Clash API。HTTPS 下默认走同源反代。密钥只存在浏览器本地。
       </p>
 
       <div class="mt-6 flex flex-col gap-5">

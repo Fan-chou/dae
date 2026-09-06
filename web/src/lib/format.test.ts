@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { connectionsPath } from "../api/client";
 import { defaultBaseUrl } from "../api/settings";
-import { applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, displayedSelected, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, parseLogLine, rateScale, siteLocalSelectionPolicy, srcHost, summarizeConnections, uniqueOutbounds, admissionCounts, admissionLabel, admissionReasonLabel, memberAdmission } from "./format";
+import { bucketRateText, trafficForName, splitEndpoint, applyConnectionFilters, appendTrafficSample, byteRate, connectionAge, connectionAgeMs, connectionMacOptions, connectionSrcOptions, displayEndpoint, displayedSelected, filterConnectionViews, logChips, lookupCachedMac, mergeConnectionSnapshots, mergeLogSnapshots, mergeSrcMacHints, parseLogLine, rateScale, siteLocalSelectionPolicy, srcHost, summarizeConnections, uniqueOutbounds, admissionCounts, admissionLabel, admissionReasonLabel, memberAdmission } from "./format";
 import { effectiveConnView } from "./layout";
 import { lintDae } from "./dae-lint";
 
@@ -244,4 +244,46 @@ describe("memberAdmission", () => {
       dead: 1,
     });
   });
+});
+
+describe("connection snapshot accuracy", () => {
+  const item = {id:"same",network:"tcp",src:"[2001:db8::1]:5000",dst:"example.test:443",outbound:"direct",start:"2026-09-06T10:00:00Z",upload:100,download:100};
+  it("does not infer closure from a truncated response", () => {
+    const before=mergeConnectionSnapshots([], [item],0);
+    expect(mergeConnectionSnapshots(before,[],1000,false)).toEqual([]);
+  });
+  it("does not compute traffic across a recycled id", () => {
+    const before=mergeConnectionSnapshots([], [item],0);
+    const next=mergeConnectionSnapshots(before,[{...item,start:"2026-09-06T11:00:00Z",upload:999}],1000);
+    expect(next[0].uploadRate).toBe(0);
+  });
+});
+
+
+describe("splitEndpoint", () => {
+ it.each([
+  ["192.168.1.2:1234","192.168.1.2","1234"],
+  ["[2001:db8::1]:443","2001:db8::1","443"],
+  ["[fe80::1%eth0]:53","fe80::1%eth0","53"],
+  ["2001:db8::443","2001:db8::443",""],
+  ["api.test:443","api.test","443"],
+  ["localhost:80","localhost","80"],
+  ["invalid AddrPort","",""],
+ ])("separates %s without inventing an address", (input,host,port) => {
+   expect(splitEndpoint(input)).toEqual({host,port});
+ });
+});
+
+it("distinguishes unknown, partial and sampled idle aggregate rates", () => {
+  const row = {id:"a",network:"tcp",src:"1.2.3.4:90",dst:"example.test:443",outbound:"A",upload:100,download:200};
+  const initial = mergeConnectionSnapshots([], [row], 0);
+  const first = trafficForName(initial, "A");
+  expect(bucketRateText(first, "download", String)).toBe("—（采集中）");
+  const next = mergeConnectionSnapshots(initial, [row, {...row,id:"b"}], 1000);
+  const partial = trafficForName(next, "A");
+  expect(partial.sampledCount).toBe(1);
+  expect(bucketRateText(partial, "download", String)).toContain("部分连接尚未采样");
+  expect(summarizeConnections(next).bySrc[0].sampledCount).toBe(1);
+  const sampled = mergeConnectionSnapshots(next, [row, {...row,id:"b"}], 1000);
+  expect(bucketRateText(trafficForName(sampled, "A"), "download", String)).toBe("0/s");
 });

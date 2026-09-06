@@ -313,23 +313,23 @@ export type ConnectionView = AdminConnection & {
   uploadRate: number;
   downloadRate: number;
   closed: boolean;
+  closedAt?: number;
+  rateKnown?: boolean;
 };
 
 export type FilterOption = { value: string; label: string };
 
-export function srcHost(src: string): string {
-  const value = String(src || "");
-  if (!value || value === "invalid AddrPort") return "";
-  if (value.startsWith("[")) {
-    const end = value.indexOf("]");
-    return end > 1 ? value.slice(1, end) : value;
-  }
-  const colon = value.lastIndexOf(":");
-  if (colon <= 0) return value;
-  const host = value.slice(0, colon);
-  if (host.includes(".")) return host;
-  return value;
+export function splitEndpoint(input: string): { host: string; port: string } {
+  const value = String(input || "").trim();
+  if (!value || value === "invalid AddrPort") return { host: "", port: "" };
+  const bracket = /^\[([^\]]+)\](?::(\d+))?$/.exec(value);
+  const pair = /^([^:]+):(\d+)$/.exec(value);
+  const match = bracket || pair;
+  if (match && (!match[2] || Number(match[2]) <= 65535)) return { host: match[1]!, port: match[2] || "" };
+  return { host: value, port: "" }; // Unbracketed IPv6 is an address, never guess its last group is a port.
 }
+
+export function srcHost(src: string): string { return splitEndpoint(src).host; }
 
 export function displayEndpoint(value: string): string {
   const text = String(value || "").trim();
@@ -580,6 +580,7 @@ export function connectionAge(start: string, nowMs = Date.now()): string {
 }
 
 export type TrafficBucket = {
+  sampledCount: number;
   name: string;
   count: number;
   upload: number;
@@ -588,17 +589,26 @@ export type TrafficBucket = {
   downloadRate: number;
 };
 
+export function bucketRateText(bucket: TrafficBucket, direction: "upload" | "download", format: (bytes: number) => string): string {
+  if (bucket.count > 0 && bucket.sampledCount === 0) return "—（采集中）";
+  const value = format(direction === "upload" ? bucket.uploadRate : bucket.downloadRate) + "/s";
+  return bucket.sampledCount < bucket.count ? value + "（部分连接尚未采样）" : value;
+}
+
 export type TrafficSamplePoint = { ts: number; up: number; down: number };
 
 export function liveSessionTraffic(rows: ConnectionView[]): TrafficBucket {
-  const bucket: TrafficBucket = { name: "session", count: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
+  const bucket: TrafficBucket = { name: "session", count: 0, sampledCount: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
   for (const row of rows) {
     if (row.closed) continue;
     bucket.count += 1;
     bucket.upload += row.upload || 0;
     bucket.download += row.download || 0;
-    bucket.uploadRate += row.uploadRate || 0;
-    bucket.downloadRate += row.downloadRate || 0;
+    if (row.rateKnown) {
+      bucket.sampledCount += 1;
+      bucket.uploadRate += row.uploadRate || 0;
+      bucket.downloadRate += row.downloadRate || 0;
+    }
   }
   return bucket;
 }
@@ -610,12 +620,15 @@ export function appendTrafficSample(samples: TrafficSamplePoint[], point: Traffi
 
 function addBucket(map: Map<string, TrafficBucket>, name: string, row: ConnectionView): void {
   const key = name || "—";
-  const cur = map.get(key) || { name: key, count: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
+  const cur = map.get(key) || { name: key, count: 0, sampledCount: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
   cur.count += 1;
   cur.upload += row.upload || 0;
   cur.download += row.download || 0;
-  cur.uploadRate += row.uploadRate || 0;
-  cur.downloadRate += row.downloadRate || 0;
+  if (row.rateKnown) {
+    cur.sampledCount += 1;
+    cur.uploadRate += row.uploadRate || 0;
+    cur.downloadRate += row.downloadRate || 0;
+  }
   map.set(key, cur);
 }
 
@@ -671,7 +684,7 @@ export function summarizeConnections(rows: ConnectionView[], limit = 8): {
 
 export function trafficForName(rows: ConnectionView[], name: string): TrafficBucket {
   const match = String(name || "");
-  const bucket: TrafficBucket = { name: match, count: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
+  const bucket: TrafficBucket = { name: match, count: 0, sampledCount: 0, upload: 0, download: 0, uploadRate: 0, downloadRate: 0 };
   if (!match) return bucket;
   for (const row of rows) {
     if (row.closed) continue;
@@ -679,8 +692,11 @@ export function trafficForName(rows: ConnectionView[], name: string): TrafficBuc
       bucket.count += 1;
       bucket.upload += row.upload || 0;
       bucket.download += row.download || 0;
-      bucket.uploadRate += row.uploadRate || 0;
-      bucket.downloadRate += row.downloadRate || 0;
+      if (row.rateKnown) {
+        bucket.sampledCount += 1;
+        bucket.uploadRate += row.uploadRate || 0;
+        bucket.downloadRate += row.downloadRate || 0;
+      }
     }
   }
   return bucket;
@@ -703,11 +719,12 @@ export function latencyFingerprint(group: {
     .join("|");
 }
 
-export function mergeConnectionSnapshots(prev: ConnectionView[], live: AdminConnection[], elapsedMs: number): ConnectionView[] {
+export function mergeConnectionSnapshots(prev: ConnectionView[], live: AdminConnection[], elapsedMs: number, complete = true): ConnectionView[] {
   const prevById = new Map(prev.map((row) => [row.id, row]));
   const liveIds = new Set(live.map((row) => row.id));
   const rows: ConnectionView[] = live.map((item) => {
-    const last = prevById.get(item.id);
+    const candidate = prevById.get(item.id);
+    const last = candidate && !candidate.closed && candidate.start === item.start ? candidate : undefined;
     return {
       ...item,
       src: displayEndpoint(item.src),
@@ -716,11 +733,12 @@ export function mergeConnectionSnapshots(prev: ConnectionView[], live: AdminConn
       uploadRate: last ? byteRate(last.upload, item.upload, elapsedMs) : 0,
       downloadRate: last ? byteRate(last.download, item.download, elapsedMs) : 0,
       closed: false,
+      rateKnown: !!last && elapsedMs > 0 && item.upload >= last.upload && item.download >= last.download,
     };
   });
   for (const row of prev) {
-    if (!liveIds.has(row.id) && !row.closed) {
-      rows.push({ ...row, uploadRate: 0, downloadRate: 0, closed: true });
+    if (complete && !liveIds.has(row.id) && !row.closed) {
+      rows.push({ ...row, uploadRate: 0, downloadRate: 0, closed: true, closedAt: Date.now() });
     }
   }
   return rows;

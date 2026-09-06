@@ -1,19 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from "vue";
-import { usePreferredDark } from "@vueuse/core";
+import prettyBytes from "pretty-bytes";
+import UiIcon from "@/components/UiIcon.vue";
+import { useNow, usePreferredDark } from "@vueuse/core";
 import { RouterLink, RouterView, useRoute } from "vue-router";
 import { applyTheme } from "@/lib/theme";
-import { reloadPlane, ui } from "@/store/session";
+import { persistPrefs, reloadPlane, ui } from "@/store/session";
 
 const route = useRoute();
 const links = [
-  { to: "/overview", key: "overview", short: "概览", d: "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z" },
-  { to: "/groups", key: "groups", short: "组", d: "M4 7a3 3 0 1 0 6 0 3 3 0 0 0-6 0m10 0a3 3 0 1 0 6 0 3 3 0 0 0-6 0M2 19a5 5 0 0 1 10 0m10 0a5 5 0 0 0-8-4" },
-  { to: "/connections", key: "connections", short: "连接", d: "M8 12h8M7 8H5a3 3 0 0 0 0 8h2m10-8h2a3 3 0 0 1 0 8h-2" },
-  { to: "/logs", key: "logs", short: "日志", d: "M6 4h9l3 3v13H6zm3 6h6M9 14h6M9 18h4" },
-  { to: "/config", key: "config", short: "配置", d: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6m7.4-3.4-.9 1.6 1.2 1.4-1.7 1.7-1.6-.6-1.4 1.1v2h-2.4v-2l-1.4-1.1-1.6.6-1.7-1.7 1.2-1.4-.9-1.6-2-.4V9.8l2-.4.9-1.6-1.2-1.4 1.7-1.7 1.6.6 1.4-1.1V2.2h2.4v2l1.4 1.1 1.6-.6 1.7 1.7-1.2 1.4.9 1.6 2 .4v2.4z" },
-  { to: "/settings", key: "settings", short: "设置", d: "M5 7h14M5 12h14M5 17h14" },
-];
+  { to: "/overview", key: "overview", short: "概览" },
+  { to: "/groups", key: "groups", short: "组" },
+  { to: "/connections", key: "connections", short: "连接" },
+  { to: "/logs", key: "logs", short: "日志" },
+  { to: "/config", key: "config", short: "配置" },
+  { to: "/settings", key: "settings", short: "设置" },
+] as const;
 
 const labels: Record<string, string> = {
   overview: "概览",
@@ -31,7 +33,23 @@ const resolvedTheme = computed(() => {
   return prefersDark.value ? "dark" : "light";
 });
 
+const clock = useNow({ interval: 1000 });
+const stale = computed(() => !ui.statusLastSuccessAt || !!ui.statusError || clock.value.getTime() - ui.statusLastSuccessAt > 10000);
+function toggleTheme(): void { persistPrefs({ theme: resolvedTheme.value === "dark" ? "light" : "dark" }); }
+function sidebarRate(value?: number): string { return stale.value || value == null ? "—" : prettyBytes(value) + "/s"; }
 let media: MediaQueryList | null = null;
+let errorTimer: ReturnType<typeof setTimeout> | undefined;
+watch(() => ui.error, (message) => {
+  clearTimeout(errorTimer);
+  if (message) errorTimer = setTimeout(() => { ui.error = ""; }, 8000);
+});
+onUnmounted(() => clearTimeout(errorTimer));
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+watch(() => ui.notice, (message) => {
+  clearTimeout(noticeTimer);
+  if (message) noticeTimer = setTimeout(() => { ui.notice = ""; }, 4500);
+});
+onUnmounted(() => clearTimeout(noticeTimer));
 function onSystemTheme(): void {
   if (ui.prefs.theme === "system") applyTheme("system");
 }
@@ -53,33 +71,28 @@ watch(
 </script>
 
 <template>
-  <div class="navbar sticky top-0 z-30 border-b border-base-300 bg-base-100 pt-[env(safe-area-inset-top)]">
-    <div class="navbar-start">
-      <RouterLink class="btn btn-ghost min-h-10 text-xl" to="/overview">kdae</RouterLink>
+  <aside class="app-sidebar" :class="{ collapsed: ui.prefs.sidebarCollapsed }">
+    <RouterLink class="app-brand" to="/overview"><span class="brand-mark">f</span><span class="brand-name">fdae</span></RouterLink>
+    <nav class="sidebar-nav" aria-label="桌面主导航">
+      <RouterLink v-for="link in links" :key="link.to" :to="link.to" :title="labels[link.key]" :class="{ 'is-active': active === link.to }">
+        <UiIcon :name="link.key" /><span class="nav-label">{{ labels[link.key] }}</span>
+      </RouterLink>
+    </nav>
+    <button class="sidebar-collapse" :aria-label="ui.prefs.sidebarCollapsed ? '展开侧栏' : '收起侧栏'" :title="ui.prefs.sidebarCollapsed ? '展开侧栏' : '收起侧栏'" @click="persistPrefs({ sidebarCollapsed: !ui.prefs.sidebarCollapsed })"><UiIcon name="chevron" :class="{ 'points-left': !ui.prefs.sidebarCollapsed }" /></button>
+    <div class="sidebar-bottom">
+      <div class="sidebar-traffic"><span>上传</span><strong>{{ sidebarRate(ui.status?.upload_rate) }}</strong><span>下载</span><strong>{{ sidebarRate(ui.status?.download_rate) }}</strong><span>内存</span><strong>{{ stale || ui.status?.rss_bytes == null ? '—' : prettyBytes(ui.status.rss_bytes) }}</strong></div>
+      <div class="sidebar-state"><i :class="{ 'is-live': !stale && ui.status?.running }" />{{ stale ? '等待状态更新' : ui.status?.running ? '运行中' : '已停止' }}</div>
+      <div class="sidebar-actions"><button class="btn btn-sm btn-ghost" :aria-label="resolvedTheme === 'dark' ? '浅色' : '深色'" :title="resolvedTheme === 'dark' ? '浅色' : '深色'" @click="toggleTheme"><UiIcon :name="resolvedTheme === 'dark' ? 'sun' : 'moon'" /><span class="action-label">{{ resolvedTheme === 'dark' ? '浅色' : '深色' }}</span></button><button class="btn btn-sm btn-ghost" aria-label="热重载" title="热重载" @click="reloadPlane"><UiIcon name="refresh" /><span class="action-label">热重载</span></button></div>
     </div>
-    <div class="navbar-center hidden lg:flex">
-      <ul class="menu menu-horizontal gap-1">
-        <li v-for="link in links" :key="link.to">
-          <RouterLink :to="link.to" :class="{ 'menu-active': active === link.to }">{{ labels[link.key] }}</RouterLink>
-        </li>
-      </ul>
-    </div>
-    <div class="navbar-end gap-2">
-      <span v-if="ui.loading" class="loading loading-spinner loading-sm" />
-      <button class="btn btn-sm btn-outline min-h-10" type="button" @click="reloadPlane">热重载</button>
-    </div>
+  </aside>
+  <header class="mobile-header"><RouterLink class="app-brand" to="/overview"><span class="brand-mark">f</span><span class="brand-name">fdae</span></RouterLink><div class="flex gap-1"><button class="btn btn-sm btn-ghost" @click="toggleTheme">{{ resolvedTheme === 'dark' ? '浅色' : '深色' }}</button><button class="btn btn-sm btn-ghost" @click="reloadPlane">热重载</button></div></header>
+  <div class="toast-stack">
+    <div v-if="ui.refreshError" class="toast-message toast-error" role="alert"><span>刷新失败：{{ ui.refreshError }}</span><button aria-label="关闭刷新提示" @click="ui.refreshError = ''">×</button></div>
+    <div v-if="ui.error" class="toast-message toast-error" role="alert"><span>{{ ui.error }}</span><button aria-label="关闭错误提示" @click="ui.error = ''">×</button></div>
+    <div v-if="ui.notice" class="toast-message" role="status"><span>{{ ui.notice }}</span><button aria-label="关闭操作提示" @click="ui.notice = ''">×</button></div>
   </div>
-  <div class="hidden overflow-x-auto px-3 py-2 md:block lg:hidden">
-    <ul class="menu menu-horizontal gap-1">
-      <li v-for="link in links" :key="'m' + link.to">
-        <RouterLink class="min-h-10" :to="link.to" :class="{ 'menu-active': active === link.to }">{{ labels[link.key] }}</RouterLink>
-      </li>
-    </ul>
-  </div>
-  <div v-if="ui.error" class="alert alert-error mx-4 mt-4 w-auto">{{ ui.error }}</div>
-  <div v-if="ui.notice" class="alert alert-success mx-4 mt-4 w-auto">{{ ui.notice }}</div>
-  <div v-if="ui.status?.sync_warning" class="alert alert-warning mx-4 mt-4 w-auto">{{ ui.status.sync_warning }}</div>
-  <main class="p-4 pb-[calc(4.75rem+env(safe-area-inset-bottom))] md:pb-4" :data-resolved-theme="resolvedTheme">
+  <main class="app-main" :class="{ 'sidebar-collapsed': ui.prefs.sidebarCollapsed }" :data-resolved-theme="resolvedTheme">
+    <div v-if="ui.status?.sync_warning" class="alert alert-warning mb-3">{{ ui.status.sync_warning }}</div>
     <RouterView />
   </main>
   <nav
@@ -93,9 +106,7 @@ watch(
       class="flex min-h-12 flex-col items-center justify-center gap-0.5 py-1 text-[11px] leading-none"
       :class="active === link.to ? 'text-primary' : 'opacity-70'"
     >
-      <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path :d="link.d" />
-      </svg>
+      <UiIcon :name="link.key" />
       {{ link.short }}
     </RouterLink>
   </nav>

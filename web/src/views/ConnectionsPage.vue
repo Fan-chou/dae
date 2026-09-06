@@ -15,17 +15,20 @@ import {
   type Updater,
   type VisibilityState,
 } from "@tanstack/vue-table";
-import { useDocumentVisibility, useIntervalFn } from "@vueuse/core";
+import { useDocumentVisibility, useIntervalFn, useEventListener, onClickOutside } from "@vueuse/core";
 import prettyBytes from "pretty-bytes";
+import UiIcon from "@/components/UiIcon.vue";
+import SegmentControl from "@/components/SegmentControl.vue";
+import ConnectionDetails from "@/components/ConnectionDetails.vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { persistPrefs, refresh, refreshConnections, ui } from "@/store/session";
 import {
   applyConnectionFilters,
+  splitEndpoint,
   connectionAge,
   connectionAgeMs,
   connectionMacOptions,
   connectionSrcOptions,
-  displayEndpoint,
   formatTimeShort,
   lookupCachedMac,
   uniqueDialers,
@@ -36,7 +39,13 @@ import {
 import { effectiveConnView, useCompactLayout } from "@/lib/layout";
 import type { ConnViewMode } from "@/api/prefs";
 
+const optionsPanel = ref<HTMLDetailsElement | null>(null);
+onClickOutside(optionsPanel, () => optionsPanel.value?.removeAttribute("open"));
+const paused = ref(false);
+const page = ref(0);
+const tabs = [{value:"active",label:"活动"},{value:"closed",label:"刚断开"},{value:"all",label:"全部"}] as const;
 const compact = useCompactLayout();
+const searchInput = ref<HTMLInputElement | null>(null);
 const search = ref("");
 const tab = ref<"active" | "closed" | "all">("active");
 const network = ref("");
@@ -44,10 +53,16 @@ const dialer = ref("");
 const sorting = ref<SortingState>([{ id: "age", desc: false }]);
 const grouping = ref<GroupingState>([]);
 const rowExpanded = ref<ExpandedState>({});
-const columnOrder = ref<ColumnOrderState>([]);
+const columnOrder = ref<ColumnOrderState>(["domain","src","srcPort","dst","dstPort","network","route","downloadRate","uploadRate","age","outbound","dialer","mac","host","policy","upload","download","start"]);
 const dragging = ref("");
 const detailId = ref("");
 const nowMs = ref(Date.now());
+useEventListener("keydown", event => {
+  const target = event.target as HTMLElement | null;
+  if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey && !detailId.value && !target?.closest("input,textarea,select,[contenteditable=true]")) {
+    event.preventDefault(); searchInput.value?.focus();
+  }
+ if (event.key === "Escape") { detailId.value = ""; optionsPanel.value?.removeAttribute("open"); } });
 
 const helper = createColumnHelper<ConnectionView>();
 
@@ -61,11 +76,14 @@ function rateCell(value: number): string {
 
 const columnMeta: { id: string; label: string }[] = [
   { id: "mac", label: "MAC" },
-  { id: "src", label: "源IP" },
-  { id: "dst", label: "目标" },
+  { id: "src", label: "源 IP" },
+  { id: "srcPort", label: "源端口" },
+  { id: "dst", label: "目标 IP / 域名" },
+  { id: "dstPort", label: "目标端口" },
   { id: "host", label: "主机" },
   { id: "domain", label: "域名" },
   { id: "network", label: "协议" },
+  { id: "route", label: "出站 / 节点" },
   { id: "outbound", label: "出站" },
   { id: "dialer", label: "节点" },
   { id: "policy", label: "策略" },
@@ -78,31 +96,34 @@ const columnMeta: { id: string; label: string }[] = [
 ];
 
 function macCell(row: ConnectionView): string {
-  return row.mac || lookupCachedMac(ui.srcMacHints, row.src) || "—";
+  return row.mac || (lookupCachedMac(ui.srcMacHints, row.src) ? lookupCachedMac(ui.srcMacHints, row.src) + "（缓存）" : "—");
 }
 
 const columns = [
-  helper.accessor((row) => row.mac || lookupCachedMac(ui.srcMacHints, row.src), {
+  helper.accessor((row) => macCell(row), {
     id: "mac",
     header: "MAC",
     cell: (ctx) => ctx.getValue() || "—",
   }),
-  helper.accessor("src", { header: "源IP", cell: (ctx) => displayEndpoint(ctx.getValue()) || "—" }),
-  helper.accessor((row) => displayEndpoint(row.dst), { id: "dst", header: "目标", cell: (ctx) => ctx.getValue() || "—" }),
-  helper.accessor((row) => row.domain || displayEndpoint(row.dst), { id: "host", header: "主机", cell: (ctx) => ctx.getValue() || "—" }),
+  helper.accessor((row) => splitEndpoint(row.src).host, { id: "src", header: "源 IP", cell: (ctx) => ctx.getValue() || "—" }),
+  helper.accessor((row) => splitEndpoint(row.src).port ? Number(splitEndpoint(row.src).port) : undefined, { id: "srcPort", header: "源端口", cell: (ctx) => ctx.getValue() ?? "—" }),
+  helper.accessor((row) => splitEndpoint(row.dst).host, { id: "dst", header: "目标 IP / 域名", cell: (ctx) => ctx.getValue() || "—" }),
+  helper.accessor((row) => splitEndpoint(row.dst).port ? Number(splitEndpoint(row.dst).port) : undefined, { id: "dstPort", header: "目标端口", cell: (ctx) => ctx.getValue() ?? "—" }),
+  helper.accessor((row) => row.domain || splitEndpoint(row.dst).host, { id: "host", header: "主机", cell: (ctx) => ctx.getValue() || "—" }),
   helper.accessor("domain", { header: "域名", cell: (ctx) => ctx.getValue() || "—" }),
+  helper.accessor(row => [row.outbound, row.dialer].filter(Boolean).join(" › "), { id: "route", header: "出站 / 节点", cell: ctx => ctx.getValue() || "—" }),
   helper.accessor("network", { header: "协议", cell: (ctx) => ctx.getValue() || "—" }),
   helper.accessor("outbound", { header: "出站", cell: (ctx) => ctx.getValue() || "—" }),
   helper.accessor("dialer", { header: "节点", cell: (ctx) => ctx.getValue() || "—" }),
   helper.accessor("policy", { header: "策略", cell: (ctx) => ctx.getValue() || "—" }),
-  helper.accessor((row) => connectionAgeMs(row.start || "", nowMs.value), {
+  helper.accessor((row) => connectionAgeMs(row.start || "", row.closedAt || nowMs.value), {
     id: "age",
     header: "时长",
     enableGrouping: false,
-    cell: (ctx) => connectionAge(ctx.row.original.start || "", nowMs.value),
+    cell: (ctx) => connectionAge(ctx.row.original.start || "", ctx.row.original.closedAt || nowMs.value),
   }),
-  helper.accessor("uploadRate", { header: "上行速度", enableGrouping: false, cell: (ctx) => rateCell(ctx.getValue()) }),
-  helper.accessor("downloadRate", { header: "下行速度", enableGrouping: false, cell: (ctx) => rateCell(ctx.getValue()) }),
+  helper.accessor("uploadRate", { header: "上行速度", enableGrouping: false, cell: (ctx) => ctx.row.original.rateKnown ? rateCell(ctx.getValue()) : "—" }),
+  helper.accessor("downloadRate", { header: "下行速度", enableGrouping: false, cell: (ctx) => ctx.row.original.rateKnown ? rateCell(ctx.getValue()) : "—" }),
   helper.accessor("upload", { header: "上行流量", enableGrouping: false, cell: (ctx) => bytesCell(ctx.getValue()) }),
   helper.accessor("download", { header: "下行流量", enableGrouping: false, cell: (ctx) => bytesCell(ctx.getValue()) }),
   helper.accessor("start", {
@@ -181,7 +202,41 @@ const table = useVueTable({
   },
 });
 
-const tableRows = computed(() => table.getRowModel().rows);
+const showCards = computed(() => effectiveConnView(ui.prefs.connView, compact.value) === "card");
+const allTableRows = computed(() => table.getRowModel().rows);
+const tableRows = computed(() => allTableRows.value.slice(page.value * 50, (page.value + 1) * 50));
+const cardRows = computed(() => filteredRows.value.slice(page.value * 50, (page.value + 1) * 50));
+const pageCount = computed(() => Math.max(1, Math.ceil((showCards.value ? filteredRows.value.length : allTableRows.value.length) / 50)));
+const selectedRow = computed(() => ui.connectionViews.find(row => row.id === detailId.value));
+const activeFilters = computed(() => {
+  const result: { key: string; label: string; clear: () => void }[] = [];
+  for (const [key, name] of [["outbound","出站"],["src","源 IP"],["mac","MAC"]] as const) {
+    if (ui.connectionFilter[key]) result.push({key, label:name + " · " + ui.connectionFilter[key], clear:() => {ui.connectionFilter[key] = "";}});
+  }
+  if (network.value) result.push({key:"network",label:"协议 · " + network.value,clear:() => {network.value = "";}});
+  if (dialer.value) result.push({key:"dialer",label:"节点 · " + dialer.value,clear:() => {dialer.value = "";}});
+  if (search.value) result.push({key:"search",label:"搜索 · " + search.value,clear:() => {search.value = "";}});
+  if (ui.prefs.connExcludeOn && ui.prefs.connExclude) result.push({key:"exclude",label:"排除 · " + ui.prefs.connExclude,clear:() => persistPrefs({connExcludeOn:false})});
+  return result;
+});
+async function copyDetails(): Promise<void> {
+  const row = selectedRow.value;
+  if (!row) return;
+  ui.notice = ""; ui.error = "";
+  try {
+    await navigator.clipboard.writeText([
+      "源 IP: " + splitEndpoint(row.src).host, "源端口: " + splitEndpoint(row.src).port,
+      "目标: " + splitEndpoint(row.dst).host, "目标端口: " + splitEndpoint(row.dst).port,
+      "域名: " + (row.domain || "—"), "出站: " + row.outbound, "节点: " + (row.dialer || "—"),
+    ].join("\n"));
+    ui.notice = "已复制连接信息";
+  } catch { ui.error = "无法访问剪贴板，请手动选择详情中的文字复制"; }
+}
+
+watch(pageCount, count => { page.value = Math.min(page.value, count - 1); });
+watch([search, network, dialer, tab, sorting, grouping], () => { page.value = 0; });
+watch(() => [ui.connectionFilter.outbound, ui.connectionFilter.src, ui.connectionFilter.mac, ui.prefs.connLimit], () => { page.value = 0; detailId.value = ""; void poll(false); });
+function clearFilters() { ui.connectionFilter = {outbound:"",src:"",mac:""}; search.value=""; network.value=""; dialer.value=""; persistPrefs({connExcludeOn:false}); }
 
 function onRowClick(row: Row<ConnectionView>): void {
   if (row.getIsGrouped()) {
@@ -191,23 +246,29 @@ function onRowClick(row: Row<ConnectionView>): void {
   detailId.value = detailId.value === row.original.id ? "" : row.original.id;
 }
 
+let refreshingStatus = false;
+async function pollStatus(silent: boolean): Promise<void> {
+  if (refreshingStatus) return;
+  refreshingStatus = true;
+  try { await refresh(undefined, { silent }); } finally { refreshingStatus = false; }
+}
 async function poll(silent = true): Promise<void> {
   nowMs.value = Date.now();
-  await refreshConnections({ silent });
+  await Promise.all([refreshConnections({ silent }), pollStatus(silent)]);
 }
 
 const visibility = useDocumentVisibility();
 const { pause, resume } = useIntervalFn(
   () => {
-    void poll(true);
+    if (!paused.value) void poll(true);
   },
   () => ui.prefs.connInterval,
   { immediate: false },
 );
 
-watch(visibility, (state) => {
-  if (state === "hidden") pause();
-  else resume();
+watch([visibility, paused], ([state, stopped]) => {
+  if (state === "hidden" || stopped) pause();
+  else { resume(); void poll(true); }
 });
 
 onMounted(() => {
@@ -218,13 +279,6 @@ onMounted(() => {
 onUnmounted(() => {
   pause();
 });
-
-function onOutboundChange(): void {
-  ui.connectionFilter.src = "";
-  ui.connectionFilter.mac = "";
-  dialer.value = "";
-  void poll(false);
-}
 
 function onHeaderDragStart(id: string): void {
   dragging.value = id;
@@ -264,10 +318,10 @@ function onIntervalChange(event: Event): void {
 }
 
 function hostOf(row: ConnectionView): string {
-  return row.domain || displayEndpoint(row.dst) || "—";
+  return row.domain || splitEndpoint(row.dst).host || "—";
 }
 
-const showCards = computed(() => effectiveConnView(ui.prefs.connView, compact.value) === "card");
+
 
 function setConnView(mode: ConnViewMode): void {
   persistPrefs({ connView: mode });
@@ -275,161 +329,69 @@ function setConnView(mode: ConnViewMode): void {
 </script>
 
 <template>
-  <div class="flex flex-col gap-3">
-    <div class="flex flex-wrap items-center gap-2">
-      <div class="join">
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'active' }" type="button" @click="tab = 'active'">活动</button>
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'closed' }" type="button" @click="tab = 'closed'">刚断开</button>
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': tab === 'all' }" type="button" @click="tab = 'all'">全部</button>
+  <div class="connection-page">
+    <section class="connection-toolbar">
+      <div class="connection-command">
+        <SegmentControl :model-value="tab" :options="tabs.map(item => ({...item, count: tab === item.value ? filteredRows.length : undefined}))" label="连接状态" @update:model-value="tab = $event as typeof tab" />
+        <label class="source-filter"><span class="sr-only">源 IP</span><select v-model="ui.connectionFilter.src" class="select select-sm"><option value="">全部来源</option><option v-for="opt in srcOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option></select></label>
+        <label class="search-field"><UiIcon name="search" /><input ref="searchInput" v-model="search" class="input input-sm" placeholder="搜索 IP、域名、节点…" aria-label="搜索已加载连接" /><button v-if="search" class="search-clear" aria-label="清空搜索" @click.prevent="search = ''"><UiIcon name="close" /></button><kbd v-else>/</kbd></label>
+      <select class="select select-sm connection-group-select" aria-label="连接分组" :value="grouping.length > 1 ? '__multiple' : grouping[0] || ''" @change="grouping = ($event.target as HTMLSelectElement).value ? [($event.target as HTMLSelectElement).value] : []">
+        <option value="">不分组</option>
+        <option v-if="grouping.length > 1" value="__multiple" disabled>多字段分组</option>
+        <template v-for="col in columnMeta" :key="col.id"><option v-if="table.getColumn(col.id)?.getCanGroup()" :value="col.id">按{{ col.label }}分组</option></template>
+      </select>
+      <details ref="optionsPanel" class="advanced-filters"><summary aria-label="显示与筛选" title="显示与筛选"><UiIcon name="filter" /><span class="sr-only">显示与筛选</span></summary>
+        <div class="connection-options">
+        <div class="options-heading">显示与筛选<button class="btn btn-sm btn-ghost" aria-label="关闭显示选项" @click="optionsPanel?.removeAttribute('open')">×</button></div>
+      <div class="filter-grid">
+        <label>出站<select v-model="ui.connectionFilter.outbound" class="select select-sm"><option value="">全部出站</option><option v-for="name in outboundOptions" :key="name">{{ name }}</option></select></label>
+        <label>协议<select v-model="network" class="select select-sm"><option value="">全部协议</option><option v-for="name in networkOptions" :key="name">{{ name }}</option></select></label>
+        <label>节点<select v-model="dialer" class="select select-sm"><option value="">全部节点</option><option v-for="name in dialerOptions" :key="name">{{ name }}</option></select></label>
       </div>
-      <span class="text-sm opacity-70">{{ filteredRows.length }} / {{ ui.connectionsTotal }}{{ ui.connectionsTruncated ? "（截断）" : "" }}</span>
-    </div>
-
-    <details class="rounded-box border border-base-300 bg-base-100 p-3 md:hidden">
-      <summary class="cursor-pointer text-sm font-medium">筛选 · {{ filteredRows.length }} 条</summary>
-      <div class="mt-3 flex flex-col gap-2">
-        <select v-model="ui.connectionFilter.outbound" class="select select-bordered select-sm w-full" @change="onOutboundChange">
-          <option value="">全部出站</option>
-          <option v-for="name in outboundOptions" :key="'m-ob-' + name" :value="name">{{ name }}</option>
-        </select>
-        <select v-model="ui.connectionFilter.src" class="select select-bordered select-sm w-full">
-          <option value="">全部源</option>
-          <option v-for="opt in srcOptions" :key="'m-src-' + opt.value" :value="opt.value">{{ opt.label }}</option>
-        </select>
-        <select v-model="ui.connectionFilter.mac" class="select select-bordered select-sm w-full">
-          <option value="">全部 MAC</option>
-          <option v-for="opt in macOptions" :key="'m-mac-' + opt.value" :value="opt.value">{{ opt.label }}</option>
-        </select>
-        <select v-model="network" class="select select-bordered select-sm w-full">
-          <option value="">协议</option>
-          <option v-for="name in networkOptions" :key="'m-net-' + name" :value="name">{{ name }}</option>
-        </select>
-        <select v-model="dialer" class="select select-bordered select-sm w-full">
-          <option value="">全部节点</option>
-          <option v-for="name in dialerOptions" :key="'m-d-' + name" :value="name">{{ name }}</option>
-        </select>
-        <input v-model="search" class="input input-bordered input-sm w-full" placeholder="空格分隔，同时匹配主机/源/出站/节点" />
-        <label class="flex items-center gap-2 text-sm">
-          <input type="checkbox" class="checkbox checkbox-sm" :checked="ui.prefs.connExcludeOn" @change="onExcludeToggle" />
-          排除
-        </label>
-        <input
-          class="input input-bordered input-sm w-full"
-          :value="ui.prefs.connExclude"
-          placeholder="正则，匹配则隐藏（如 stun|ntp）"
-          @change="onExcludeChange"
-        />
-        <select class="select select-bordered select-sm w-full" :value="String(ui.prefs.connInterval)" @change="onIntervalChange">
-          <option value="1000">1s</option>
-          <option value="2000">2s</option>
-          <option value="5000">5s</option>
-        </select>
-        <div class="join w-full">
-          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'auto' }" type="button" @click="setConnView('auto')">自动</button>
-          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'table' }" type="button" @click="setConnView('table')">表格</button>
-          <button class="btn btn-sm join-item flex-1" :class="{ 'btn-active': ui.prefs.connView === 'card' }" type="button" @click="setConnView('card')">卡片</button>
+        <div class="filter-grid mt-3">
+          <label>MAC<select v-model="ui.connectionFilter.mac" class="select select-sm"><option value="">全部 MAC</option><option v-for="opt in macOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option></select></label>
+          <label>刷新间隔<select class="select select-sm" :value="ui.prefs.connInterval" @change="onIntervalChange"><option :value="1000">1 秒</option><option :value="2000">2 秒</option><option :value="5000">5 秒</option></select></label>
+          <label>加载上限<select class="select select-sm" :value="ui.prefs.connLimit" @change="persistPrefs({connLimit: Number(($event.target as HTMLSelectElement).value)})"><option :value="256">256 条</option><option :value="512">512 条</option><option :value="1024">1024 条</option></select></label>
+          <label>视图<select class="select select-sm" :value="ui.prefs.connView" @change="setConnView(($event.target as HTMLSelectElement).value as ConnViewMode)"><option value="auto">自动</option><option value="table">表格</option><option value="card">卡片</option></select></label>
+        </div>
+        <div class="flex flex-wrap items-center gap-3 mt-3"><label class="flex items-center gap-2"><input type="checkbox" class="checkbox checkbox-sm" :checked="ui.prefs.connExcludeOn" @change="onExcludeToggle" />排除匹配</label><input class="input input-sm flex-1" aria-label="排除正则表达式" :value="ui.prefs.connExclude" placeholder="例如 stun|ntp" @change="onExcludeChange" /></div>
+        <p class="options-label">分组</p>
+        <div class="column-options"><template v-for="col in columnMeta" :key="col.id"><label v-if="table.getColumn(col.id)?.getCanGroup()"><input type="checkbox" class="checkbox checkbox-xs" :checked="grouping.includes(col.id)" @change="table.getColumn(col.id)?.toggleGrouping()" />{{ col.label }}</label></template></div>
+        <p class="options-label">可见列 · 拖动表头调整顺序</p>
+        <div class="column-options"><label v-for="col in columnMeta" :key="col.id"><input type="checkbox" class="checkbox checkbox-xs" :checked="!ui.prefs.connHiddenCols.includes(col.id)" @change="toggleCol(col.id)" />{{ col.label }}</label></div>
+      </div></details>
+        <div class="refresh-controls">
+          <button class="btn btn-sm btn-ghost icon-button" :aria-label="paused ? '继续刷新' : '暂停刷新'" :title="paused ? '继续刷新' : '暂停刷新'" :aria-pressed="paused" @click="paused = !paused"><UiIcon :name="paused ? 'play' : 'pause'" /></button>
+          <button class="btn btn-sm btn-ghost icon-button" aria-label="刷新" title="刷新" :disabled="ui.connectionsPending" @click="poll(false)"><UiIcon name="refresh" /></button>
         </div>
       </div>
-    </details>
+      <div v-if="activeFilters.length" class="filter-chips"><button @click="clearFilters">清除筛选</button><button v-for="filter in activeFilters" :key="filter.key" :aria-label="'移除' + filter.label" @click="filter.clear()"><span>{{ filter.label }}</span><UiIcon name="close" /></button></div>
+    </section>
+    <div v-if="ui.connectionsError" role="alert" class="data-note">{{ ui.connectionsError }} · 以下保留上次成功结果</div>
 
-    <div class="hidden flex-wrap items-center gap-2 md:flex">
-      <select v-model="ui.connectionFilter.outbound" class="select select-bordered select-sm max-w-56" @change="onOutboundChange">
-        <option value="">全部出站</option>
-        <option v-for="name in outboundOptions" :key="name" :value="name">{{ name }}</option>
-      </select>
-      <select v-model="ui.connectionFilter.src" class="select select-bordered select-sm max-w-72">
-        <option value="">全部源</option>
-        <option v-for="opt in srcOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-      </select>
-      <select v-model="ui.connectionFilter.mac" class="select select-bordered select-sm max-w-80">
-        <option value="">全部 MAC</option>
-        <option v-for="opt in macOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-      </select>
-      <select v-model="network" class="select select-bordered select-sm w-28">
-        <option value="">协议</option>
-        <option v-for="name in networkOptions" :key="name" :value="name">{{ name }}</option>
-      </select>
-      <select v-model="dialer" class="select select-bordered select-sm max-w-56">
-        <option value="">全部节点</option>
-        <option v-for="name in dialerOptions" :key="name" :value="name">{{ name }}</option>
-      </select>
-      <input v-model="search" class="input input-bordered input-sm min-w-48 flex-1" placeholder="空格分隔，同时匹配主机/源/出站/节点" />
-    </div>
-    <div class="hidden flex-wrap items-center gap-2 md:flex">
-      <label class="flex items-center gap-1 text-sm">
-        <input type="checkbox" class="checkbox checkbox-xs" :checked="ui.prefs.connExcludeOn" @change="onExcludeToggle" />
-        排除
-      </label>
-      <input
-        class="input input-bordered input-sm min-w-40 flex-1"
-        :value="ui.prefs.connExclude"
-        placeholder="正则，匹配则隐藏（如 stun|ntp）"
-        @change="onExcludeChange"
-      />
-      <select class="select select-bordered select-sm w-28" :value="String(ui.prefs.connInterval)" @change="onIntervalChange">
-        <option value="1000">1s</option>
-        <option value="2000">2s</option>
-        <option value="5000">5s</option>
-      </select>
-      <div class="join">
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'auto' }" type="button" @click="setConnView('auto')">自动</button>
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'table' }" type="button" @click="setConnView('table')">表格</button>
-        <button class="btn btn-sm join-item min-h-10" :class="{ 'btn-active': ui.prefs.connView === 'card' }" type="button" @click="setConnView('card')">卡片</button>
-      </div>
-      <details class="dropdown">
-        <summary class="btn btn-sm min-h-10">列</summary>
-        <div class="menu dropdown-content z-20 rounded-box bg-base-100 p-2 shadow">
-          <label v-for="col in columnMeta" :key="col.id" class="flex cursor-pointer items-center gap-2 px-2 py-1 text-sm">
-            <input type="checkbox" class="checkbox checkbox-xs" :checked="!ui.prefs.connHiddenCols.includes(col.id)" @change="toggleCol(col.id)" />
-            {{ col.label }}
-          </label>
-        </div>
-      </details>
-    </div>
-    <p class="text-sm opacity-70">开始是 kdae 开始跟踪这条流的时间；时长由开始时间推算。这是 tproxy 抓住的流，不是整机 conntrack。</p>
-
-    <div v-if="showCards" class="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-      <button
-        v-for="row in filteredRows"
-        :key="row.id"
-        type="button"
-        class="min-h-16 rounded-box border border-base-300 bg-base-100 p-3 text-left shadow"
-        :class="{ 'opacity-40': row.closed }"
-        @click="detailId = detailId === row.id ? '' : row.id"
-      >
-        <div class="flex items-start justify-between gap-2">
-          <div class="min-w-0 break-all text-base font-semibold leading-snug">{{ hostOf(row) }}</div>
-          <span v-if="row.closed" class="badge badge-ghost badge-sm shrink-0">断开</span>
-        </div>
-        <div class="mt-1 break-all font-mono text-sm font-medium text-primary">{{ displayEndpoint(row.src) || "—" }}</div>
-        <div class="mt-2 flex flex-wrap items-center gap-1.5">
-          <span class="badge badge-primary badge-sm font-semibold">{{ row.outbound || "—" }}</span>
-          <span class="text-sm font-semibold text-secondary">{{ row.dialer || "—" }}</span>
-        </div>
-        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-          <span class="font-semibold text-success">↓ {{ prettyBytes(row.downloadRate) }}/s</span>
-          <span class="font-medium text-info">↑ {{ prettyBytes(row.uploadRate) }}/s</span>
-          <span class="opacity-70">{{ connectionAge(row.start || "", nowMs) }}</span>
-          <span class="opacity-70">{{ row.network }}</span>
-          <span v-if="macCell(row) !== '—'" class="font-mono opacity-70">{{ macCell(row) }}</span>
-        </div>
-        <div v-if="detailId === row.id" class="mt-2 grid grid-cols-1 gap-1 font-mono text-xs sm:grid-cols-2">
-          <div class="break-all">目标 {{ displayEndpoint(row.dst) || "—" }}</div>
-          <div class="break-all">MAC {{ macCell(row) }}</div>
-          <div>开始 {{ formatTimeShort(row.start || "") || "—" }}</div>
-          <div>上行 {{ prettyBytes(row.upload) }} · 下行 {{ prettyBytes(row.download) }}</div>
-        </div>
+    <p v-if="ui.connectionsTruncated" class="data-note" role="status">结果超过加载上限。搜索、节点与协议筛选仅覆盖已加载连接；可先按出站、源 IP 或 MAC 缩小范围。未返回的连接不会被判定为断开。</p>
+    <div v-if="showCards" class="connection-cards">
+      <button v-for="row in cardRows" :key="row.id" class="connection-card" :class="{'is-closed': row.closed}" @click="detailId = detailId === row.id ? '' : row.id">
+        <div class="card-heading"><strong>{{ hostOf(row) }}</strong><span class="badge badge-sm">{{ row.closed ? '刚断开' : row.network }}</span></div>
+        <div class="endpoint-line"><span>源 IP</span><code>{{ splitEndpoint(row.src).host || '—' }}</code><span>端口 <b>{{ splitEndpoint(row.src).port || '—' }}</b></span></div>
+        <div class="endpoint-line"><span>目标</span><code>{{ splitEndpoint(row.dst).host || '—' }}</code><span>端口 <b>{{ splitEndpoint(row.dst).port || '—' }}</b></span></div>
+        <div class="card-route"><span>{{ row.outbound || '—' }}</span><span>→</span><span>{{ row.dialer || '—' }}</span></div>
+        <div class="card-rates"><span>↓ {{ row.rateKnown ? rateCell(row.downloadRate) : "—" }}</span><span>↑ {{ row.rateKnown ? rateCell(row.uploadRate) : "—" }}</span><span>{{ connectionAge(row.start || '', row.closedAt || nowMs) }}</span></div>
       </button>
-      <div v-if="!filteredRows.length" class="col-span-full py-8 text-center opacity-60">暂无 kdae 抓住的流。</div>
+      <div v-if="!cardRows.length" class="empty-state">{{ search || network || dialer ? '没有符合筛选条件的连接' : '当前没有连接记录' }}</div>
     </div>
-
-    <div v-else class="overflow-x-auto rounded-box border border-base-300 bg-base-100">
-      <table class="table table-sm kdae-zebra">
+    <div v-else class="connection-table-wrap">
+      <table class="table kdae-zebra connection-table">
         <thead>
           <tr v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
             <th
               v-for="header in headerGroup.headers"
               :key="header.id"
+              :data-column="header.column.id"
+              :aria-sort="header.column.getIsSorted() === 'asc' ? 'ascending' : header.column.getIsSorted() === 'desc' ? 'descending' : 'none'"
+              tabindex="0"
+              @keydown.enter.prevent="header.column.getToggleSortingHandler()?.($event)"
+              @keydown.space.prevent="header.column.getToggleSortingHandler()?.($event)"
               draggable="true"
               class="cursor-pointer select-none bg-base-100"
               @click="header.column.getToggleSortingHandler()?.($event)"
@@ -439,32 +401,25 @@ function setConnView(mode: ConnViewMode): void {
             >
               <div class="flex items-center gap-1">
                 <FlexRender :render="header.column.columnDef.header" :props="header.getContext()" />
-                <button
-                  v-if="header.column.getCanGroup()"
-                  class="btn btn-ghost btn-sm h-8 min-h-8 px-2"
-                  type="button"
-                  :title="header.column.getIsGrouped() ? '取消分组' : '按此列分组'"
-                  @click.stop="header.column.getToggleGroupingHandler()?.()"
-                >
-                  {{ header.column.getIsGrouped() ? "−" : "+" }}
-                </button>
-                <span v-if="header.column.getIsSorted() === 'asc'">↑</span>
-                <span v-else-if="header.column.getIsSorted() === 'desc'">↓</span>
+                <UiIcon v-if="header.column.getIsSorted()" :name="header.column.getIsSorted() === 'asc' ? 'up' : 'down'" />
               </div>
             </th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!tableRows.length">
-            <td :colspan="columns.length" class="text-center opacity-60">暂无 kdae 抓住的流。must_direct 未劫持、block 静默丢、DNS 不在此表。</td>
+            <td :colspan="table.getVisibleLeafColumns().length" class="connection-empty"><UiIcon name="search" /><strong>{{ ui.connectionsPending ? "正在获取连接" : "没有符合条件的连接" }}</strong><span>{{ activeFilters.length ? "尝试移除筛选条件，或检查加载范围。" : "此处显示 fdae 跟踪的连接。" }}</span></td>
           </tr>
           <tr
             v-for="row in tableRows"
             :key="row.id"
-            :class="{ 'opacity-40': !row.getIsGrouped() && row.original.closed, 'font-semibold': row.getIsGrouped() }"
+            :class="{ 'opacity-40': !row.getIsGrouped() && row.original.closed, 'font-semibold': row.getIsGrouped(), 'is-selected': !row.getIsGrouped() && row.original.id === detailId }"
+            tabindex="0"
+            @keydown.enter="onRowClick(row)"
+            @keydown.space.prevent="onRowClick(row)"
             @click="onRowClick(row)"
           >
-            <td v-for="cell in row.getVisibleCells()" :key="cell.id" class="font-mono whitespace-nowrap">
+            <td v-for="cell in row.getVisibleCells()" :key="cell.id" :data-column="cell.column.id" class="whitespace-nowrap">
               <div class="flex items-center gap-1">
                 <template v-if="cell.getIsGrouped()">
                   <button class="btn btn-ghost btn-sm h-8 min-h-8 px-2" type="button" @click.stop="row.getToggleExpandedHandler()?.()">
@@ -484,6 +439,8 @@ function setConnView(mode: ConnViewMode): void {
         </tbody>
       </table>
     </div>
+
+    <footer class="connection-footer"><div class="connection-summary"><span>匹配 {{ ui.connectionsLastPollAt ? ui.connectionsTotal : "—" }} · 已加载 {{ ui.connections.length }} · 当前 {{ filteredRows.length }}</span><span class="refresh-status">{{ ui.connectionsPending ? '刷新中…' : paused ? '已暂停' : ui.connectionsLastPollAt ? '更新于 ' + formatTimeShort(new Date(ui.connectionsLastPollAt).toISOString()) : '等待连接' }}</span><span title="仅包含 fdae 跟踪的连接；每页 50 条；速率 — 表示等待两次可比较的采样。" tabindex="0" class="table-help" aria-label="仅包含 fdae 跟踪的连接；每页 50 条；速率未知时显示横线。">ⓘ</span></div><div class="join"><button class="btn btn-sm join-item" :disabled="page === 0" @click="page--">上一页</button><span class="btn btn-sm join-item pointer-events-none">{{ page + 1 }} / {{ pageCount }}</span><button class="btn btn-sm join-item" :disabled="page + 1 >= pageCount" @click="page++">下一页</button></div></footer>
+    <ConnectionDetails v-if="selectedRow" :row="selectedRow" :mac="macCell(selectedRow)" @close="detailId = ''" @copy="copyDetails" />
   </div>
 </template>
-
