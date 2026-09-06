@@ -1,0 +1,6 @@
+fdae dashboard is adapted from Zephyruso/zashboard 3.25.0 (MIT).
+Upstream: https://github.com/Zephyruso/zashboard
+Upstream license: ZASHBOARD-LICENSE.txt
+fdae integration: https://github.com/Fan-chou/dae
+
+Editor language tokenization adapted from daeuniverse/daed (MIT), commit 671e65d2fdcd62fe6a3ec18ecda209c5addea898. See DAED-LICENSE.txt.

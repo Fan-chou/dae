@@ -1,0 +1,285 @@
+import {
+  blockConnectionByIdAPI,
+  disconnectByIdAPI,
+  getConnectionDisplayValue,
+} from '@/assembly/connections'
+import { useBounceOnVisible } from '@/composables/bouncein'
+import { useConnections } from '@/composables/connections'
+import {
+  CONNECTION_TAB_TYPE,
+  CONNECTIONS_TABLE_ACCESSOR_KEY,
+  PROXY_CHAIN_DIRECTION,
+} from '@/constant'
+import { getConnectionChains, getConnectionSmartBlock } from '@/helper'
+import { notifyRequestError } from '@/helper/requestError'
+import {
+  connectionFilter,
+  connectionTabShow,
+  isClosedConnection,
+} from '@/store/connections'
+import {
+  connectionCardLines,
+  proxyChainDirection,
+  showFullProxyChain,
+} from '@/store/settings'
+import type { Connection } from '@/types'
+import {
+  ArrowDownCircleIcon,
+  ArrowDownIcon,
+  ArrowRightCircleIcon,
+  ArrowUpCircleIcon,
+  ArrowUpIcon,
+  NoSymbolIcon,
+  XMarkIcon,
+} from '@heroicons/vue/24/outline'
+import { first, last } from 'lodash'
+import { defineComponent } from 'vue'
+import type { JSX } from 'vue/jsx-runtime'
+import HighlightText from '../common/HighlightText.vue'
+import ProxyName from '../proxies/ProxyName.vue'
+
+export default defineComponent<{
+  conn: Connection
+}>({
+  props: {
+    conn: Object,
+  },
+  name: 'ConnectionCard',
+  setup(props) {
+    const { handlerInfo } = useConnections()
+
+    useBounceOnVisible()
+
+    return () => {
+      const conn = props.conn
+      const chains = getConnectionChains(conn)
+      const displayOptions = {
+        mode: 'card' as const,
+        proxyChainDirection: proxyChainDirection.value,
+        showFullProxyChain: showFullProxyChain.value,
+      }
+      const highlightedText = (key: CONNECTIONS_TABLE_ACCESSOR_KEY) => (
+        <HighlightText
+          text={getConnectionDisplayValue(conn, key, displayOptions)}
+          filter={connectionFilter.value}
+        />
+      )
+      const endpointField = (
+        key: CONNECTIONS_TABLE_ACCESSOR_KEY,
+        label: string,
+        port = false,
+      ) => (
+        <span
+          class={
+            port
+              ? 'flex shrink-0 items-baseline gap-1 text-xs'
+              : 'flex min-w-0 flex-1 items-baseline gap-1 text-xs'
+          }
+          data-connection-field={key}
+        >
+          <span class="shrink-0 text-base-content/40">{label}</span>
+          <span class="min-w-0 break-all font-mono">
+            {getConnectionDisplayValue(conn, key, displayOptions) || '—'}
+          </span>
+        </span>
+      )
+      const componentMap: Record<
+        CONNECTIONS_TABLE_ACCESSOR_KEY,
+        () => JSX.Element
+      > = {
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationPort]: () =>
+          endpointField(
+            CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationPort,
+            '目标端口',
+            true,
+          ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Dialer]: () => (
+          <span>{highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Dialer)}</span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.MAC]: () =>
+          endpointField(CONNECTIONS_TABLE_ACCESSOR_KEY.MAC, 'MAC', false),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Host]: () => (
+          <span class="text-main w-80 grow truncate">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Host)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Destination]: () =>
+          endpointField(
+            CONNECTIONS_TABLE_ACCESSOR_KEY.Destination,
+            '目标 IP',
+            false,
+          ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.RemoteAddress]: () => (
+          <span class="w-80 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.RemoteAddress)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.GeoIP]: () => (
+          <span class="w-80 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.GeoIP)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.SourceIP]: () =>
+          endpointField(
+            CONNECTIONS_TABLE_ACCESSOR_KEY.SourceIP,
+            '源 IP',
+            false,
+          ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.SourcePort]: () =>
+          endpointField(
+            CONNECTIONS_TABLE_ACCESSOR_KEY.SourcePort,
+            '源端口',
+            true,
+          ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.SniffHost]: () => (
+          <span class="w-80 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.SniffHost)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Type]: () => (
+          <span class="w-60 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Type)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Rule]: () => (
+          <span class="w-80 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Rule)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Process]: () => (
+          <span class="w-60 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Process)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Chains]: () => (
+          <span
+            class={[
+              'flex w-80 grow items-center gap-1 truncate break-all',
+              proxyChainDirection.value === PROXY_CHAIN_DIRECTION.REVERSE &&
+                'flex-row-reverse justify-end',
+            ]}
+          >
+            {<ProxyName name={last(chains)!} filter={connectionFilter.value} />}
+            {last(chains) !== first(chains) && (
+              <>
+                <ArrowRightCircleIcon class="h-4 w-4 shrink-0"></ArrowRightCircleIcon>
+                {
+                  <ProxyName
+                    name={first(chains)!}
+                    filter={connectionFilter.value}
+                  />
+                }
+              </>
+            )}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Outbound]: () => (
+          <span class="w-60 grow truncate break-all">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Outbound)}
+          </span>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Download]: () => (
+          <div class="mr-1 flex items-center gap-[1px] text-xs whitespace-nowrap">
+            <ArrowDownIcon class="text-success h-3 w-3 shrink-0" />
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Download)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Upload]: () => (
+          <div class="mr-1 flex items-center gap-[1px] text-xs whitespace-nowrap">
+            <ArrowUpIcon class="text-info h-3 w-3 shrink-0" />
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Upload)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.DlSpeed]: () => (
+          <div class="mr-1 flex items-center gap-[1px] text-xs whitespace-nowrap">
+            <ArrowDownCircleIcon class="text-success h-4 w-4 shrink-0" />
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.DlSpeed)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.UlSpeed]: () => (
+          <div class="mr-1 flex items-center gap-[1px] text-xs whitespace-nowrap">
+            <ArrowUpCircleIcon class="text-info h-4 w-4 shrink-0" />
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.UlSpeed)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.ConnectTime]: () => (
+          <div class="whitespace-nowrap">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.ConnectTime)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationType]: () => (
+          <div class="whitespace-nowrap">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationType)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.InboundUser]: () => (
+          <div class="whitespace-nowrap">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.InboundUser)}
+          </div>
+        ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Close]: () => {
+          const closeButton = (
+            <button
+              class="btn btn-circle btn-xs"
+              onClick={(e) => {
+                e.stopPropagation()
+                disconnectByIdAPI(conn.id).catch(notifyRequestError)
+              }}
+            >
+              <XMarkIcon class="h-4 w-4" />
+            </button>
+          )
+
+          if (getConnectionSmartBlock(conn) === 'normal') {
+            const degradeButton = (
+              <button
+                class="btn btn-circle btn-xs"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  blockConnectionByIdAPI(conn.id).catch(notifyRequestError)
+                }}
+              >
+                <NoSymbolIcon class="h-4 w-4" />
+              </button>
+            )
+            return (
+              <div class="flex gap-1">
+                {degradeButton}
+                {closeButton}
+              </div>
+            )
+          }
+          return closeButton
+        },
+      }
+      const isClosed = isClosedConnection(conn)
+      // 淡化只能落在行上:根节点的 opacity 归 bounce-in 入场动画所有(见 composables/bouncein),
+      // 两者写在同一元素上会互相覆盖。
+      const dimmed =
+        isClosed && connectionTabShow.value === CONNECTION_TAB_TYPE.ALL
+
+      return (
+        <div
+          class="text-base-content/65 flex cursor-pointer flex-col gap-1 px-3 py-2"
+          onClick={() => handlerInfo(conn)}
+        >
+          {connectionCardLines.value.map((line) => (
+            <div
+              class={[
+                'flex min-h-5 items-baseline gap-2 text-sm',
+                dimmed ? 'opacity-60' : '',
+              ]}
+            >
+              {line
+                // 已关闭的连接关不掉,不给按钮(「已关闭」与「全部」两个 tab 都适用)。
+                .filter((key) => key !== CONNECTIONS_TABLE_ACCESSOR_KEY.Close)
+                .map((key) => {
+                  return componentMap[key]()
+                })}
+            </div>
+          ))}
+        </div>
+      )
+    }
+  },
+})

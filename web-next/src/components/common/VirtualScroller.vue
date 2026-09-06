@@ -1,0 +1,107 @@
+<template>
+  <div
+    ref="parentRef"
+    class="flex min-h-0 h-full w-full flex-1 flex-col overflow-y-auto"
+  >
+    <slot name="before" />
+    <div
+      :style="{
+        height: `${totalSize}px`,
+      }"
+      class="relative w-full shrink-0"
+      v-if="data.length > 0"
+    >
+      <div
+        :class="['absolute top-3 right-3 left-3', contentClass]"
+        :style="{
+          transform: `translateY(${virtualRows[0]?.start ?? 0}px)`,
+        }"
+      >
+        <!--
+          每条自成一张卡片、靠间距分隔。间距做在被测量的行容器的 padding 上，不能用
+          margin 或 flex gap——虚拟滚动按 getBoundingClientRect 累加行高，两者都不计入，
+          totalSize 会和实际布局对不上。
+        -->
+        <div
+          v-for="row in virtualRows"
+          :key="row.key.toString()"
+          :data-index="row.index"
+          :ref="(ref) => measureElement(ref as Element | null)"
+          class="pb-2"
+        >
+          <div class="base-container">
+            <slot :item="data[row.index]" :index="row.index" />
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      v-else
+      class="base-container m-3 flex-row p-3 text-sm"
+      :style="{
+        marginTop: `${(reserveControls ? paddingTop : 0) + 12}px`,
+        marginBottom: `${reserveControls ? paddingBottom : 0}px`,
+      }"
+    >
+      {{ $t('noData') }}
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { usePaddingForViews } from '@/composables/paddingViews'
+import { useVirtualizer } from '@tanstack/vue-virtual'
+import { computed, nextTick, ref } from 'vue'
+
+const { paddingTop, paddingBottom } = usePaddingForViews({
+  offsetTop: 0,
+  offsetBottom: 0,
+})
+const parentRef = ref<HTMLElement | null>(null)
+const props = withDefaults(
+  defineProps<{
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    data: any[]
+    reserveControls?: boolean
+    size?: number
+    overscan?: number
+    contentClass?: string
+    getItemKey?: (item: unknown, index: number) => string | number
+  }>(),
+  {
+    data: () => [],
+    size: 64,
+    reserveControls: true,
+    overscan: 24,
+    contentClass: '',
+  },
+)
+
+const virutalOptions = computed(() => {
+  return {
+    count: props.data.length,
+    getScrollElement: () => parentRef.value,
+    estimateSize: () => props.size,
+    getItemKey: (index: number) =>
+      props.getItemKey?.(props.data[index], index) ?? index,
+    overscan: props.overscan,
+    paddingStart: props.reserveControls ? paddingTop.value : 0,
+    paddingEnd: (props.reserveControls ? paddingBottom.value : 0) + 24,
+  }
+})
+
+const rowVirtualizer = useVirtualizer(virutalOptions)
+const virtualRows = computed(() => rowVirtualizer.value.getVirtualItems())
+const totalSize = computed(() => rowVirtualizer.value.getTotalSize())
+const measureElement = (el: Element | null) => {
+  if (!el) {
+    return
+  }
+
+  nextTick(() => {
+    rowVirtualizer.value.measureElement(el)
+  })
+
+  return undefined
+}
+</script>

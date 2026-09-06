@@ -9,7 +9,7 @@ Packages:
 - `kdae` — binary as `/usr/bin/dae`, `PROVIDES`/`CONFLICTS`/`REPLACES` official `dae`
 - `kdae-rule-sync` — `/usr/libexec/dae/dae-rule-sync`
 - `luci-app-kdae` — start/stop, validate, reload, rule-sync warnings, panel link
-- `kdae-ui` — Vite-built Vue panel at `/www/kdae-ui/` (`web/dist`)
+- `kdae-ui` — Vite-built Vue panel at `/www/kdae-ui/` (`web-next/dist`, based on zashboard; override with `KDAE_UI_DIR`)
 
 Do not enable `DAE_ALLOW_TCP_SOCKMAP` on kernels older than 6.6.94.
 
