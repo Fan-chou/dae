@@ -21,6 +21,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"io"
@@ -377,4 +378,67 @@ func runTCPOffloadSentAccountE2E(t *testing.T, address string, destination bool)
 		t.Fatalf("L3 FAIL: backlog=%d far above resume threshold — fuse metric still wrong", backlogVal)
 	}
 	t.Logf("L3 PASS: backlog stays at %d (≪ %d engage threshold) — fuse will not mis-engage on unconstrained transfers", backlogVal, tcpOffloadMaxPeerBacklog)
+}
+
+func TestTCPOffloadFINRealSockmapE2E(t *testing.T) {
+	if unix.Geteuid() != 0 {
+		t.Skip("requires BPF privileges")
+	}
+	coll := loadOffloadVerifyCollection(t)
+	defer coll.Close()
+	fast := coll.Maps["fast_sock"]
+	verdict, err := link.AttachRawLink(link.RawLinkOptions{Target: fast.FD(), Program: coll.Programs["tcp_offload_redirect"], Attach: ebpf.AttachSkSKBStreamVerdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verdict.Close()
+	left, client := offloadTCPPair(t)
+	right, server := offloadTCPPair(t)
+	session, err := newTCPRelayOffloadSession(nil, fast, coll.Maps["tcp_offload_pause"], coll.Maps["tcp_offload_sent"], left, right, func(int64) {}, func(int64) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, _, err := session.Run(ctx); done <- err }()
+	want := bytes.Repeat([]byte("payload"), 32768)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write(want)
+		if err == nil {
+			err = client.CloseWrite()
+		}
+		writeDone <- err
+	}()
+	got, err := io.ReadAll(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("sockmap tail bytes=%d want=%d", len(got), len(want))
+	}
+	if _, err := server.Write([]byte("reply after EOF")); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.CloseWrite(); err != nil {
+		t.Errorf("server halfclose: %v", err)
+	}
+	reply, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reply) != "reply after EOF" {
+		t.Fatalf("reply=%q", reply)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("sockmap session ended only on timeout")
+	}
 }

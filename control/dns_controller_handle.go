@@ -7,7 +7,6 @@ package control
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -69,13 +68,20 @@ func (c *DnsController) forwardWithFallback(
 	primaryDialArg *dialArgument,
 	data []byte,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
-	// UDP and TCP share the parent work budget (typically 5s, itself bound
-	// to lifecycleCtx). Do not WithoutCancel: a UDP black hole must not get
-	// a fresh 8s, and TCP fallback must not stack another 8s after that.
-	primaryCtx, primaryCancel := childTimeout(ctx, consts.DefaultDialTimeout)
-	defer primaryCancel()
+	// Bound the whole operation, including fallback selection. Reserve half
+	// the remaining budget for TCP on combined upstreams; UDP-only keeps
+	// the full budget. A fast UDP error still falls back immediately.
+	ctx, cancel := childTimeout(ctx, consts.DefaultDialTimeout)
+	defer cancel()
+	primaryBudget := consts.DefaultDialTimeout
+	if upstream != nil && upstream.Scheme == dns.UpstreamScheme_TCP_UDP && primaryDialArg.l4proto == consts.L4ProtoStr_UDP {
+		deadline, _ := ctx.Deadline()
+		primaryBudget = time.Until(deadline) / 2
+	}
+	primaryCtx, primaryCancel := childTimeout(ctx, primaryBudget)
 
 	respMsg, err = c.forwardWithDialArg(primaryCtx, upstream, primaryDialArg, data)
+	primaryCancel()
 	if err == nil {
 		return respMsg, primaryDialArg, nil
 	}
@@ -180,6 +186,36 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			return herr
 		}
 
+		if !dnsQueryCanShare(dnsMessage) {
+			// Keep request/response policy, but no lookup, coalescing or cache
+			// insertion for query semantics the shared key cannot represent.
+			workCtx, cancel := c.newWorkContext(5 * time.Second)
+			defer cancel()
+			if ctx != nil {
+				stop := context.AfterFunc(ctx, cancel)
+				defer stop()
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			data, err := dnsMessage.Pack()
+			if err != nil {
+				return err
+			}
+			result, err := c.resolveDNSUpstream(workCtx, 0, req, data, upstream)
+			if err != nil {
+				return err
+			}
+			if err := c.publishDNSRouteOnly(result.response, responseCacheKey); err != nil && c.log != nil {
+				c.log.Warnf("failed to project DNS response route: %v", err)
+			}
+			wire, err := result.response.Pack()
+			if err != nil {
+				return err
+			}
+			return c.writeCachedResponse(wire, dnsMessage.Id, req, responseWriter, dnsMessage)
+		}
+
 		// Check cache after routing (non-reject case). Cache hits return
 		// immediately without singleflight; stale entries background-refresh.
 		if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
@@ -219,43 +255,14 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			}
 		}
 
-		// Write response.
-		// For packet-send path, avoid deep-copying DNS message and just patch ID in packed bytes.
-		if responseWriter != nil {
-			respMsgUnique := respMsg.Copy()
-			respMsgUnique.Id = dnsMessage.Id
-			c.rewriteClientMsg(respMsgUnique, req)
-			return responseWriter.WriteMsg(respMsgUnique)
-		}
-
-		// If no responseWriter (internal UDP path), pack and send directly.
-		// Reuse the DNS response buffer pool; data is consumed synchronously by the send.
 		bufPtr := dnsResponseBufPool.Get().(*[]byte)
 		defer dnsResponseBufPool.Put(bufPtr)
 		data, err := respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
 			return fmt.Errorf("pack DNS packet: %w", err)
 		}
-		if len(respMsg.Question) > 0 {
-			q := respMsg.Question[0]
-			data = c.rewriteClientPacked(q.Name, q.Qtype, data, req)
-		}
-		if len(data) >= 2 {
-			binary.BigEndian.PutUint16(data[:2], dnsMessage.Id)
-		}
-		// Apply the client's UDP size limit (512 or its EDNS0 advertisement)
-		// with the TC bit so an oversized reply triggers a TCP retry instead
-		// of an unsendable datagram; every other UDP send path already does.
-		// truncateDNSResponse unpacks into a fresh message, so the shared
-		// singleflight result is never mutated.
-		data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
-		if req == nil || req.lConn == nil {
-			return fmt.Errorf("dns request connection is nil for singleflight response")
-		}
-		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
-			return err
-		}
-		return nil
+		return c.writeCachedResponse(data, dnsMessage.Id, req, responseWriter, dnsMessage)
+
 	}
 
 	return c.handleWithResponseWriter_(ctx, dnsMessage, req, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)

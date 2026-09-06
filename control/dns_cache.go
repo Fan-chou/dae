@@ -6,6 +6,8 @@
 package control
 
 import (
+	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"slices"
 	"sync/atomic"
@@ -13,13 +15,6 @@ import (
 
 	dnsmessage "github.com/miekg/dns"
 )
-
-// Approximate TTL refresh threshold in seconds.
-// Pre-packed response is refreshed when TTL difference exceeds this value.
-// This balances between performance (avoiding frequent repack) and TTL accuracy.
-// NOTE: Increased from 5 to 15 to reduce memory allocation frequency under high load
-// while maintaining acceptable TTL accuracy (15s variance is negligible for DNS caching).
-const ttlRefreshThresholdSeconds = 15
 
 // BPF update configuration
 const (
@@ -34,11 +29,15 @@ const (
 
 type dnsPackedResponse struct {
 	wire              []byte
+	ttlOffsets        []int
 	ttl               uint32
 	createdAtUnixNano int64
 }
 
 type DnsCache struct {
+	// RouteOnly entries own address routing, never reusable DNS answers.
+	RouteOnly            bool
+	Rcode                int
 	RouteOwnerKey        string
 	RouteProjectionEpoch uint64
 	DomainBitmap         []uint32
@@ -46,6 +45,7 @@ type DnsCache struct {
 	NS                   []dnsmessage.RR
 	Extra                []dnsmessage.RR
 	Deadline             time.Time
+	ReceivedAt           time.Time
 	OriginalDeadline     time.Time // This field is not impacted by `fixed_domain_ttl`.
 
 	// lastRouteSyncNano tracks when route binding was last synced to BPF.
@@ -63,8 +63,7 @@ type DnsCache struct {
 	// OPTIMIZATION: Uses Copy-on-Write with one atomic.Pointer for lock-free
 	// reads. The wire bytes and the metadata used to interpret them are one
 	// immutable publication unit, so readers cannot mix refresh generations.
-	packedResponse           atomic.Pointer[dnsPackedResponse]
-	packedResponseRefreshing atomic.Bool
+	packedResponse atomic.Pointer[dnsPackedResponse]
 	// deadlineNano caches the Deadline as UnixNano for fast comparison.
 	// This avoids time.Time method calls on every cache hit.
 	deadlineNano atomic.Int64
@@ -86,9 +85,6 @@ func ttlFromDeadline(deadline time.Time, now time.Time) uint32 {
 	}
 
 	ttlSeconds := (deadlineNano - nowNano) / 1e9
-	if ttlSeconds < 1 {
-		return 1
-	}
 	return uint32(ttlSeconds)
 }
 
@@ -212,7 +208,7 @@ func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
 		}
 	}
 
-	req.Rcode = dnsmessage.RcodeSuccess
+	req.Rcode = c.Rcode
 	req.Response = true
 	req.RecursionAvailable = true
 	req.Truncated = false
@@ -227,7 +223,7 @@ func (c *DnsCache) FillIntoWithPacked(req *dnsmessage.Msg) []byte {
 	if packedPtr != nil && packedPtr.wire != nil {
 		// Still need to unpack to fill the request message for logging/tracing
 		// But we return the pre-packed bytes for sending
-		return packedPtr.wire
+		return packedPtr.withTTL(time.Now(), ttlFromDeadline(c.Deadline, time.Now()))
 	}
 	// Slow path: fill and pack (should not happen if cache is properly initialized)
 	c.FillInto(req)
@@ -241,10 +237,13 @@ func (c *DnsCache) FillIntoWithPacked(req *dnsmessage.Msg) []byte {
 
 func (c *DnsCache) Clone() *DnsCache {
 	newCache := &DnsCache{
+		RouteOnly:            c.RouteOnly,
+		Rcode:                c.Rcode,
 		RouteOwnerKey:        c.RouteOwnerKey,
 		RouteProjectionEpoch: c.RouteProjectionEpoch,
 		Deadline:             c.Deadline,
 		OriginalDeadline:     c.OriginalDeadline,
+		ReceivedAt:           c.ReceivedAt,
 	}
 
 	if c.DomainBitmap != nil {
@@ -292,6 +291,8 @@ func (c *DnsCache) cloneWithDeadlines(deadline, originalDeadline time.Time) *Dns
 		return nil
 	}
 	next := &DnsCache{
+		RouteOnly:            c.RouteOnly,
+		Rcode:                c.Rcode,
 		RouteOwnerKey:        c.RouteOwnerKey,
 		RouteProjectionEpoch: c.RouteProjectionEpoch,
 		DomainBitmap:         c.DomainBitmap,
@@ -300,6 +301,7 @@ func (c *DnsCache) cloneWithDeadlines(deadline, originalDeadline time.Time) *Dns
 		Extra:                c.Extra,
 		Deadline:             deadline,
 		OriginalDeadline:     originalDeadline,
+		ReceivedAt:           c.ReceivedAt,
 	}
 	if packedPtr := c.packedResponse.Load(); packedPtr != nil {
 		next.packedResponse.Store(packedPtr)
@@ -324,6 +326,8 @@ func (c *DnsCache) cloneWithDeadlines(deadline, originalDeadline time.Time) *Dns
 // matcher and lifecycle bookkeeping.
 func (c *DnsCache) CloneForReload() *DnsCache {
 	newCache := &DnsCache{
+		RouteOnly:            c.RouteOnly,
+		Rcode:                c.Rcode,
 		RouteOwnerKey:        c.RouteOwnerKey,
 		RouteProjectionEpoch: c.RouteProjectionEpoch,
 		Answer:               c.Answer,
@@ -331,6 +335,7 @@ func (c *DnsCache) CloneForReload() *DnsCache {
 		Extra:                c.Extra,
 		Deadline:             c.Deadline,
 		OriginalDeadline:     c.OriginalDeadline,
+		ReceivedAt:           c.ReceivedAt,
 	}
 
 	if packed := c.packedResponse.Load(); packed != nil && packed.wire != nil {
@@ -356,8 +361,7 @@ func (c *DnsCache) CloneForReload() *DnsCache {
 // PrepackResponse generates a pre-packed DNS response message.
 // This should be called once when creating the cache entry.
 // The qname should be the full qualified domain name (with trailing dot).
-// Uses approximate TTL - the pre-packed response is refreshed when TTL changes
-// by more than ttlRefreshThresholdSeconds.
+// TTL field offsets are indexed once; cache hits age a private wire copy.
 func (c *DnsCache) PrepackResponse(qname string, qtype uint16) error {
 	now := time.Now()
 
@@ -382,13 +386,6 @@ func setRecordTTL(rr dnsmessage.RR, ttl uint32) {
 	}
 }
 
-func setSectionTTL(rrs []dnsmessage.RR, ttl uint32, scratch []uint32) {
-	for i, rr := range rrs {
-		scratch[i] = rr.Header().Ttl
-		setRecordTTL(rr, ttl)
-	}
-}
-
 func restoreSectionTTL(rrs []dnsmessage.RR, scratch []uint32) {
 	for i, rr := range rrs {
 		rr.Header().Ttl = scratch[i]
@@ -406,7 +403,7 @@ func (c *DnsCache) prepackResponseBeforeStore(qname string, qtype uint16, ttl ui
 
 	msg := dnsmessage.Msg{
 		MsgHdr: dnsmessage.MsgHdr{
-			Rcode:              dnsmessage.RcodeSuccess,
+			Rcode:              c.Rcode,
 			Response:           true,
 			RecursionAvailable: true,
 			RecursionDesired:   true,
@@ -428,9 +425,9 @@ func (c *DnsCache) prepackResponseBeforeStore(qname string, qtype uint16, ttl ui
 	nsTTLs := ttlScratchSlice(len(c.NS), &nsStack)
 	extraTTLs := ttlScratchSlice(len(c.Extra), &extraStack)
 
-	setSectionTTL(c.Answer, ttl, answerTTLs)
-	setSectionTTL(c.NS, ttl, nsTTLs)
-	setSectionTTL(c.Extra, ttl, extraTTLs)
+	c.setSectionRemainingTTL(c.Answer, ttl, now, answerTTLs)
+	c.setSectionRemainingTTL(c.NS, ttl, now, nsTTLs)
+	c.setSectionRemainingTTL(c.Extra, ttl, now, extraTTLs)
 	defer func() {
 		restoreSectionTTL(c.Extra, extraTTLs)
 		restoreSectionTTL(c.NS, nsTTLs)
@@ -442,7 +439,12 @@ func (c *DnsCache) prepackResponseBeforeStore(qname string, qtype uint16, ttl ui
 		return err
 	}
 
+	offsets, err := dnsWireTTLOffsets(packed)
+	if err != nil {
+		return err
+	}
 	c.packedResponse.Store(&dnsPackedResponse{
+		ttlOffsets:        offsets,
 		wire:              packed,
 		ttl:               ttl,
 		createdAtUnixNano: now.UnixNano(),
@@ -461,7 +463,7 @@ func (c *DnsCache) prepackResponseBeforeStore(qname string, qtype uint16, ttl ui
 func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32, now time.Time) error {
 	msg := &dnsmessage.Msg{
 		MsgHdr: dnsmessage.MsgHdr{
-			Rcode:              dnsmessage.RcodeSuccess,
+			Rcode:              c.Rcode,
 			Response:           true,
 			RecursionAvailable: true,
 			RecursionDesired:   true,
@@ -477,7 +479,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Answer = make([]dnsmessage.RR, len(c.Answer))
 		for i, rr := range c.Answer {
 			copiedRR := dnsmessage.Copy(rr)
-			setRecordTTL(copiedRR, ttl)
+			setRecordTTL(copiedRR, c.recordTTL(rr, ttl, now))
 			msg.Answer[i] = copiedRR
 		}
 	}
@@ -485,7 +487,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Ns = make([]dnsmessage.RR, len(c.NS))
 		for i, rr := range c.NS {
 			copiedRR := dnsmessage.Copy(rr)
-			setRecordTTL(copiedRR, ttl)
+			setRecordTTL(copiedRR, c.recordTTL(rr, ttl, now))
 			msg.Ns[i] = copiedRR
 		}
 	}
@@ -493,7 +495,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Extra = make([]dnsmessage.RR, len(c.Extra))
 		for i, rr := range c.Extra {
 			copiedRR := dnsmessage.Copy(rr)
-			setRecordTTL(copiedRR, ttl)
+			setRecordTTL(copiedRR, c.recordTTL(rr, ttl, now))
 			msg.Extra[i] = copiedRR
 		}
 	}
@@ -503,7 +505,12 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		return err
 	}
 
+	offsets, err := dnsWireTTLOffsets(packed)
+	if err != nil {
+		return err
+	}
 	c.packedResponse.Store(&dnsPackedResponse{
+		ttlOffsets:        offsets,
 		wire:              packed,
 		ttl:               ttl,
 		createdAtUnixNano: now.UnixNano(),
@@ -511,58 +518,79 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 	return nil
 }
 
-// GetPackedResponseWithApproximateTTL returns pre-packed response with approximate TTL.
-// OPTIMIZED: Uses Copy-on-Write with atomic.Pointer for lock-free reads.
-// Fast path: returns cached pre-packed response if TTL difference is within threshold.
-// Slow path: refreshes pre-packed response if TTL has changed significantly.
-// THREAD-SAFE: Lock-free reads + atomic updates. No mutex contention.
-// PERFORMANCE: Eliminates deep copy + Pack() bottleneck. 10-100x faster for cache hits.
-// NOTE: Only returns fresh (unexpired) responses. For stale responses, use GetStaleResponse.
+// GetPackedResponseWithApproximateTTL retains its API name but now ages every
+// wire TTL on a private copy. Readers never observe a previous refresh's TTL.
 func (c *DnsCache) GetPackedResponseWithApproximateTTL(qname string, qtype uint16, now time.Time) []byte {
-	nowNano := now.UnixNano()
-	deadlineNano := c.deadlineNano.Load()
-
-	// Check if cache is expired - return nil immediately
-	if deadlineNano <= nowNano {
+	if c.RouteOnly || c.deadlineNano.Load() <= now.UnixNano() {
 		return nil
 	}
-
-	// Calculate current TTL in seconds (avoid float operations)
-	currentTTL := uint32((deadlineNano - nowNano) / 1e9)
-	if currentTTL == 0 {
-		currentTTL = 1
-	}
-
-	// Lock-free read: one load observes wire bytes and TTL metadata from the
-	// same immutable publication.
 	packed := c.packedResponse.Load()
-	if packed != nil && packed.wire != nil {
-		if packed.ttl >= currentTTL {
-			if packed.ttl-currentTTL <= ttlRefreshThresholdSeconds {
-				return packed.wire
-			}
-		} else if currentTTL-packed.ttl <= ttlRefreshThresholdSeconds {
-			return packed.wire
-		}
-	}
-
-	// The separate flag is only a best-effort refresh admission gate; it does
-	// not describe the published response and therefore cannot create a mixed
-	// response generation.
-	if (packed == nil || nowNano-packed.createdAtUnixNano > 1e9) && c.packedResponseRefreshing.CompareAndSwap(false, true) {
-		current := c.packedResponse.Load()
-		if current == nil || nowNano-current.createdAtUnixNano > 1e9 {
-			_ = c.prepackResponseWithTTL(qname, qtype, currentTTL, now)
-		}
-		c.packedResponseRefreshing.Store(false)
-	}
-
-	// Return the latest complete response (it may have a slightly stale TTL).
-	packed = c.packedResponse.Load()
 	if packed == nil {
 		return nil
 	}
-	return packed.wire
+	return packed.withTTL(now, ttlFromDeadline(c.Deadline, now))
+}
+
+func (p *dnsPackedResponse) withTTL(now time.Time, limit uint32) []byte {
+	out := slices.Clone(p.wire)
+	// Round elapsed time up so truncation to whole seconds never extends a RR.
+	elapsed := max(int64(0), now.UnixNano()-p.createdAtUnixNano)
+	age := uint64((elapsed + int64(time.Second) - 1) / int64(time.Second))
+	for _, offset := range p.ttlOffsets {
+		original := binary.BigEndian.Uint32(out[offset:])
+		remaining := uint32(0)
+		if uint64(original) > age {
+			remaining = uint32(uint64(original) - age)
+		}
+		binary.BigEndian.PutUint32(out[offset:], min(remaining, limit))
+	}
+	return out
+}
+
+// dnsWireTTLOffsets runs once on locally packed data, never on each cache hit.
+func dnsWireTTLOffsets(wire []byte) ([]int, error) {
+	if len(wire) < 12 {
+		return nil, fmt.Errorf("short packed DNS header")
+	}
+	pos := 12
+	for range int(binary.BigEndian.Uint16(wire[4:6])) {
+		_, next, err := dnsmessage.UnpackDomainName(wire, pos)
+		if err != nil || next+4 > len(wire) {
+			return nil, fmt.Errorf("invalid packed DNS question")
+		}
+		pos = next + 4
+	}
+	count := int(binary.BigEndian.Uint16(wire[6:8])) + int(binary.BigEndian.Uint16(wire[8:10])) + int(binary.BigEndian.Uint16(wire[10:12]))
+	offsets := make([]int, 0, count)
+	for range count {
+		_, next, err := dnsmessage.UnpackDomainName(wire, pos)
+		if err != nil || next+10 > len(wire) {
+			return nil, fmt.Errorf("invalid packed DNS record")
+		}
+		if binary.BigEndian.Uint16(wire[next:]) != dnsmessage.TypeOPT {
+			offsets = append(offsets, next+4)
+		}
+		pos = next + 10 + int(binary.BigEndian.Uint16(wire[next+8:]))
+		if pos > len(wire) {
+			return nil, fmt.Errorf("invalid packed DNS record length")
+		}
+	}
+	return offsets, nil
+}
+
+func (c *DnsCache) recordTTL(rr dnsmessage.RR, limit uint32, now time.Time) uint32 {
+	// Explicit fixed_domain_ttl retains its existing override contract.
+	if c.ReceivedAt.IsZero() || !c.Deadline.Equal(c.OriginalDeadline) {
+		return limit
+	}
+	return min(limit, ttlFromDeadline(c.ReceivedAt.Add(time.Duration(rr.Header().Ttl)*time.Second), now))
+}
+
+func (c *DnsCache) setSectionRemainingTTL(rrs []dnsmessage.RR, ttl uint32, now time.Time, saved []uint32) {
+	for i, rr := range rrs {
+		saved[i] = rr.Header().Ttl
+		setRecordTTL(rr, c.recordTTL(rr, ttl, now))
+	}
 }
 
 // GetStaleResponse returns expired response if within stale-while-revalidate window.
@@ -594,7 +622,7 @@ func (c *DnsCache) GetStaleResponse(now time.Time, staleTtl int) []byte {
 	if packed == nil {
 		return nil
 	}
-	return packed.wire
+	return packed.withTTL(now, 0)
 }
 
 // IsRefreshing checks if background refresh is in progress (optimistic cache).
@@ -616,28 +644,12 @@ func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) []
 	if req == nil {
 		return nil
 	}
-	req.Answer = nil
-	req.Rcode = dnsmessage.RcodeSuccess
-	req.Response = true
-	req.RecursionAvailable = true
-	req.Truncated = false
-
-	if c.Answer == nil {
-		req.Compress = true
-		b, _ := req.Pack()
-		return b
-	}
-
-	// Calculate remaining TTL based on the provided time
+	c.FillInto(req)
 	remainingTTL := ttlFromDeadline(c.Deadline, now)
-
-	// Copy answers with updated TTL
-	req.Answer = make([]dnsmessage.RR, len(c.Answer))
-	for i, rr := range c.Answer {
-		copiedRR := dnsmessage.Copy(rr)
-		// Update TTL to remaining time
-		setRecordTTL(copiedRR, remainingTTL)
-		req.Answer[i] = copiedRR
+	for _, section := range [][]dnsmessage.RR{req.Answer, req.Ns, req.Extra} {
+		for _, rr := range section {
+			setRecordTTL(rr, c.recordTTL(rr, remainingTTL, now))
+		}
 	}
 
 	req.Compress = true

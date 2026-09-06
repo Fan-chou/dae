@@ -145,10 +145,18 @@ func TestDNSDialSendOversizedOPT(t *testing.T) {
 			require.NotNil(t, full)
 			require.False(t, full.Truncated)
 			require.Len(t, full.Answer, 1)
-			require.Equal(t, originalOPT, full.IsEdns0(), "async cache must retain the complete OPT for TCP")
-			require.EqualValues(t, 1, forwards.Load(), "TCP must read the asynchronously stored answer")
+			if size != 0 {
+				require.Equal(t, originalOPT, full.IsEdns0(), "special TCP response retains its own OPT")
+			} else {
+				require.Nil(t, full.IsEdns0())
+			}
+			if size != 0 {
+				require.EqualValues(t, 2, forwards.Load(), "DO query must bypass ordinary cache")
+			} else {
+				require.EqualValues(t, 1, forwards.Load())
+			}
 			limit := dnsUDPResponseSizeLimit(query)
-			t.Logf("UDP bytes=%d limit=%d TC=%t; cached TCP answers=%d OPT bytes=%d", n, limit, got.Truncated, len(full.Answer), dnsmessage.Len(full.IsEdns0()))
+			t.Logf("UDP bytes=%d limit=%d TC=%t; cached TCP answers=%d OPT bytes=%d", n, limit, got.Truncated, len(full.Answer), len(full.Extra))
 			require.LessOrEqual(t, n, limit)
 			require.Equal(t, len(wire) > limit, got.Truncated)
 			require.NotNil(t, got.IsEdns0())
@@ -274,14 +282,13 @@ func TestDNSResponseOversizedOPT(t *testing.T) {
 								require.False(t, got.Truncated)
 								require.Len(t, got.Answer, 1)
 								require.Equal(t, originalOPT, got.IsEdns0(), "TCP must retain the entire cached OPT after small UDP replies")
+							} else if request.size == 0 {
+								require.Nil(t, got.IsEdns0(), "plain query must not inherit another client's OPT")
+								require.False(t, got.Truncated)
 							} else {
 								checkUDP(t, got, dnsUDPResponseSizeLimit(query))
 							}
-							if cacheEnabled {
-								require.EqualValues(t, 1, forwards.Load())
-							} else {
-								require.EqualValues(t, i+1, forwards.Load())
-							}
+							require.EqualValues(t, i+1, forwards.Load(), "DO queries bypass sharing; the single plain query is independent")
 						})
 					}
 				})

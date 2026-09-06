@@ -102,7 +102,7 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 	c.requireStore()
 	count := 0
 	for k, v := range entries {
-		if v == nil {
+		if v == nil || (v.RouteOnly && !v.Deadline.After(now)) {
 			continue
 		}
 
@@ -134,7 +134,7 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			c.cacheProjectionMu.Lock()
 			c.enforceDnsCacheCapacityLocked(k)
 			_, loaded := c.storeDnsCache(k, restored)
-			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline, !loaded)
+			c.rememberDnsKnowledge(dnsKnowledgeBaseKey(k), restored.OriginalDeadline, !loaded)
 			if rt != nil && rt.cacheAccessCallback != nil {
 				if err := rt.cacheAccessCallback(restored); err != nil {
 					c.cacheProjectionMu.Unlock()
@@ -173,10 +173,19 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 }
 
 func dnsCacheBaseKey(cacheKey string) string {
+	if strings.HasPrefix(cacheKey, dnsRouteOnlyPrefix) {
+		return ""
+	}
 	if before, _, ok := strings.Cut(cacheKey, "|"); ok {
 		return before
 	}
 	return cacheKey
+}
+
+// Domain validation evidence is shared independently of reusable answers.
+// Route-only owners retain their separate response namespace and lifetime.
+func dnsKnowledgeBaseKey(cacheKey string) string {
+	return dnsCacheBaseKey(strings.TrimPrefix(cacheKey, dnsRouteOnlyPrefix))
 }
 
 // responseCacheKey scopes a base cache key to the upstream that produced the
@@ -265,7 +274,7 @@ func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline ti
 }
 
 func (c *DnsController) forgetDnsKnowledge(cacheKey string, cache *DnsCache) {
-	baseKey := dnsCacheBaseKey(cacheKey)
+	baseKey := dnsKnowledgeBaseKey(cacheKey)
 	if baseKey == "" || cache == nil {
 		return
 	}
@@ -310,7 +319,7 @@ func (c *DnsController) syncDnsKnowledgeLocked(baseKey string) {
 
 	c.dnsCache.Range(func(key, value any) bool {
 		cacheKey, ok := key.(string)
-		if !ok || dnsCacheBaseKey(cacheKey) != baseKey {
+		if !ok || dnsKnowledgeBaseKey(cacheKey) != baseKey {
 			return true
 		}
 		cache, ok := value.(*DnsCache)
@@ -456,44 +465,47 @@ func (c *DnsController) evictDnsRespCacheIfSame(cacheKey string, cache *DnsCache
 
 func (c *DnsController) evictExpiredDnsCache(now time.Time) {
 	optimisticCacheEnabled, optimisticCacheTtl, maxCacheSize := c.currentOptimisticCacheConfig()
+	// Route-only owners always expire, independently of optimistic responses.
 	// Step 1: Time-based eviction
 	// - When optimistic_cache_ttl > 0: evict entries older than (deadline + stale_window)
 	// - When optimistic_cache_ttl == 0 AND maxCacheSize > 0: skip time-based eviction (rely on LRU)
 	// - When both are 0 (backward compat / direct struct creation): use deadline-based eviction
 	useTimeBasedEviction := optimisticCacheTtl > 0 || (optimisticCacheTtl == 0 && maxCacheSize == 0)
 
-	if useTimeBasedEviction {
-		c.dnsCache.Range(func(key, value any) bool {
-			cacheKey, ok := key.(string)
-			if !ok {
-				if _, loaded := c.dnsCache.LoadAndDelete(key); loaded {
-					c.decrementDnsCacheSize()
-				}
-				return true
+	c.dnsCache.Range(func(key, value any) bool {
+		cacheKey, ok := key.(string)
+		if !ok {
+			if _, loaded := c.dnsCache.LoadAndDelete(key); loaded {
+				c.decrementDnsCacheSize()
 			}
-			cache, ok := value.(*DnsCache)
-			if !ok {
-				c.loadAndDeleteDnsCache(cacheKey)
-				return true
-			}
-
-			// Calculate effective deadline
-			// - If optimistic cache is enabled and ttl > 0: use (deadline + optimisticCacheTtl)
-			// - Otherwise: use deadline directly
-			effectiveDeadline := cache.Deadline
-			if optimisticCacheEnabled && optimisticCacheTtl > 0 {
-				effectiveDeadline = cache.Deadline.Add(time.Duration(optimisticCacheTtl) * time.Second)
-			}
-
-			if effectiveDeadline.After(now) {
-				return true // Still valid, keep it
-			}
-
-			// Too stale or expired without optimistic cache, evict it
-			c.evictDnsRespCacheIfSame(cacheKey, cache)
 			return true
-		})
-	}
+		}
+		cache, ok := value.(*DnsCache)
+		if !ok {
+			c.loadAndDeleteDnsCache(cacheKey)
+			return true
+		}
+
+		if !useTimeBasedEviction && !cache.RouteOnly {
+			return true
+		}
+
+		// Calculate effective deadline
+		// - If optimistic cache is enabled and ttl > 0: use (deadline + optimisticCacheTtl)
+		// - Otherwise: use deadline directly
+		effectiveDeadline := cache.Deadline
+		if !cache.RouteOnly && optimisticCacheEnabled && optimisticCacheTtl > 0 {
+			effectiveDeadline = cache.Deadline.Add(time.Duration(optimisticCacheTtl) * time.Second)
+		}
+
+		if effectiveDeadline.After(now) {
+			return true // Still valid, keep it
+		}
+
+		// Too stale or expired without optimistic cache, evict it
+		c.evictDnsRespCacheIfSame(cacheKey, cache)
+		return true
+	})
 
 	// Step 2: LRU eviction if cache size exceeds limit
 	// This is important when optimistic_cache_ttl=0 (never expire)
@@ -652,6 +664,9 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 		return nil
 	}
 	cache = val.(*DnsCache)
+	if cache.RouteOnly {
+		return nil
+	}
 	now := time.Now()
 	var deadline time.Time
 	if !ignoreFixedTtl {
@@ -675,7 +690,7 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 // LookupDnsRespCache_ will modify the msg in place.
 
 // OPTIMIZED: Uses pre-packed response with approximate TTL for near-zero latency.
-// TTL is refreshed when difference exceeds ttlRefreshThresholdSeconds (15 seconds by default).
+// Every ordinary RR TTL is aged on the outgoing wire copy.
 // OPTIMISTIC CACHE (RFC 8767): Returns stale response while background refresh is in progress.
 // Falls back to an owned in-place TTL-aware pack if pre-packed response is not available.
 func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string, ignoreFixedTtl bool) (resp []byte, needRefresh bool) {
@@ -686,6 +701,9 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 		return nil, false
 	}
 	cache := val.(*DnsCache)
+	if cache.RouteOnly {
+		return nil, false
+	}
 
 	now := time.Now()
 
@@ -751,19 +769,37 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
 func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseCacheKey string) (err error) {
 	// Check healthy resp.
-	if !msg.Response || len(msg.Question) == 0 || msg.Rcode != dnsmessage.RcodeSuccess {
+	if !msg.Response || len(msg.Question) != 1 || msg.Question[0].Qclass != dnsmessage.ClassINET || (msg.Rcode != dnsmessage.RcodeSuccess && msg.Rcode != dnsmessage.RcodeNameError) {
 		return nil
 	}
 
 	q := msg.Question[0]
 
-	// Get TTL.
+	// Bound the full answer chain, including CNAME + negative SOA replies.
 	var ttl uint32
+	positive := q.Qtype == dnsmessage.TypeANY && len(msg.Answer) > 0
 	if len(msg.Answer) > 0 {
 		ttl = msg.Answer[0].Header().Ttl
-	} else {
-		// NXDomain or empty answer
-		ttl = minFirefoxCacheTtl
+		for _, rr := range msg.Answer {
+			ttl = min(ttl, rr.Header().Ttl)
+			if rr.Header().Rrtype == q.Qtype {
+				positive = true
+			}
+		}
+	}
+	if msg.Rcode == dnsmessage.RcodeNameError || !positive {
+		negativeTTL := uint32(0)
+		for _, rr := range msg.Ns {
+			if soa, ok := rr.(*dnsmessage.SOA); ok {
+				negativeTTL = min(soa.Hdr.Ttl, soa.Minttl)
+				break
+			}
+		}
+		if len(msg.Answer) > 0 {
+			ttl = min(ttl, negativeTTL)
+		} else {
+			ttl = negativeTTL
+		}
 	}
 
 	// Clamp TTL to 1 year max to prevent integer overflow when casting to int on 32-bit platforms
@@ -771,14 +807,18 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 		ttl = 31536000
 	}
 
-	// For A/AAAA records, we set TTL to 0 to prevent downstream caching while we manage it.
-	if q.Qtype == dnsmessage.TypeA || q.Qtype == dnsmessage.TypeAAAA {
-		for i := range msg.Answer {
-			msg.Answer[i].Header().Ttl = 0
+	if ttl == 0 {
+		// A zero-lifetime result must not expose the old positive answer via
+		// the post-resolution cache lookup or optimistic stale serving.
+		c.requireStore()
+		if responseCacheKey == "" {
+			responseCacheKey = c.cacheKey(q.Name, q.Qtype)
 		}
+		if old, ok := c.dnsCache.Load(responseCacheKey); ok {
+			c.evictDnsRespCacheIfSame(responseCacheKey, old.(*DnsCache))
+		}
+		return c.publishDNSRouteOnly(msg, responseCacheKey)
 	}
-
-	// Update DnsCache.
 	return c.updateDnsCache(msg, responseCacheKey, ttl, &q)
 }
 
@@ -792,7 +832,16 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, responseCacheKey str
 		}).Tracef("Update DNS record cache")
 	}
 
-	if err := c.UpdateDnsCacheTtlWithKey(responseCacheKey, q.Name, q.Qtype, msg.Answer, msg.Ns, msg.Extra, int(ttl)); err != nil {
+	// OPT describes this DNS exchange, not the reusable RR result. Delivery
+	// reconstructs ordinary EDNS; special queries never enter this cache.
+	extra := make([]dnsmessage.RR, 0, len(msg.Extra))
+	for _, rr := range msg.Extra {
+		if rr.Header().Rrtype != dnsmessage.TypeOPT {
+			extra = append(extra, rr)
+		}
+	}
+	c.requireStore()
+	if err := c.updateDnsCacheDeadline(responseCacheKey, q.Name, q.Qtype, msg.Answer, msg.Ns, extra, c.fixedTtlDeadlineFunc(int(ttl)), msg); err != nil {
 		return err
 	}
 	return nil
@@ -800,7 +849,7 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, responseCacheKey str
 
 type deadlineFunc func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time)
 
-func (c *DnsController) updateDnsCacheDeadline(cacheKey string, host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, deadlineFunc deadlineFunc) (err error) {
+func (c *DnsController) updateDnsCacheDeadline(cacheKey string, host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, deadlineFunc deadlineFunc, response ...*dnsmessage.Msg) (err error) {
 	var fqdn string
 	if strings.HasSuffix(host, ".") {
 		fqdn = strings.ToLower(host)
@@ -819,7 +868,7 @@ func (c *DnsController) updateDnsCacheDeadline(cacheKey string, host string, dns
 	if cacheKey == "" {
 		cacheKey = c.cacheKey(fqdn, dnsTyp)
 	}
-	baseKey := dnsCacheBaseKey(cacheKey)
+	baseKey := dnsKnowledgeBaseKey(cacheKey)
 
 	for {
 		rt := c.runtime()
@@ -830,14 +879,23 @@ func (c *DnsController) updateDnsCacheDeadline(cacheKey string, host string, dns
 		if err != nil {
 			return err
 		}
+		newCache.RouteOnly = strings.HasPrefix(cacheKey, dnsRouteOnlyPrefix)
+		newCache.ReceivedAt = now
+		newCache.deadlineNano.Store(deadline.UnixNano())
+		newCache.lastAccessNano.Store(now.UnixNano())
+		if len(response) > 0 {
+			newCache.Rcode = response[0].Rcode
+		}
 		newCache.RouteProjectionEpoch = rt.routeProjectionEpoch
 
 		// Pre-pack before publication so cache readers only observe a complete
 		// entry. The cache/runtime locks below make the entry, its projection,
 		// and reload epoch one atomic publication unit.
-		if err = newCache.prepackResponseBeforeStore(fqdn, dnsTyp, ttlFromDeadline(deadline, now), now); err != nil {
-			if c.log != nil {
-				c.log.Warnf("failed to prepack DNS response: %v", err)
+		if !newCache.RouteOnly {
+			if err = newCache.prepackResponseBeforeStore(fqdn, dnsTyp, ttlFromDeadline(deadline, now), now); err != nil {
+				if c.log != nil {
+					c.log.Warnf("failed to prepack DNS response: %v", err)
+				}
 			}
 		}
 
@@ -855,8 +913,13 @@ func (c *DnsController) updateDnsCacheDeadline(cacheKey string, host string, dns
 
 		newCache.RouteOwnerKey = cacheKey
 		c.enforceDnsCacheCapacityLocked(cacheKey)
-		_, loaded := c.storeDnsCache(cacheKey, newCache)
-		c.rememberDnsKnowledge(baseKey, originalDeadline, !loaded)
+		previous, loaded := c.storeDnsCache(cacheKey, newCache)
+		if old, ok := previous.(*DnsCache); newCache.RouteOnly && ok && old.OriginalDeadline.After(originalDeadline) {
+			// A shorter replacement must not inherit the old evidence expiry.
+			c.syncDnsKnowledge(baseKey)
+		} else {
+			c.rememberDnsKnowledge(baseKey, originalDeadline, !loaded)
+		}
 
 		projectionErr := error(nil)
 		if rt.cacheAccessCallback != nil {

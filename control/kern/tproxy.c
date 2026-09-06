@@ -4135,6 +4135,12 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 SEC("sk_skb/tcp_offload_redirect")
 int tcp_offload_redirect(struct __sk_buff *skb)
 {
+	/* A FIN-only skb has no payload for skb_send_sock. Redirecting it
+	 * queues a zero-byte send, which sk_psock_backlog treats as EPIPE.
+	 * Leave EOF on the source socket for the relay's half-close state. */
+	if (skb->len == 0)
+		return SK_PASS;
+
 	struct tuples_key peer_key = {};
 
 	// Key layout must match Go's makeTuplesKey(remote, local, TCP):

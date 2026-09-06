@@ -254,3 +254,28 @@ func TestAdminGetConnectionsForwardsFiltersAndOmitsURI(t *testing.T) {
 		t.Fatalf("invalid limit status = %d", rec.Code)
 	}
 }
+
+func TestTailLogLinesBlockBoundaryAndUnterminatedUTF8(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dae.log")
+	content := strings.Repeat("old entry\n", 5000) + strings.Repeat("中", 6000) + "\nlast"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := tailLogLines(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != strings.Repeat("中", 6000) || got[1] != "last" {
+		t.Fatal("tail lost UTF-8 boundary or final line")
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 2<<20)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = tailLogLines(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatal("must not return partial oversized line")
+	}
+}

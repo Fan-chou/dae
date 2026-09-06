@@ -97,6 +97,8 @@ type tcpRelayOffloadSession struct {
 	// Baseline tcp_info receive counters at registration, for final accounting.
 	leftRxBase  uint64
 	rightRxBase uint64
+	txBase      [2]uint64
+	finSent     uint8
 
 	// finalLeftRx/finalRightRx capture the accounting deltas before the
 	// sockets are force-closed: tcp_info is unreadable after close, and most
@@ -242,13 +244,13 @@ func newTCPRelayOffloadSession(log *logrus.Logger, fastSock, pauseMap, sentMap *
 		return nil, fmt.Errorf("%w: right fd: %v", errTCPRelayOffloadUnavailable, err)
 	}
 
-	leftRxBase, err := tcpConnRxBytes(leftTCP)
+	leftRxBase, leftTxBase, err := tcpOffloadBaseline(leftTCP)
 	if err != nil {
-		return nil, fmt.Errorf("%w: left tcp_info: %v", errTCPRelayOffloadUnavailable, err)
+		return nil, fmt.Errorf("%w: left baseline: %v", errTCPRelayOffloadUnavailable, err)
 	}
-	rightRxBase, err := tcpConnRxBytes(rightTCP)
+	rightRxBase, rightTxBase, err := tcpOffloadBaseline(rightTCP)
 	if err != nil {
-		return nil, fmt.Errorf("%w: right tcp_info: %v", errTCPRelayOffloadUnavailable, err)
+		return nil, fmt.Errorf("%w: right baseline: %v", errTCPRelayOffloadUnavailable, err)
 	}
 
 	session := &tcpRelayOffloadSession{
@@ -263,6 +265,7 @@ func newTCPRelayOffloadSession(log *logrus.Logger, fastSock, pauseMap, sentMap *
 		leftKey:     leftKey,
 		rightKey:    rightKey,
 		leftRxBase:  leftRxBase,
+		txBase:      [2]uint64{leftTxBase, rightTxBase},
 		rightRxBase: rightRxBase,
 	}
 	if err := session.register(); err != nil {
@@ -312,6 +315,9 @@ func (s *tcpRelayOffloadSession) Close() error {
 // while the kernel drains already-redirected skbs; lift demands they be
 // re-added.
 func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool, err error) {
+	if s.sentMap == nil {
+		return false, false, nil
+	}
 	lrx, err := tcpConnRxBytes(s.left)
 	if err != nil {
 		return false, false, nil // transient; skip this round
@@ -437,6 +443,14 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 			return 0, 0, nil
 		}
 
+		if err := s.propagateFIN(poller.closed); err != nil {
+			s.forceClose()
+			return 0, 0, err
+		}
+		if s.finSent == 3 {
+			return 0, 0, nil
+		}
+
 		// Backlog fuse guard: compute the egress retry-queue backlog
 		// (tcp_info receive deltas minus skb_send_sock accounting), engage
 		// or lift the pause, and manage the drain window. Checked at the
@@ -467,6 +481,12 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		waitMs := int(tcpOffloadEpollWaitCap.Milliseconds())
+		if poller.closed != s.finSent {
+			// The kernel retry queue has no userspace completion event. Only
+			// while a FIN is waiting for its tail, resample promptly instead
+			// of adding the normal one-second maintenance wait to the reply.
+			waitMs = 10
+		}
 		if !firstClose.IsZero() && relayHalfCloseTimeout > 0 {
 			remaining := relayHalfCloseTimeout - time.Since(firstClose)
 			if remaining <= 0 {
@@ -535,7 +555,11 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 			}
 		}
 
-		if poller.closed == 0x3 {
+		if err := s.propagateFIN(poller.closed); err != nil {
+			s.forceClose()
+			return 0, 0, err
+		}
+		if s.finSent == 3 {
 			return 0, 0, nil
 		}
 		if firstClose.IsZero() && poller.closed != 0 {
@@ -831,4 +855,92 @@ func tcpRelayOffloadReason(err error) string {
 		}
 	}
 	return msg
+}
+
+// tcpOffloadBaseline snapshots consumed input and accepted output before map
+// registration. If arrival/ACK races the snapshot, ordinary relay remains the
+// safe fallback. No traffic is redirected yet, so we need not wait or poll.
+func tcpOffloadBaseline(conn *net.TCPConn) (received, accepted uint64, err error) {
+	first, err := tcpConnInfo(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	pending, err := tcpConnPendingBytes(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	out, err := tcpConnOutQueue(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	last, err := tcpConnInfo(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	if first.State != 1 || last.State != 1 || first.Bytes_received != last.Bytes_received || first.Bytes_acked != last.Bytes_acked || pending < 0 || uint64(pending) > first.Bytes_received {
+		return 0, 0, fmt.Errorf("socket changed during offload baseline")
+	}
+	return first.Bytes_received - uint64(pending), first.Bytes_acked + uint64(out), nil
+}
+
+func tcpConnOutQueue(conn *net.TCPConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	var callErr error
+	if err := raw.Control(func(fd uintptr) { n, callErr = unix.IoctlGetInt(int(fd), unix.TIOCOUTQ) }); err != nil {
+		return 0, err
+	}
+	return n, callErr
+}
+
+// propagateFIN uses accepted TCP bytes, not the skb_send_sock entry counter:
+// that counter includes failed/retried attempts and cannot prove queue drain.
+// Linux SIOCOUTQ is write_seq-snd_una. Reading bytes_acked BEFORE it yields
+// a lower bound on accepted bytes if an ACK races the two reads. Once all
+// input has reached the destination send queue, TCP itself orders FIN after it.
+func (s *tcpRelayOffloadSession) propagateFIN(readClosed uint8) error {
+	conns := [2]*net.TCPConn{s.left, s.right}
+	bases := [2]uint64{s.leftRxBase, s.rightRxBase}
+	for index, src := range conns {
+		bit := uint8(1 << index)
+		if readClosed&bit == 0 || s.finSent&bit != 0 {
+			continue
+		}
+		dst := conns[1-index]
+		if s.fastSock != nil {
+			received, err := tcpConnRxBytes(src)
+			if err != nil {
+				return err
+			}
+			info, err := tcpConnInfo(dst)
+			if err != nil {
+				return err
+			}
+			queued, err := tcpConnOutQueue(dst)
+			if err != nil {
+				return err
+			}
+			// Linux bytes_received includes the orderly FIN sequence byte.
+			// Baselines are taken only in ESTABLISHED, before this FIN.
+			if received == 0 {
+				return fmt.Errorf("missing offload EOF sequence byte")
+			}
+			received--
+			if queued < 0 || received < bases[index] {
+				return fmt.Errorf("invalid offload close counters")
+			}
+			accepted := info.Bytes_acked + uint64(queued)
+			if accepted < s.txBase[1-index] || accepted-s.txBase[1-index] < received-bases[index] {
+				continue
+			}
+		}
+		if err := dst.CloseWrite(); err != nil {
+			return fmt.Errorf("offload FIN direction %d: %w", index, err)
+		}
+		s.finSent |= bit
+	}
+	return nil
 }

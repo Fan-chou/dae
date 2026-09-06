@@ -124,7 +124,7 @@ func (c *ControlPlane) projectDnsReloadCacheStream(
 	start := time.Now()
 	count := 0
 	err := source(func(cacheKey string, cache *DnsCache) error {
-		if cache == nil {
+		if cache == nil || (cache.RouteOnly && !cache.Deadline.After(start)) {
 			return nil
 		}
 		bitmap := cache.DomainBitmap

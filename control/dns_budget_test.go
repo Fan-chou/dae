@@ -105,10 +105,13 @@ func TestForwardWithFallbackBlackholeStaysWithinParentBudget(t *testing.T) {
 	parent, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, _, err := ctrl.forwardWithFallback(parent, &udpRequest{}, tcpUDPUpstream(), udpPrimaryDialArg(), []byte{0})
+	msg, used, err := ctrl.forwardWithFallback(parent, &udpRequest{}, tcpUDPUpstream(), udpPrimaryDialArg(), []byte{0})
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("blackhole UDP must not succeed via stacked TCP budget")
+	if err != nil {
+		t.Fatalf("TCP must recover within the shared budget: %v", err)
+	}
+	if parent.Err() != nil || used.l4proto != consts.L4ProtoStr_TCP || dnsAnswerIPv4(t, msg) != "198.51.100.53" {
+		t.Fatal("fallback did not deliver TCP answer before parent expired")
 	}
 	if elapsed > time.Second {
 		t.Fatalf("blackhole took %s, want parent 250ms (not 8s+8s)", elapsed)
@@ -116,8 +119,8 @@ func TestForwardWithFallbackBlackholeStaysWithinParentBudget(t *testing.T) {
 	if udpCalls.Load() != 1 {
 		t.Fatalf("UDP calls = %d, want 1", udpCalls.Load())
 	}
-	if tcpCalls.Load() != 0 {
-		t.Fatalf("TCP calls = %d, want 0 after parent expired", tcpCalls.Load())
+	if tcpCalls.Load() != 1 {
+		t.Fatalf("TCP calls = %d, want 1 with reserved budget", tcpCalls.Load())
 	}
 }
 

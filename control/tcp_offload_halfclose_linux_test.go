@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -179,5 +180,119 @@ func TestTCPOffloadRunDrainsBothFINQueues(t *testing.T) {
 		if !bytes.Equal(got, side.want) {
 			t.Fatal("queued payload changed")
 		}
+	}
+}
+
+func TestTCPOffloadRunPropagatesFINBeforeLateReply(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		t.Run(map[bool]string{false: "upload", true: "download"}[reverse], func(t *testing.T) {
+			left, client := offloadTCPPair(t)
+			right, server := offloadTCPPair(t)
+			if reverse {
+				left, right = right, left
+				client, server = server, client
+			}
+			lfd, err := tcpConnFD(left)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rfd, err := tcpConnFD(right)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := &tcpRelayOffloadSession{left: left, right: right, leftFD: lfd, rightFD: rfd}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, _, err := s.Run(ctx); done <- err }()
+			want := bytes.Repeat([]byte("request"), 3*relayCopyBufferSize/7)
+			if _, err := client.Write(want); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(server)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatal("request tail lost")
+			}
+			if _, err := server.Write([]byte("late response")); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			reply, err := io.ReadAll(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(reply) != "late response" {
+				t.Fatalf("reply=%q", reply)
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if ctx.Err() != nil {
+				t.Fatal("relay only ended on cancellation")
+			}
+		})
+	}
+}
+
+func TestTCPOffloadFINWaitsForAcceptedTail(t *testing.T) {
+	left, client := offloadTCPPair(t)
+	right, server := offloadTCPPair(t)
+	rx, _, err := tcpOffloadBaseline(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tx, err := tcpOffloadBaseline(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &tcpRelayOffloadSession{left: left, right: right, leftRxBase: rx, txBase: [2]uint64{0, tx}, fastSock: &ebpf.Map{}}
+	if _, err := client.Write([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	tail, err := io.ReadAll(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.propagateFIN(1); err != nil {
+		t.Fatal(err)
+	}
+	if s.finSent != 0 {
+		t.Fatal("FIN passed data not yet accepted by destination TCP")
+	}
+	if _, err := right.Write(tail); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for s.finSent == 0 {
+		if err := s.propagateFIN(1); err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			info, _ := tcpConnInfo(right)
+			in, _ := tcpConnRxBytes(left)
+			out, _ := tcpConnOutQueue(right)
+			t.Fatalf("accepted tail did not release FIN: rx=%d base=%d ack=%d out=%d txbase=%d", in, rx, info.Bytes_acked, out, tx)
+		}
+		if s.finSent == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	got, err := io.ReadAll(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tail" {
+		t.Fatalf("tail=%q", got)
 	}
 }

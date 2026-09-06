@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDNSCachePreservesEDNSMetadata(t *testing.T) {
+func TestDNSCacheDoesNotShareUnsolicitedEDNS(t *testing.T) {
 	for _, ttl := range []uint32{300, 86400} {
 		t.Run(fmt.Sprint(ttl), func(t *testing.T) {
 			logger := logrus.New()
@@ -57,22 +57,23 @@ func TestDNSCachePreservesEDNSMetadata(t *testing.T) {
 				t.Run(path, func(t *testing.T) {
 					got := resolvePhase0NamedUpstreamScope(t, controller, req, uint16(i+1))
 					require.EqualValues(t, 1, forwards.Load())
-					require.Equal(t, opt, got.IsEdns0(), "cache TTL must not overwrite EDNS version, flags or options")
+					require.Nil(t, got.IsEdns0(), "ordinary query must not inherit unsolicited upstream EDNS options")
 				})
 			}
 
 			entries := controller.CloneCacheForReload()
 			require.Len(t, entries, 1)
 			for _, cache := range entries {
-				require.Equal(t, opt, cache.Extra[0], "prepack must restore the stored OPT")
+				require.Len(t, cache.Extra, 1, "only the ordinary additional record is shared")
+				require.Equal(t, opt, response.IsEdns0(), "cache insertion must not mutate upstream OPT")
 				t.Run("refresh", func(t *testing.T) {
 					wire := cache.GetPackedResponseWithApproximateTTL(phase0NamedUpstreamScopeQName, dnsmessage.TypeA, cache.Deadline.Add(-30*time.Second))
 					var got dnsmessage.Msg
 					require.NoError(t, got.Unpack(wire))
 					require.EqualValues(t, 30, got.Answer[0].Header().Ttl)
-					require.EqualValues(t, 30, got.Extra[1].Header().Ttl, "ordinary additional records still receive the remaining TTL")
-					require.Equal(t, opt, got.IsEdns0())
-					require.Equal(t, opt, cache.Extra[0], "refresh must not mutate shared stored records")
+					require.Zero(t, got.Extra[0].Header().Ttl, "expired additional record must not acquire the answer lifetime")
+					require.Nil(t, got.IsEdns0())
+					require.EqualValues(t, 60, cache.Extra[0].Header().Ttl, "refresh must not mutate shared stored records")
 				})
 			}
 		})

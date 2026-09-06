@@ -78,7 +78,7 @@ func TestDNSListenerResponseSize(t *testing.T) {
 						query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
 						query.Id = uint16(i + 1)
 						if ednsSize != 0 {
-							query.SetEdns0(ednsSize, true)
+							query.SetEdns0(ednsSize, false)
 						}
 						writer := &dnsTransportResponseWriter{addr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}}
 						if path == "tcp" {

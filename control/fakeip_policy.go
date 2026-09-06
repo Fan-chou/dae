@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-	"sync"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
@@ -24,15 +23,7 @@ type FakeIPPolicy struct {
 	matcher *RoutingMatcher
 	filter  *fakeIPFilterMatcher
 
-	mu     sync.Mutex
-	packed map[fakeIPPackedKey][]byte
-	epoch  uint64
-}
-
-type fakeIPPackedKey struct {
-	qname string
-	qtype uint16
-	inet6 string
+	epoch uint64
 }
 
 func NewFakeIPPolicy(cfg config.FakeIP, store *FakeIPStore, matcher *RoutingMatcher, filter *fakeIPFilterMatcher, epoch uint64) *FakeIPPolicy {
@@ -42,7 +33,6 @@ func NewFakeIPPolicy(cfg config.FakeIP, store *FakeIPStore, matcher *RoutingMatc
 		store:   store,
 		matcher: matcher,
 		filter:  filter,
-		packed:  make(map[fakeIPPackedKey][]byte),
 		epoch:   epoch,
 	}
 }
@@ -116,21 +106,16 @@ func (p *FakeIPPolicy) RewriteMsg(msg *dnsmessage.Msg, src netip.Addr, mac [6]by
 	return nil
 }
 
-// shouldRewrite mirrors the real-answer guards for both packed and unpacked
-// paths. NXDOMAIN / SERVFAIL stay as-is. A/AAAA are faked when the real
-// answer has that family. With no inet6 pool, eligible AAAA becomes NODATA
-// and AAAA-only names (no real A) still get a Fake A so clients have a
-// mapping handle; dial_mode domain++ uses the qname, not the missing IPv4.
+// shouldRewrite requires positive answer evidence. Empty answers, including
+// response-policy rejection and A NODATA, must never acquire a FakeIP merely
+// because no IPv6 pool is configured. Negative answers retain their authority.
 func (p *FakeIPPolicy) shouldRewrite(msg *dnsmessage.Msg, qtype uint16) bool {
-	if msg == nil || msg.Rcode != dnsmessage.RcodeSuccess {
+	if msg == nil || len(msg.Question) != 1 || msg.Question[0].Qclass != dnsmessage.ClassINET || msg.Rcode != dnsmessage.RcodeSuccess || len(msg.Answer) == 0 {
 		return false
 	}
 	switch qtype {
 	case dnsmessage.TypeA:
-		if fakeIPMsgHasIP(msg, false) {
-			return true
-		}
-		return !p.inet6Enabled()
+		return fakeIPMsgHasIP(msg, false) || (!p.inet6Enabled() && fakeIPMsgHasIP(msg, true))
 	case dnsmessage.TypeAAAA:
 		if !p.inet6Enabled() {
 			return true
@@ -143,15 +128,8 @@ func (p *FakeIPPolicy) shouldRewrite(msg *dnsmessage.Msg, qtype uint16) bool {
 
 func (p *FakeIPPolicy) packedAnswer(qname string, qtype uint16) ([]byte, error) {
 	qname = canonicalizeFakeIPQname(qname)
-	key := fakeIPPackedKey{qname: qname, qtype: qtype, inet6: p.inet6CacheID()}
-	p.mu.Lock()
-	if packed, ok := p.packed[key]; ok {
-		out := cloneFakeIPPacked(packed)
-		p.mu.Unlock()
-		p.store.Touch(qname)
-		return out, nil
-	}
-	p.mu.Unlock()
+	// Derive the response from the current mapping every time. A separate
+	// packed cache can outlive a retired IPv4 range and return its old IP.
 
 	msg := new(dnsmessage.Msg)
 	msg.SetReply(&dnsmessage.Msg{Question: []dnsmessage.Question{{
@@ -188,23 +166,7 @@ func (p *FakeIPPolicy) packedAnswer(qname string, qtype uint16) ([]byte, error) 
 		msg.Answer = nil
 	}
 
-	packed, err := msg.Pack()
-	if err != nil {
-		return nil, err
-	}
-	p.mu.Lock()
-	p.packed[key] = packed
-	p.mu.Unlock()
-	return cloneFakeIPPacked(packed), nil
-}
-
-func cloneFakeIPPacked(packed []byte) []byte {
-	if packed == nil {
-		return nil
-	}
-	out := make([]byte, len(packed))
-	copy(out, packed)
-	return out
+	return msg.Pack()
 }
 
 func (p *FakeIPPolicy) assign(qname string) (netip.Addr, netip.Addr, error) {

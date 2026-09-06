@@ -63,7 +63,9 @@ fallback: direct
 	if err := p.RewriteMsg(aaaaOnlyA, netip.Addr{}, [6]byte{}); err != nil {
 		t.Fatal(err)
 	}
-	mustFakeA(t, aaaaOnlyA, v4)
+	if len(aaaaOnlyA.Answer) != 0 {
+		t.Fatal("A NODATA must not invent a FakeIP without real address evidence")
+	}
 }
 
 func TestRewriteMsgInet6StillFakesAAAA(t *testing.T) {
@@ -195,7 +197,9 @@ fallback: direct
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustPackedFakeA(t, got)
+	if string(got) != string(nodataPacked) {
+		t.Fatal("NODATA must not acquire a FakeIP")
+	}
 
 	aaaaOnly := new(dnsmessage.Msg)
 	aaaaOnly.SetQuestion("chatgpt.com.", dnsmessage.TypeA)
@@ -369,4 +373,83 @@ fallback: direct
 		t.Fatal(err)
 	}
 	mustFakeA(t, proxy, v4)
+}
+
+func TestFakeIPPreservesEmptyAuthorityAndReject(t *testing.T) {
+	store := NewFakeIPStore(t.TempDir(), 8)
+	if err := store.Open(netip.MustParsePrefix("198.18.0.0/24"), netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	m := testFakeIPMatcher(t, "domain(suffix: chatgpt.com) -> AI\nfallback: direct", []string{"AI"})
+	p := NewFakeIPPolicy(config.FakeIP{Enable: true, Ttl: 60}, store, m, nil, 1)
+	for _, typ := range []uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA, dnsmessage.TypeHTTPS} {
+		msg := new(dnsmessage.Msg)
+		msg.SetQuestion("chatgpt.com.", typ)
+		msg.Response = true
+		msg.Ns = []dnsmessage.RR{&dnsmessage.SOA{Hdr: dnsmessage.RR_Header{Name: "chatgpt.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 30}, Ns: "ns.chatgpt.com.", Mbox: "hostmaster.chatgpt.com.", Minttl: 30}}
+		before := msg.String()
+		if err := p.RewriteMsg(msg, netip.Addr{}, [6]byte{}); err != nil {
+			t.Fatal(err)
+		}
+		if msg.String() != before {
+			t.Fatalf("type %d changed empty answer/authority", typ)
+		}
+		msg.Ns = nil // The response reject path clears Answer, without inventing an address.
+		if err := p.RewriteMsg(msg, netip.Addr{}, [6]byte{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(msg.Answer) != 0 {
+			t.Fatalf("type %d revived rejection", typ)
+		}
+	}
+}
+
+func TestFakeIPPackedFollowsIPv4PoolChange(t *testing.T) {
+	store := NewFakeIPStore(t.TempDir(), 8)
+	first := netip.MustParsePrefix("198.18.0.0/24")
+	next := netip.MustParsePrefix("198.19.0.0/24")
+	if err := store.Open(first, netip.Prefix{}); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	p := NewFakeIPPolicy(config.FakeIP{Enable: true, Ttl: 60}, store, nil, nil, 1)
+	before, err := p.packedAnswer("example.com.", dnsmessage.TypeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old dnsmessage.Msg
+	if err := old.Unpack(before); err != nil {
+		t.Fatal(err)
+	}
+	mustFakeA(t, &old, first)
+	store.ApplyRanges(next, netip.Prefix{})
+	after, err := p.packedAnswer("example.com.", dnsmessage.TypeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got dnsmessage.Msg
+	if err := got.Unpack(after); err != nil {
+		t.Fatal(err)
+	}
+	mustFakeA(t, &got, next)
+}
+
+func BenchmarkFakeIPPackedMappingHit(b *testing.B) {
+	store := NewFakeIPStore(b.TempDir(), 8)
+	if err := store.Open(netip.MustParsePrefix("198.18.0.0/24"), netip.Prefix{}); err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	policy := NewFakeIPPolicy(config.FakeIP{Enable: true, Ttl: 60}, store, nil, nil, 1)
+	if _, err := policy.packedAnswer("example.com.", dnsmessage.TypeA); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := policy.packedAnswer("example.com.", dnsmessage.TypeA); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

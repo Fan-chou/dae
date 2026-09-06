@@ -311,6 +311,10 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Selection, resolution and actual failure retries consume one budget.
+	// This context ends when dialing returns, never as a relay lifetime timer.
+	ctx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+	defer cancel()
 	var lastRes *proxyDialResult
 	var lastErr error
 	for attempt := range 2 {
@@ -320,21 +324,13 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		}
 		lastRes = res
 
-		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 		start := time.Now()
-		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
+		conn, err := res.Dialer.DialContext(ctx, res.Network, res.DialTarget)
 		handshake := time.Since(start)
-		cancel()
 		if err == nil {
-			slow := res.Dialer.ObserveHandshake(res.SelectionNetworkTypeObj, handshake)
-			if attempt == 0 && slow && c.canExcludeSlowHandshake(res) {
-				_ = conn.Close()
-				res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
-				p.Excluded = res.Dialer
-				lastErr = fmt.Errorf("slow handshake %s", handshake.Truncate(time.Millisecond))
-				lastRes = res
-				continue
-			}
+			// A slow but successful connection is already usable. Record its
+			// quality for future selections without discarding this handshake.
+			res.Dialer.ObserveHandshake(res.SelectionNetworkTypeObj, handshake)
 			return conn, res, nil
 		}
 		lastErr = err
@@ -392,15 +388,4 @@ func pinSiteSubject(sticky, sniffed string) string {
 		return sticky
 	}
 	return sniffed
-}
-
-func (c *ControlPlane) canExcludeSlowHandshake(res *proxyDialResult) bool {
-	if res == nil || res.Outbound == nil || res.Dialer == nil || res.SelectionNetworkTypeObj == nil {
-		return false
-	}
-	if !res.SelectPath.HasSiteSticky() {
-		return false
-	}
-	d, _, _, err := res.Outbound.SelectWithExclusionResultForSite(res.SelectionNetworkTypeObj, res.IsDialIp, res.Dialer, res.StickySite)
-	return err == nil && d != nil && d != res.Dialer
 }

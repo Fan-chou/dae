@@ -120,6 +120,29 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		q := reqMsg.Question[0]
 		resp = c.rewriteClientPacked(q.Name, q.Qtype, resp, req)
 	}
+	// Ordinary shared answers never inherit another client's OPT. Only the
+	// advertised delivery size is reconstructed; special queries bypass sharing.
+	if dnsQueryCanShare(reqMsg) && (len(reqMsg.Extra) != 0 || (len(resp) >= 12 && binary.BigEndian.Uint16(resp[10:12]) != 0)) {
+		var msg dnsmessage.Msg
+		if err := msg.Unpack(resp); err != nil {
+			return err
+		}
+		extra := msg.Extra[:0]
+		for _, rr := range msg.Extra {
+			if rr.Header().Rrtype != dnsmessage.TypeOPT {
+				extra = append(extra, rr)
+			}
+		}
+		msg.Extra = extra
+		if reqMsg.IsEdns0() != nil {
+			msg.SetEdns0(dnsmessage.MaxMsgSize, false)
+		}
+		var err error
+		resp, err = msg.Pack()
+		if err != nil {
+			return err
+		}
+	}
 	// Optimization: Patch ID directly in the packed buffer if possible.
 	// For UDP, we can use Write() directly. For TCP, we might need WriteMsg or manual length.
 	// However, most responseWriters here are either UDP or wrappers that handle message framing.
@@ -317,4 +340,19 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 	}
 
 	return respMsg
+}
+
+// dnsQueryCanShare recognizes only the semantics represented by the scoped
+// cache key. UDP size is a delivery limit, not a different DNS answer.
+func dnsQueryCanShare(msg *dnsmessage.Msg) bool {
+	if msg == nil || len(msg.Question) != 1 || msg.Question[0].Qclass != dnsmessage.ClassINET || msg.Opcode != dnsmessage.OpcodeQuery || msg.CheckingDisabled || msg.AuthenticatedData || !msg.RecursionDesired {
+		return false
+	}
+	for _, rr := range msg.Extra {
+		opt, ok := rr.(*dnsmessage.OPT)
+		if !ok || opt.Hdr.Ttl != 0 || len(opt.Option) != 0 {
+			return false
+		}
+	}
+	return len(msg.Extra) <= 1
 }

@@ -23,14 +23,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// The response is served through the singleflight cache-replay path: the
-// store-path prepack now initializes deadlineNano, so a TTL-0 entry (dae
-// zeroes downstream answer TTLs and manages caching itself) is immediately
-// stale-window eligible and replayed from the cache. The replayed wire keeps
-// the prepacked RecursionAvailable bit and spells the answer name in full
-// because the responseWriter path re-packs an uncompressed message.
+// TTL0 responses are delivered once without cache replay. Preserve the
+// upstream header, including its unset RA bit, and its zero address TTL.
 const phase0TCPIngressResponseWireHex = "" +
-	"4a2b818000010001000000000b7463702d696e67726573730670686173653004746573740000010001" +
+	"4a2b810000010001000000000b7463702d696e67726573730670686173653004746573740000010001" +
 	"0b7463702d696e67726573730670686173653004746573740000010001000000000004c633644d"
 
 // TestPhase0TCPDNSIngressCorpus_LegacyBaseline fixes the complete ingress

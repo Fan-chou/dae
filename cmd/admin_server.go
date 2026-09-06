@@ -6,7 +6,7 @@
 package cmd
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -494,22 +494,53 @@ func tailLogLines(path string, n int) ([]string, error) {
 		return nil, err
 	}
 	defer file.Close()
-	lines := make([]string, 0, n)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !utf8.ValidString(line) {
-			continue
-		}
-		lines = append(lines, line)
-		if len(lines) > n {
-			lines = lines[len(lines)-n:]
-		}
+	if n <= 0 {
+		return []string{}, nil
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+	stat, err := file.Stat()
+	if err != nil {
 		return nil, err
 	}
+	// Read backwards from a fixed size snapshot. Rotation keeps this fd on
+	// the original file; concurrent truncation is handled by ReadAt's EOF.
+	end := stat.Size()
+	floor := max(int64(0), end-(1<<20))
+	var data []byte
+	for end > floor {
+		start := max(floor, end-16*1024)
+		block := make([]byte, int(end-start))
+		read, err := file.ReadAt(block, start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		data = append(block[:read], data...)
+		end = start
+		if bytes.Count(data, []byte{'\n'}) > n {
+			break
+		}
+	}
+	if end > 0 {
+		if cut := bytes.IndexByte(data, '\n'); cut >= 0 {
+			data = data[cut+1:]
+		} else {
+			return []string{}, nil
+		}
+	}
+	data = bytes.TrimSuffix(data, []byte{'\n'})
+	lines := make([]string, 0, n)
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if utf8.Valid(line) {
+			lines = append(lines, string(line))
+		}
+	}
+	if len(data) == 0 {
+		return []string{}, nil
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+
 	return lines, nil
 }
 

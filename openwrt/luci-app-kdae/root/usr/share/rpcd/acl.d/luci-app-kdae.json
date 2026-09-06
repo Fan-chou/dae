@@ -8,7 +8,7 @@
 				"/etc/dae/local.dae": [ "read" ],
 				"/etc/dae/metadata.json": [ "read" ],
 				"/etc/dae/current/metadata.json": [ "read" ],
-				"/var/log/dae/dae.log": [ "read" ],
+				"/usr/libexec/dae/kdae-log-tail.sh": [ "exec" ],
 				"/var/run/kdae-last-sync.json": [ "read" ],
 				"/etc/init.d/dae": [ "exec" ],
 				"/usr/bin/dae": [ "exec" ],

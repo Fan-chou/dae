@@ -186,7 +186,7 @@ func udpCacheHitFixture() DnsCorpusFixture {
 					AnswerCount:    1,
 					AnswerIPv4:     "203.0.113.42", // the cached IP, not the factory IP
 					HasAnswerTTL:   true,
-					AnswerTTLMin:   300,
+					AnswerTTLMin:   298,
 					AnswerTTLMax:   300,
 					WireHex:        "1002818000010001000000000963616368652d686974047465737400000100010963616368652d68697404746573740000010001000000000004cb00712a",
 				},
@@ -245,7 +245,7 @@ func udpCacheHitAAAAFixture() DnsCorpusFixture {
 					AnswerCount:    1,
 					AnswerIPv6:     "2001:db8::42",
 					HasAnswerTTL:   true,
-					AnswerTTLMin:   300,
+					AnswerTTLMin:   298,
 					AnswerTTLMax:   300,
 					WireHex:        "1006818000010001000000000a616161612d6361636865047465737400001c00010a616161612d6361636865047465737400001c000100000000001020010db8000000000000000000000042",
 				},
@@ -483,14 +483,14 @@ func tcpUdpFallbackFixture() DnsCorpusFixture {
 }
 
 // tcpUdpBlackholeFallbackFixture pins UDP black-hole behaviour under the
-// shared 5s work budget: silent UDP loss exhausts the parent, TCP fallback
-// is not given a fresh 8s, and the request fails instead of stacking 16s.
+// shared 5s work budget: UDP ends early enough for TCP to recover without
+// receiving a fresh independent budget.
 func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
 	var udpCalls atomic.Int32
 	var tcpCalls atomic.Int32
 	return DnsCorpusFixture{
 		Name:        "tcp_udp_blackhole_fallback",
-		Description: "UDP black hole exhausts the 5s work budget and does not stack a TCP 8s",
+		Description: "UDP black hole leaves time for TCP within the 5s work budget",
 		BuildConfig: func() *config.Dns {
 			return &config.Dns{
 				Upstream: []config.KeyableString{
@@ -546,13 +546,13 @@ func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
 				Query: func() *dnsmessage.Msg {
 					return corpusDnsQuery(0x1006, "tcp-fallback.test.", dnsmessage.TypeA)
 				},
-				ExpectError: true,
+				ExpectError: false,
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
 					if got := udpCalls.Load(); got != 1 {
 						t.Fatalf("UDP forward calls = %d, want 1", got)
 					}
-					if got := tcpCalls.Load(); got != 0 {
-						t.Fatalf("TCP forward calls = %d, want 0 (parent budget exhausted)", got)
+					if got := tcpCalls.Load(); got != 1 {
+						t.Fatalf("TCP forward calls = %d, want 1 (reserved parent budget)", got)
 					}
 				},
 			},

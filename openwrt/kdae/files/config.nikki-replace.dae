@@ -17,6 +17,8 @@ include {
 
 global {
     log_level: info
+    # localhost only; 0 disables. Used to profile userspace CPU on 223.
+    pprof_port: 6060
     tproxy_port: 12345
     tproxy_port_protect: true
     auto_config_kernel_parameter: true

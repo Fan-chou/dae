@@ -174,7 +174,7 @@ func (c *DnsController) reprojectCachedRoutes(rt *dnsControllerRuntimeState) {
 			return true
 		}
 		cache, ok := value.(*DnsCache)
-		if !ok || cache == nil || cache.RouteProjectionEpoch == rt.routeProjectionEpoch {
+		if !ok || cache == nil || (cache.RouteOnly && !cache.Deadline.After(now)) || cache.RouteProjectionEpoch == rt.routeProjectionEpoch {
 			return true
 		}
 

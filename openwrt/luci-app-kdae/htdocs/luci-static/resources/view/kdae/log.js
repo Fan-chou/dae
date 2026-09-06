@@ -41,7 +41,7 @@ return view.extend({
 		}
 
 		function loadLog() {
-			return fs.read_direct('/var/log/dae/dae.log', 'text').then(function (content) {
+			return fs.exec_direct('/usr/libexec/dae/kdae-log-tail.sh', [String(maxLines)], 'text').then(function (content) {
 				paint(tailReverse(content, maxLines));
 			}).catch(function (e) {
 				const msg = e.toString().includes('NotFoundError')
