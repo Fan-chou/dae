@@ -462,6 +462,12 @@ func NewControlPlaneWithContextOptions(
 		}
 	}()
 
+	stopLocalAddresses, err := acquireLocalAddressWatcher(bpf, log)
+	if err != nil {
+		return nil, fmt.Errorf("watch host addresses: %w", err)
+	}
+	core.addDeferFunc(func() error { stopLocalAddresses(); return nil })
+
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")

@@ -249,6 +249,7 @@ type bpfMapSpecs struct {
 	TcpOffloadPause          *ebpf.MapSpec `ebpf:"tcp_offload_pause"`
 	TcpOffloadSent           *ebpf.MapSpec `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.MapSpec `ebpf:"listen_socket_map"`
+	LocalAddrMap             *ebpf.MapSpec `ebpf:"local_addr_map"`
 	LpmArrayMap              *ebpf.MapSpec `ebpf:"lpm_array_map"`
 	FakeipLpmMap             *ebpf.MapSpec `ebpf:"fakeip_lpm_map"`
 	OutboundConnectivityMap  *ebpf.MapSpec `ebpf:"outbound_connectivity_map"`
@@ -298,6 +299,7 @@ type bpfMaps struct {
 	TcpOffloadPause          *ebpf.Map `ebpf:"tcp_offload_pause"`
 	TcpOffloadSent           *ebpf.Map `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
+	LocalAddrMap             *ebpf.Map `ebpf:"local_addr_map"`
 	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
 	FakeipLpmMap             *ebpf.Map `ebpf:"fakeip_lpm_map"`
 	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
@@ -331,6 +333,7 @@ func (m *bpfMaps) Close() error {
 		m.TcpOffloadPause,
 		m.TcpOffloadSent,
 		m.ListenSocketMap,
+		m.LocalAddrMap,
 		m.LpmArrayMap,
 		m.FakeipLpmMap,
 		m.OutboundConnectivityMap,

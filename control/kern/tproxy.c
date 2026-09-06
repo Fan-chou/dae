@@ -58,6 +58,17 @@
 #define NOWHERE_IFINDEX 0
 
 #define MAX_INTERFACE_NUM 256
+
+/* Exact host addresses, maintained from netlink by the control plane. A
+ * wildcard UDP socket is not evidence that the packet's destination is local.
+ * Keep this map unpinned: each fresh datapath gets its own address snapshot.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct in6_addr);
+	__type(value, __u8);
+} local_addr_map SEC(".maps");
 #ifndef MAX_MATCH_SET_LEN
 #define MAX_MATCH_SET_LEN \
 	(32 * 32) // Should be sync with common/consts/ebpf_sync_spec.json.
@@ -3023,11 +3034,13 @@ lan_new_flow_route:;
 			  (__u32)pkt->ethh.h_source[5]),
 	};
 
-	// Socket lookup before routing to detect local services (NAT loopback).
-	// UDP only: any matching socket indicates a local service. TCP is not
-	// looked up here because every non-SYN TCP packet already returned above,
+	// Socket lookup before routing for UDP services addressed to this host.
+	// Wildcard listeners also match forwarded destinations, so require an
+	// exact local address before looking up a socket. Never bypass FakeIP.
+	// TCP is not looked up here: every non-SYN packet already returned above,
 	// so only SYNs reach this point and a SYN must go through routing.
-	if (pkt->l4proto == IPPROTO_UDP) {
+	if (pkt->l4proto == IPPROTO_UDP && !dest_is_fakeip &&
+	    bpf_map_lookup_elem(&local_addr_map, &pkt->tuples.five.dip)) {
 		struct bpf_sock_tuple tuple = { 0 };
 		__u32 tuple_size;
 		struct bpf_sock *sk;

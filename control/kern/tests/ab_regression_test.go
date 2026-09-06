@@ -10,6 +10,7 @@ package tests
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -74,7 +75,7 @@ func TestABRegression(t *testing.T) {
 		}
 	})
 
-	t.Run("LAN ingress host UDP listener passthrough", func(t *testing.T) {
+	t.Run("LAN ingress wildcard UDP listener requires local destination", func(t *testing.T) {
 		listener, err := net.ListenUDP("udp4", &net.UDPAddr{
 			IP:   net.IPv4zero,
 			Port: abTestHostUDPPort,
@@ -101,8 +102,19 @@ func TestABRegression(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LAN ingress program: %v", err)
 		}
-		if status != 0 {
-			t.Fatalf("host-netns UDP listener was not passed through: status=%d", status)
+		// The fixture targets 1.1.1.1, not this host. A wildcard listener
+		// must not override its routing result.
+		if status != 7 {
+			t.Fatalf("remote UDP destination bypassed routing: status=%d", status)
+		}
+		local := netip.MustParseAddr("127.0.0.1")
+		if err := obj.LocalAddrMap.Update(local.As16(), uint8(1), ebpf.UpdateAny); err != nil {
+			t.Fatal(err)
+		}
+		copy(data[14+16:14+20], local.AsSlice())
+		status, _, _, err = runBpfProgram(obj.TestAbLanIngressUdpHostListener, data, ctx)
+		if err != nil || status != 0 {
+			t.Fatalf("local UDP listener was not passed through: status=%d err=%v", status, err)
 		}
 	})
 }

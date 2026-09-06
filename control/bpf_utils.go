@@ -344,6 +344,7 @@ type bpfDataplaneMaps struct {
 	DomainRoutingMap         *ebpf.Map `ebpf:"domain_routing_map"`
 	EventRingbuf             *ebpf.Map `ebpf:"event_ringbuf"`
 	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
+	LocalAddrMap             *ebpf.Map `ebpf:"local_addr_map"`
 	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
 	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
 	ParseCtxScratchMap       *ebpf.Map `ebpf:"parse_ctx_scratch_map"`
@@ -685,6 +686,7 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.DomainRoutingMap = dp.DomainRoutingMap
 	bpf.EventRingbuf = dp.EventRingbuf
 	bpf.ListenSocketMap = dp.ListenSocketMap
+	bpf.LocalAddrMap = dp.LocalAddrMap
 	bpf.LpmArrayMap = dp.LpmArrayMap
 	bpf.OutboundConnectivityMap = dp.OutboundConnectivityMap
 	bpf.ParseCtxScratchMap = dp.ParseCtxScratchMap
