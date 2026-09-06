@@ -7,6 +7,7 @@ package control
 
 import (
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ type AdminConnection struct {
 
 // AdminConnectionsSnapshot is the bounded live-flow list. It never includes node URIs.
 type AdminConnectionsSnapshot struct {
+	Scope       string            `json:"scope,omitempty"`
 	Total       int               `json:"total"`
 	Truncated   bool              `json:"truncated"`
 	Connections []AdminConnection `json:"connections"`
@@ -83,9 +85,7 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 			return
 		}
 		total++
-		if len(out) < limit {
-			out = append(out, item)
-		}
+		out = append(out, item)
 	}
 	for _, flow := range tcp {
 		appendFiltered(adminConnectionFromTCP(flow))
@@ -93,10 +93,20 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 	for _, flow := range udp {
 		appendFiltered(adminConnectionFromUDP(flow))
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].ID) != len(out[j].ID) {
+			return len(out[i].ID) < len(out[j].ID)
+		}
+		return out[i].ID < out[j].ID
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	if out == nil {
 		out = []AdminConnection{}
 	}
 	return AdminConnectionsSnapshot{
+		Scope:       m.adminSnapshotID,
 		Total:       total,
 		Truncated:   total > len(out),
 		Connections: out,

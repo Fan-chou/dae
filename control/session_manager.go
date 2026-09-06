@@ -151,8 +151,9 @@ func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
 // generationsMu. Refcount maps are sharded by tuple hash. Established packet
 // forwarding does not take these lifecycle locks.
 type SessionManager struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	adminSnapshotID string
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	closed atomic.Bool
 
@@ -265,10 +266,11 @@ func NewSessionManager(parent context.Context) *SessionManager {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m := &SessionManager{
-		ctx:         ctx,
-		cancel:      cancel,
-		generations: make(map[routing.PolicyEpoch]*sessionGenerationState),
-		pinnedUDP:   make(map[bpfTuplesKey]int),
+		adminSnapshotID: fmt.Sprintf("%d", time.Now().UnixNano()),
+		ctx:             ctx,
+		cancel:          cancel,
+		generations:     make(map[routing.PolicyEpoch]*sessionGenerationState),
+		pinnedUDP:       make(map[bpfTuplesKey]int),
 	}
 	for i := range m.pinnedShards {
 		m.pinnedShards[i].keys = make(map[bpfTuplesKey]int)

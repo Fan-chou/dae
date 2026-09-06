@@ -136,6 +136,20 @@ func TestAdminConnectionsSnapshotTruncates(t *testing.T) {
 	if snap.Total != 3 || !snap.Truncated || len(snap.Connections) != 2 {
 		t.Fatalf("truncated snap = %+v", snap)
 	}
+	if snap.Scope == "" {
+		t.Fatal("missing snapshot scope")
+	}
+	for i := 0; i < 5; i++ {
+		next := manager.adminConnectionsSnapshot(2, adminConnectionFilter{})
+		if next.Connections[0].ID != snap.Connections[0].ID || next.Connections[1].ID != snap.Connections[1].ID {
+			t.Fatal("bounded snapshot order changed")
+		}
+	}
+	other := NewSessionManager(context.Background())
+	defer other.Close()
+	if other.adminConnectionsSnapshot(2, adminConnectionFilter{}).Scope == snap.Scope {
+		t.Fatal("different managers share scope")
+	}
 	if clampAdminConnectionLimit(0) != adminConnectionsDefaultLimit || clampAdminConnectionLimit(4096) != adminConnectionsMaxLimit {
 		t.Fatalf("clamp 0=%d 4096=%d", clampAdminConnectionLimit(0), clampAdminConnectionLimit(4096))
 	}
