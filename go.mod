@@ -15,7 +15,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+	github.com/olicesx/quic-go v0.0.0-20260907151012-7d0036ec968d
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -114,11 +114,11 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Published Fan-chou sync: quic-go fbf90cb0, descended from fdae pin 8cfce08b.
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+// Published fork includes cancellable DATAGRAM enqueue and queue observations.
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d
 
 //replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
-// Published outbound retains fdae reply identity and adds AnyTLS lifecycle/memory fixes.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260906020559-8ad471b39caa
+// Published outbound includes UDP deadlines, connected-socket GSO and Hy2 observations.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260907151152-f3e853a8586f
