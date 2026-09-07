@@ -19,10 +19,10 @@ const (
 	// Shadowsocks+shadow-tls).
 	UdpForwardNone UdpForwardMode = iota
 	// UdpForwardReliableOrdered multiplexes UDP on a reliable ordered stream
-	// (AnyTLS UoT, VLESS/VMess/Trojan, WS/gRPC, TUIC stream relay).
+	// (AnyTLS UoT, VLESS/VMess/Trojan, Juicity ordinary UDP, WS/gRPC, TUIC stream relay).
 	UdpForwardReliableOrdered
 	// UdpForwardDatagram is hop-by-hop unreliable datagram UDP (Hy2/TUIC
-	// native/Juicity/SS-UDP including v2ray-plugin passthrough/SOCKS5/direct).
+	// native/SS-UDP including v2ray-plugin passthrough/SOCKS5/direct).
 	UdpForwardDatagram
 )
 
@@ -123,7 +123,7 @@ func udpForwardModeFromProtocolToken(token, name string) UdpForwardMode {
 	case "block":
 		return UdpForwardNone
 	case "hysteria", "hysteria1", "hysteria2", "hy", "hy2",
-		"tuic", "tuic5", "juicity",
+		"tuic", "tuic5",
 		"ss", "shadowsocks", "shadowsocksr", "ssr",
 		"socks", "socks5":
 		return UdpForwardDatagram
@@ -132,7 +132,7 @@ func udpForwardModeFromProtocolToken(token, name string) UdpForwardMode {
 		return UdpForwardNone
 	case "shadow-tls", "shadowtls":
 		return UdpForwardNone
-	case "anytls",
+	case "juicity", "anytls",
 		"vmess", "vless",
 		"trojan", "trojan-go",
 		"anytls-go":
@@ -185,14 +185,14 @@ func udpForwardModeFromLinkScheme(scheme string) UdpForwardMode {
 	switch strings.ToLower(strings.TrimSpace(scheme)) {
 	case "ss", "ssr", "shadowsocks", "shadowsocksr",
 		"hysteria", "hysteria1", "hysteria2", "hy", "hy2",
-		"tuic", "tuic5", "juicity",
+		"tuic", "tuic5",
 		"socks", "socks5", "direct":
 		return UdpForwardDatagram
 	case "http", "https", "naive", "naive+https", "socks4", "socks4a":
 		return UdpForwardNone
 	case "shadow-tls", "shadowtls":
 		return UdpForwardNone
-	case "vless", "vmess", "trojan", "trojan-go", "anytls", "anytls-go":
+	case "juicity", "vless", "vmess", "trojan", "trojan-go", "anytls", "anytls-go":
 		return UdpForwardReliableOrdered
 	default:
 		return UdpForwardDatagram

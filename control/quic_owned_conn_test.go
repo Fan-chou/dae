@@ -146,3 +146,10 @@ var (
 	_ io.Closer            = (*ownedPacketCloser)(nil)
 	_ quic.EarlyConnection = (*stubEarlyConn)(nil)
 )
+
+func (s *stubEarlyConn) SendDatagramContext(ctx context.Context, p []byte) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	return s.SendDatagram(p)
+}

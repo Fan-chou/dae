@@ -1,0 +1,1077 @@
+diff --git a/protocol/hysteria2/client/client.go b/protocol/hysteria2/client/client.go
+index febc5d7..42b0245 100644
+--- a/protocol/hysteria2/client/client.go
++++ b/protocol/hysteria2/client/client.go
+@@ -553,10 +553,10 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
+ 	}
+ }
+ 
+-func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
++func (io *udpIOImpl) SendMessage(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
+ 	msgN := msg.Serialize(buf)
+ 	if msgN < 0 {
+ 		return &quic.DatagramTooLargeError{MaxDataLen: int64(len(buf))}
+ 	}
+-	return io.Conn.SendDatagram(buf[:msgN])
++	return io.Conn.SendDatagramContext(ctx, buf[:msgN])
+ }
+diff --git a/protocol/hysteria2/client/client_test.go b/protocol/hysteria2/client/client_test.go
+index d8314a5..11f83c5 100644
+--- a/protocol/hysteria2/client/client_test.go
++++ b/protocol/hysteria2/client/client_test.go
+@@ -82,7 +82,7 @@ func TestUDPIOImplSendMessageReturnsDatagramTooLargeOnSerializeOverflow(t *testi
+ 		Data:      bytes.Repeat([]byte("x"), 64),
+ 	}
+ 
+-	err := io.SendMessage(make([]byte, 16), msg)
++	err := io.SendMessage(context.Background(), make([]byte, 16), msg)
+ 	var errTooLarge *quic.DatagramTooLargeError
+ 	if !errors.As(err, &errTooLarge) {
+ 		t.Fatalf("SendMessage() error = %T %v, want DatagramTooLargeError", err, err)
+@@ -262,3 +262,10 @@ func TestClientCloseDefersTransportCloseUntilActiveUDPSessionsDrain(t *testing.T
+ 		t.Fatalf("client resources not cleared after UDP drain: conn=%v pktConn=%v udpSM=%v", c.conn, c.pktConn, c.udpSM)
+ 	}
+ }
++
++func (c *closeTrackingQuicConn) SendDatagramContext(ctx context.Context, p []byte) error {
++	if err := context.Cause(ctx); err != nil {
++		return err
++	}
++	return c.SendDatagram(p)
++}
+diff --git a/protocol/hysteria2/client/udp.go b/protocol/hysteria2/client/udp.go
+index e20c97a..02f3a99 100644
+--- a/protocol/hysteria2/client/udp.go
++++ b/protocol/hysteria2/client/udp.go
+@@ -2,6 +2,7 @@ package client
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"io"
+ 	"net"
+@@ -43,7 +44,7 @@ var sendBufPool = sync.Pool{
+ 
+ type udpIO interface {
+ 	ReceiveMessage() (*protocol.UDPMessage, error)
+-	SendMessage([]byte, *protocol.UDPMessage) error
++	SendMessage(context.Context, []byte, *protocol.UDPMessage) error
+ }
+ 
+ type udpConn struct {
+@@ -51,7 +52,7 @@ type udpConn struct {
+ 	D         *frag.Defragger
+ 	ReceiveCh chan *protocol.UDPMessage
+ 	SendBuf   []byte
+-	SendFunc  func([]byte, *protocol.UDPMessage) error
++	SendFunc  func(context.Context, []byte, *protocol.UDPMessage) error
+ 	CloseFunc func()
+ 	closed    atomic.Bool
+ 
+@@ -64,10 +65,10 @@ type udpConn struct {
+ 	receiveMu sync.Mutex
+ 	// deliverMu serializes RegisterPacketReceiver's drain against feed's
+ 	// deliver/queue path so queued datagrams stay FIFO with live ones.
+-	deliverMu sync.Mutex
+-	muTimer   sync.Mutex
+-	timer     *time.Timer
+-	target    string
++	deliverMu     sync.Mutex
++	readDeadline  netproxy.PacketDeadline
++	writeDeadline netproxy.PacketDeadline
++	target        string
+ 	// targetBytes is target as bytes for the per-datagram default-target
+ 	// comparison (message addresses are byte slices since they stopped
+ 	// being materialized as strings on receive).
+@@ -107,7 +108,16 @@ func (u *udpConn) Write(b []byte) (n int, err error) {
+ 
+ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
+ 	for {
+-		msg := <-u.ReceiveCh
++		ctx := u.readDeadline.Context()
++		if err := context.Cause(ctx); err != nil {
++			return 0, netip.AddrPort{}, err
++		}
++		var msg *protocol.UDPMessage
++		select {
++		case msg = <-u.ReceiveCh:
++		case <-ctx.Done():
++			return 0, netip.AddrPort{}, context.Cause(ctx)
++		}
+ 		if msg == nil {
+ 			// Closed
+ 			return 0, netip.AddrPort{}, io.EOF
+@@ -255,6 +265,11 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+ 		return 0, coreErrs.ClosedError{}
+ 	}
+ 
++	ctx := u.writeDeadline.Context()
++	if err := context.Cause(ctx); err != nil {
++		return 0, err
++	}
++
+ 	// Try no frag first
+ 	msg := &protocol.UDPMessage{
+ 		SessionID: u.ID,
+@@ -270,7 +285,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+ 	if msg.Size() > len(u.SendBuf) {
+ 		err = &quic.DatagramTooLargeError{MaxDataLen: int64(len(u.SendBuf))}
+ 	} else {
+-		err = u.SendFunc(u.SendBuf, msg)
++		err = u.SendFunc(ctx, u.SendBuf, msg)
+ 	}
+ 	var errTooLarge *quic.DatagramTooLargeError
+ 	if errors.As(err, &errTooLarge) {
+@@ -281,7 +296,7 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+ 			return 0, coreErrs.ProtocolError{Message: fragErr.Error()}
+ 		}
+ 		for _, fMsg := range fMsgs {
+-			err := u.SendFunc(u.SendBuf, &fMsg)
++			err := u.SendFunc(ctx, u.SendBuf, &fMsg)
+ 			if err != nil {
+ 				return 0, err
+ 			}
+@@ -293,48 +308,21 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+ }
+ 
+ func (u *udpConn) Close() error {
+-	u.stopDeadlineTimer()
++	u.readDeadline.Close()
++	u.writeDeadline.Close()
+ 	u.CloseFunc()
+ 	return nil
+ }
+ 
+-func (u *udpConn) stopDeadlineTimer() {
+-	u.muTimer.Lock()
+-	defer u.muTimer.Unlock()
+-	if u.timer != nil {
+-		u.timer.Stop()
+-		u.timer = nil
+-	}
+-}
+-
+ func (u *udpConn) SetDeadline(t time.Time) error {
+-	u.muTimer.Lock()
+-	defer u.muTimer.Unlock()
+-	if u.timer != nil {
+-		u.timer.Stop()
+-		u.timer = nil
++	if err := u.SetReadDeadline(t); err != nil {
++		return err
+ 	}
+-	if t.IsZero() {
+-		return nil
+-	}
+-	u.timer = time.AfterFunc(time.Until(t), func() {
+-		u.muTimer.Lock()
+-		u.timer = nil
+-		u.muTimer.Unlock()
+-		_ = u.Close()
+-	})
+-	return nil
+-}
+-
+-func (u *udpConn) SetReadDeadline(t time.Time) error {
+-	// FIXME: Single direction.
+-	return u.SetDeadline(t)
+-}
+-
+-func (u *udpConn) SetWriteDeadline(t time.Time) error {
+-	// FIXME: Single direction.
+-	return u.SetDeadline(t)
++	return u.SetWriteDeadline(t)
+ }
++func (u *udpConn) SetReadDeadline(t time.Time) error            { return u.readDeadline.Set(t) }
++func (u *udpConn) SetWriteDeadline(t time.Time) error           { return u.writeDeadline.Set(t) }
++func (u *udpConn) SupportsIndependentPacketWriteDeadline() bool { return true }
+ 
+ type udpSessionManager struct {
+ 	io udpIO
+@@ -474,7 +462,9 @@ func (m *udpSessionManager) closeCleanup() {
+ 		close(m.done)
+ 	}
+ 	var onIdle func()
++	conns := make([]*udpConn, 0, len(m.m))
+ 	for _, conn := range m.m {
++		conns = append(conns, conn)
+ 		if cb := m.closeLocked(conn); cb != nil {
+ 			onIdle = cb
+ 		}
+@@ -485,6 +475,9 @@ func (m *udpSessionManager) closeCleanup() {
+ 	}
+ 	m.closed = true
+ 	m.mutex.Unlock()
++	for _, conn := range conns {
++		conn.releaseSendBuffer()
++	}
+ 
+ 	if onIdle != nil {
+ 		onIdle()
+@@ -564,7 +557,6 @@ func (m *udpSessionManager) openUDP(addr string, replyAddr netip.AddrPort) (netp
+ 		transportDone: m.done,
+ 
+ 		writeMu:           sync.Mutex{},
+-		muTimer:           sync.Mutex{},
+ 		target:            addr,
+ 		targetBytes:       []byte(addr),
+ 		writeAddrStr:      addr,
+@@ -584,12 +576,25 @@ func (m *udpSessionManager) close(conn *udpConn) {
+ 	m.mutex.Lock()
+ 	onIdle := m.closeLocked(conn)
+ 	m.mutex.Unlock()
++	conn.releaseSendBuffer()
+ 
+ 	if onIdle != nil {
+ 		onIdle()
+ 	}
+ }
+ 
++func (conn *udpConn) releaseSendBuffer() {
++	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
++	// returning SendBuf so a concurrent write cannot use-after-put the
++	// serialize buffer.
++	conn.writeMu.Lock()
++	if conn.SendBuf != nil {
++		sendBufPool.Put(conn.SendBuf)
++		conn.SendBuf = nil
++	}
++	conn.writeMu.Unlock()
++}
++
+ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
+ 	if conn == nil || conn.closed.Load() {
+ 		return nil
+@@ -600,7 +605,8 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
+ 	conn.closed.Store(true)
+ 	conn.receiver = nil
+ 	conn.receiverMu.Unlock()
+-	conn.stopDeadlineTimer()
++	conn.readDeadline.Close()
++	conn.writeDeadline.Close()
+ 	// Return any partially-reassembled fragments to the quic-go pool; the
+ 	// session is dead and nobody will complete the reassembly. Take
+ 	// receiveMu: concurrent deliverMessage/ReadFrom hold it around D.Feed,
+@@ -613,15 +619,6 @@ func (m *udpSessionManager) closeLocked(conn *udpConn) func() {
+ 		releaseUDPMessage(msg)
+ 	}
+ 	delete(m.m, conn.ID)
+-	// WriteTo holds writeMu around Serialize+SendDatagram. Take it before
+-	// returning SendBuf so a concurrent write cannot use-after-put the
+-	// serialize buffer.
+-	conn.writeMu.Lock()
+-	if conn.SendBuf != nil {
+-		sendBufPool.Put(conn.SendBuf)
+-		conn.SendBuf = nil
+-	}
+-	conn.writeMu.Unlock()
+ 	if m.draining && len(m.m) == 0 {
+ 		onIdle := m.onIdle
+ 		m.onIdle = nil
+diff --git a/protocol/hysteria2/client/udp_demux_test.go b/protocol/hysteria2/client/udp_demux_test.go
+index 88af041..6be1432 100644
+--- a/protocol/hysteria2/client/udp_demux_test.go
++++ b/protocol/hysteria2/client/udp_demux_test.go
+@@ -1,6 +1,7 @@
+ package client
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"sync"
+ 	"sync/atomic"
+@@ -27,7 +28,7 @@ func (io *chanUDPIO) ReceiveMessage() (*protocol.UDPMessage, error) {
+ 	}
+ }
+ 
+-func (io *chanUDPIO) SendMessage([]byte, *protocol.UDPMessage) error { return nil }
++func (io *chanUDPIO) SendMessage(context.Context, []byte, *protocol.UDPMessage) error { return nil }
+ 
+ // TestUDPSessionManagerDemuxPreservesPerSessionOrder is the ordering
+ // counterpart of the parallel-demux test above: datagrams of one session
+diff --git a/protocol/hysteria2/client/udp_test.go b/protocol/hysteria2/client/udp_test.go
+index 60732b0..57e5593 100644
+--- a/protocol/hysteria2/client/udp_test.go
++++ b/protocol/hysteria2/client/udp_test.go
+@@ -2,9 +2,11 @@ package client
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+-	"io"
++	"net"
+ 	"net/netip"
++	"os"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -19,8 +21,8 @@ import (
+ 
+ type noopUDPTestIO struct{}
+ 
+-func (noopUDPTestIO) ReceiveMessage() (*protocol.UDPMessage, error)  { return nil, nil }
+-func (noopUDPTestIO) SendMessage([]byte, *protocol.UDPMessage) error { return nil }
++func (noopUDPTestIO) ReceiveMessage() (*protocol.UDPMessage, error)                   { return nil, nil }
++func (noopUDPTestIO) SendMessage(context.Context, []byte, *protocol.UDPMessage) error { return nil }
+ 
+ func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
+ 	t.Helper()
+@@ -36,7 +38,7 @@ func TestUDPConnWriteToSerializesSendFunc(t *testing.T) {
+ 		ID:        1,
+ 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+ 		SendBuf:   make([]byte, protocol.MaxUDPSize),
+-		SendFunc: func(buf []byte, msg *protocol.UDPMessage) error {
++		SendFunc: func(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
+ 			if len(buf) != protocol.MaxUDPSize {
+ 				t.Fatalf("unexpected send buffer length: got %d want %d", len(buf), protocol.MaxUDPSize)
+ 			}
+@@ -160,9 +162,9 @@ func TestUDPConnCloseConcurrentWrite(t *testing.T) {
+ 	firstWrite := make(chan struct{})
+ 	var firstWriteOnce sync.Once
+ 	originalSend := u.SendFunc
+-	u.SendFunc = func(buf []byte, msg *protocol.UDPMessage) error {
++	u.SendFunc = func(ctx context.Context, buf []byte, msg *protocol.UDPMessage) error {
+ 		firstWriteOnce.Do(func() { close(firstWrite) })
+-		return originalSend(buf, msg)
++		return originalSend(ctx, buf, msg)
+ 	}
+ 
+ 	u.receiverMu.Lock()
+@@ -634,6 +636,12 @@ func TestUDPConnSetDeadlineZeroClearsTimer(t *testing.T) {
+ 		t.Fatalf("SetDeadline(zero) error = %v", err)
+ 	}
+ 	time.Sleep(75 * time.Millisecond)
++	if err := u.readDeadline.Context().Err(); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.writeDeadline.Context().Err(); err != nil {
++		t.Fatal(err)
++	}
+ 	if got := closes.Load(); got != 0 {
+ 		t.Fatalf("CloseFunc calls after clearing deadline = %d, want 0", got)
+ 	}
+@@ -658,33 +666,33 @@ func TestUDPConnCloseStopsDeadlineTimer(t *testing.T) {
+ 	}
+ }
+ 
+-func TestUDPConnDeadlineClosesSession(t *testing.T) {
+-	var closes atomic.Int32
+-	var closeOnce sync.Once
+-	u := &udpConn{
+-		ID:        1,
+-		D:         &frag.Defragger{},
+-		ReceiveCh: make(chan *protocol.UDPMessage, 1),
++func TestUDPConnWriteDeadlinePreservesReadAndSession(t *testing.T) {
++	m := &udpSessionManager{io: noopUDPTestIO{}, m: make(map[uint32]*udpConn), nextID: 1, done: make(chan struct{})}
++	raw, err := m.NewUDP("192.0.2.1:27015")
++	if err != nil {
++		t.Fatal(err)
+ 	}
+-	u.CloseFunc = func() {
+-		closes.Add(1)
+-		closeOnce.Do(func() { close(u.ReceiveCh) })
++	u := raw.(*udpConn)
++	defer u.Close()
++	if err := u.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
++		t.Fatal(err)
+ 	}
+-
+-	if err := u.SetDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
+-		t.Fatalf("SetDeadline() error = %v", err)
++	if _, err := u.WriteTo([]byte("tick"), u.target); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("write: %v", err)
+ 	}
+-
+-	select {
+-	case msg := <-u.ReceiveCh:
+-		if msg != nil {
+-			t.Fatalf("ReceiveCh yielded %v, want closed channel", msg)
+-		}
+-	case <-time.After(time.Second):
+-		t.Fatal("deadline did not close UDP session")
++	u.ReceiveCh <- &protocol.UDPMessage{Addr: []byte(u.target), Data: []byte("reply"), FragCount: 1}
++	buf := make([]byte, 64)
++	if n, _, err := u.ReadFrom(buf); err != nil || string(buf[:n]) != "reply" {
++		t.Fatalf("read: %d %v", n, err)
+ 	}
+-	if got := closes.Load(); got != 1 {
+-		t.Fatalf("CloseFunc calls after deadline = %d, want 1", got)
++	if u.closed.Load() {
++		t.Fatal("deadline closed the session")
++	}
++	if err := u.SetWriteDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := u.WriteTo([]byte("tick"), u.target); err != nil {
++		t.Fatal(err)
+ 	}
+ }
+ 
+@@ -715,14 +723,14 @@ func TestUDPConnDeadlineCanBeAppliedWhileReadIsPending(t *testing.T) {
+ 
+ 	select {
+ 	case err := <-errCh:
+-		if err != io.EOF {
+-			t.Fatalf("ReadFrom() error = %T %v, want EOF after close", err, err)
++		if !errors.Is(err, os.ErrDeadlineExceeded) {
++			t.Fatalf("ReadFrom deadline: %v", err)
+ 		}
+ 	case <-time.After(time.Second):
+-		t.Fatal("ReadFrom did not unblock after deadline closed the session")
++		t.Fatal("ReadFrom did not unblock on read deadline")
+ 	}
+-	if got := closes.Load(); got != 1 {
+-		t.Fatalf("CloseFunc calls after pending read deadline = %d, want 1", got)
++	if got := closes.Load(); got != 0 {
++		t.Fatalf("read deadline closed session: %d", got)
+ 	}
+ }
+ 
+@@ -764,7 +772,7 @@ func TestUDPConnWriteToFragmentsWhenLocalSendBufferIsTooSmall(t *testing.T) {
+ 		ID:        7,
+ 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+ 		SendBuf:   make([]byte, 32),
+-		SendFunc: func(_ []byte, msg *protocol.UDPMessage) error {
++		SendFunc: func(_ context.Context, _ []byte, msg *protocol.UDPMessage) error {
+ 			msgCopy := *msg
+ 			msgCopy.Data = append([]byte(nil), msg.Data...)
+ 			sent = append(sent, msgCopy)
+@@ -804,7 +812,7 @@ func TestUDPConnWriteToRejectsUnfragmentableDatagram(t *testing.T) {
+ 		ID:        7,
+ 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+ 		SendBuf:   make([]byte, 8),
+-		SendFunc: func(_ []byte, _ *protocol.UDPMessage) error {
++		SendFunc: func(_ context.Context, _ []byte, _ *protocol.UDPMessage) error {
+ 			t.Fatal("SendFunc should not be called when fragmentation is impossible")
+ 			return nil
+ 		},
+@@ -1063,7 +1071,7 @@ func TestUDPConnWriteToRejectsUndersizedDatagram(t *testing.T) {
+ 		ID:        1,
+ 		ReceiveCh: make(chan *protocol.UDPMessage, 1),
+ 		SendBuf:   make([]byte, protocol.MaxUDPSize),
+-		SendFunc: func([]byte, *protocol.UDPMessage) error {
++		SendFunc: func(context.Context, []byte, *protocol.UDPMessage) error {
+ 			return &quic.DatagramTooLargeError{MaxDataLen: 8}
+ 		},
+ 		CloseFunc: func() {},
+@@ -1082,3 +1090,65 @@ func TestUDPConnWriteToRejectsUndersizedDatagram(t *testing.T) {
+ 		t.Fatalf("ProtocolError.Message = %q, want %q", protoErr.Message, frag.ErrMaxSizeTooSmall.Error())
+ 	}
+ }
++
++func TestUDPSessionCloseCancelsSendWithoutBlockingSibling(t *testing.T) {
++	m := &udpSessionManager{io: noopUDPTestIO{}, m: make(map[uint32]*udpConn), nextID: 1, done: make(chan struct{})}
++	raw, err := m.NewUDP("192.0.2.1:27015")
++	if err != nil {
++		t.Fatal(err)
++	}
++	u := raw.(*udpConn)
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	defer releaseOnce.Do(func() { close(release) })
++	u.SendFunc = func(ctx context.Context, _ []byte, _ *protocol.UDPMessage) error {
++		close(entered)
++		<-ctx.Done()
++		// Emulate delayed sender cleanup even after cancellation. This must no
++		// longer retain the manager's lock and block unrelated sessions.
++		<-release
++		return context.Cause(ctx)
++	}
++	written, closed := make(chan error, 1), make(chan struct{})
++	go func() { _, err := u.WriteTo([]byte("tick"), u.target); written <- err }()
++	<-entered
++	go func() { _ = u.Close(); close(closed) }()
++	select {
++	case <-u.writeDeadline.Context().Done():
++	case <-time.After(time.Second):
++		t.Fatal("close did not cancel write")
++	}
++	opened := make(chan struct{})
++	go func() {
++		other, e := m.NewUDP("192.0.2.2:27016")
++		if e != nil {
++			t.Error(e)
++		} else {
++			_ = other.Close()
++		}
++		close(opened)
++	}()
++	select {
++	case <-opened:
++	case <-time.After(time.Second):
++		t.Fatal("sibling creation blocked on sender cleanup")
++	}
++	// Wait only after releasing the simulated sender.
++	defer func() {
++		select {
++		case <-closed:
++		case <-time.After(time.Second):
++			t.Error("close did not finish")
++		}
++		select {
++		case err := <-written:
++			if !errors.Is(err, net.ErrClosed) {
++				t.Error(err)
++			}
++		case <-time.After(time.Second):
++			t.Error("write did not return")
++		}
++	}()
++
++	releaseOnce.Do(func() { close(release) })
++}
+diff --git a/protocol/juicity/client_test.go b/protocol/juicity/client_test.go
+index 003ea90..bab8b11 100644
+--- a/protocol/juicity/client_test.go
++++ b/protocol/juicity/client_test.go
+@@ -743,3 +743,10 @@ func TestNewDialerKeepsDatagramsDisabled(t *testing.T) {
+ 		t.Fatal("juicity must keep EnableDatagrams=false")
+ 	}
+ }
++
++func (c *juicityTestQUICConn) SendDatagramContext(ctx context.Context, p []byte) error {
++	if err := context.Cause(ctx); err != nil {
++		return err
++	}
++	return c.SendDatagram(p)
++}
+diff --git a/protocol/juicity/stream_packet_conn.go b/protocol/juicity/stream_packet_conn.go
+index 2c18ac7..ab61437 100644
+--- a/protocol/juicity/stream_packet_conn.go
++++ b/protocol/juicity/stream_packet_conn.go
+@@ -113,3 +113,6 @@ func SealUDP(metadata trojanc.Metadata, dst []byte, data []byte) []byte {
+ 	binary.BigEndian.PutUint16(dst[n:], uint16(len(data)))
+ 	return dst[:n+2+len(data)]
+ }
++
++// The underlying QUIC stream supports independent write deadlines.
++func (c *PacketConn) SupportsIndependentPacketWriteDeadline() bool { return true }
+diff --git a/protocol/tuic/client.go b/protocol/tuic/client.go
+index 5e6ab7c..1cf6586 100644
+--- a/protocol/tuic/client.go
++++ b/protocol/tuic/client.go
+@@ -293,6 +293,11 @@ func (t *clientImpl) deferQuicConn(quicConn quic.Connection, err error) {
+ 		t.forceClose(quicConn, err)
+ 		return
+ 	}
++	// Association cancellation and send-queue pressure are local, not tunnel failure.
++	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) ||
++		errors.Is(err, quic.ErrDatagramQueueFullTimeout) {
++		return
++	}
+ 	// Only close connection on non-temporary errors. Stream exhaustion is a
+ 	// per-attempt condition: quic-go reports it as *quic.StreamLimitReachedError
+ 	// ("too many open streams"), which IsStreamExhausted matches, so the shared
+diff --git a/protocol/tuic/client_lifecycle_test.go b/protocol/tuic/client_lifecycle_test.go
+index df2b0dc..191340e 100644
+--- a/protocol/tuic/client_lifecycle_test.go
++++ b/protocol/tuic/client_lifecycle_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"io"
+ 	"net"
++	"os"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -47,6 +48,13 @@ func TestDeferQuicConnKeepsAliveOnDatagramQueueTimeout(t *testing.T) {
+ 	if closed.Load() {
+ 		t.Fatal("live-connection datagram send-queue timeout must not invoke the client close callback")
+ 	}
++	for _, err := range []error{net.ErrClosed, context.Canceled, os.ErrDeadlineExceeded} {
++		client.deferQuicConn(live, err)
++		if client.closed.Load() {
++			t.Fatalf("association-local error closed transport: %v", err)
++		}
++	}
++
+ }
+ 
+ func TestDeferQuicConnStillClosesOnPermanentError(t *testing.T) {
+@@ -174,3 +182,10 @@ func TestDeferQuicConnRetiresClosedConnectionOnTemporaryError(t *testing.T) {
+ 		t.Fatal("closed-connection temporary errors must invoke the client close callback")
+ 	}
+ }
++
++func (c *lifecycleQuicConn) SendDatagramContext(ctx context.Context, p []byte) error {
++	if err := context.Cause(ctx); err != nil {
++		return err
++	}
++	return c.SendDatagram(p)
++}
+diff --git a/protocol/tuic/frag.go b/protocol/tuic/frag.go
+index 05337ef..c3f5e1b 100644
+--- a/protocol/tuic/frag.go
++++ b/protocol/tuic/frag.go
+@@ -1,6 +1,7 @@
+ package tuic
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"net/netip"
+ 	"sync/atomic"
+@@ -51,6 +52,10 @@ func fragmentPackets(packet *Packet, fragSize int) ([]*Packet, error) {
+ }
+ 
+ func fragWriteNative(quicConn quic.Connection, packet *Packet, buf *bytes.Buffer, fragSize int) (err error) {
++	return fragWriteNativeContext(context.Background(), quicConn, packet, buf, fragSize)
++}
++
++func fragWriteNativeContext(ctx context.Context, quicConn quic.Connection, packet *Packet, buf *bytes.Buffer, fragSize int) (err error) {
+ 	frags, err := fragmentPackets(packet, fragSize)
+ 	if err != nil {
+ 		return err
+@@ -62,7 +67,7 @@ func fragWriteNative(quicConn quic.Connection, packet *Packet, buf *bytes.Buffer
+ 			return
+ 		}
+ 		data := buf.Bytes()
+-		err = quicConn.SendDatagram(data)
++		err = quicConn.SendDatagramContext(ctx, data)
+ 		if err != nil {
+ 			return
+ 		}
+diff --git a/protocol/tuic/packet.go b/protocol/tuic/packet.go
+index 2cff456..e3f6c78 100644
+--- a/protocol/tuic/packet.go
++++ b/protocol/tuic/packet.go
+@@ -1,10 +1,10 @@
+ package tuic
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"net"
+ 	"net/netip"
+-	"os"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -200,17 +200,12 @@ type quicStreamPacketConn struct {
+ 	closeErr  error
+ 	closed    atomic.Bool
+ 
+-	// deadlineExceeded records that the conn was torn down by its own
+-	// deadline timer rather than an explicit Close, so ReadFrom can report a
+-	// timeout instead of net.ErrClosed.
+-	deadlineExceeded atomic.Bool
+-
+ 	deFraggers sync.Map
+ 
+ 	lastDeFraggerCleanupNano atomic.Int64
+ 
+-	muTimer       sync.Mutex
+-	deadlineTimer *time.Timer
++	readDeadline  netproxy.PacketDeadline
++	writeDeadline netproxy.PacketDeadline
+ }
+ 
+ var deFraggerIdleTimeout = 30 * time.Second
+@@ -392,6 +387,8 @@ func (b *deFraggerBucket) feed(packet *Packet, p []byte, nowNano int64) (n int,
+ func (q *quicStreamPacketConn) Close() error {
+ 	q.closeOnce.Do(func() {
+ 		q.closed.Store(true)
++		q.readDeadline.Close()
++		q.writeDeadline.Close()
+ 		q.closeErr = q.close()
+ 	})
+ 	return q.closeErr
+@@ -432,8 +429,12 @@ func (q *quicStreamPacketConn) close() (err error) {
+ 		if err != nil {
+ 			return
+ 		}
++		// Dissociate is best effort. A flow-controlled control stream must not
++		// turn association Close into an unbounded wait after cancelling UDP.
++		_ = stream.SetWriteDeadline(time.Now().Add(time.Second))
+ 		_, err = buf.WriteTo(stream)
+ 		if err != nil {
++			stream.CancelWrite(0)
+ 			return
+ 		}
+ 		err = stream.Close()
+@@ -475,41 +476,15 @@ func (q *quicStreamPacketConn) maybeCleanupDeFraggers(nowNano int64) {
+ }
+ 
+ func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
+-	q.muTimer.Lock()
+-	defer q.muTimer.Unlock()
+-	if t.IsZero() {
+-		// A zero time clears the deadline per the net.Conn contract;
+-		// time.Until would yield a hugely negative duration and fire the
+-		// close callback immediately.
+-		if q.deadlineTimer != nil {
+-			q.deadlineTimer.Stop()
+-			q.deadlineTimer = nil
+-		}
+-		return nil
+-	}
+-	dur := time.Until(t)
+-	if q.deadlineTimer != nil {
+-		q.deadlineTimer.Reset(dur)
+-	} else {
+-		q.deadlineTimer = time.AfterFunc(dur, func() {
+-			q.muTimer.Lock()
+-			defer q.muTimer.Unlock()
+-			q.deadlineExceeded.Store(true)
+-			_ = q.Close()
+-			q.deadlineTimer = nil
+-		})
++	if err := q.SetReadDeadline(t); err != nil {
++		return err
+ 	}
+-	return nil
+-}
+-
+-func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error {
+-	// FIXME: Single direction.
+-	return q.SetDeadline(t)
++	return q.SetWriteDeadline(t)
+ }
+-
+-func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error {
+-	// FIXME: Single direction.
+-	return q.SetDeadline(t)
++func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error  { return q.readDeadline.Set(t) }
++func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error { return q.writeDeadline.Set(t) }
++func (q *quicStreamPacketConn) SupportsIndependentPacketWriteDeadline() bool {
++	return q.udpRelayMode != common.QUIC
+ }
+ 
+ func (q *quicStreamPacketConn) addrPortFrom(addr *Address) netip.AddrPort {
+@@ -541,21 +516,21 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
+ 	q.mu.Unlock()
+ 
+ 	if incomingPackets == nil {
+-		if q.deadlineExceeded.Load() {
+-			return 0, netip.AddrPort{}, os.ErrDeadlineExceeded
+-		}
+ 		return 0, netip.AddrPort{}, net.ErrClosed
+ 	}
+-
++	ctx := q.readDeadline.Context()
+ 	for {
+-		packet, closed := incomingPackets.PopFrontBlock()
+-		if closed {
+-			if q.deadlineExceeded.Load() {
+-				err = os.ErrDeadlineExceeded
+-			} else {
+-				err = net.ErrClosed
++		if err := context.Cause(ctx); err != nil {
++			return 0, netip.AddrPort{}, err
++		}
++		var packet *Packet
++		select {
++		case packet = <-incomingPackets.ch:
++			if packet == nil {
++				return 0, netip.AddrPort{}, net.ErrClosed
+ 			}
+-			return
++		case <-ctx.Done():
++			return 0, netip.AddrPort{}, context.Cause(ctx)
+ 		}
+ 		if packet.FRAG_TOTAL <= 1 {
+ 			if packet.ADDR == nil {
+@@ -692,6 +667,10 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
+ 	}
+ 	q.writeMu.Lock()
+ 	defer q.writeMu.Unlock()
++	ctx := q.writeDeadline.Context()
++	if err := context.Cause(ctx); err != nil {
++		return 0, err
++	}
+ 	// Conn-private serialization scratch: grown to this association's peak
+ 	// frame once, then reused without touching the shared pool. Nil-ed on
+ 	// Close so a closed association does not pin its peak size.
+@@ -728,7 +707,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
+ 		if err != nil {
+ 			return
+ 		}
+-		err = q.quicConn.SendDatagram(buf.Bytes())
++		err = q.quicConn.SendDatagramContext(ctx, buf.Bytes())
+ 		var tooLarge *quic.DatagramTooLargeError
+ 		if errors.As(err, &tooLarge) {
+ 			firstHeaderLen := packet.BytesLen() - len(packet.DATA)
+@@ -736,7 +715,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
+ 			if q.maxUdpRelayPacketSize > 0 && fragSize > q.maxUdpRelayPacketSize {
+ 				fragSize = q.maxUdpRelayPacketSize
+ 			}
+-			err = fragWriteNative(q.quicConn, packet, buf, fragSize)
++			err = fragWriteNativeContext(ctx, q.quicConn, packet, buf, fragSize)
+ 		}
+ 		if err != nil {
+ 			return
+diff --git a/netproxy/packet_deadline.go b/netproxy/packet_deadline.go
+new file mode 100644
+index 0000000..c7cccd3
+--- /dev/null
++++ b/netproxy/packet_deadline.go
+@@ -0,0 +1,88 @@
++package netproxy
++
++import (
++	"context"
++	"net"
++	"os"
++	"sync"
++	"time"
++)
++
++// PacketDeadline provides a reusable, independently cancellable I/O direction.
++// Extending or clearing a pending deadline keeps its context alive. After expiry,
++// a new context is used for subsequent operations. The zero value is ready to use.
++// Contexts and timers are per deadline generation, not per datagram.
++type PacketDeadline struct {
++	mu         sync.Mutex
++	ctx        context.Context
++	cancel     context.CancelCauseFunc
++	timer      *time.Timer
++	generation uint64
++	closed     bool
++}
++
++func (d *PacketDeadline) Context() context.Context {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.ctx == nil {
++		d.ctx, d.cancel = context.WithCancelCause(context.Background())
++		if d.closed {
++			d.cancel(net.ErrClosed)
++		}
++	}
++	return d.ctx
++}
++
++func (d *PacketDeadline) Set(t time.Time) error {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if d.closed {
++		return net.ErrClosed
++	}
++	d.generation++
++	if d.timer != nil {
++		d.timer.Stop()
++		d.timer = nil
++	}
++	if d.ctx == nil || d.ctx.Err() != nil {
++		d.ctx, d.cancel = context.WithCancelCause(context.Background())
++	}
++	if t.IsZero() {
++		return nil
++	}
++	delay := time.Until(t)
++	if delay <= 0 {
++		d.cancel(os.ErrDeadlineExceeded)
++		return nil
++	}
++	gen := d.generation
++	d.timer = time.AfterFunc(delay, func() {
++		d.mu.Lock()
++		defer d.mu.Unlock()
++		if gen == d.generation && !d.closed {
++			d.cancel(os.ErrDeadlineExceeded)
++			d.timer = nil
++		}
++	})
++	return nil
++}
++
++func (d *PacketDeadline) Close() {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	d.closed = true
++	d.generation++
++	if d.timer != nil {
++		d.timer.Stop()
++		d.timer = nil
++	}
++	if d.cancel != nil {
++		d.cancel(net.ErrClosed)
++	}
++}
++
++// IndependentPacketWriteDeadline identifies datagram transports whose write
++// deadline cancels only the current I/O direction, not the logical session.
++type IndependentPacketWriteDeadline interface {
++	SupportsIndependentPacketWriteDeadline() bool
++}
+diff --git a/netproxy/packet_deadline_test.go b/netproxy/packet_deadline_test.go
+new file mode 100644
+index 0000000..5cc202f
+--- /dev/null
++++ b/netproxy/packet_deadline_test.go
+@@ -0,0 +1,52 @@
++package netproxy
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"testing"
++	"time"
++)
++
++func TestPacketDeadlineUpdateClearAndClose(t *testing.T) {
++	var d PacketDeadline
++	ctx := d.Context()
++	if err := d.Set(time.Now().Add(20 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	if err := d.Set(time.Now().Add(time.Hour)); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-ctx.Done():
++		t.Fatal("old deadline fired after extension")
++	case <-time.After(40 * time.Millisecond):
++	}
++	if err := d.Set(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	if d.Context() != ctx {
++		t.Fatal("clearing a live deadline must preserve pending context")
++	}
++	if err := d.Set(time.Now().Add(-time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if !errors.Is(context.Cause(ctx), os.ErrDeadlineExceeded) {
++		t.Fatal(context.Cause(ctx))
++	}
++	if err := d.Set(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	next := d.Context()
++	if next.Err() != nil {
++		t.Fatal(next.Err())
++	}
++	d.Close()
++	if !errors.Is(context.Cause(next), net.ErrClosed) {
++		t.Fatal(context.Cause(next))
++	}
++	if !errors.Is(d.Set(time.Time{}), net.ErrClosed) {
++		t.Fatal("closed direction resurrected")
++	}
++}
+diff --git a/protocol/tuic/packet_deadline_test.go b/protocol/tuic/packet_deadline_test.go
+new file mode 100644
+index 0000000..573ded7
+--- /dev/null
++++ b/protocol/tuic/packet_deadline_test.go
+@@ -0,0 +1,115 @@
++package tuic
++
++import (
++	"context"
++	"errors"
++	"github.com/daeuniverse/outbound/protocol/tuic/common"
++	"github.com/olicesx/quic-go"
++	"net"
++	"os"
++	"testing"
++	"time"
++)
++
++type cancellableDatagramConn struct {
++	quic.Connection
++	entered chan struct{}
++	block   bool
++}
++
++func (c *cancellableDatagramConn) SendDatagramContext(ctx context.Context, _ []byte) error {
++	if c.entered != nil {
++		close(c.entered)
++		c.entered = nil
++	}
++	if !c.block {
++		return context.Cause(ctx)
++	}
++	<-ctx.Done()
++	return context.Cause(ctx)
++}
++func (c *cancellableDatagramConn) OpenUniStream() (quic.SendStream, error) { return nil, net.ErrClosed }
++
++func TestPacketWriteDeadlineAndCloseAreSessionLocal(t *testing.T) {
++	transport := &cancellableDatagramConn{entered: make(chan struct{}), block: true}
++	q := &quicStreamPacketConn{quicConn: transport, incomingPackets: NewPackets(), udpRelayMode: common.NATIVE}
++	defer q.Close()
++	entered := transport.entered
++	written := make(chan error, 1)
++	go func() { _, err := q.WriteTo([]byte("tick"), "192.0.2.1:27015"); written <- err }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("send not entered")
++	}
++	if err := q.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-written:
++		if !errors.Is(err, os.ErrDeadlineExceeded) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("write did not time out")
++	}
++	if q.closed.Load() {
++		t.Fatal("write deadline closed association")
++	}
++	if q.readDeadline.Context().Err() != nil {
++		t.Fatal("write deadline cancelled read")
++	}
++	if err := q.SetWriteDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	transport.entered = make(chan struct{})
++	entered = transport.entered
++	go func() { _, err := q.WriteTo([]byte("tick"), "192.0.2.1:27015"); written <- err }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("send not entered")
++	}
++	closed := make(chan struct{})
++	go func() { _ = q.Close(); close(closed) }()
++	select {
++	case <-closed:
++	case <-time.After(time.Second):
++		t.Fatal("Close blocked on pending send")
++	}
++	select {
++	case err := <-written:
++		if !errors.Is(err, net.ErrClosed) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("write did not cancel")
++	}
++}
++
++func TestPacketReadDeadlineKeepsAssociation(t *testing.T) {
++	q := &quicStreamPacketConn{incomingPackets: NewPackets()}
++	defer q.Close()
++	result := make(chan error, 1)
++	go func() { _, _, err := q.ReadFrom(make([]byte, 128)); result <- err }()
++	if err := q.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-result:
++		if !errors.Is(err, os.ErrDeadlineExceeded) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("read did not time out")
++	}
++	if q.closed.Load() || q.writeDeadline.Context().Err() != nil {
++		t.Fatal("read deadline closed other direction")
++	}
++	if err := q.SetReadDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	if q.readDeadline.Context().Err() != nil {
++		t.Fatal("read deadline not cleared")
++	}
++}

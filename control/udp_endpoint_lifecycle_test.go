@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	daeerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/olicesx/quic-go"
 )
@@ -117,8 +116,8 @@ func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
 	}
 }
 
-// fdae retires a stalled datagram transport on queue timeout.
-func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
+// Queue pressure drops the packet without discarding the session.
+func TestUdpEndpointWriteToKeepsSessionOnDatagramQueueTimeout(t *testing.T) {
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
 			return 0, quic.ErrDatagramQueueFullTimeout
@@ -129,8 +128,8 @@ func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
 	if !stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
 		t.Fatalf("expected datagram queue timeout error, got: %v", err)
 	}
-	if !ue.dead.Load() {
-		t.Fatal("endpoint must retire on a datagram send-queue timeout")
+	if ue.dead.Load() || !isUdpEndpointWriteTolerated(err) {
+		t.Fatal("datagram queue timeout must preserve the session")
 	}
 }
 
@@ -176,322 +175,29 @@ func TestUdpEndpointWriteToRetiresOnClosedConn(t *testing.T) {
 	}
 }
 
-// A session that was established (hasReply) but whose client has been silent
-// for udpEndpointSendStaleTimeout must be rebuilt on the next write: the pause
-// means a new round is starting and the remote (e.g. a game server) may have
-// reaped the old session. Retiring now lets the next GetOrCreate dial a fresh
-// hy2 session with a new forwarding source port.
-//
-// Rebuild is gated to the game profile (proxy-backed, not H3/DNS ports, no
-// sniffed domain). A nil Dialer is userspace-direct and must not rebuild.
-func TestUdpEndpointWriteToRebuildsStaleSession(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newGameProxyEndpoint(t, mock, "203.0.113.1:27015")
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-
-	_, err := ue.WriteTo([]byte("hello world"), "203.0.113.1:27015")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected ErrClosedConnection on stale session, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("endpoint must be retired when the client session is stale")
-	}
-}
-
-// An established session whose client sent recently must NOT be rebuilt: this
-// keeps normal gameplay (sub-second heartbeats) on the same hy2 session. After
-// a successful write the lastSendNano is refreshed.
-func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().UnixNano())
-	ue.lastReplyNano.Store(time.Now().UnixNano())
-
-	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err != nil {
-		t.Fatalf("expected success on fresh session, got: %v", err)
-	}
-	if n != len("hello world") {
-		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-	}
-	if ue.dead.Load() {
-		t.Fatal("fresh session must not be retired")
-	}
-	if ue.lastSendNano.Load() < time.Now().Add(-time.Second).UnixNano() {
-		t.Fatal("lastSendNano must be refreshed after a successful write")
-	}
-}
-
-// A client that paused briefly but whose server is still replying must NOT be
-// rebuilt: the session is mid-round and only the client side is silent. This
-// is what keeps a live game from being kicked when the player hits a loading
-// or idle stretch.
-func TestUdpEndpointWriteToKeepsSessionWhileServerReplyFresh(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().UnixNano())
-
-	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err != nil {
-		t.Fatalf("expected success while upstream still replies, got: %v", err)
-	}
-	if n != len("hello world") {
-		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-	}
-	if ue.dead.Load() {
-		t.Fatal("endpoint must not be retired while the upstream is still replying")
-	}
-}
-
-// Game UDP over a QUIC-backed transport (hy2/tuic, empty SniffedDomain)
-// still rebuilds after 5s of bidirectional silence: that is the inter-round
-// signal, independent of the transport.
-func TestUdpEndpointWriteToRebuildsGameSessionOnQuicTransport(t *testing.T) {
-	done := make(chan struct{})
-	mock := &deadlineRecordingPacketConn{transportDone: done}
-	ue := newGameProxyEndpoint(t, mock, "1.2.3.4:23002")
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected ErrClosedConnection on stale game session, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("game UDP over hy2/tuic must still rebuild after 5s of silence")
-	}
-}
-
-// A sniffed long-lived session (H3/DASH/HLS video) silent for the game 5s
-// window must NOT be rebuilt: segment gaps of 6-15s are normal and would
-// otherwise look like a new round.
-func TestUdpEndpointWriteToKeepsSniffedSessionAcrossGameStaleWindow(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.SniffedDomain = "video.example.com"
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-
-	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err != nil {
-		t.Fatalf("expected success across the 5s game window on a sniffed session, got: %v", err)
-	}
-	if n != len("hello world") {
-		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-	}
-	if ue.dead.Load() {
-		t.Fatal("sniffed session must not rebuild after 5s of silence")
-	}
-}
-
-// Sniffed QUIC endpoints retain fdae's idle policy: only raw game UDP
-// sessions use the short send-stale rebuild window.
-func TestUdpEndpointWriteToKeepsSniffedSessionAfterLongSilence(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.SniffedDomain = "video.example.com"
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-time.Minute).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-time.Minute).UnixNano())
-	if _, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53"); err != nil {
-		t.Fatal(err)
-	}
-	if ue.dead.Load() {
-		t.Fatal("sniffed endpoint was retired by game stale policy")
-	}
-}
-
-// A probing endpoint (never replied) is not subject to stale-session rebuild:
-// the reply guard is only meaningful once the session has been established.
-func TestUdpEndpointWriteToProbingNotRebuilt(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	// hasReply stays false; lastSendNano is irrelevant.
-
-	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err != nil {
-		t.Fatalf("expected success while probing, got: %v", err)
-	}
-	if n != len("hello world") {
-		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-	}
-	if ue.dead.Load() {
-		t.Fatal("probing endpoint must not be retired")
-	}
-}
-
-func newGameProxyEndpoint(t *testing.T, conn netproxy.PacketConn, dialTarget string) *UdpEndpoint {
-	t.Helper()
-	d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", conn)
-	ue := newTestEndpoint(conn)
-	ue.Dialer = d
-	ue.DialTarget = dialTarget
-	if ap, err := netip.ParseAddrPort(dialTarget); err == nil {
-		ue.poolKey.Dst = ap
-	}
-	return ue
-}
-
-func markBothDirectionsStale(ue *UdpEndpoint) {
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-}
-
-func TestStaleRebuildTimeout(t *testing.T) {
-	hy2, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", &mockPacketConn{})
-	ss, _ := newCountingProxyEndpointDialer("shadowsocks", "127.0.0.1:8388", &mockPacketConn{})
-	direct, _ := newCountingProxyEndpointDialer("direct", "", &mockPacketConn{})
-
-	tests := []struct {
-		name  string
-		setup func(*UdpEndpoint)
-		want  time.Duration
-	}{
-		{
-			name: "hy2 full-cone game",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = hy2
-				ue.DialTarget = "203.0.113.1:27015"
-			},
-			want: udpEndpointSendStaleTimeout,
-		},
-		{
-			name: "hy2 quic game on non-443",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = hy2
-				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:27015")
-			},
-			want: udpEndpointSendStaleTimeout,
-		},
-		{
-			name: "hy2 h3 on 443",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = hy2
-				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:443")
-			},
-			want: 0,
-		},
-		{
-			name: "hy2 sniffed domain on game port",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = hy2
-				ue.DialTarget = "203.0.113.1:8443"
-				ue.SniffedDomain = "video.example.com"
-			},
-			want: 0,
-		},
-		{
-			name: "hy2 doq 853",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = hy2
-				ue.poolKey.Dst = netip.MustParseAddrPort("1.1.1.1:853")
-			},
-			want: 0,
-		},
-		{
-			name: "userspace direct",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = direct
-				ue.DialTarget = "203.0.113.1:27015"
-			},
-			want: 0,
-		},
-		{
-			name: "shadowsocks",
-			setup: func(ue *UdpEndpoint) {
-				ue.Dialer = ss
-				ue.DialTarget = "203.0.113.1:27015"
-			},
-			want: 0,
-		},
-		{
-			name:  "nil dialer",
-			setup: func(ue *UdpEndpoint) {},
-			want:  0,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ue := newTestEndpoint(&mockPacketConn{})
-			tt.setup(ue)
-			if got := ue.staleRebuildTimeout(); got != tt.want {
-				t.Fatalf("staleRebuildTimeout() = %v, want %v", got, tt.want)
+// A game-shaped endpoint keeps its identity across loading/menu pauses.
+func TestUdpEndpointKeepsGameSessionAcrossSilence(t *testing.T) {
+	for _, pause := range []time.Duration{6 * time.Second, time.Minute} {
+		t.Run(pause.String(), func(t *testing.T) {
+			calls := 0
+			conn := &mockPacketConn{writeToFn: func(p []byte, addr string) (int, error) { calls++; return len(p), nil }}
+			d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", conn)
+			ue := newTestEndpoint(conn)
+			ue.Dialer = d
+			ue.DialTarget = "203.0.113.1:27015"
+			ue.poolKey.Dst = netip.MustParseAddrPort(ue.DialTarget)
+			ue.NatTimeout = QuicNatTimeout
+			ue.hasReply.Store(true)
+			ue.lastSendNano.Store(time.Now().Add(-pause).UnixNano())
+			ue.lastReplyNano.Store(time.Now().Add(-pause).UnixNano())
+			n, err := ue.WriteTo([]byte("next tick"), ue.DialTarget)
+			if err != nil || n != len("next tick") || calls != 1 || ue.IsDead() {
+				t.Fatalf("paused session not reused: n=%d err=%v writes=%d dead=%v", n, err, calls, ue.IsDead())
+			}
+			if ue.lastSendNano.Load() < time.Now().Add(-time.Second).UnixNano() {
+				t.Fatal("successful send not recorded")
 			}
 		})
-	}
-}
-
-func TestUdpEndpointWriteToKeepsStaleDirectAndH3(t *testing.T) {
-	cases := []struct {
-		name  string
-		setup func(*UdpEndpoint)
-	}{
-		{
-			name: "userspace direct",
-			setup: func(ue *UdpEndpoint) {
-				d, _ := newCountingProxyEndpointDialer("direct", "", ue.conn)
-				ue.Dialer = d
-				ue.DialTarget = "203.0.113.1:27015"
-			},
-		},
-		{
-			name: "hy2 h3 443",
-			setup: func(ue *UdpEndpoint) {
-				d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", ue.conn)
-				ue.Dialer = d
-				ue.poolKey.Dst = netip.MustParseAddrPort("203.0.113.1:443")
-				ue.DialTarget = "203.0.113.1:443"
-			},
-		},
-		{
-			name: "hy2 sniffed video",
-			setup: func(ue *UdpEndpoint) {
-				d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", ue.conn)
-				ue.Dialer = d
-				ue.DialTarget = "203.0.113.1:8443"
-				ue.SniffedDomain = "video.example.com"
-			},
-		},
-	}
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockPacketConn{}
-			ue := newTestEndpoint(mock)
-			tt.setup(ue)
-			markBothDirectionsStale(ue)
-			n, err := ue.WriteTo([]byte("hello world"), ue.DialTarget)
-			if err != nil {
-				t.Fatalf("expected success, got: %v", err)
-			}
-			if n != len("hello world") {
-				t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-			}
-			if ue.dead.Load() {
-				t.Fatal("non-game profile must not rebuild after bidirectional silence")
-			}
-		})
-	}
-}
-
-func TestUdpEndpointWriteToRebuildsStaleQuicGame(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newGameProxyEndpoint(t, mock, "203.0.113.1:27015")
-	markBothDirectionsStale(ue)
-
-	_, err := ue.WriteTo([]byte("hello world"), "203.0.113.1:27015")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected rebuild for non-443 QUIC game, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("non-443 QUIC game must still rebuild after bidirectional silence")
 	}
 }
 
@@ -590,5 +296,30 @@ func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
 	}
 	if !ue.dead.Load() {
 		t.Fatal("endpoint must be retired after the tolerated threshold is exceeded")
+	}
+}
+
+type independentDeadlinePacketConn struct{ deadlineRecordingPacketConn }
+
+func (*independentDeadlinePacketConn) SupportsIndependentPacketWriteDeadline() bool { return true }
+
+func TestIndependentDatagramDeadlineKeepsSession(t *testing.T) {
+	done := make(chan struct{})
+	conn := &independentDeadlinePacketConn{deadlineRecordingPacketConn{transportDone: done, writeToFn: func([]byte, string) (int, error) { return 0, os.ErrDeadlineExceeded }}}
+	d, _ := newCountingProxyEndpointDialer("hysteria2", "127.0.0.1:443", conn)
+	ue := newTestEndpoint(conn)
+	ue.Dialer = d
+	for range 5 {
+		_, err := ue.WriteTo([]byte("tick"), "192.0.2.1:27015")
+		if !isUdpEndpointWriteTolerated(err) || ue.IsDead() {
+			t.Fatalf("deadline retired datagram session: %v", err)
+		}
+	}
+	if !conn.setWriteDeadlineCalled {
+		t.Fatal("independent deadline not armed")
+	}
+	close(done)
+	if _, err := ue.WriteTo([]byte("tick"), "192.0.2.1:27015"); err == nil || !ue.IsDead() {
+		t.Fatal("dead transport must retire")
 	}
 }
