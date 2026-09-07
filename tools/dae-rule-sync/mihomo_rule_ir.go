@@ -66,6 +66,8 @@ const (
 // MihomoExpr is a tagged expression tree. Exactly one of Atom, Children,
 // ProviderRef, ProviderDataRef, or SubRuleRef is populated according to Kind.
 type MihomoExpr struct {
+	MemoID          int // One SUB-RULE call's entry decision, shared by its expanded children.
+	NoResolve       bool
 	Kind            MihomoExprKind
 	Raw             string
 	Atom            *MihomoAtom
@@ -379,10 +381,12 @@ func parseMihomoExpression(raw string, source MihomoRuleSource) (MihomoExpr, err
 		if len(fields) < 2 || fields[1] == "" {
 			return MihomoExpr{}, errors.New("RULE-SET condition requires provider")
 		}
-		if len(fields) > 2 {
-			return MihomoExpr{}, errors.New("RULE-SET condition parameters are unsupported in nested expressions")
+		for _, option := range fields[2:] {
+			if option != "no-resolve" {
+				return MihomoExpr{}, errors.New("unsupported RULE-SET condition parameter")
+			}
 		}
-		return MihomoExpr{Kind: MihomoExprRuleSet, Raw: strings.Join(fields, ","), ProviderRef: &MihomoRuleSetRef{Provider: fields[1]}}, nil
+		return MihomoExpr{NoResolve: len(fields) > 2, Kind: MihomoExprRuleSet, Raw: strings.Join(fields, ","), ProviderRef: &MihomoRuleSetRef{Provider: fields[1]}}, nil
 	case "SUB-RULE":
 		if len(fields) != 3 || fields[2] == "" {
 			return MihomoExpr{}, errors.New("SUB-RULE condition requires guard and sub-rule name")

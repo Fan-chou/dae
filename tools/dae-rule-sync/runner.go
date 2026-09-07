@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/geodata"
@@ -1982,12 +1983,27 @@ func generationDATBindingKey(provider, kind string) string {
 func generationDATReferences(rules []*config_parser.RoutingRule) ([]generationDATReference, error) {
 	var references []generationDATReference
 	for _, rule := range rules {
-		for _, function := range rule.AndFunctions {
+		functions := rule.AndFunctions
+		var leaves []*config_parser.Function
+		for _, f := range functions {
+			if f.Name == "route_expr" {
+				e, err := routing.DecodeOrderedExpr(f)
+				if err != nil {
+					return nil, err
+				}
+				if err = e.Walk(func(atom *config_parser.Function) error { leaves = append(leaves, atom); return nil }); err != nil {
+					return nil, err
+				}
+			} else {
+				leaves = append(leaves, f)
+			}
+		}
+		for _, function := range leaves {
 			var kind string
 			switch function.Name {
 			case consts.Function_Domain:
 				kind = "domain"
-			case "dip", consts.Function_Ip:
+			case "dip", consts.Function_Ip, "ip_no_resolve":
 				kind = "ipcidr"
 			}
 			for _, param := range function.Params {
@@ -2152,7 +2168,7 @@ func expandGenerationDAT(logger *logrus.Logger, path string, reference generatio
 		}
 		return params, nil
 	case "ipcidr":
-		if reference.function != "dip" && reference.function != consts.Function_Ip {
+		if reference.function != "dip" && reference.function != consts.Function_Ip && reference.function != "ip_no_resolve" {
 			return nil, fmt.Errorf("generation DAT function = %q, want ip", reference.function)
 		}
 		geoIP, err := geodata.UnmarshalGeoIp(logger, path, reference.provider)

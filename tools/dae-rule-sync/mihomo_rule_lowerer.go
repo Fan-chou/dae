@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
@@ -165,10 +166,31 @@ func (l *MihomoRuleLowerer) lowerRule(rule MihomoRuleIRRule, limit int) ([]Mihom
 	if err != nil {
 		return nil, err
 	}
+
 	if rule.Action.NoResolve || mihomoActionHasNoResolve(rule.Action) {
-		if err := l.validateNoResolve(expr, rule.MihomoRuleSource); err != nil {
+		// Mihomo ignores action-level options on outer logical rules.
+		if expr.Kind == MihomoExprAtom || expr.Kind == MihomoExprRuleSet || expr.Kind == MihomoExprProviderData {
+			expr.NoResolve = true
+		}
+	}
+	if hasMihomoNoResolve(expr) {
+		e, err := l.orderedExpr(expr, rule.MihomoRuleSource, false)
+		if err != nil {
 			return nil, err
 		}
+		f := e.Atom
+		if e.Op != "atom" || e.MemoID != 0 {
+			f, err = routing.EncodeOrderedExpr(e)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		out, err := l.lowerAction(rule.Action, rule.MihomoRuleSource)
+		if err != nil {
+			return nil, err
+		}
+		return []MihomoLoweredRoutingRule{{Source: rule.MihomoRuleSource, Rule: &config_parser.RoutingRule{AndFunctions: []*config_parser.Function{f}, Outbound: *out}, AlternativeCount: 1}}, nil
 	}
 
 	terms, err := l.lowerExpression(expr, false, rule.MihomoRuleSource, limit)
@@ -461,6 +483,9 @@ func lowerMihomoAtom(atom MihomoAtom, negated bool, source MihomoRuleSource) (*c
 			functionName = "sip"
 		}
 	}
+	if (functionName == "ip" || functionName == "dip") && mihomoAtomHasOption(options, "no-resolve") {
+		functionName = "ip_no_resolve"
+	}
 	if key != "" {
 		for _, param := range params {
 			param.Key = key
@@ -509,9 +534,7 @@ func validateMihomoAtomOptions(typeName string, options []string, source MihomoR
 		case strings.EqualFold(option, "no-resolve"):
 			switch upperType {
 			case "IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR":
-				// kdae's IP matchers do not perform the Mihomo hostname
-				// resolution fallback, so this option is semantically inert
-				// after the condition has been lowered to an IP matcher.
+				// Lower to an explicit no-resolve predicate; source IP never resolves.
 			default:
 				return mihomoLoweringError(source, fmt.Sprintf("Mihomo atom %q option %q has no exact kdae equivalent", typeName, option))
 			}
@@ -828,61 +851,6 @@ func mihomoActionHasNoResolve(action MihomoAction) bool {
 
 func mihomoActionHasOption(action MihomoAction, wanted string) bool {
 	return mihomoAtomHasOption(action.Options, wanted)
-}
-
-func (l *MihomoRuleLowerer) validateNoResolve(expr MihomoExpr, source MihomoRuleSource) error {
-	switch expr.Kind {
-	case MihomoExprAtom:
-		if expr.Atom == nil {
-			return mihomoLoweringError(source, "no-resolve is not valid for an empty atom")
-		}
-		if ignoredMihomoAtom(expr.Atom.Type) {
-			return nil
-		}
-		switch strings.ToUpper(expr.Atom.Type) {
-		case "IP-CIDR", "IP-CIDR6", "SRC-IP-CIDR":
-			return nil
-		default:
-			return mihomoLoweringError(source, fmt.Sprintf("no-resolve is only equivalent for IP-CIDR/SRC-IP-CIDR conditions, not %q", expr.Atom.Type))
-		}
-	case MihomoExprRuleSet:
-		if expr.ProviderRef == nil || strings.TrimSpace(expr.ProviderRef.Provider) == "" {
-			return mihomoLoweringError(source, "no-resolve RULE-SET has no provider")
-		}
-		provider := expr.ProviderRef.Provider
-		behavior, ok := l.options.ProviderBehaviors[provider]
-		if !ok {
-			if safeName, mapped := l.options.ProviderNameMap[provider]; mapped {
-				behavior, ok = l.options.ProviderBehaviors[safeName]
-			}
-		}
-		if !ok || !strings.EqualFold(strings.TrimSpace(behavior), "ipcidr") {
-			return mihomoLoweringError(source, fmt.Sprintf("no-resolve RULE-SET provider %q is not known to have ipcidr behavior", provider))
-		}
-		return nil
-	case MihomoExprProviderData:
-		if err := validateMihomoProviderDataRef(expr.ProviderDataRef, source); err != nil {
-			return err
-		}
-		if expr.ProviderDataRef.Kind != MihomoProviderDataIPCIDR {
-			return mihomoLoweringError(source, fmt.Sprintf("no-resolve is only equivalent for ipcidr provider-data, not %q", expr.ProviderDataRef.Kind))
-		}
-		return nil
-	case MihomoExprSubRule:
-		return mihomoLoweringError(source, "SUB-RULE expression is unsupported; graph compiler must lower it")
-	case MihomoExprNot, MihomoExprAnd, MihomoExprOr:
-		if len(expr.Children) == 0 {
-			return mihomoLoweringError(source, "no-resolve expression has no children")
-		}
-		for _, child := range expr.Children {
-			if err := l.validateNoResolve(child, source); err != nil {
-				return err
-			}
-		}
-		return nil
-	default:
-		return mihomoLoweringError(source, fmt.Sprintf("no-resolve expression kind %q is unsupported", expr.Kind))
-	}
 }
 
 func (l *MihomoRuleLowerer) expansionLimit() (int, error) {

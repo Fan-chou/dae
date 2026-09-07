@@ -25,6 +25,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"golang.org/x/sys/unix"
@@ -2523,10 +2524,15 @@ func appendProviderRule(result *ProviderRules, seen map[string]struct{}, trimmed
 		return nil
 	}
 	key := functionKey(function)
-	if _, ok := seen[key]; ok {
-		return nil
+	// A later no-resolve occurrence can match after an intervening predicate
+	// resolves the destination. Preserve its position; adjacent sets are
+	// compacted safely by the ordered routing compiler.
+	if function.Name != "ip_no_resolve" {
+		if _, ok := seen[key]; ok {
+			return nil
+		}
+		seen[key] = struct{}{}
 	}
-	seen[key] = struct{}{}
 	result.Functions = append(result.Functions, function)
 	if len(result.Functions) > maxProviderRules {
 		return fmt.Errorf("provider contains too many supported rules")
@@ -3358,7 +3364,11 @@ func parseItem(raw, behavior string) (*config_parser.Function, error) {
 		if kind == "IP-CIDR" && !prefix.Addr().Is4() {
 			return nil, fmt.Errorf("IP-CIDR rule %q is not IPv4", raw)
 		}
-		return &config_parser.Function{Name: "dip", Params: []*config_parser.Param{{Val: prefix.Masked().String()}}}, nil
+		name := "dip"
+		if strings.Contains(value, ",") {
+			name = "ip_no_resolve"
+		}
+		return &config_parser.Function{Name: name, Params: []*config_parser.Param{{Val: prefix.Masked().String()}}}, nil
 	case "DOMAIN-WILDCARD", "GEOSITE", "GEOIP", "IP-ASN", "PROCESS-NAME", "DST-PORT", "SRC-IP-CIDR", "NETWORK", "AND", "OR", "NOT":
 		return nil, fmt.Errorf("unsupported provider rule type %q", kind)
 	}
@@ -3447,6 +3457,41 @@ func ExpandRoutingRules(rules []*config_parser.RoutingRule, registry Registry) (
 func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_parser.RoutingRule, error) {
 	if rule == nil {
 		return nil, errors.New("routing rule is nil")
+	}
+
+	ordered := routing.HasOrderedRules([]*config_parser.RoutingRule{rule})
+	for _, f := range rule.AndFunctions {
+		if f.Name == "ruleset_no_resolve" {
+			ordered = true
+		}
+		if f.Name == "ruleset" && len(f.Params) == 1 {
+			if p, ok := registry[f.Params[0].Val]; ok {
+				for _, atom := range p.Functions {
+					if atom.Name == "ip_no_resolve" {
+						ordered = true
+					}
+				}
+			}
+		}
+	}
+	if ordered {
+		root := &routing.OrderedExpr{Op: "and"}
+		for _, f := range rule.AndFunctions {
+			e, err := routing.ExprFromFunction(cloneFunction(f))
+			if err != nil {
+				return nil, err
+			}
+			e, err = expandOrderedExpr(e, registry, false)
+			if err != nil {
+				return nil, err
+			}
+			root.Children = append(root.Children, e)
+		}
+		f, err := routing.EncodeOrderedExpr(root)
+		if err != nil {
+			return nil, err
+		}
+		return []*config_parser.RoutingRule{{AndFunctions: []*config_parser.Function{f}, Outbound: *cloneFunction(&rule.Outbound)}}, nil
 	}
 	current := []*config_parser.RoutingRule{cloneRule(rule)}
 	for index, function := range rule.AndFunctions {

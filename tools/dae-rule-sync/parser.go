@@ -35,6 +35,7 @@ type UnsupportedRule struct {
 }
 
 type ParsedRuleSet struct {
+	Ordered     []MihomoExpr
 	Domains     []DomainRule
 	Prefixes    []netip.Prefix
 	Unsupported []UnsupportedRule
@@ -66,6 +67,8 @@ func ParseProvider(data []byte, spec ProviderSpec) (ParsedRuleSet, error) {
 		return ParsedRuleSet{}, fmt.Errorf("unsupported provider behavior %q", spec.Behavior)
 	}
 	result := ParsedRuleSet{}
+	var ordered []MihomoExpr
+	hasNoResolve := false
 	seenDomains := make(map[DomainRule]struct{})
 	seenPrefixes := make(map[netip.Prefix]struct{})
 	for _, item := range items {
@@ -81,6 +84,21 @@ func ParseProvider(data []byte, spec ProviderSpec) (ParsedRuleSet, error) {
 			result.Unsupported = append(result.Unsupported, *unsupported)
 			continue
 		}
+
+		if prefix.IsValid() {
+			args := []string{prefix.Masked().String()}
+			parts := strings.Split(item, ",")
+			for _, option := range parts[min(2, len(parts)):] {
+				if strings.EqualFold(strings.TrimSpace(option), "no-resolve") {
+					args = append(args, "no-resolve")
+					hasNoResolve = true
+				}
+			}
+			ordered = append(ordered, makeMihomoAtomExpression("IP-CIDR", args, item))
+		} else {
+			tp := map[DomainKind]string{DomainFull: "DOMAIN", DomainSuffix: "DOMAIN-SUFFIX", DomainKeyword: "DOMAIN-KEYWORD", DomainRegex: "DOMAIN-REGEX"}[kind]
+			ordered = append(ordered, makeMihomoAtomExpression(tp, []string{value}, item))
+		}
 		if prefix.IsValid() {
 			prefix = prefix.Masked()
 			if _, ok := seenPrefixes[prefix]; !ok {
@@ -95,6 +113,9 @@ func ParseProvider(data []byte, spec ProviderSpec) (ParsedRuleSet, error) {
 		}
 		seenDomains[rule] = struct{}{}
 		result.Domains = append(result.Domains, rule)
+	}
+	if hasNoResolve {
+		result.Ordered = ordered
 	}
 	return result, nil
 }
@@ -325,6 +346,20 @@ func generateDaeRoutes(manifest Manifest, sets map[string]ParsedRuleSet, strict,
 				report.Generated++
 			}
 		case "ipcidr":
+			if len(set.Ordered) > 0 {
+				for _, e := range set.Ordered {
+					if e.Atom == nil || (e.Atom.Type != "IP-CIDR" && e.Atom.Type != "IP-CIDR6") {
+						continue
+					}
+					f, err := lowerMihomoAtom(*e.Atom, false, MihomoRuleSource{})
+					if err != nil {
+						return "", report, nil, err
+					}
+					fmt.Fprintf(&output, "%s -> %s\n", f.String(false, true, false), route.Outbound)
+					report.Generated++
+				}
+				continue
+			}
 			if useDAT && len(set.Prefixes) >= generationDATRuleThreshold {
 				key := route.Provider + "\x00" + kind
 				if _, ok := specIndices[key]; !ok {

@@ -138,9 +138,10 @@ func (p *Param) String(compact bool, quoteVal bool) string {
 }
 
 type Function struct {
-	Name   string
-	Not    bool
-	Params []*Param
+	EvaluationID int `json:"-"` // Cold-path identity for ordered routing compilation.
+	Name         string
+	Not          bool
+	Params       []*Param
 }
 
 func (f *Function) String(compact bool, quoteVal bool, omitEmpty bool) string {

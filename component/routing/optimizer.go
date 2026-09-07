@@ -51,6 +51,8 @@ func (o *AliasOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*config
 			switch function.Name {
 			case "dport":
 				function.Name = consts.Function_Port
+			case "dip_no_resolve":
+				function.Name = "ip_no_resolve"
 			case "dip":
 				function.Name = consts.Function_Ip
 			}
@@ -354,7 +356,7 @@ func (o *DatReaderOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*co
 						switch f.Name {
 						case consts.Function_Domain, consts.Function_QName:
 							params, loadErr = o.loadGeoSite(fields[0], fields[1])
-						case consts.Function_Ip:
+						case consts.Function_Ip, "ip_no_resolve":
 							params, loadErr = o.loadGeoIp(fields[0], fields[1])
 						default:
 							loadErr = fmt.Errorf("unsupported extension file extraction in function %v", f.Name)

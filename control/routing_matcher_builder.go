@@ -41,6 +41,8 @@ type RoutingMatcherBuilder struct {
 	bpf                *bpfObjects
 	rules              []bpfMatchSet
 	compiledRules      []compiledRoutingMatch
+	orderedRules       []routing.OrderedRule
+	evaluationSpans    map[int][]int
 	predicateGroups    []routingMatcherPredicateGroupSpan
 	simulatedLpmTries  [][]netip.Prefix
 	simulatedDomainSet []routing.DomainSet
@@ -140,6 +142,8 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 	}
 	ruleCap := len(program.Rules)
 	b = &RoutingMatcherBuilder{
+		orderedRules:    program.Ordered,
+		evaluationSpans: make(map[int][]int),
 		log:             log,
 		outboundName2Id: outboundName2Id,
 		bpf:             bpf,
@@ -163,6 +167,7 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
 	b.registerProgramParser(rulesBuilder, consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
 	b.registerProgramParser(rulesBuilder, consts.Function_Ip, routing.IpParserFactory(b.addIp))
+	b.registerProgramParser(rulesBuilder, "ip_no_resolve", routing.IpParserFactory(b.addIp))
 	b.registerProgramParser(rulesBuilder, consts.Function_SourceIp, b.parseSourceIp)
 	b.registerProgramParser(rulesBuilder, consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
 	b.registerProgramParser(rulesBuilder, consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
@@ -184,6 +189,20 @@ func (b *RoutingMatcherBuilder) registerProgramParser(rulesBuilder *routing.Rule
 		start := len(b.compiledRules)
 		if err := parser(log, function, key, values, overrideOutbound); err != nil {
 			return err
+		}
+
+		if function.EvaluationID != 0 {
+			// Repeated DNF occurrences are equivalent with a known destination.
+			// Record their indices for ordered predicate and action compilation.
+			for i := start; i < len(b.compiledRules); i++ {
+				b.evaluationSpans[function.EvaluationID] = append(b.evaluationSpans[function.EvaluationID], i)
+			}
+		}
+		if function.Name == "ip_no_resolve" {
+			for i := start; i < len(b.compiledRules); i++ {
+				b.compiledRules[i].noResolve = true
+				b.rules[i].Value[4] = 1 // IP index occupies bytes 0..3; kernel ignores the rest.
+			}
 		}
 		b.predicateGroups = append(b.predicateGroups, routingMatcherPredicateGroupSpan{
 			name:  function.Name,
@@ -1056,7 +1075,12 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		}
 	}
 
+	ordered, err := compileOrderedRouting(b.orderedRules, b.evaluationSpans, compiledMatches)
+	if err != nil {
+		return nil, err
+	}
 	matcher = &RoutingMatcher{
+		orderedRules:    ordered,
 		lpmMatcher:      lpmMatcher,
 		domainMatcher:   domainMatcher,
 		compiledMatches: compiledMatches,

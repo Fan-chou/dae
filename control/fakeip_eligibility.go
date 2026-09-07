@@ -147,6 +147,9 @@ func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, 
 		return fakeIPKleeneFalse, true
 	case consts.MatchType_IpSet:
 		if !dest.IsValid() {
+			if match.noResolve {
+				return fakeIPKleeneFalse, true
+			}
 			return fakeIPKleeneUnknown, true
 		}
 		if m.fakeIPLpmHit(match.lpmIndex, fakeIPAddrBin(dest)) {

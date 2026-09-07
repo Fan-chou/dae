@@ -81,6 +81,31 @@ func (c *ControlPlane) routeFakeIP(
 	copy(mac16[10:], routingResult.Mac[:])
 	bSrc := src.Addr().As16()
 	bDst := dst.Addr().As16()
+
+	if len(c.routingMatcher.orderedRules) > 0 {
+		facts, factErr := c.routingMatcher.newFacts(bSrc, bDst, src.Port(), dst.Port(), ipVersion, l4proto, domain, routingResult.Pname, routingResult.Dscp, mac16)
+		if factErr != nil {
+			return 0, 0, false, netip.Addr{}, factErr
+		}
+		attempted := false
+		var resolved netip.Addr
+		var resolveErr error
+		lookup := func() (netip.Addr, error) {
+			if !attempted {
+				attempted = true
+				resolved, resolveErr = c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+			}
+			return resolved, resolveErr
+		}
+		out, routeMark, routeMust, real, routeErr := c.routingMatcher.matchOrderedFakeIP(facts, lookup)
+		if routeErr != nil {
+			return 0, 0, false, netip.Addr{}, routeErr
+		}
+		if !real.IsValid() && !fakeIPDialSkipResolve(c.routingMatcher, out) {
+			real, routeErr = lookup()
+		}
+		return out, routeMark, routeMust, real, routeErr
+	}
 	outboundIndex, mark, must, needsDestIP, err := c.routingMatcher.MatchDeferringDestIP(
 		bSrc,
 		bDst,

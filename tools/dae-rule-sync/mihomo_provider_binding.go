@@ -139,6 +139,9 @@ func newMihomoProviderBinder(
 
 func (b *mihomoProviderBinder) bindRule(rule MihomoRuleIRRule) (MihomoRuleIRRule, error) {
 	cloned := cloneMihomoRuleIRRule(rule)
+	if cloned.Expr.Kind == MihomoExprRuleSet && (cloned.Action.NoResolve || mihomoActionHasNoResolve(cloned.Action)) {
+		cloned.Expr.NoResolve = true
+	}
 	expr, err := b.bindExpression(cloned.Expr, cloned.MihomoRuleSource)
 	if err != nil {
 		return MihomoRuleIRRule{}, err
@@ -149,7 +152,9 @@ func (b *mihomoProviderBinder) bindRule(rule MihomoRuleIRRule) (MihomoRuleIRRule
 
 func (b *mihomoProviderBinder) bindExpression(expr MihomoExpr, source MihomoRuleSource) (MihomoExpr, error) {
 	if expr.Kind == MihomoExprRuleSet {
-		return b.bindRuleSet(expr, source)
+		bound, err := b.bindRuleSet(expr, source)
+		bound.MemoID = expr.MemoID
+		return bound, err
 	}
 	cloned := expr
 	if len(expr.Children) != 0 {
@@ -190,6 +195,14 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 	if len(set.Unsupported) != 0 {
 		return MihomoExpr{}, b.bindingError(source, fmt.Sprintf("provider %q contains %d unsupported rules; refusing to bind a convertible subset", providerName, len(set.Unsupported)))
 	}
+	if len(set.Ordered) > 0 {
+		b.recordProvider(safeName)
+		children := make([]MihomoExpr, len(set.Ordered))
+		for i, e := range set.Ordered {
+			children[i] = cloneMihomoExpr(e)
+		}
+		return MihomoExpr{Kind: MihomoExprOr, NoResolve: expr.NoResolve, Children: children}, nil
+	}
 	behavior := strings.ToLower(strings.TrimSpace(provider.Behavior))
 	switch behavior {
 	case "domain":
@@ -203,6 +216,7 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 		if err != nil {
 			return MihomoExpr{}, b.bindingError(source, err.Error())
 		}
+		leaf.NoResolve = expr.NoResolve
 		return leaf, nil
 	case "ipcidr":
 		if len(set.Domains) != 0 {
@@ -215,6 +229,7 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 		if err != nil {
 			return MihomoExpr{}, b.bindingError(source, err.Error())
 		}
+		leaf.NoResolve = expr.NoResolve
 		return leaf, nil
 	case "classical":
 		if len(set.Domains) == 0 && len(set.Prefixes) == 0 {
@@ -225,6 +240,7 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 			if err != nil {
 				return MihomoExpr{}, b.bindingError(source, err.Error())
 			}
+			leaf.NoResolve = expr.NoResolve
 			return leaf, nil
 		}
 		if len(set.Prefixes) == 0 {
@@ -232,6 +248,7 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 			if err != nil {
 				return MihomoExpr{}, b.bindingError(source, err.Error())
 			}
+			leaf.NoResolve = expr.NoResolve
 			return leaf, nil
 		}
 		domainLeaf, err := b.bindLeaf(safeName, MihomoProviderDataDomain, set)
@@ -243,9 +260,10 @@ func (b *mihomoProviderBinder) bindRuleSet(expr MihomoExpr, source MihomoRuleSou
 			return MihomoExpr{}, b.bindingError(source, err.Error())
 		}
 		return MihomoExpr{
-			Kind:     MihomoExprOr,
-			Raw:      expr.Raw,
-			Children: []MihomoExpr{domainLeaf, ipLeaf},
+			NoResolve: expr.NoResolve,
+			Kind:      MihomoExprOr,
+			Raw:       expr.Raw,
+			Children:  []MihomoExpr{domainLeaf, ipLeaf},
 		}, nil
 	default:
 		return MihomoExpr{}, b.bindingError(source, fmt.Sprintf("provider %q has unsupported behavior %q", providerName, provider.Behavior))

@@ -8,6 +8,7 @@ package routing
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -178,6 +179,14 @@ func hashNormalizedProgram(program *NormalizedProgram) ([sha256.Size]byte, error
 	}
 	hasher := newCanonicalPolicyHasher(normalizedPolicyHashSchema)
 	hasher.writeRules(program.Rules)
+	if len(program.Ordered) > 0 {
+		data, err := json.Marshal(program.Ordered)
+		if err != nil {
+			return [sha256.Size]byte{}, err
+		}
+		hasher.writeString("ordered-v1")
+		hasher.writeRawBytes(data)
+	}
 	if err := hasher.writeFallback(program.Fallback); err != nil {
 		return [sha256.Size]byte{}, err
 	}

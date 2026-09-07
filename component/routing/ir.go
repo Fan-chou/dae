@@ -14,6 +14,7 @@ import (
 // Rules are immutable after construction and may be lowered into userspace,
 // DNS, or kernel-space backends.
 type NormalizedProgram struct {
+	Ordered  []OrderedRule
 	Rules    []*config_parser.RoutingRule
 	Fallback config.FunctionOrString
 }

@@ -71,6 +71,7 @@ func (e *MihomoSubRuleCompileError) Is(target error) bool {
 // It is deliberately independent from the lowerer and does not create routes
 // or runtime objects.
 type MihomoSubRuleCompiler struct {
+	nextGuardID      int
 	maxDepth         int
 	maxExpandedRules int
 	definitions      map[string][]MihomoSubRuleIR
@@ -137,6 +138,7 @@ func (c *MihomoSubRuleCompiler) Compile(ir MihomoRuleIR) (MihomoRuleIR, error) {
 		c.definitions[definition.Name] = append(c.definitions[definition.Name], definition)
 	}
 	c.emitted = 0
+	c.nextGuardID = 0
 
 	compiled := make([]MihomoRuleIRRule, 0, len(ir.Rules))
 	for _, rule := range ir.Rules {
@@ -174,8 +176,9 @@ func (c *MihomoSubRuleCompiler) expandCall(call MihomoRuleIRRule, inherited *Mih
 	if err := mihomoRejectEmbeddedSubRule(ref.Guard, call.MihomoRuleSource); err != nil {
 		return nil, err
 	}
-
 	effectiveGuard := mihomoCombineSubRuleGuards(inherited, ref.Guard)
+	c.nextGuardID++
+	effectiveGuard.MemoID = c.nextGuardID
 	nextTrace := appendMihomoSubRuleTrace(trace, MihomoSubRuleCall{
 		Name:   ref.Name,
 		Source: call.MihomoRuleSource,
@@ -223,6 +226,14 @@ func (c *MihomoSubRuleCompiler) expandNamed(name string, guard *MihomoExpr, dept
 			return nil, err
 		}
 		leaf := cloneMihomoRuleIRRule(child)
+		// Attach the option to the child before adding the call guard; it
+		// belongs to the child predicate, not the resulting AND expression.
+		if leaf.Action.NoResolve || mihomoActionHasNoResolve(leaf.Action) {
+			switch leaf.Expr.Kind {
+			case MihomoExprAtom, MihomoExprRuleSet, MihomoExprProviderData:
+				leaf.Expr.NoResolve = true
+			}
+		}
 		leaf.Expr = mihomoCombineSubRuleGuards(guard, leaf.Expr)
 		leaf.CallTrace = appendMihomoSubRuleTrace(nil, trace...)
 		if err := c.emit(leaf.MihomoRuleSource); err != nil {

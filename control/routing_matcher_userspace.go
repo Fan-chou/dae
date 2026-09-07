@@ -16,6 +16,7 @@ import (
 )
 
 type RoutingMatcher struct {
+	orderedRules  []orderedRoutingRule
 	lpmMatcher    []*trie.Trie
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 
@@ -97,6 +98,7 @@ type routingMatcherFacts struct {
 }
 
 type compiledRoutingMatch struct {
+	noResolve bool
 	matchType consts.MatchType
 	outbound  consts.OutboundIndex
 	not       bool
@@ -123,6 +125,7 @@ func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
 	switch compiled.matchType {
 	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 		compiled.lpmIndex = nativeBpfABI.uint32(match.Value[:4])
+		compiled.noResolve = compiled.matchType == consts.MatchType_IpSet && match.Value[4] != 0
 	case consts.MatchType_Port, consts.MatchType_SourcePort:
 		compiled.portStart, compiled.portEnd = ParsePortRange(match.Value[:])
 	case consts.MatchType_IpVersion, consts.MatchType_L4Proto:
@@ -475,6 +478,9 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 
 func (m *RoutingMatcher) evalDeferringDestIP(index int, match compiledRoutingMatch, facts *routingMatcherFacts) (fakeIPKleene, error) {
 	if destIPRoutingMatch(match.matchType) {
+		if match.noResolve {
+			return fakeIPKleeneFalse, nil
+		}
 		return fakeIPKleeneUnknown, nil
 	}
 	hit, err := m.matchCompiledMatch(index, match, facts)
