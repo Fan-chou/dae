@@ -858,7 +858,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				_, _ = sniffer.ObserveQuicInitial(data)
 				overBudget := !sniffer.RecordQuicInitialPacket()
 				sniffer.AppendData(data)
-				if overBudget {
+				if overBudget || !sniffer.flushDeadline.IsZero() && !time.Now().Before(sniffer.flushDeadline) {
 					sniffer.GiveUpIncomplete()
 					MarkQuicDcidFailed(key, quicDcidFailureReasonSoftBypass)
 				} else {
@@ -899,6 +899,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 
 				if sniffer.NeedMore() {
+					c.armUDPSniffFlush(sniffer, key, now, lConn, realSrc, realDst, routingResult, flowDecision)
 					// We don't record No SNI streak for NeedMore because handshakes naturally span multiple packets.
 					holdForMore = true
 					return

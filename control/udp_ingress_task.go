@@ -113,6 +113,7 @@ type udpIngressTask struct {
 	convergeSrc  netip.AddrPort
 	flowDecision UdpFlowDecision
 	nbytes       int
+	queuedAt     time.Time
 	// dispatchSem, when non-nil, is the direct-dispatch concurrency slot this
 	// task holds; Run releases it together with the other resources. It must
 	// be assigned on every pool checkout (nil for queued dispatch) so a stale
@@ -142,6 +143,7 @@ func (t *udpIngressTask) Discard() { t.discard() }
 // Run executes the ingress packet handling. The buffer and admission gate
 // are released and the task is returned to the pool in all paths.
 func (t *udpIngressTask) Run() {
+	udpIngressWait.finish(t.queuedAt)
 	c := t.c
 	data := t.pktBuf
 	realDst := t.realDst

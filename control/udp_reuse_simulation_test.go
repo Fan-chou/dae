@@ -221,7 +221,8 @@ func newUdpReuseSimulationControlPlane(outbound *ob.DialerGroup) *ControlPlane {
 		controlPlaneGenerationState: controlPlaneGenerationState{
 			outbounds: outbounds,
 		},
-		soMarkFromDae: 0,
+		soMarkFromDae:   0,
+		sniffingTimeout: 30 * time.Millisecond,
 	}
 }
 

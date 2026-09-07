@@ -128,6 +128,7 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 		return true
 	default:
 		ue.replyQueueMu.Unlock()
+		udpReplyQueueDrops.Add(1)
 		recycleUdpEndpointReply(queued, false)
 		return true
 	}

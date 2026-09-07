@@ -563,7 +563,9 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Check again - endpoint may have died.
 	// The underlying conn.WriteTo is thread-safe; we accept a small race window
 	// for performance. Write errors will mark the endpoint dead for cleanup.
+	writeStarted := udpWriteWait.start()
 	n, err := ue.conn.WriteTo(b, addr)
+	udpWriteWait.finish(writeStarted)
 	if err != nil {
 		return n, ue.handleWriteError(err)
 	}

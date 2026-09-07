@@ -2557,6 +2557,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			task.convergeSrc = convergeSrc
 			task.flowDecision = flowDecision
 			task.nbytes = len(pktBuf)
+			task.queuedAt = udpIngressWait.start()
 			task.bindQ = nil
 			// Reset on every checkout: a stale slot pointer from a previous
 			// use would make Run or Discard release a semaphore this packet

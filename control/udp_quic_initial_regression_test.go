@@ -41,6 +41,8 @@ func makePaddedQuicClientInitial(dcidSeed byte) []byte {
 
 func setupQuicInitialRegressionTestState(t testing.TB) func() {
 	t.Helper()
+	oldTaskPool := DefaultUdpTaskPool
+	DefaultUdpTaskPool = NewUdpTaskPool()
 
 	oldUdpPool := DefaultUdpEndpointPool
 	DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -55,13 +57,15 @@ func setupQuicInitialRegressionTestState(t testing.TB) func() {
 	SetFailedQuicDcidCache(newFailedQuicDcidCache(failedQuicDcidCacheShardCount))
 
 	return func() {
+		DefaultPacketSnifferSessionMgr.Close()
+		DefaultUdpTaskPool.Close()
+		DefaultUdpTaskPool = oldTaskPool
 		DefaultUdpEndpointPool.Reset()
 		DefaultUdpEndpointPool = oldUdpPool
 
 		DefaultAnyfromPool.Reset()
 		DefaultAnyfromPool = oldAnyfromPool
 
-		DefaultPacketSnifferSessionMgr.Close()
 		DefaultPacketSnifferSessionMgr = oldSnifferPool
 
 		SetFailedQuicDcidCache(oldFailedCache)

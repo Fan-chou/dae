@@ -8,6 +8,7 @@ package control
 import (
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/pool"
 )
@@ -259,8 +260,9 @@ func (ue *UdpEndpoint) releaseCachedResponseConns() {
 const udpEndpointReplyQueueSize = 256
 
 type udpEndpointReply struct {
-	data pool.PB
-	from netip.AddrPort
+	queuedAt time.Time
+	data     pool.PB
+	from     netip.AddrPort
 	// release, when set, owns the reply payload instead of the package pool:
 	// transport-owned packet receivers hand their buffers in with a release
 	// callback (ReceivedPacket.Release).
@@ -281,6 +283,7 @@ func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {
 	reply := udpEndpointReplyObjects.Get().(*udpEndpointReply)
 	reply.data = data
 	reply.from = from
+	reply.queuedAt = udpReplyWait.start()
 	// Clear any stale release callback explicitly instead of relying solely
 	// on recycleUdpEndpointReply's whole-struct zeroing: recycled objects must
 	// never inherit transport-owned buffer ownership from a previous use.
@@ -335,6 +338,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 	drainBatch:
 		for i := range batch {
 			queued := batch[i]
+			udpReplyWait.finish(queued.queuedAt)
 			// Do NOT skip queued replies when dead: these were already received
 			// from the upstream before the read loop exited, and must be forwarded
 			// to the client. The handler (forwardUdpEndpointReplyToClient) only

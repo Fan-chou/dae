@@ -404,6 +404,10 @@ type PacketSniffer struct {
 	// to this session. Honk stops waiting after MAX_INITIAL_SNIFF_PACKETS (8)
 	// so a ClientHello that never completes cannot pin the first packet.
 	quicInitialPackets int
+	flushTimer         *time.Timer
+	flushDeadline      time.Time
+	flushSampledAt     time.Time
+	createdAt          time.Time
 
 	quicInitialSig    quicInitialFingerprint
 	hasQuicInitialSig bool
@@ -447,12 +451,30 @@ func (ps *PacketSniffer) Close() error {
 }
 
 func (ps *PacketSniffer) closeLocked() error {
+	ps.stopFlushLocked()
 	if ps.Sniffer == nil {
 		return nil
 	}
 	err := ps.Sniffer.Close()
 	ps.Sniffer = nil
 	return err
+}
+
+// stopFlushLocked also invalidates an expiry task already queued by the timer.
+func (ps *PacketSniffer) stopFlushLocked() {
+	udpSniffWait.finish(ps.flushSampledAt)
+	ps.flushSampledAt = time.Time{}
+	if ps.flushTimer != nil {
+		ps.flushTimer.Stop()
+		ps.flushTimer = nil
+	}
+	ps.flushDeadline = time.Time{}
+}
+
+// CompactPacketState is called with Mu held after normal sniff completion.
+func (ps *PacketSniffer) CompactPacketState() {
+	ps.stopFlushLocked()
+	ps.Sniffer.CompactPacketState()
 }
 
 // RecordSniffNoSni advances the no-SNI streak and arms the temporary bypass
@@ -844,8 +866,9 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *Pack
 
 	for {
 		newQs := &PacketSniffer{
-			Sniffer: sniffing.NewPacketSniffer(nil, createOption.Ttl),
-			ttl:     createOption.Ttl,
+			Sniffer:   sniffing.NewPacketSniffer(nil, createOption.Ttl),
+			ttl:       createOption.Ttl,
+			createdAt: time.Now(),
 		}
 		newQs.RefreshTtl()
 		actual, loaded := p.pool.LoadOrStore(key, newQs)
