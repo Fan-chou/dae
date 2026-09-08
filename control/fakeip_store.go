@@ -90,6 +90,8 @@ func newFakeIPGeneration(inet4, inet6 netip.Prefix) *fakeIPGeneration {
 // one store and only swap FakeIPPolicy.
 type FakeIPStore struct {
 	dir string
+	// Stable peer aliases cannot be evicted, reused, or reset after disk corruption.
+	stableAliases bool
 
 	mu       sync.RWMutex
 	ready    bool
@@ -160,6 +162,9 @@ func (s *FakeIPStore) Open(inet4, inet6 netip.Prefix) error {
 	loadErr := s.loadLocked()
 	s.loadWarn = nil
 	if loadErr != nil {
+		if s.stableAliases {
+			return fmt.Errorf("load stable UDP peer mappings: %w", loadErr)
+		}
 		s.quarantineDiskLocked()
 		s.resetMemoryLocked(inet4, inet6)
 		s.loadWarn = fmt.Errorf("fakeip store load failed; quarantined as *.corrupt-* under %s and reset: %w", s.dir, loadErr)
@@ -792,6 +797,12 @@ func unionUsed(active map[uint32]struct{}, retired []*fakeIPGeneration, ipv4 boo
 
 func (s *FakeIPStore) evictIfNeededLocked() (restore func(), err error) {
 	restore = func() {}
+	if s.stableAliases {
+		if len(s.records) >= s.maxLive {
+			return restore, fmt.Errorf("UDP peer mapping table full")
+		}
+		return restore, nil
+	}
 	live := 0
 	oldestIdx := -1
 	oldestUnix := int64(1<<63 - 1)
@@ -831,6 +842,9 @@ func (s *FakeIPStore) evictIfNeededLocked() (restore func(), err error) {
 }
 
 func (s *FakeIPStore) expireTombstonesLocked(now time.Time) {
+	if s.stableAliases {
+		return
+	}
 	graceSec := int64(fakeIPTombstoneGrace / time.Second)
 	nowUnix := now.Unix()
 	var live []int

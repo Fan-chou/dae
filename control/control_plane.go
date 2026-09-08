@@ -46,8 +46,9 @@ import (
 )
 
 type ControlPlane struct {
-	log          *logrus.Logger
-	directDialer netproxy.Dialer
+	udpCrossFamily *UDPCrossFamilyStore
+	log            *logrus.Logger
+	directDialer   netproxy.Dialer
 
 	runtimeStats *runtimeStats
 
@@ -938,8 +939,17 @@ func NewControlPlaneWithContextOptions(
 		plane.ResumeOutboundConnectivityUpdates()
 	}
 	core.bindDomainRoutingFingerprinter(routingMatcher)
+	if err := plane.initUDPCrossFamily(ctx, global, dnsConfig); err != nil {
+		return nil, err
+	}
 	plane.bindFakeIPLeafResolver()
 	if err := plane.initFakeIP(ctx, log, dnsConfig, tagToNodeList, locationFinder); err != nil {
+		return nil, err
+	}
+	if err := plane.validateUDPCrossFamilyPools(); err != nil {
+		return nil, err
+	}
+	if err := plane.syncFakeIPKernelPrefixes(); err != nil {
 		return nil, err
 	}
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)

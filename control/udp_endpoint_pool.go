@@ -51,7 +51,8 @@ type udpConnStateOwner interface {
 }
 
 type UdpEndpoint struct {
-	conn netproxy.PacketConn
+	crossFamily *UDPCrossFamilyStore
+	conn        netproxy.PacketConn
 	// writeBatch, when non-nil, aggregates outgoing datagrams and flushes
 	// them through the transport's batched writer (netproxy.PacketBatchWriter,
 	// e.g. sendmmsg on direct UDP). See udp_write_batch.go.
@@ -278,9 +279,10 @@ func (g *udpEndpointAdmissionGate) closeAndWait() {
 }
 
 type UdpEndpointOptions struct {
-	Ctx        context.Context
-	Handler    UdpHandler
-	NatTimeout time.Duration
+	crossFamily *UDPCrossFamilyStore
+	Ctx         context.Context
+	Handler     UdpHandler
+	NatTimeout  time.Duration
 	// ConnStateOwner releases eBPF UDP conn-state tuples when the endpoint exits.
 	ConnStateOwner udpConnStateOwner
 	// DrainTracker keeps the creating generation alive while the endpoint remains
@@ -641,6 +643,8 @@ func udpCreateBudgetInheritedFromParent(baseCtx, createCtx context.Context) bool
 // createEndpointLocked dials and registers a new UdpEndpoint under the caller's shard lock.
 // The caller MUST hold the shard mutex for key before calling this function.
 func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption *UdpEndpointOptions) (*UdpEndpoint, error) {
+	started := udpCreateWait.start()
+	defer udpCreateWait.finish(started)
 	if createOption == nil {
 		createOption = &UdpEndpointOptions{}
 	}
@@ -675,7 +679,9 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 		return time.Until(deadline)
 	}
 
+	selectStarted := udpSelectWait.start()
 	dialOption, err := createOption.GetDialOption(createCtx)
+	udpSelectWait.finish(selectStarted)
 	if err != nil {
 		if shouldCacheUdpEndpointCreateFailure(err) && !parentExhausted() {
 			p.cacheFailureLocked(key, createOption.Log, err)
@@ -683,18 +689,24 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 		return nil, err
 	}
 	dialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
+	dialStarted := udpDialWait.start()
 	udpConn, err := dialOption.Dialer.DialContext(dialCtx, dialOption.Network, dialOption.Target)
+	udpDialWait.finish(dialStarted)
 	if err != nil {
 		if !parentExhausted() {
 			reportUdpEndpointDialCreateFailure(key, dialOption, err)
 		}
 		if !parentExhausted() && shouldForceMarkUnavailableOnProxyDialError(err) &&
 			retryRemaining() >= udpEndpointRetryMinRemaining {
+			selectStarted = udpSelectWait.start()
 			retryOption, retryErr := createOption.GetDialOption(createCtx)
+			udpSelectWait.finish(selectStarted)
 			if retryErr == nil {
 				dialOption = retryOption
 				retryDialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
+				dialStarted = udpDialWait.start()
 				udpConn, err = dialOption.Dialer.DialContext(retryDialCtx, dialOption.Network, dialOption.Target)
+				udpDialWait.finish(dialStarted)
 				if err == nil {
 					goto dialSuccess
 				}
@@ -717,6 +729,7 @@ dialSuccess:
 		return nil, fmt.Errorf("protocol does not support udp")
 	}
 	ue := &UdpEndpoint{
+		crossFamily:       createOption.crossFamily,
 		conn:              packetConn,
 		handler:           createOption.Handler,
 		NatTimeout:        effectiveUdpEndpointNatTimeout(dialOption.Dialer, createOption.NatTimeout),

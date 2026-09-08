@@ -397,6 +397,14 @@ func (s *tcpRelayOffloadSession) drainResidual(lastProgress *time.Time) bool {
 // left/right record callbacks count bytes written to the peer, which equals
 // the bytes received on the corresponding socket.
 func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64, err error) {
+	tcpOffloadActive.Add(1)
+	defer tcpOffloadActive.Add(-1)
+	finPending := false
+	defer func() {
+		if finPending {
+			tcpOffloadFINPending.Add(-1)
+		}
+	}()
 	defer func() {
 		// Prefer the snapshot taken before a force-close; fall back to a live
 		// read when the sockets are still open (graceful double-close exit).
@@ -445,6 +453,9 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 
 		if err := s.propagateFIN(poller.closed); err != nil {
 			s.forceClose()
+			if errors.Is(err, net.ErrClosed) {
+				return 0, 0, nil
+			}
 			return 0, 0, err
 		}
 		if s.finSent == 3 {
@@ -481,6 +492,15 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		waitMs := int(tcpOffloadEpollWaitCap.Milliseconds())
+		pending := poller.closed != s.finSent
+		if pending != finPending {
+			if pending {
+				tcpOffloadFINPending.Add(1)
+			} else {
+				tcpOffloadFINPending.Add(-1)
+			}
+			finPending = pending
+		}
 		if poller.closed != s.finSent {
 			// The kernel retry queue has no userspace completion event. Only
 			// while a FIN is waiting for its tail, resample promptly instead
@@ -557,6 +577,9 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 
 		if err := s.propagateFIN(poller.closed); err != nil {
 			s.forceClose()
+			if errors.Is(err, net.ErrClosed) {
+				return 0, 0, nil
+			}
 			return 0, 0, err
 		}
 		if s.finSent == 3 {
@@ -911,7 +934,7 @@ func (s *tcpRelayOffloadSession) propagateFIN(readClosed uint8) error {
 		}
 		dst := conns[1-index]
 		if s.fastSock != nil {
-			received, err := tcpConnRxBytes(src)
+			srcInfo, err := tcpConnInfo(src)
 			if err != nil {
 				return err
 			}
@@ -919,6 +942,18 @@ func (s *tcpRelayOffloadSession) propagateFIN(readClosed uint8) error {
 			if err != nil {
 				return err
 			}
+			// Reset / terminal TCP sockets can retain an unaccepted tail.
+			// Their counters will never converge, and EOF may already have
+			// removed both readiness watchers. Do not wait forever on an
+			// empty epoll instance or send FIN to a transport that is gone.
+			// A CLOSED source may still have a redirected tail awaiting the
+			// destination: normal bidirectional FIN can close that source
+			// before the reverse payload has drained. Do not discard it.
+			if info.State == 7 { // TCP_CLOSE on the destination
+				tcpOffloadTerminalReaped.Add(1)
+				return net.ErrClosed
+			}
+			received := srcInfo.Bytes_received
 			queued, err := tcpConnOutQueue(dst)
 			if err != nil {
 				return err

@@ -10,14 +10,127 @@ package control
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
+
+func TestTCPOffloadFINRealRedirect(t *testing.T) {
+	if unix.Geteuid() != 0 {
+		t.Skip("needs root for isolated BPF map")
+	}
+	for _, reset := range []bool{false, true} {
+		t.Run(map[bool]string{false: "graceful", true: "reset"}[reset], func(t *testing.T) {
+			coll := loadOffloadVerifyCollection(t)
+			defer coll.Close()
+			fast := coll.Maps["fast_sock"]
+			lnk, err := link.AttachRawLink(link.RawLinkOptions{Target: fast.FD(), Program: coll.Programs["tcp_offload_redirect"], Attach: ebpf.AttachSkSKBStreamVerdict})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lnk.Close()
+			left, client := offloadTCPPair(t)
+			server, right := offloadTCPPair(t) // production egress is dialed
+			s, err := newTCPRelayOffloadSession(nil, fast, coll.Maps["tcp_offload_pause"], coll.Maps["tcp_offload_sent"], left, right, func(int64) {}, func(int64) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { _, _, e := s.Run(ctx); done <- e }()
+			payload := bytes.Repeat([]byte("tail"), 16384)
+			if _, err := client.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(server)
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("request tail: n=%d err=%v", len(got), err)
+			}
+			if reset {
+				if err := server.SetLinger(0); err != nil {
+					t.Fatal(err)
+				}
+				if err := server.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := server.Write(payload); err != nil {
+					t.Fatal(err)
+				}
+				if err := server.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				got, err := io.ReadAll(client)
+				if err != nil || !bytes.Equal(got, payload) {
+					t.Fatalf("response tail: n=%d err=%v", len(got), err)
+				}
+			}
+			<-done // reset may report its socket error; it must not wait for ctx
+			if ctx.Err() != nil {
+				t.Fatal("relay failed to retire before cancellation")
+			}
+		})
+	}
+}
+
+// A reset may arrive after EOF readiness was removed. TCP_CLOSE must end
+// FIN accounting even when bytes accepted by the dead peer cannot catch up.
+func TestTCPOffloadFINStopsWaitingForResetPeer(t *testing.T) {
+	left, client := offloadTCPPair(t)
+	right, server := offloadTCPPair(t)
+	rx, _, err := tcpOffloadBaseline(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tx, err := tcpOffloadBaseline(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &tcpRelayOffloadSession{left: left, right: right, leftRxBase: rx, txBase: [2]uint64{0, tx}, fastSock: &ebpf.Map{}}
+	if _, err := client.Write([]byte("unaccepted tail")); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(left); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		info, err := tcpConnInfo(right)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State == 7 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reset did not reach relay")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := s.propagateFIN(1); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("dead peer must terminate FIN wait, got %v", err)
+	}
+}
 
 func offloadTCPPair(t *testing.T) (relay, peer *net.TCPConn) {
 	t.Helper()

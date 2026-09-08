@@ -37,8 +37,11 @@ import (
 )
 
 var (
-	processFakeIPOnce  sync.Once
-	processFakeIPValue *control.FakeIPStore
+	processUDPCrossFamilyMu    sync.Mutex
+	processUDPCrossFamilyValue *control.UDPCrossFamilyStore
+	processUDPCrossFamilyPath  string
+	processFakeIPOnce          sync.Once
+	processFakeIPValue         *control.FakeIPStore
 )
 
 func processFakeIPStore(conf *config.Config) *control.FakeIPStore {
@@ -227,6 +230,24 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 	if fakeStore := processFakeIPStore(conf); fakeStore != nil {
 		ctx = control.WithFakeIPStore(ctx, fakeStore)
+	}
+	processUDPCrossFamilyMu.Lock()
+	if conf.Global.UDPCrossFamilyInet4Range != "" && processUDPCrossFamilyValue == nil {
+		dir := "."
+		if cfgFile != "" {
+			dir = filepath.Dir(cfgFile)
+		}
+		processUDPCrossFamilyValue = control.NewUDPCrossFamilyStore(dir, conf.Global.UDPCrossFamilyPath)
+		processUDPCrossFamilyPath = conf.Global.UDPCrossFamilyPath
+	}
+	crossStore := processUDPCrossFamilyValue
+	pathChanged := crossStore != nil && conf.Global.UDPCrossFamilyInet4Range != "" && conf.Global.UDPCrossFamilyPath != processUDPCrossFamilyPath
+	processUDPCrossFamilyMu.Unlock()
+	if pathChanged {
+		return nil, fmt.Errorf("changing udp_cross_family_path requires a restart with the existing mapping data")
+	}
+	if crossStore != nil {
+		ctx = control.WithUDPCrossFamilyStore(ctx, crossStore)
 	}
 	if conf.Global.SoMarkFromDae == 0 {
 		var autoSelected bool

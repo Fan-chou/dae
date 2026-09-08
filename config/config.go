@@ -17,6 +17,10 @@ var (
 )
 
 type Global struct {
+	UDPCrossFamilyInet4Range string `mapstructure:"udp_cross_family_inet4_range"`
+	UDPCrossFamilyInet6Range string `mapstructure:"udp_cross_family_inet6_range"`
+	UDPCrossFamilyPath       string `mapstructure:"udp_cross_family_path"`
+
 	TproxyPort        uint16 `mapstructure:"tproxy_port" default:"12345"`
 	TproxyPortProtect bool   `mapstructure:"tproxy_port_protect" default:"true"`
 	SoMarkFromDae     uint32 `mapstructure:"so_mark_from_dae"`
@@ -278,6 +282,9 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 		if err = patch(conf); err != nil {
 			return nil, err
 		}
+	}
+	if _, _, err := conf.Global.UDPCrossFamilyPrefixes(conf.Dns.FakeIP); err != nil {
+		return nil, err
 	}
 	return conf, nil
 }

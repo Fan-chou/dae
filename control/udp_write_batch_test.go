@@ -773,3 +773,45 @@ func TestSyncWriteToSuccessResetsTrafficFailCount(t *testing.T) {
 		t.Fatal("synchronous WriteTo success must reset the write-fail streak")
 	}
 }
+
+// Models a batch blocked in lazy direct DNS. Close must signal cancellation
+// before attempting to acquire the flusher's mutex or close the socket.
+type cancelableBatchConn struct {
+	batchRecorder
+	entered    chan struct{}
+	canceled   chan struct{}
+	cancelOnce sync.Once
+}
+
+func (c *cancelableBatchConn) CancelPendingPacketWrites() {
+	c.cancelOnce.Do(func() { close(c.canceled) })
+}
+func (c *cancelableBatchConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	close(c.entered)
+	<-c.canceled
+	return 0, net.ErrClosed
+}
+func TestUDPBatchCloseCancelsBlockedWriteBeforeDrain(t *testing.T) {
+	conn := &cancelableBatchConn{entered: make(chan struct{}), canceled: make(chan struct{})}
+	t.Cleanup(conn.CancelPendingPacketWrites)
+	ue := &UdpEndpoint{conn: conn, NatTimeout: time.Minute}
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	if err := ue.writeBatch.Append([]byte("x"), "pending.example:27015"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conn.entered:
+	case <-time.After(time.Second):
+		t.Fatal("batch did not start")
+	}
+	done := make(chan error, 1)
+	go func() { done <- ue.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for DNS before cancelling it")
+	}
+}

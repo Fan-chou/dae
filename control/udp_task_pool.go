@@ -67,13 +67,14 @@ func (f udpTaskFunc) Run() { f() }
 // Field order optimized for memory alignment (Go best practice).
 type UdpTaskQueue struct {
 	// 8-byte aligned fields first
-	p         *UdpTaskPool
-	ch        chan UdpTask
-	wake      chan struct{}
-	done      chan struct{}
-	overflow  []UdpTask
-	enqueueMu sync.Mutex
-	flowBytes atomic.Int64
+	p           *UdpTaskPool
+	ch          chan UdpTask
+	wake        chan struct{}
+	done        chan struct{}
+	overflow    []UdpTask
+	enqueueMu   sync.Mutex
+	flowBytes   atomic.Int64
+	activeStage atomic.Int32
 
 	// 8-byte fields
 	agingTime time.Duration
@@ -105,7 +106,8 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 		return false
 	}
 	n := udpTaskQueuedBytes(task)
-	for q.wouldExceedLocked(n) {
+	for reason := q.overloadReasonLocked(n); reason != ""; reason = q.overloadReasonLocked(n) {
+		recordUDPOverload(q, reason)
 		if !q.dropOldestLocked() {
 			udpTaskDiscard(task)
 			return true
@@ -127,7 +129,7 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 		return true
 	default:
 		// Keep accepted work FIFO without blocking producers. UDP overload
-		// drops the newest task once the bounded overflow tier is full.
+		// drops the oldest task once the bounded overflow tier is full.
 		q.overflowMode = true
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(1)
@@ -136,15 +138,15 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 	}
 }
 
-func (q *UdpTaskQueue) wouldExceedLocked(extraBytes int) bool {
+func (q *UdpTaskQueue) overloadReasonLocked(extraBytes int) string {
 	pending := len(q.ch) + len(q.overflow)
 	if pending >= UdpTaskQueueLength+UdpTaskOverflowMax {
-		return true
+		return "packet_limit"
 	}
 	if extraBytes > 0 && q.flowBytes.Load()+int64(extraBytes) > udpTaskPerFlowMaxBytes {
-		return true
+		return "byte_limit"
 	}
-	return false
+	return ""
 }
 
 func (q *UdpTaskQueue) dropOldestLocked() bool {

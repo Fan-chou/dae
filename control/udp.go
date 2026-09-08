@@ -457,6 +457,17 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 var udpReplyReinjectionDrops atomic.Uint64
 
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
+	if ue != nil && ue.crossFamily != nil {
+		mapped, err := ue.crossFamily.reply(from, clientAddr)
+		if err != nil {
+			udpReplyReinjectionDrops.Add(1)
+			if log != nil && ue.crossFamily.allowErrorLog() {
+				log.WithError(err).Warn("UDP peer reply mapping failed")
+			}
+			return nil
+		}
+		from = mapped
+	}
 	recordDownload = normalizeTrafficRecord(recordDownload)
 	var cacheSlot udpEndpointResponseConnSlot
 	var cacheProvider udpEndpointResponseConnCache
@@ -503,12 +514,20 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 }
 
 func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) (bool, error) {
+	if _, _, err := c.udpCrossFamily.decode(realDst); err != nil {
+		return true, err
+	}
 	manager, _ := c.controlPlaneSessionManager()
 	if manager == nil {
 		return false, nil
 	}
 	ue, ok := manager.retainedUDPEndpoint(src, realDst, routingResult, c.PolicyEpoch())
 	if !ok {
+		return false, nil
+	}
+	// A retained source-only endpoint predating FakeIP destination isolation
+	// cannot preserve this client's synthetic destination on writes/replies.
+	if c.destIsFakeIP(realDst.Addr()) && ue.poolKey.Dst != realDst {
 		return false, nil
 	}
 	identified := quicIdentifiedFromEndpoint(c.isQuicBlockCandidate(flowDecision, data), ue)
@@ -527,6 +546,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
+	flowDecision.observeStage(3)
 	_, err := ue.WriteTo(data, ue.dialTargetForWrite(realDst))
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
@@ -627,11 +647,35 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	now := time.Now()
 	nowNano := now.UnixNano()
 	realSrc = src
+	var alias bool
+	routingResult, alias, err = c.routeUDPAlias(src, realDst, routingResult)
+	if err != nil {
+		return err
+	}
+	if alias {
+		prefetched = nil
+		prefetchOK = false
+	}
 	routeScope := udpEndpointRouteScope{}
 	forceSymmetricKey := false
 	if c.udpRouteScopeSensitive {
 		routeScope = newUdpEndpointRouteScope(routingResult)
 		forceSymmetricKey = udpRouteScopeNeedsDestinationAffinity(routingResult)
+	}
+
+	// DNS FakeIP identity is destination-specific even without metadata rules.
+	// Decide this before any source-only reuse; resolving the name here is a
+	// local reverse lookup, not a real DNS query. Keep sniffing available so
+	// an observed SNI may still take precedence over the DNS name.
+	var fakeDomain string
+	if c.destIsFakeIP(realDst.Addr()) {
+		fakeDomain, err = c.resolveFakeIPDomain("", realDst.Addr())
+		if err != nil {
+			return err
+		}
+		forceSymmetricKey = true
+		prefetched = nil
+		prefetchOK = false
 	}
 
 	// DNS to port 53 never reaches this point in production: the ingress
@@ -739,6 +783,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 
 				ue.TrackUdpConnStateTuplePair(realSrc, realDst)
+				flowDecision.observeStage(3)
 				_, err = ue.WriteTo(data, dialTarget)
 				if err == nil {
 					c.recordUploadTraffic(int64(len(data)))
@@ -958,6 +1003,9 @@ afterSniffing:
 	if domain == "" {
 		domain = c.rememberedUdpFlowDomain(realSrc, realDst)
 	}
+	if domain == "" {
+		domain = fakeDomain
+	}
 	if routingResult.Mark == 0 {
 		routingResult.Mark = c.soMarkFromDae
 	}
@@ -1051,8 +1099,10 @@ getNew:
 			endpointDrainTracker = nil
 		}
 		replyLog := c.log
+		flowDecision.observeStage(2)
 		ue, isNew, err = DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
-			Ctx: c.ctx,
+			Ctx:         c.ctx,
+			crossFamily: c.udpCrossFamily,
 			// Handler handles response packets and send it to the client.
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
 				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, RecordDownloadTraffic)
@@ -1175,6 +1225,7 @@ getNew:
 	dialTarget = ue.dialTargetForWrite(realDst)
 
 	for packetIndex < len(payloads) {
+		flowDecision.observeStage(3)
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
 			if isUdpEndpointWriteTolerated(err) {

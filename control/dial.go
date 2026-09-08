@@ -125,6 +125,19 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	mark := p.Mark
 	must := p.Must
 
+	if c.udpCrossFamily != nil {
+		real, alias, err := c.udpCrossFamily.decode(dst)
+		if err != nil {
+			return nil, err
+		}
+		if alias {
+			if p.Network != "udp" {
+				return nil, fmt.Errorf("UDP peer aliases cannot be used for %s", p.Network)
+			}
+			dst = real
+			outboundIndex = consts.OutboundControlPlaneRouting
+		}
+	}
 	domain, err := c.resolveFakeIPDomain(domain, dst.Addr())
 	if err != nil {
 		return nil, err
@@ -214,12 +227,13 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		UdpHealthDomain: dialer.UdpHealthDomainData,
 	}
 
-	// For UDP, ensure dialer's address family matches client's to prevent
-	// "non-IPv4/IPv6 address" errors when writing responses.
+	// Without peer mapping, retain the client-family selection for UDP replies.
+	// With cross-family forwarding, selection may follow the real destination;
+	// the direct socket is dual-stack and replies restore the client family.
 	// FakeIP direct pin uses the resolved real family so ipversion() and the
 	// WAN dest follow the real A/AAAA, not the client's FakeIP v4 socket.
 	selectionNetworkType := networkType
-	if p.Network == "udp" && !pinnedFakeIPRealDest {
+	if p.Network == "udp" && !pinnedFakeIPRealDest && c.udpCrossFamily == nil {
 		if clientIpVersion := consts.IpVersionFromAddr(src.Addr()); clientIpVersion != networkType.IpVersion {
 			selectionNetworkType = &dialer.NetworkType{
 				L4Proto:         networkType.L4Proto,
@@ -270,7 +284,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		Dialer:        d,
 		DialTarget:    dialTarget,
 		Network: func() string {
-			if p.Network == "udp" {
+			if p.Network == "udp" && !(c.udpCrossFamily != nil && !isProxyBackedDialer(d)) {
 				return common.MagicNetworkWithIPVersion(p.Network, mark, c.mptcp, string(selectionNetworkType.IpVersion))
 			}
 			return common.MagicNetwork(p.Network, mark, c.mptcp)

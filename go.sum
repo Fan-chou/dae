@@ -25,12 +25,16 @@ github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260906020559-8ad471b39caa h1:/
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260906020559-8ad471b39caa/go.mod h1:vGKMD2lkMLGmuIP89GLhkuWLjuUlCPfWQl+8DZEuRJE=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260907151152-f3e853a8586f h1:mBgUMcThHf5wQE46PwNiCemPBoIn4DAnbqXLsZbwqNE=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260907151152-f3e853a8586f/go.mod h1:1V5Aitd73knqS39KVlkmWf1DmMJJZIhIGdNUce9MzCk=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260908145744-204c35ee4c4f h1:hWxqqyc21ED24MQS6d9wWV8O6LOwTpsJTPFKGBa/hvU=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260908145744-204c35ee4c4f/go.mod h1:UmVrSb6tEEMX+tK6b7brWRCAmhgKv85EHKUifBuje9k=
 github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc h1:4YPZ0W1yHpWAB2CNxhJQr3pTPV/rZ4aG1orny4BQYv8=
 github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc/go.mod h1:rWDDhF7On0JnwicQw70jFP5jbqJg1B/5nRVbc2bmYfo=
 github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d h1:FOJ0LoSUMDDij+CYBRO3waCcgq5HTiXEreT2gFwkTxo=
 github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d h1:GQNKnrRvEYyzYS2TPxePF2VgeWfNubZou/7wRmj/4KA=
 github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185 h1:sX+DiAluUPnZbf1UEwv4finfyM1gijJr1VAOzsTQhRA=
+github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=

@@ -76,6 +76,7 @@ func udpRouteScopeNeedsDestinationAffinity(result *bpfRoutingResult) bool {
 // UdpFlowDecision centralizes the cheap ingress classification that is shared
 // across scheduling, sniffing, and UDP endpoint selection.
 type UdpFlowDecision struct {
+	observationQueue      *UdpTaskQueue
 	Key                   UdpFlowKey
 	SnifferKey            PacketSnifferKey
 	HasSnifferSession     bool
@@ -331,3 +332,10 @@ const (
 	// Preserves packet ordering within each UDP flow.
 	StrategyOrderedIngress
 )
+
+// Only used for the bounded overload snapshot; no per-flow logging.
+func (d UdpFlowDecision) observeStage(stage int32) {
+	if d.observationQueue != nil {
+		d.observationQueue.activeStage.Store(stage)
+	}
+}

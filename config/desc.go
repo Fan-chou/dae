@@ -36,18 +36,21 @@ var SectionDescription = map[string]Desc{
 }
 
 var GlobalDesc = Desc{
-	"tproxy_port":           "tproxy port to listen on. It is NOT a HTTP/SOCKS port, and is just used by eBPF program.\nIn normal case, you do not need to use it.",
-	"tproxy_port_protect":   "Set it true to protect tproxy port from unsolicited traffic. Set it false to allow users to use self-managed iptables tproxy rules.",
-	"so_mark_from_dae":      "Socket mark for dae-originated traffic. If omitted, dae auto-selects an internal mark to prevent UDP self-capture. Set a non-zero value to override that mark. Set 0 explicitly to keep the internal protection mark without the unset warning.",
-	"log_level":             "Log level: error, warn, info, debug, trace.",
-	"tcp_check_url":         "Node connectivity check.\nHost of URL should have both IPv4 and IPv6 if you have double stack in local.\nConsidering traffic consumption, it is recommended to choose a site with anycast IP and less response.",
-	"tcp_check_http_method": "The HTTP request method to `tcp_check_url`. Use 'HEAD' by default because some server implementations bypass accounting for this kind of traffic.",
-	"udp_check_dns":         "This DNS will be used to check UDP connectivity of nodes. And if dns_upstream below contains tcp, it also be used to check TCP DNS connectivity of nodes.\nThis DNS should have both IPv4 and IPv6 if you have double stack in local.",
-	"check_interval":        "Interval of connectivity check for TCP and UDP",
-	"check_tolerance":       "Group will switch node only when new_latency <= old_latency - tolerance.",
-	"lan_interface":         "The LAN interface to bind. Use it if you want to proxy LAN.",
-	"wan_interface":         "The WAN interface to bind. Use it if you want to proxy localhost. Use \"auto\" to auto detect.",
-	"allow_insecure":        "Allow insecure TLS certificates. It is not recommended to turn it on unless you have to.",
+	"udp_cross_family_inet4_range": "IPv4 mapping pool for IPv6 UDP peers. Configure both pools to enable cross-family forwarding. Must not overlap LAN or DNS FakeIP addresses.",
+	"udp_cross_family_inet6_range": "IPv6 mapping pool for IPv4 UDP peers (at least /96). Clients must route both mapping pools through this gateway.",
+	"udp_cross_family_path":        "Persistent UDP peer mappings, relative to the configuration directory. Default: persist.d/udp-cross-family. Keep across restarts; allocated addresses are never reassigned to other peers.",
+	"tproxy_port":                  "tproxy port to listen on. It is NOT a HTTP/SOCKS port, and is just used by eBPF program.\nIn normal case, you do not need to use it.",
+	"tproxy_port_protect":          "Set it true to protect tproxy port from unsolicited traffic. Set it false to allow users to use self-managed iptables tproxy rules.",
+	"so_mark_from_dae":             "Socket mark for dae-originated traffic. If omitted, dae auto-selects an internal mark to prevent UDP self-capture. Set a non-zero value to override that mark. Set 0 explicitly to keep the internal protection mark without the unset warning.",
+	"log_level":                    "Log level: error, warn, info, debug, trace.",
+	"tcp_check_url":                "Node connectivity check.\nHost of URL should have both IPv4 and IPv6 if you have double stack in local.\nConsidering traffic consumption, it is recommended to choose a site with anycast IP and less response.",
+	"tcp_check_http_method":        "The HTTP request method to `tcp_check_url`. Use 'HEAD' by default because some server implementations bypass accounting for this kind of traffic.",
+	"udp_check_dns":                "This DNS will be used to check UDP connectivity of nodes. And if dns_upstream below contains tcp, it also be used to check TCP DNS connectivity of nodes.\nThis DNS should have both IPv4 and IPv6 if you have double stack in local.",
+	"check_interval":               "Interval of connectivity check for TCP and UDP",
+	"check_tolerance":              "Group will switch node only when new_latency <= old_latency - tolerance.",
+	"lan_interface":                "The LAN interface to bind. Use it if you want to proxy LAN.",
+	"wan_interface":                "The WAN interface to bind. Use it if you want to proxy localhost. Use \"auto\" to auto detect.",
+	"allow_insecure":               "Allow insecure TLS certificates. It is not recommended to turn it on unless you have to.",
 	"block_quic": `When true (default), identified QUIC/HTTP3 is REJECT-NO-DROP unless the selected node's final chain carries UDP as unreliable datagrams (Hysteria2/TUIC native/Juicity/Shadowsocks UDP/SOCKS5/direct).
 Identification is a strict RFC 9000 client Initial (any port), a persisted UDP endpoint QUIC mark, or a recently identified 4-tuple — not UDP/443, a FakeIP domain, or the cheap 443/8443 sniff likely-check.
 reliable_ordered hops (AnyTLS UDP-over-TCP, VLESS/VMess/Trojan, WS/gRPC) and UDP-less hops (including Shadowsocks+shadow-tls) get ICMP Destination Unreachable — Communication Administratively Prohibited so clients fall back to HTTP/2 quickly.

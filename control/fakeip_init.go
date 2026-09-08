@@ -40,7 +40,6 @@ func (c *ControlPlane) initFakeIP(
 		}
 		store.RetireActive(inet4, inet6)
 		c.fakeIPPolicy = NewFakeIPPolicy(fake, store, c.routingMatcher, nil, uint64(c.policyIdentity.Epoch()))
-		c.syncFakeIPKernelPrefixes()
 		return nil
 	}
 	if err := fake.Validate(); err != nil {
@@ -75,7 +74,6 @@ func (c *ControlPlane) initFakeIP(
 		}
 		log.Infof("selective FakeIP enabled: inet4=%s inet6=%s filter_mode=%s", inet4, inet6Text, fake.ResolvedFilterMode())
 	}
-	c.syncFakeIPKernelPrefixes()
 	return nil
 }
 

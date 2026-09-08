@@ -485,6 +485,11 @@ func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
 	if ue != nil && ue.poolKey.Dst.IsValid() {
 		return ue.DialTarget
 	}
+	if ue != nil && ue.crossFamily != nil {
+		if real, alias, err := ue.crossFamily.decode(realDst); alias && err == nil {
+			return real.String()
+		}
+	}
 	return realDst.String()
 }
 
@@ -564,8 +569,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// The underlying conn.WriteTo is thread-safe; we accept a small race window
 	// for performance. Write errors will mark the endpoint dead for cleanup.
 	writeStarted := udpWriteWait.start()
+	carrier := &udpWriteByCarrier[udpCarrierIndex(ue)]
+	carrierStarted := carrier.start()
 	n, err := ue.conn.WriteTo(b, addr)
 	udpWriteWait.finish(writeStarted)
+	recordUDPSlowWrite(ue, addr, carrier.finish(carrierStarted), err)
 	if err != nil {
 		return n, ue.handleWriteError(err)
 	}
@@ -681,7 +689,13 @@ func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 
 		// conn is nil for negatively-cached failure entries; guard against panic.
 		if ue.writeBatch != nil {
-			// Drain any buffered datagrams before the conn closes.
+			// A direct batch can be blocked inside lazy DNS resolution. Cancel
+			// writes before waiting for the batch; closing the socket afterwards
+			// is too late to unblock that wait. Other transports retain their
+			// existing drain behavior.
+			if canceler, ok := ue.conn.(interface{ CancelPendingPacketWrites() }); ok {
+				canceler.CancelPendingPacketWrites()
+			}
 			ue.writeBatch.Close()
 		}
 		if ue.conn != nil {
@@ -728,6 +742,9 @@ func (ue *UdpEndpoint) setNatTimeout(timeout time.Duration) {
 // incorrectly strand valid flows whose first reply address is rewritten by the
 // proxy layer.
 func (ue *UdpEndpoint) requiresInitialReplyGuard() bool {
+	if ue != nil && ue.crossFamily != nil && !ue.poolKey.Dst.IsValid() {
+		return false
+	}
 	return ue == nil || !isProxyBackedDialer(ue.Dialer)
 }
 

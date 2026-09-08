@@ -147,8 +147,12 @@ func (t *udpIngressTask) Run() {
 	c := t.c
 	data := t.pktBuf
 	realDst := t.realDst
+	fakeDest := c.destIsFakeIP(realDst.Addr())
 	convergeSrc := t.convergeSrc
 	flowDecision := t.flowDecision
+	flowDecision.observationQueue = t.bindQ
+	flowDecision.observeStage(1)
+	defer flowDecision.observeStage(0)
 
 	// Defers run in LIFO order: dispatch slot, admission, buffer, then the
 	// task itself (the pool must not see the task before its deferred cleanup
@@ -170,7 +174,7 @@ func (t *udpIngressTask) Run() {
 	// UdpEndpoint state tracking on ingress. Keep userspace handling to
 	// reduce hot-path overhead, but best-effort preserve tuple metadata
 	// for rules matching (pname/mac/dscp).
-	if realDst.Port() == 53 {
+	if realDst.Port() == 53 && !(c.udpCrossFamily != nil && c.udpCrossFamily.store.Contains(realDst.Addr())) {
 		// Only self-directed traffic to the local DNS listener should be
 		// short-circuited here. External LAN clients targeting a LAN-bound
 		// listener have already entered the ingress/TProxy userspace path
@@ -291,7 +295,7 @@ func (t *udpIngressTask) Run() {
 	}
 
 	var cacheLookup cachedRoutingLookup
-	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
+	if !fakeDest && !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
 		cacheLookup = lookupCachedRoutingBinding(flowDecision, realDst)
 		if cacheLookup.bindingHit {
 			routingResult = cacheLookup.bound
@@ -351,7 +355,7 @@ func (t *udpIngressTask) Run() {
 		return
 	}
 
-	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
+	if !fakeDest && !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
 		owner := cacheLookup.owner
 		if owner == nil {
 			owner = routingCacheOwnerEndpoint(flowDecision)
@@ -393,6 +397,8 @@ func (t *udpIngressTask) discard() {
 	if t == nil {
 		return
 	}
+	udpDiscardWait.operations.Add(1)
+	udpDiscardWait.finish(t.queuedAt)
 	t.releaseDispatchSem()
 	t.noteQueueComplete()
 	if t.pktBuf != nil {

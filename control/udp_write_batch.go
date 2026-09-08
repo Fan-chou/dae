@@ -51,11 +51,12 @@ func udpWriteBatchOptedIn() bool { return os.Getenv(udpWriteBatchOptInEnv) == "1
 type udpWriteBatchAggregator struct {
 	ue *UdpEndpoint
 
-	mu    sync.Mutex
-	items []netproxy.BatchItem
-	buf   []byte
-	used  int
-	timer *time.Timer
+	mu       sync.Mutex
+	items    []netproxy.BatchItem
+	buf      []byte
+	used     int
+	timer    *time.Timer
+	queuedAt time.Time
 
 	closed bool // guarded by mu
 
@@ -100,6 +101,7 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 		})
 		a.used += len(data)
 		if len(a.items) == 1 {
+			a.queuedAt = udpBatchQueueWait.start()
 			a.timer = time.AfterFunc(udpWriteBatchWindow, a.flush)
 		}
 		if a.ue != nil && !a.ue.hasSent.Load() && !a.ue.hasReply.Load() {
@@ -161,6 +163,10 @@ func (a *udpWriteBatchAggregator) flush() {
 		return
 	}
 	a.unflushedFirst = false
+	udpBatchQueueWait.finish(a.queuedAt)
+	a.queuedAt = time.Time{}
+	flushStarted := udpBatchFlushWait.start()
+	defer udpBatchFlushWait.finish(flushStarted)
 	a.ue.armWriteDeadline(time.Now())
 	bw, ok := a.ue.conn.(netproxy.PacketBatchWriter)
 	if !ok {
