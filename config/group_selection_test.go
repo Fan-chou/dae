@@ -20,6 +20,7 @@ group {
     Proxy {
         filter: name('node-one', 'node-two')
         selection_members: "node-one,node-two"
+        isolate_transport: true
         policy: fixed(0)
     }
 }
@@ -32,7 +33,7 @@ routing {}
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if len(conf.Group) != 1 || len(conf.Group[0].SelectionMembers) != 2 || conf.Group[0].SelectionMembers[1] != "node-two" {
+	if len(conf.Group) != 1 || !conf.Group[0].IsolateTransport || len(conf.Group[0].SelectionMembers) != 2 || conf.Group[0].SelectionMembers[1] != "node-two" {
 		t.Fatalf("group selection metadata = %#v", conf.Group)
 	}
 }

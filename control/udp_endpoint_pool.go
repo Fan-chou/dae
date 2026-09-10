@@ -691,7 +691,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 	}
 	dialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
 	dialStarted := udpDialWait.start()
-	udpConn, err := dialOption.Dialer.DialContext(dialCtx, dialOption.Network, dialOption.Target)
+	udpConn, err := dialOption.Outbound.DialContextWithSelected(dialCtx, dialOption.Dialer, dialOption.Network, dialOption.Target)
 	udpDialWait.finish(dialStarted)
 	if err != nil {
 		if !parentExhausted() {
@@ -706,7 +706,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 				dialOption = retryOption
 				retryDialCtx := netproxy.ContextWithUDPReplyAddr(createCtx, dialOption.Target, key.Dst)
 				dialStarted = udpDialWait.start()
-				udpConn, err = dialOption.Dialer.DialContext(retryDialCtx, dialOption.Network, dialOption.Target)
+				udpConn, err = dialOption.Outbound.DialContextWithSelected(retryDialCtx, dialOption.Dialer, dialOption.Network, dialOption.Target)
 				udpDialWait.finish(dialStarted)
 				if err == nil {
 					goto dialSuccess

@@ -86,6 +86,10 @@ func CachedTimeNano() int64 {
 }
 
 type Dialer struct {
+	transportClassMu        sync.Mutex
+	transportClasses        map[string]*Dialer
+	transportClassesRetired bool
+
 	*GlobalOption
 	InstanceOption
 	netproxy.Dialer
@@ -390,6 +394,7 @@ func (d *Dialer) RetireForEstablishedFlows() {
 		return
 	}
 	d.retireOnce.Do(func() {
+		d.retireTransportClasses()
 		d.cancel()
 		d.retireForEstablishedFlows()
 		if d.metadataRetirer != nil {
@@ -445,6 +450,7 @@ func (d *Dialer) Close() error {
 	}
 	d.closeOnce.Do(func() {
 		d.RetireForEstablishedFlows()
+		d.closeTransportClasses()
 
 		// Multiplexed transports must remain open until the last established flow
 		// releases this concrete dialer.

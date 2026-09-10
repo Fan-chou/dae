@@ -87,8 +87,9 @@ func skipBeyondExcluded(skip map[*dialer.Dialer]struct{}, excluded *dialer.Diale
 type DialerGroup struct {
 	netproxy.Dialer
 
-	log  *logrus.Logger
-	Name string
+	log              *logrus.Logger
+	Name             string
+	IsolateTransport bool
 
 	Dialers []*dialer.Dialer
 
@@ -186,6 +187,7 @@ type dialerGroupMember struct {
 // defers those checks until the group participates in a real selection; it
 // must not invent a second probe layer on its own.
 type DialerGroupRuntimeOptions struct {
+	IsolateTransport   bool
 	HealthCheckEnabled bool
 	Lazy               bool
 	HealthDialers      *HealthDialerCache
@@ -224,6 +226,7 @@ func NewDialerGroupWithRuntimeOptions(
 	group := &DialerGroup{
 		log:                log,
 		Name:               name,
+		IsolateTransport:   runtimeOptions.IsolateTransport,
 		Dialers:            dialers,
 		dialersAnnotations: dialersAnnotations,
 		checkTolerance:     option.CheckTolerance,
@@ -618,6 +621,7 @@ func (g *DialerGroup) snapshotForEstablishedFlow(selected *dialer.Dialer, tables
 	view := &DialerGroup{
 		log:                    g.log,
 		Name:                   g.Name,
+		IsolateTransport:       g.IsolateTransport,
 		cachedMinCheckInterval: g.cachedMinCheckInterval,
 		siteSticky:             g.siteSticky,
 		siteStickyTree:         uniqueStickyTables(append([]*siteStickyTable(nil), tables...)),

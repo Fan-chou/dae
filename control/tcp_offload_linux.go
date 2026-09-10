@@ -427,7 +427,21 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 	if err != nil {
 		return 0, 0, fmt.Errorf("epoll_create1: %w", err)
 	}
-	defer func() { _ = unix.Close(epfd) }()
+	// The epoll descriptor is pollable: wait in Go netpoll instead of
+	// occupying one OS thread per established offload session.
+	if err := unix.SetNonblock(epfd, true); err != nil {
+		unix.Close(epfd)
+		return 0, 0, err
+	}
+	pollFile := os.NewFile(uintptr(epfd), "tcp-offload-epoll")
+	defer pollFile.Close()
+	if err := pollFile.SetReadDeadline(time.Time{}); err != nil {
+		return 0, 0, err
+	}
+	rawPoll, err := pollFile.SyscallConn()
+	if err != nil {
+		return 0, 0, err
+	}
 
 	poller := tcpOffloadPoller{epfd: epfd, fds: [2]int{s.leftFD, s.rightFD}}
 	if err := poller.arm(); err != nil {
@@ -522,7 +536,25 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 			}
 		}
 
-		n, err := unix.EpollWait(epfd, events[:], waitMs)
+		if err := pollFile.SetReadDeadline(time.Now().Add(time.Duration(waitMs) * time.Millisecond)); err != nil {
+			return 0, 0, err
+		}
+		var n int
+		var waitErr error
+		err := rawPoll.Read(func(fd uintptr) bool {
+			n, waitErr = unix.EpollWait(int(fd), events[:], 0)
+			if waitErr == syscall.EINTR {
+				return false
+			}
+			return n > 0 || waitErr != nil
+		})
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			err = nil
+			n = 0
+		} else if err == nil {
+			err = waitErr
+		}
+
 		if err != nil {
 			if err == syscall.EINTR {
 				continue

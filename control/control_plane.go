@@ -649,6 +649,7 @@ func NewControlPlaneWithContextOptions(
 				*policy,
 				callback,
 				outbound.DialerGroupRuntimeOptions{
+					IsolateTransport:   group.IsolateTransport,
 					HealthCheckEnabled: group.EnablesHealthCheck(),
 					Lazy:               group.Lazy,
 					HealthDialers:      healthDialers,
@@ -714,6 +715,7 @@ func NewControlPlaneWithContextOptions(
 			*policy,
 			callback,
 			outbound.DialerGroupRuntimeOptions{
+				IsolateTransport:   group.IsolateTransport,
 				HealthCheckEnabled: group.EnablesHealthCheck(),
 				Lazy:               group.Lazy,
 				HealthDialers:      healthDialers,

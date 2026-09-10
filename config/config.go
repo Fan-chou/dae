@@ -120,7 +120,10 @@ func ParseFunctionListOrString(fs FunctionListOrString) ([]*config_parser.Functi
 }
 
 type Group struct {
-	Name string `mapstructure:"_"`
+	// IsolateTransport gives this explicitly routed group a private proxy
+	// transport per node. It does not infer realtime traffic from packet size.
+	IsolateTransport bool   `mapstructure:"isolate_transport"`
+	Name             string `mapstructure:"_"`
 
 	Filter           [][]*config_parser.Function `mapstructure:"filter" repeatable:""`
 	FilterAnnotation [][]*config_parser.Param    `mapstructure:"_"`

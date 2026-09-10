@@ -143,7 +143,16 @@ func (t *udpIngressTask) Discard() { t.discard() }
 // Run executes the ingress packet handling. The buffer and admission gate
 // are released and the task is returned to the pool in all paths.
 func (t *udpIngressTask) Run() {
-	udpIngressWait.finish(t.queuedAt)
+	if elapsed := udpIngressWait.finish(t.queuedAt); elapsed >= 100*time.Millisecond {
+		dispatch := "ordered"
+		if t.dispatchSem != nil {
+			dispatch = "direct"
+		}
+		udpLastSlowIngress.Store(&udpSlowIngressEvent{
+			At: time.Now().UTC().Format(time.RFC3339Nano), Milliseconds: float64(elapsed) / float64(time.Millisecond),
+			Source: t.convergeSrc, Destination: t.realDst, PacketBytes: t.nbytes, Dispatch: dispatch,
+		})
+	}
 	c := t.c
 	data := t.pktBuf
 	realDst := t.realDst

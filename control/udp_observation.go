@@ -57,6 +57,20 @@ func (o *udpWaitObservation) snapshot() map[string]any {
 }
 
 var udpIngressWait, udpWriteWait, udpReplyWait, udpSniffWait, udpReplyHandlerWait udpWaitObservation
+
+// Keep values only: ingress tasks and packet buffers return to their pools
+// immediately after processing. This sample must not retain either object.
+type udpSlowIngressEvent struct {
+	At           string         `json:"at"`
+	Milliseconds float64        `json:"milliseconds"`
+	Source       netip.AddrPort `json:"source"`
+	Destination  netip.AddrPort `json:"destination"`
+	PacketBytes  int            `json:"packet_bytes"`
+	Dispatch     string         `json:"dispatch"`
+}
+
+var udpLastSlowIngress atomic.Pointer[udpSlowIngressEvent]
+
 var udpObservationEpoch = time.Now()
 var udpDiscardWait, udpCreateWait, udpSelectWait, udpDialWait, udpBatchFlushWait, udpBatchQueueWait udpWaitObservation
 var udpWriteByCarrier [4]udpWaitObservation
@@ -164,6 +178,7 @@ func init() {
 		discard["sampling_basis"] = "ingress_operations"
 		return map[string]any{
 			"ingress_wait":           udpIngressWait.snapshot(),
+			"last_slow_ingress":      udpLastSlowIngress.Load(),
 			"discard_wait":           discard,
 			"endpoint_create_wait":   udpCreateWait.snapshot(),
 			"select_resolve_wait":    udpSelectWait.snapshot(),

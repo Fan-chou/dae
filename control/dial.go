@@ -360,7 +360,7 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		lastRes = res
 
 		start := time.Now()
-		conn, err := res.Dialer.DialContext(ctx, res.Network, res.DialTarget)
+		conn, err := res.Outbound.DialContextWithSelected(ctx, res.Dialer, res.Network, res.DialTarget)
 		handshake := time.Since(start)
 		if err == nil {
 			// A slow but successful connection is already usable. Record its
