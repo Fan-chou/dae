@@ -1257,3 +1257,39 @@ func TestUdpEndpointCreateFailureTTL(t *testing.T) {
 		t.Fatalf("other failure = %v", got)
 	}
 }
+
+func TestResolveDNSPinWaitCancellationKeepsSharedLookup(t *testing.T) {
+	d := newNamedTestEndpointDialer("direct")
+	d.SetResolveDNS(netip.MustParseAddrPort("1.1.1.1:53"))
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	res := &proxyDialResult{Dialer: d}
+	entered, release := make(chan struct{}), make(chan struct{})
+	old := resolveIPViaDialer
+	resolveIPViaDialer = func(context.Context, netproxy.Dialer, netip.AddrPort, string, uint16, string) ([]netip.Addr, time.Duration, error) {
+		close(entered)
+		<-release
+		return []netip.Addr{netip.MustParseAddr("192.0.2.20")}, time.Minute, nil
+	}
+	defer func() { resolveIPViaDialer = old }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := cp.lookupProxyResolveDNSPin(ctx, res, "example.test", false); done <- err }()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("waiter error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("DNS pin wait ignored cancellation")
+	}
+	close(release)
+	// Join the shared lookup before restoring the test resolver. Its result
+	// must remain usable by another flow even though the first waiter left.
+	ip, err := cp.lookupProxyResolveDNSPin(context.Background(), res, "example.test", false)
+	if err != nil || ip != netip.MustParseAddr("192.0.2.20") {
+		t.Fatalf("shared lookup: %s %v", ip, err)
+	}
+}

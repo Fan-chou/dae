@@ -339,3 +339,21 @@ func (d UdpFlowDecision) observeStage(stage int32) {
 		d.observationQueue.activeStage.Store(stage)
 	}
 }
+
+// The queue has one consumer. Keep a reference only for the active WriteTo,
+// including its local admission wait, without allocating per-packet snapshots.
+func (d UdpFlowDecision) writeTo(ue *UdpEndpoint, data []byte, addr string) (int, error) {
+	q := d.observationQueue
+	if q == nil {
+		return ue.WriteTo(data, addr)
+	}
+	q.activeEndpoint.Store(ue)
+	q.writeCallStarted.Store(time.Since(udpObservationEpoch).Nanoseconds())
+	q.activeStage.Store(3)
+	defer func() {
+		q.writeCallStarted.Store(0)
+		q.activeEndpoint.Store(nil)
+		q.activeStage.Store(1)
+	}()
+	return ue.WriteTo(data, addr)
+}

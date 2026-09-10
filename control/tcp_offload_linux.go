@@ -95,10 +95,11 @@ type tcpRelayOffloadSession struct {
 	rightKey bpfTuplesKey
 
 	// Baseline tcp_info receive counters at registration, for final accounting.
-	leftRxBase  uint64
-	rightRxBase uint64
-	txBase      [2]uint64
-	finSent     uint8
+	leftRxBase   uint64
+	rightRxBase  uint64
+	txBase       [2]uint64
+	finSent      uint8
+	terminalDebt [2]tcpTerminalDebtObservation
 
 	// finalLeftRx/finalRightRx capture the accounting deltas before the
 	// sockets are force-closed: tcp_info is unreadable after close, and most
@@ -969,8 +970,22 @@ func (s *tcpRelayOffloadSession) propagateFIN(readClosed uint8) error {
 			}
 			accepted := info.Bytes_acked + uint64(queued)
 			if accepted < s.txBase[1-index] || accepted-s.txBase[1-index] < received-bases[index] {
+				terminal := readClosed == 3 && srcInfo.State == 7 &&
+					s.finSent&(1<<uint(1-index)) != 0 && queued == 0 && info.Unacked == 0
+				if terminal {
+					pending, err := tcpConnPendingBytes(src)
+					if err != nil {
+						return err
+					}
+					terminal = pending == 0
+				}
+				if s.terminalDebt[index].observe(time.Now(), terminal, received, accepted) {
+					tcpOffloadTerminalReaped.Add(1)
+					return net.ErrClosed
+				}
 				continue
 			}
+			s.terminalDebt[index] = tcpTerminalDebtObservation{}
 		}
 		if err := dst.CloseWrite(); err != nil {
 			return fmt.Errorf("offload FIN direction %d: %w", index, err)
@@ -978,4 +993,23 @@ func (s *tcpRelayOffloadSession) propagateFIN(readClosed uint8) error {
 		s.finSent |= bit
 	}
 	return nil
+}
+
+// This window applies only to terminal, empty transports with an outstanding
+// counter deficit. It is not a half-close timeout for live connections.
+type tcpTerminalDebtObservation struct {
+	since              time.Time
+	received, accepted uint64
+}
+
+func (o *tcpTerminalDebtObservation) observe(now time.Time, terminal bool, received, accepted uint64) bool {
+	if !terminal {
+		*o = tcpTerminalDebtObservation{}
+		return false
+	}
+	if o.since.IsZero() || o.received != received || o.accepted != accepted {
+		*o = tcpTerminalDebtObservation{since: now, received: received, accepted: accepted}
+		return false
+	}
+	return now.Sub(o.since) >= time.Second
 }

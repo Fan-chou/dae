@@ -308,6 +308,27 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	if p.IdentifiedQuic && c.shouldRejectProxiedQuic(d, true) {
 		return res, ErrQuicAdministrativelyProhibited
 	}
+	// Routing uses the name; a selected direct leaf uses the actual destination.
+	// Explicit resolve_dns keeps its existing override semantics.
+	if isDirectResolveDNSDial(res) && !res.Dialer.ResolveDNS().IsValid() {
+		if c.destIsFakeIP(dst.Addr()) {
+			real, err := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+			if err != nil {
+				return res, err
+			}
+			dst = netip.AddrPortFrom(real, dst.Port())
+			res.PinnedFakeIPRealDest = true
+		}
+		res.DialTarget, res.IsDialIp = dst.String(), true
+		if p.Network == "udp" {
+			c.pinProxyResolveDNSTarget(res, dst.Addr(), dst.Port())
+		} else if nt := res.SelectionNetworkTypeObj; nt != nil && nt.IpVersion != consts.IpVersionFromAddr(dst.Addr()) {
+			realType := *nt
+			realType.IpVersion = consts.IpVersionFromAddr(dst.Addr())
+			res.SelectionNetworkTypeObj = &realType
+			res.SelectionNetworkType = realType.StringWithoutDns()
+		}
+	}
 	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
 		return res, err
 	}

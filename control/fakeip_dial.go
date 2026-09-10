@@ -264,7 +264,7 @@ func udpDialTarget(selected, pinned string) string {
 //
 // resolve_dns: applyProxyResolveDNS already pinned an IP (and its cache);
 // leave that IP alone.
-// No resolve_dns: pass domain:port when we have a name (Hy2/TUIC accept
+// No resolve_dns: direct keeps the real IP; proxies pass domain:port (Hy2/TUIC accept
 // host:port on the wire). No name: pass the packet dest IP. FakeIP 28.x
 // is never dialed — rewriteFakeIPDialTarget must have produced a domain.
 func (c *ControlPlane) ensureUdpDialTargetIP(ctx context.Context, p *proxyDialParam, res *proxyDialResult) error {
@@ -279,7 +279,7 @@ func (c *ControlPlane) ensureUdpDialTargetIP(ctx context.Context, p *proxyDialPa
 	domain := udpDialDomain(res)
 	// FakeIP direct pin: keep the resolved real IP. Rewriting to domain:port
 	// would let a direct leaf resolve via the system and bounce into 28.x.
-	if res.PinnedFakeIPRealDest {
+	if res.PinnedFakeIPRealDest || isDirectResolveDNSDial(res) {
 		if _, err := parseDialTargetIP(res.DialTarget); err == nil {
 			return nil
 		}
@@ -474,7 +474,11 @@ func (c *ControlPlane) pinProxyResolveDNSTarget(res *proxyDialResult, ip netip.A
 	if c != nil {
 		mptcp = c.mptcp
 	}
-	res.Network = common.MagicNetworkWithIPVersion("udp", res.Mark, mptcp, string(ipVer))
+	if c != nil && c.udpCrossFamily != nil {
+		res.Network = common.MagicNetwork("udp", res.Mark, mptcp)
+	} else {
+		res.Network = common.MagicNetworkWithIPVersion("udp", res.Mark, mptcp, string(ipVer))
+	}
 	if res.SelectionNetworkTypeObj != nil && res.SelectionNetworkTypeObj.IpVersion != ipVer {
 		nt := *res.SelectionNetworkTypeObj
 		nt.IpVersion = ipVer
@@ -489,6 +493,10 @@ func isDirectResolveDNSDial(res *proxyDialResult) bool {
 	}
 	if res.OutboundIndex == consts.OutboundDirect {
 		return true
+	}
+	if res.Dialer != nil {
+		p := res.Dialer.Property()
+		return p != nil && p.Address == "" && p.Name == "direct"
 	}
 	return res.Outbound != nil && strings.EqualFold(res.Outbound.Name, consts.OutboundDirect.String())
 }
@@ -515,7 +523,7 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 		return nil
 	}
 	preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-	ip, err := c.lookupProxyResolveDNSPin(res, domain, preferV6)
+	ip, err := c.lookupProxyResolveDNSPin(ctx, res, domain, preferV6)
 	if err != nil {
 		return err
 	}
@@ -535,7 +543,7 @@ func (c *ControlPlane) applyProxyResolveDNS(ctx context.Context, p *proxyDialPar
 	return nil
 }
 
-func (c *ControlPlane) lookupProxyResolveDNSPin(res *proxyDialResult, domain string, preferV6 bool) (netip.Addr, error) {
+func (c *ControlPlane) lookupProxyResolveDNSPin(ctx context.Context, res *proxyDialResult, domain string, preferV6 bool) (netip.Addr, error) {
 	dns := res.Dialer.ResolveDNS()
 	key := proxyResolveDNSPinKey(res.Dialer, dns, domain, preferV6)
 	if ip, stale, ok := c.resolveDNSPins.lookupFreshOrStale(key, time.Now()); ok {
@@ -544,7 +552,7 @@ func (c *ControlPlane) lookupProxyResolveDNSPin(res *proxyDialResult, domain str
 		}
 		return ip, nil
 	}
-	v, err, _ := c.resolveDNSPins.sf.Do(key, func() (any, error) {
+	result := c.resolveDNSPins.sf.DoChan(key, func() (any, error) {
 		if ip, stale, ok := c.resolveDNSPins.lookupFreshOrStale(key, time.Now()); ok && !stale {
 			return ip, nil
 		}
@@ -555,8 +563,17 @@ func (c *ControlPlane) lookupProxyResolveDNSPin(res *proxyDialResult, domain str
 		c.resolveDNSPins.store(key, ip, time.Now(), ttl)
 		return ip, nil
 	})
-	if err != nil {
-		return netip.Addr{}, err
+	// A shared, bounded refresh can outlive this waiter. Endpoint creation
+	// must still return as soon as its own dial budget is cancelled.
+	var v any
+	select {
+	case <-ctx.Done():
+		return netip.Addr{}, ctx.Err()
+	case r := <-result:
+		if r.Err != nil {
+			return netip.Addr{}, r.Err
+		}
+		v = r.Val
 	}
 	ip, _ := v.(netip.Addr)
 	if !ip.IsValid() {

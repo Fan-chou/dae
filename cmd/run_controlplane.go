@@ -195,10 +195,9 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 // around the per-packet QUIC receive path cost more CPU than the parallelism
 // buys: on a 2-core box, GOMAXPROCS=1 cut proxied-relay CPU roughly in half at
 // identical throughput (measured 23.6 -> ~13 CPU-seconds per 45s of ~14MB/s
-// relay). The userspace relay stays well under one core, and direct traffic
-// bypasses userspace via the eBPF fast path, so a single P is not a
-// bottleneck; Go's asynchronous preemption keeps head-of-line delays bounded
-// if a bulk burst monopolizes the P.
+// relay). UDP/FakeIP direct traffic can still require userspace forwarding.
+// Receive loops explicitly yield between bounded bursts: asynchronous
+// preemption alone does not prevent short bursts from filling UDP queues.
 //
 // An explicit GOMAXPROCS environment variable always wins, preserving the
 // escape hatch for deployments that can actually saturate a core (e.g. many

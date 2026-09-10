@@ -67,14 +67,16 @@ func (f udpTaskFunc) Run() { f() }
 // Field order optimized for memory alignment (Go best practice).
 type UdpTaskQueue struct {
 	// 8-byte aligned fields first
-	p           *UdpTaskPool
-	ch          chan UdpTask
-	wake        chan struct{}
-	done        chan struct{}
-	overflow    []UdpTask
-	enqueueMu   sync.Mutex
-	flowBytes   atomic.Int64
-	activeStage atomic.Int32
+	p                *UdpTaskPool
+	ch               chan UdpTask
+	wake             chan struct{}
+	done             chan struct{}
+	overflow         []UdpTask
+	enqueueMu        sync.Mutex
+	flowBytes        atomic.Int64
+	activeStage      atomic.Int32
+	activeEndpoint   atomic.Pointer[UdpEndpoint]
+	writeCallStarted atomic.Int64
 
 	// 8-byte fields
 	agingTime time.Duration

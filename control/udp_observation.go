@@ -2,6 +2,8 @@ package control
 
 import (
 	"expvar"
+	"fmt"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -54,7 +56,8 @@ func (o *udpWaitObservation) snapshot() map[string]any {
 	return map[string]any{"last_slow_sample": o.lastSlow.Load(), "operations": o.operations.Load(), "sample_every": 64, "bucket_upper_ms": []string{"1", "5", "20", "50", "100", "200", "500", "1000", "+Inf"}, "samples": counts}
 }
 
-var udpIngressWait, udpWriteWait, udpReplyWait, udpSniffWait udpWaitObservation
+var udpIngressWait, udpWriteWait, udpReplyWait, udpSniffWait, udpReplyHandlerWait udpWaitObservation
+var udpObservationEpoch = time.Now()
 var udpDiscardWait, udpCreateWait, udpSelectWait, udpDialWait, udpBatchFlushWait, udpBatchQueueWait udpWaitObservation
 var udpWriteByCarrier [4]udpWaitObservation
 var udpOverloadPackets, udpOverloadBytes atomic.Uint64
@@ -82,14 +85,25 @@ func recordUDPSlowWrite(ue *UdpEndpoint, addr string, elapsed time.Duration, err
 	udpLastSlowWrite.Store(&udpSlowWriteEvent{At: time.Now().UTC().Format(time.RFC3339Nano), Milliseconds: float64(elapsed) / float64(time.Millisecond), Src: ue.lAddr.String(), Dst: addr, Dialer: name, Failed: err != nil})
 }
 
+type udpTransportWriteState struct {
+	LockWaiters     int32 `json:"lock_waiters"`
+	LockHeld        bool  `json:"lock_held"`
+	DatagramPending int   `json:"datagram_pending"` // -1 if unavailable; shared QUIC connection
+}
+
 type udpOverloadEvent struct {
-	ActiveStage int32  `json:"active_stage"` // 0 idle, 1 routing/sniff, 2 create/select/dial, 3 write
-	At          string `json:"at"`
-	Src         string `json:"src"`
-	Dst         string `json:"dst"`
-	Reason      string `json:"reason"`
-	Pending     int    `json:"pending"`
-	Bytes       int64  `json:"bytes"`
+	TransportWrite        *udpTransportWriteState `json:"transport_write,omitempty"`
+	Endpoint              string                  `json:"endpoint,omitempty"`
+	Dialer                string                  `json:"dialer,omitempty"`
+	Carrier               string                  `json:"carrier,omitempty"`
+	WriteCallMilliseconds float64                 `json:"write_call_ms,omitempty"`
+	ActiveStage           int32                   `json:"active_stage"` // 0 idle, 1 routing/sniff, 2 create/select/dial, 3 write
+	At                    string                  `json:"at"`
+	Src                   string                  `json:"src"`
+	Dst                   string                  `json:"dst"`
+	Reason                string                  `json:"reason"`
+	Pending               int                     `json:"pending"`
+	Bytes                 int64                   `json:"bytes"`
 }
 
 func recordUDPOverload(q *UdpTaskQueue, reason string) {
@@ -103,7 +117,25 @@ func recordUDPOverload(q *UdpTaskQueue, reason string) {
 	if now.UnixNano()-old < int64(time.Second) || !udpLastOverloadAt.CompareAndSwap(old, now.UnixNano()) {
 		return
 	}
-	udpLastOverload.Store(&udpOverloadEvent{ActiveStage: q.activeStage.Load(), At: now.UTC().Format(time.RFC3339Nano), Src: q.key.Src.String(), Dst: q.key.Dst.String(), Reason: reason, Pending: len(q.ch) + len(q.overflow), Bytes: q.flowBytes.Load()})
+	event := &udpOverloadEvent{ActiveStage: q.activeStage.Load(), At: now.UTC().Format(time.RFC3339Nano), Src: q.key.Src.String(), Dst: q.key.Dst.String(), Reason: reason, Pending: len(q.ch) + len(q.overflow), Bytes: q.flowBytes.Load()}
+	start := q.writeCallStarted.Load()
+	if ue := q.activeEndpoint.Load(); ue != nil && start != 0 && event.ActiveStage == 3 {
+		endpoint, name, carrier := udpEndpointObservation(ue)
+		elapsed := time.Since(udpObservationEpoch).Nanoseconds() - start
+		var transport *udpTransportWriteState
+		if observer, ok := ue.conn.(interface{ UDPWriteState() (int32, bool, int) }); ok {
+			waiters, held, pending := observer.UDPWriteState()
+			transport = &udpTransportWriteState{waiters, held, pending}
+		}
+		// The worker may finish or switch endpoints during this snapshot.
+		// Omit attribution if it no longer describes the same write call.
+		if q.writeCallStarted.Load() == start && q.activeEndpoint.Load() == ue {
+			event.TransportWrite = transport
+			event.Endpoint, event.Dialer, event.Carrier = endpoint, name, carrier
+			event.WriteCallMilliseconds = float64(elapsed) / float64(time.Millisecond)
+		}
+	}
+	udpLastOverload.Store(event)
 }
 
 func udpCarrierIndex(ue *UdpEndpoint) int {
@@ -145,6 +177,8 @@ func init() {
 			"last_slow_write":        udpLastSlowWrite.Load(),
 			"synchronous_write_wait": udpWriteWait.snapshot(),
 			"reply_wait":             udpReplyWait.snapshot(),
+			"reply_handler_wait":     udpReplyHandlerWait.snapshot(),
+			"last_reply_overload":    udpLastReplyOverload.Load(),
 			"sniff_hold":             udpSniffWait.snapshot(),
 			"sniff_budget_flushes":   udpSniffBudgetFlushes.Load(),
 			"sniff_budget_rejected":  udpSniffBudgetRejected.Load(),
@@ -152,4 +186,53 @@ func init() {
 			"ingress_drop_oldest":    udpIngressDropOldest.Load(),
 		}
 	}))
+}
+
+const (
+	udpReplyIdle int32 = iota
+	udpReplyHandler
+	udpReplyMapping
+	udpReplySocketLookup
+	udpReplySocketWrite
+)
+
+func (ue *UdpEndpoint) observeReplyStage(stage int32) {
+	if ue != nil {
+		ue.replyStage.Store(stage)
+	}
+}
+
+func udpEndpointObservation(ue *UdpEndpoint) (endpoint, name, carrier string) {
+	endpoint = fmt.Sprintf("%p", ue)
+	if ue.Dialer != nil && ue.Dialer.Property() != nil {
+		name = ue.Dialer.Property().Name
+	}
+	carrier = [...]string{"direct", "datagram", "stream", "other"}[udpCarrierIndex(ue)]
+	return
+}
+
+type udpReplyOverloadEvent struct {
+	At       string `json:"at"`
+	Endpoint string `json:"endpoint"`
+	Src      string `json:"src"`
+	Client   string `json:"client"`
+	Dialer   string `json:"dialer"`
+	Carrier  string `json:"carrier"`
+	Pending  int    `json:"pending"`
+	Stage    string `json:"stage"`
+}
+
+var udpLastReplyOverload atomic.Pointer[udpReplyOverloadEvent]
+var udpLastReplyOverloadAt atomic.Int64
+
+func recordUDPReplyOverload(ue *UdpEndpoint, from netip.AddrPort, pending int) {
+	udpReplyQueueDrops.Add(1)
+	now := time.Now()
+	old := udpLastReplyOverloadAt.Load()
+	if now.UnixNano()-old < int64(time.Second) || !udpLastReplyOverloadAt.CompareAndSwap(old, now.UnixNano()) {
+		return
+	}
+	endpoint, name, carrier := udpEndpointObservation(ue)
+	stage := [...]string{"idle", "handler", "mapping", "socket_lookup", "socket_write"}[ue.replyStage.Load()]
+	udpLastReplyOverload.Store(&udpReplyOverloadEvent{At: now.UTC().Format(time.RFC3339Nano), Endpoint: endpoint, Src: from.String(), Client: ue.lAddr.String(), Dialer: name, Carrier: carrier, Pending: pending, Stage: stage})
 }

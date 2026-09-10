@@ -344,7 +344,12 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// to the client. The handler (forwardUdpEndpointReplyToClient) only
 			// writes to the local tproxy socket, which is independent of the
 			// upstream endpoint's liveness.
-			if err := ue.handler(ue, queued.data, queued.from); err != nil {
+			ue.observeReplyStage(udpReplyHandler)
+			started := udpReplyHandlerWait.start()
+			err := ue.handler(ue, queued.data, queued.from)
+			udpReplyHandlerWait.finish(started)
+			ue.observeReplyStage(udpReplyIdle)
+			if err != nil {
 				releaseUdpEndpointReplies(batch[i:])
 				retire()
 				close(stop)

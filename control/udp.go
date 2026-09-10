@@ -295,6 +295,12 @@ func swapPinnedAnyfrom(slot **Anyfrom, next *Anyfrom) {
 }
 
 func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, soMark uint32, slot udpEndpointResponseConnSlot, cache udpEndpointResponseConnCache) (err error) {
+	return sendPktWithReplyObservation(log, data, from, realTo, soMark, slot, cache, nil)
+}
+
+func sendPktWithReplyObservation(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, soMark uint32, slot udpEndpointResponseConnSlot, cache udpEndpointResponseConnCache, ue *UdpEndpoint) (err error) {
+	ue.observeReplyStage(udpReplySocketLookup)
+
 	// Proxy chain support: Use original 'from' address as bindAddr to ensure
 	// each server response gets its own UDP socket. This prevents response mixing
 	// when multiple IPv6 servers would otherwise share [::]:port (wildcard binding).
@@ -329,6 +335,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 					}).Debug("sendPkt: discarded cached socket with mismatched mark")
 				}
 			} else {
+				ue.observeReplyStage(udpReplySocketWrite)
 				if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
 					if traceEnabled {
 						log.WithFields(logrus.Fields{
@@ -351,6 +358,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		}
 	}
 
+	ue.observeReplyStage(udpReplySocketLookup)
 	if cache != nil {
 		if cached := cache.CachedResponseConn(bindAddr); cached != nil {
 			if cached.soMark != soMark {
@@ -363,6 +371,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 					}).Debug("sendPkt: discarded bind-address cached socket with mismatched mark")
 				}
 			} else {
+				ue.observeReplyStage(udpReplySocketWrite)
 				if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
 					if traceEnabled {
 						log.WithFields(logrus.Fields{
@@ -385,8 +394,10 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		}
 	}
 
+	ue.observeReplyStage(udpReplySocketLookup)
 	uConn, isNew, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, soMark, AnyfromTimeout)
 	if err != nil {
+		ue.observeReplyStage(udpReplySocketWrite)
 		if tryRawUDPFallback(log, data, from, realTo, soMark, debugEnabled, errorEnabled, "get-or-create", err) {
 			return nil
 		}
@@ -410,6 +421,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		}).Trace("sendPkt: got socket from pool")
 	}
 
+	ue.observeReplyStage(udpReplySocketWrite)
 	_, err = uConn.WriteToUDPAddrPort(data, writeAddr)
 	if err != nil {
 		if tryRawUDPFallback(log, data, from, realTo, soMark, debugEnabled, errorEnabled, "write-to-udp", err) {
@@ -457,6 +469,8 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 var udpReplyReinjectionDrops atomic.Uint64
 
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
+	ue.observeReplyStage(udpReplyMapping)
+	defer ue.observeReplyStage(udpReplyIdle)
 	if ue != nil && ue.crossFamily != nil {
 		mapped, err := ue.crossFamily.reply(from, clientAddr)
 		if err != nil {
@@ -480,7 +494,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	// broken. Keeping the endpoint alive avoids recreating a fresh UDP session
 	// for every subsequent client packet after a transient local send failure.
 	if send == nil {
-		if err := sendPktWithResponseConnSlot(log, data, from, clientAddr, replySoMark, cacheSlot, cacheProvider); err != nil {
+		if err := sendPktWithReplyObservation(log, data, from, clientAddr, replySoMark, cacheSlot, cacheProvider, ue); err != nil {
 			udpReplyReinjectionDrops.Add(1)
 			if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 				log.WithFields(logrus.Fields{
@@ -546,8 +560,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
-	flowDecision.observeStage(3)
-	_, err := ue.WriteTo(data, ue.dialTargetForWrite(realDst))
+	_, err := flowDecision.writeTo(ue, data, ue.dialTargetForWrite(realDst))
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
@@ -783,8 +796,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 
 				ue.TrackUdpConnStateTuplePair(realSrc, realDst)
-				flowDecision.observeStage(3)
-				_, err = ue.WriteTo(data, dialTarget)
+				_, err = flowDecision.writeTo(ue, data, dialTarget)
 				if err == nil {
 					c.recordUploadTraffic(int64(len(data)))
 					return nil
@@ -1225,8 +1237,7 @@ getNew:
 	dialTarget = ue.dialTargetForWrite(realDst)
 
 	for packetIndex < len(payloads) {
-		flowDecision.observeStage(3)
-		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
+		_, err = flowDecision.writeTo(ue, payloads[packetIndex], dialTarget)
 		if err != nil {
 			if isUdpEndpointWriteTolerated(err) {
 				// Transient write failure: drop this datagram, keep the session.

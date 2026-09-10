@@ -239,7 +239,7 @@ func BenchmarkUDPCrossFamilyEstablishedMapping(b *testing.B) {
 	}
 }
 
-func TestUDPCrossFamilyIPv6ClientDirectIPv4Domain(t *testing.T) {
+func TestUDPCrossFamilyIPv6FakeIPDirectIPv4(t *testing.T) {
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -254,14 +254,24 @@ func TestUDPCrossFamilyIPv6ClientDirectIPv4Domain(t *testing.T) {
 	cp.udpCrossFamily = openCrossFamilyTestStore(t, t.TempDir())
 	cp.dialMode = consts.DialMode_DomainPlus
 	client := netip.MustParseAddrPort("[2001:db8::2]:31000")
-	original := netip.AddrPortFrom(netip.MustParseAddr("::1"), server.LocalAddr().(*net.UDPAddr).AddrPort().Port())
+	store, _ := newTestFakeIPStore(t, "localhost")
+	_, fake6, _, err := store.Assign("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachFakeIPStore(cp, store)
+	seedDnsCacheA(t, cp, "localhost", netip.MustParseAddr("127.0.0.1"))
+	cp.routingMatcher = testFakeIPMatcher(t, "fallback: proxy", []string{"proxy"})
+	cp.routingMatcher.fakeIPLeafIsProxy = func(consts.OutboundIndex) bool { return false }
+	original := netip.AddrPortFrom(fake6, server.LocalAddr().(*net.UDPAddr).AddrPort().Port())
 	res, err := cp.chooseProxyDialer(context.Background(), &proxyDialParam{Src: client, Dest: original, Domain: "localhost", Network: "udp", Outbound: consts.OutboundUserDefinedMin})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.DialTarget == original.String() {
-		t.Fatal("fixture did not select a domain")
+	if res.DialTarget != server.LocalAddr().String() || !res.IsDialIp {
+		t.Fatalf("direct must keep the resolved IPv4 target: %s", res.DialTarget)
 	}
+	assertMagicIPVersion(t, res.Network, "")
 	conn, err := res.Dialer.DialContext(context.Background(), res.Network, res.DialTarget)
 	if err != nil {
 		t.Fatal(err)

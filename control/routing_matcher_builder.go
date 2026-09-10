@@ -83,7 +83,7 @@ func canonicalizePrefixes(prefixes []netip.Prefix) []netip.Prefix {
 	if len(prefixes) == 0 {
 		return nil
 	}
-	canonical := append([]netip.Prefix(nil), prefixes...)
+	canonical := routingAddressFamilyPrefixes(prefixes)
 	sort.Slice(canonical, func(i, j int) bool {
 		if canonical[i].Bits() != canonical[j].Bits() {
 			return canonical[i].Bits() < canonical[j].Bits()

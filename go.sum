@@ -27,6 +27,8 @@ github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260907151152-f3e853a8586f h1:m
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260907151152-f3e853a8586f/go.mod h1:1V5Aitd73knqS39KVlkmWf1DmMJJZIhIGdNUce9MzCk=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260908145744-204c35ee4c4f h1:hWxqqyc21ED24MQS6d9wWV8O6LOwTpsJTPFKGBa/hvU=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260908145744-204c35ee4c4f/go.mod h1:UmVrSb6tEEMX+tK6b7brWRCAmhgKv85EHKUifBuje9k=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260909151816-0875e73d6ff1 h1:BSi/k9N+qD3WVh6xU1L1xLTR4KOQ1Yhp2XGYLpnvxD0=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260909151816-0875e73d6ff1/go.mod h1:l3t+MmZDnmHV+rL012PQKB8Ea+Jhb1Gzu7UafpAMgnY=
 github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc h1:4YPZ0W1yHpWAB2CNxhJQr3pTPV/rZ4aG1orny4BQYv8=
 github.com/Fan-chou/quic-go v0.0.0-20260824024751-8cfce08be8dc/go.mod h1:rWDDhF7On0JnwicQw70jFP5jbqJg1B/5nRVbc2bmYfo=
 github.com/Fan-chou/quic-go v0.0.0-20260831031827-fbf90cb0a47d h1:FOJ0LoSUMDDij+CYBRO3waCcgq5HTiXEreT2gFwkTxo=
@@ -35,6 +37,8 @@ github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d h1:GQNKnrRvEYyzYS
 github.com/Fan-chou/quic-go v0.0.0-20260907151012-7d0036ec968d/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185 h1:sX+DiAluUPnZbf1UEwv4finfyM1gijJr1VAOzsTQhRA=
 github.com/Fan-chou/quic-go v0.0.0-20260908010219-707a33e66185/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062 h1:3jfLJF5j2KUYHTS594llhzM6m752HACue8r2laU4kMA=
+github.com/Fan-chou/quic-go v0.0.0-20260909151702-8fd15d6d9062/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
@@ -632,3 +636,7 @@ lukechampine.com/blake3 v1.4.1/go.mod h1:QFosUxmjB8mnrWFSNwKmvxHpfY72bmD2tQ0kBMM
 rsc.io/binaryregexp v0.2.0/go.mod h1:qTv7/COck+e2FymRvadv62gMdZztPaShugOCi3I+8D8=
 rsc.io/quote/v3 v3.1.0/go.mod h1:yEA65RcK8LyAZtP9Kv3t0HmxON59tX3rD+tICJqUlj0=
 rsc.io/sampler v1.3.0/go.mod h1:T1hPZKmBbMNahiBKFy5HrXp6adAjACjK9JXDnKaTXpA=
+github.com/Fan-chou/quic-go v0.0.0-20260909160215-8d1171a22068 h1:dCP2X0zv2WPu5sZKdUrSNR4Vl2CQyVlmOTF0df0yyYU=
+github.com/Fan-chou/quic-go v0.0.0-20260909160215-8d1171a22068/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260909163600-bbc675ae9c1f h1:exncDN7ZhRnQ9yO8VXFAvXIXSr5gKKhUgdLXyB7Mrl8=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260909163600-bbc675ae9c1f/go.mod h1:l3t+MmZDnmHV+rL012PQKB8Ea+Jhb1Gzu7UafpAMgnY=

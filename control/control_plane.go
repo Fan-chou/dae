@@ -2609,6 +2609,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// }
 		}
 
+		var ingressBudget udpIngressScheduleBudget
 		if udpIngressSupportsBatch(udpConn) {
 			batchReader := newUDPIngressBatchReader(udpConn, 0)
 			if batchReader == nil {
@@ -2623,7 +2624,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				default:
 				}
 
-				// IPv4 listener fast path: batch read reduces syscall overhead while
+				// Batch read reduces syscall overhead for either address family while
 				// preserving one exclusive ingress buffer per packet.
 				n, err := batchReader.ReadBatch()
 				if err != nil {
@@ -2638,6 +2639,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 						continue
 					}
 					processPacket(pktBuf, src, oob)
+					ingressBudget.packetHandled()
 				}
 			}
 			return
@@ -2664,10 +2666,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				continue
 			}
 
-			// Dual-stack UDP listener path: prefer correctness and IPv6 coverage
-			// over batch-read optimization. OOB is consumed synchronously in
+			// Single-read fallback. OOB is consumed synchronously in
 			// processPacket, so reusing the stack buffer is safe here.
 			processPacket(pktBuf, src, oob[:oobn])
+			ingressBudget.packetHandled()
 		}
 	}()
 	c.ActivateCheck()

@@ -51,6 +51,7 @@ type udpConnStateOwner interface {
 }
 
 type UdpEndpoint struct {
+	replyStage  atomic.Int32
 	crossFamily *UDPCrossFamilyStore
 	conn        netproxy.PacketConn
 	// writeBatch, when non-nil, aggregates outgoing datagrams and flushes
