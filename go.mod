@@ -115,10 +115,10 @@ require (
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
 // Published fork includes cancellable DATAGRAMs, queue observations and MTU-safe Initial packets.
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260910143732-73a4196e13d4
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260911160057-c501a9e0af98
 
 //replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
-// Published outbound includes UDP deadlines, connected-socket GSO and Hy2 observations.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260910115855-68c58b0f6d04
+// Published outbound includes UDP lifecycle fixes and explicit BBR application supply state.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260911160117-77f4a93959f4
