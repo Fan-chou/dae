@@ -115,7 +115,7 @@ require (
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
 // Published fork includes cancellable DATAGRAMs, queue observations and MTU-safe Initial packets.
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260911160057-c501a9e0af98
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20260911161415-b43ac74354b4
 
 //replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config

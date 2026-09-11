@@ -55,6 +55,8 @@ github.com/Fan-chou/quic-go v0.0.0-20260910143732-73a4196e13d4 h1:jNhihdY0qbIQXT
 github.com/Fan-chou/quic-go v0.0.0-20260910143732-73a4196e13d4/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20260911160057-c501a9e0af98 h1:R7coqYdbebgXRvPIHJzmElO1E4DMEpkuvRovug3DZq4=
 github.com/Fan-chou/quic-go v0.0.0-20260911160057-c501a9e0af98/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
+github.com/Fan-chou/quic-go v0.0.0-20260911161415-b43ac74354b4 h1:m484cTHOBrrdLsMrz8gq85Cd80hG36TQqrti5h5AkXk=
+github.com/Fan-chou/quic-go v0.0.0-20260911161415-b43ac74354b4/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
