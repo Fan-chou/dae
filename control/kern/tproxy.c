@@ -324,11 +324,10 @@ struct {
 	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
 } tcp_offload_pause SEC(".maps");
 
-/* tcp_offload_sent counts bytes that skb_send_sock delivered to a socket's
- * send path, keyed by the skb's reversed four-tuple (the same key space as
- * fast_sock and tcp_offload_pause). The Go session compares it against
- * tcp_info receive deltas to compute the egress retry-queue backlog that
- * drives the pause fuse.
+/* tcp_offload_sent counts attempted bytes at the send-function entry,
+ * keyed by the skb's reversed four-tuple. Partial writes and retries can
+ * overcount; this is diagnostic data, not proof of delivery or queue drain.
+ * The Go backlog fuse uses TCP acceptance counters instead.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
@@ -4222,11 +4221,11 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * (reuse across reload generations), so re-attaching to skb_send_sock
  * should now succeed.
  *
- * Accounting caveat: fentry fires on function entry, so skbs requeued via
- * the EAGAIN retry path in sk_psock_handle_skb (!sock_writeable) are
- * counted once per attempt. Under congestion this over-estimates "sent"
- * and delays fuse engagement slightly — the conservative direction
- * relative to a dead counter, accepted deliberately.
+ * Accounting caveat: entry hooks count attempted lengths, including
+ * partially completed and failed sends. Repeated attempts can exceed total
+ * input, so this counter must not control the backlog fuse or FIN propagation.
+ * The !sock_writeable check in sk_psock_handle_skb precedes this function;
+ * retries rejected by that check do not reach this hook.
  *
  * KPROBE FALLBACK: on kernels without CONFIG_DYNAMIC_FTRACE (trimmed
  * router builds such as ImmortalWrt), functions carry no mcount NOP

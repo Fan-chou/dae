@@ -112,8 +112,8 @@ type tcpRelayOffloadSession struct {
 	// fused marks the backlog fuse as engaged: the verdict program passes
 	// data through (pause map) and the userspace fallback forwards it.
 	fused bool
-	// fusePassBytes accumulates userspace-fallback bytes so the backlog
-	// metric stays continuous without racing the kernel-side accounting.
+	// fusePassBytes records userspace-fallback traffic for relay accounting
+	// checks only; it is not part of the backlog calculation.
 	fusePassBytes uint64
 	// fuseDrainUntil (zero while inactive) marks the drain window after the
 	// fuse engages: the fallback pauses so the kernel drains the retry queue
@@ -307,38 +307,71 @@ func (s *tcpRelayOffloadSession) Close() error {
 	return errors.Join(errs...)
 }
 
-// fuseStep evaluates the backlog fuse once: it computes the egress retry
-// queue backlog (tcp_info receive deltas since registration minus bytes
-// already pushed into the peers' send paths, tracked by the skb_send_sock
-// kprobe and by the userspace fallback), engages the pause when the backlog
-// exceeds tcpOffloadMaxPeerBacklog, and lifts it once the backlog drains.
-// Returns (engage, lift, err): engage demands the fds be dropped from epoll
-// while the kernel drains already-redirected skbs; lift demands they be
-// re-added.
+// offloadBacklog measures input consumed by the relay but not yet accepted by
+// the opposite TCP send path. Entry-probe counters include failed attempts and
+// must never control the fuse. Pending source data is still flow-controlled by
+// TCP: exclude it so SK_PASS data cannot prevent a paused redirect from resuming.
+func (s *tcpRelayOffloadSession) offloadBacklog() (uint64, error) {
+	conns := [2]*net.TCPConn{s.left, s.right}
+	bases := [2]uint64{s.leftRxBase, s.rightRxBase}
+	var backlog uint64
+	for i, src := range conns {
+		// Read pending first: a concurrent arrival may overestimate debt, but
+		// must not make already redirected data look drained.
+		pending, err := tcpConnPendingBytes(src)
+		if err != nil {
+			return 0, err
+		}
+		rx, err := tcpConnRxBytes(src)
+		if err != nil {
+			return 0, err
+		}
+		dst := conns[1-i]
+		info, err := tcpConnInfo(dst)
+		if err != nil {
+			return 0, err
+		}
+		// Read ACKed before OUTQ, as in propagateFIN. Concurrent ACKs can
+		// temporarily undercount acceptance, never falsely prove drain.
+		queued, err := tcpConnOutQueue(dst)
+		if err != nil {
+			return 0, err
+		}
+		if pending < 0 || queued < 0 {
+			return 0, fmt.Errorf("invalid offload queue counters")
+		}
+		accepted := info.Bytes_acked + uint64(queued)
+		if rx < bases[i] {
+			return 0, fmt.Errorf("offload receive counter moved backwards")
+		}
+		received := rx - bases[i]
+		if received <= uint64(pending) {
+			continue
+		}
+		consumed := received - uint64(pending)
+		var sent uint64
+		if accepted > s.txBase[1-i] {
+			sent = accepted - s.txBase[1-i]
+		}
+		// Clamp each direction separately: an ACK/read race on one side
+		// must not cancel real backlog on the other. Accepted bytes already
+		// include userspace fallback writes; do not subtract those twice.
+		if consumed > sent {
+			backlog += consumed - sent
+		}
+	}
+	return backlog, nil
+}
+
+// fuseStep pauses redirection until the kernel's outstanding relay data drains.
 func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool, err error) {
-	if s.sentMap == nil {
+	if s.fastSock == nil {
 		return false, false, nil
 	}
-	lrx, err := tcpConnRxBytes(s.left)
+	backlog, err := s.offloadBacklog()
 	if err != nil {
-		return false, false, nil // transient; skip this round
+		return false, false, err
 	}
-	rrx, err := tcpConnRxBytes(s.right)
-	if err != nil {
-		return false, false, nil
-	}
-	var lSent, rSent uint64
-	var lv, rv []uint64
-	_ = s.sentMap.Lookup(&s.leftKey, &lv)
-	_ = s.sentMap.Lookup(&s.rightKey, &rv)
-	for _, v := range lv {
-		lSent += v
-	}
-	for _, v := range rv {
-		rSent += v
-	}
-	inflow := int64((lrx - s.leftRxBase) + (rrx - s.rightRxBase))
-	backlog := inflow - int64(lSent+rSent+s.fusePassBytes)
 	if s.fused {
 		if backlog <= tcpOffloadFuseResumeBytes {
 			// Drain residual SK_PASS data before lifting: once the verdict
@@ -357,7 +390,7 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 		}
 		return false, false, nil
 	}
-	if backlog > int64(tcpOffloadMaxPeerBacklog) {
+	if backlog > tcpOffloadMaxPeerBacklog {
 		s.fused = true
 		s.fuseDrainUntil = time.Now().Add(tcpOffloadFuseDrainWait)
 		one := uint8(1)
@@ -478,7 +511,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		}
 
 		// Backlog fuse guard: compute the egress retry-queue backlog
-		// (tcp_info receive deltas minus skb_send_sock accounting), engage
+		// (consumed input minus accepted TCP output), engage
 		// or lift the pause, and manage the drain window. Checked at the
 		// top of every iteration (throttled) so a busy event stream cannot
 		// starve it.
