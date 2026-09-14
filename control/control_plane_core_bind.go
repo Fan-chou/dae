@@ -599,6 +599,11 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	bpf := c.bpf.Load()
 	daens := GetDaeNetns()
 
+	// Install TCP socket lookup before admitting redirected SYNs.
+	if err = c.bindTCPListenerLookup(daens, bpf); err != nil {
+		return err
+	}
+
 	// tproxy_dae0peer_ingress@eth0 at dae netns
 	// Best effort: qdisc may already exist and tx queue tuning is non-critical.
 	daens.WithBestEffort("set dae0peer tx queue and add clsact qdisc", func() error {

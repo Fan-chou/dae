@@ -208,6 +208,8 @@ kdae_sync_main() {
 	overlay="${cache_dir}/node-resolve-dns.json"
 	write_node_resolve_dns "$overlay"
 	set -- "$@" -node-resolve-dns "$overlay"
+	isolate_groups=$(uci -q get dae.config.isolate_transport_groups || true)
+	[ -z "$isolate_groups" ] || set -- "$@" -isolate-transport-groups "$isolate_groups"
 
 	if [ ! -x "$SYNC" ]; then
 		restore_local_dae

@@ -29,20 +29,21 @@ import (
 var runSyncMu sync.Mutex
 
 type SyncOptions struct {
-	ManifestPath         string
-	MihomoRoutingPath    string
-	MihomoRoutingURL     string
-	MihomoRoutingURLFile string
-	CacheDir             string
-	RoutesOutput         string
-	GroupsInputPath      string
-	GroupsOutput         string
-	NodesOutput          string
-	GenerationDir        string
-	NodeResolveDNSFile   string
-	Client               *http.Client
-	Strict               bool
-	AllowPrivate         bool
+	IsolateTransportGroups []string
+	ManifestPath           string
+	MihomoRoutingPath      string
+	MihomoRoutingURL       string
+	MihomoRoutingURLFile   string
+	CacheDir               string
+	RoutesOutput           string
+	GroupsInputPath        string
+	GroupsOutput           string
+	NodesOutput            string
+	GenerationDir          string
+	NodeResolveDNSFile     string
+	Client                 *http.Client
+	Strict                 bool
+	AllowPrivate           bool
 }
 
 func (options SyncOptions) hasMihomoRoutingSource() bool {
@@ -275,6 +276,7 @@ func RunSync(ctx context.Context, options SyncOptions) (SyncReport, error) {
 		if err != nil {
 			return SyncReport{}, err
 		}
+		mihomoConfig.IsolateTransportGroups = options.IsolateTransportGroups
 		var groupsText string
 		var groupReport GroupConversionReport
 		if fullMihomoOutput {

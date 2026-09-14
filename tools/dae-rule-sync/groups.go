@@ -14,8 +14,9 @@ import (
 )
 
 type MihomoConfig struct {
-	Proxies []MihomoProxy `yaml:"proxies"`
-	Groups  []MihomoGroup `yaml:"proxy-groups"`
+	IsolateTransportGroups []string      `yaml:"-"`
+	Proxies                []MihomoProxy `yaml:"proxies"`
+	Groups                 []MihomoGroup `yaml:"proxy-groups"`
 }
 
 type MihomoProxy struct {
@@ -185,6 +186,13 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 		safeNames[safeName] = group.Name
 		report.NameMap[group.Name] = safeName
 	}
+	isolated := make(map[string]bool, len(config.IsolateTransportGroups))
+	for _, name := range config.IsolateTransportGroups {
+		if _, exists := safeNames[name]; !exists {
+			return "", GroupConversionReport{}, fmt.Errorf("isolated transport group %q does not exist", name)
+		}
+		isolated[name] = true
+	}
 	if nodeNames != nil {
 		if err := validateMihomoOutputNames(nodeNames, report.NameMap); err != nil {
 			return "", GroupConversionReport{}, err
@@ -284,6 +292,9 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 			report.Approximated++
 		}
 		fmt.Fprintf(&output, "    %s {\n", report.NameMap[group.Name])
+		if isolated[report.NameMap[group.Name]] {
+			output.WriteString("        isolate_transport: true\n")
+		}
 		// Every fixed policy needs the member identities persisted. Select groups
 		// were the original fixed-policy case; a single-member url-test is also
 		// lowered to fixed(0) because there is no latency choice to preserve.

@@ -8,16 +8,9 @@ package control
 // Real-kernel verification harness for the TCP offload sent-accounting hook.
 // Requires root and kernel BTF; only the non-root case is skipped.
 // It loads the pruned offload datapath (verdict + accounting programs),
-// mirrors dae's two-connection relay topology, and asserts that redirected
-// traffic populates tcp_offload_sent and that the fuse backlog stays near
-// zero on transfers above the engage threshold — the regression class where
-// a dead accounting hook made every >64MiB session freeze for 10s.
-//
-// Note on accounting precision: fentry fires on function entry, so skbs
-// requeued via the EAGAIN retry path are counted once per attempt; observed
-// over-estimation is ~1-2% on loopback (sent slightly above tcp_info
-// inflow), which is the conservative direction for the fuse (engages later,
-// never early).
+// mirrors dae's two-connection relay topology, and checks redirected traffic
+// populates tcp_offload_sent. Entry counts include retries and are diagnostic
+// only; TestTCPOffloadBacklogUsesAcceptedBytes checks the actual fuse metric.
 
 import (
 	"bytes"
@@ -366,18 +359,18 @@ func runTCPOffloadSentAccountE2E(t *testing.T, address string, destination bool)
 		t.Fatalf("L3 FAIL: sent lookup: %v", lookupErr)
 	}
 	backlogVal := inflow - int64(sentL3)
-	t.Logf("L3: delivered=%d inflow=%d sent=%d backlog=%d (fuse engage at %d, resume at %d)",
-		n, inflow, sentL3, backlogVal, tcpOffloadMaxPeerBacklog, tcpOffloadFuseResumeBytes)
+	t.Logf("L3: delivered=%d inflow=%d sent=%d backlog=%d (diagnostic entry counter; engage threshold %d)",
+		n, inflow, sentL3, backlogVal, tcpOffloadMaxPeerBacklog)
 	if n < tcpOffloadMaxPeerBacklog {
 		t.Fatalf("L3 FAIL: only %d bytes delivered (below the %d engage threshold); cannot assert fuse behavior", n, tcpOffloadMaxPeerBacklog)
 	}
 	if sentL3 < uint64(n) {
-		t.Fatalf("L3 FAIL: sent=%d after %d delivered bytes — counter is not tracking inflow; fuse would mis-engage", sentL3, n)
+		t.Fatalf("L3 FAIL: sent=%d after %d delivered bytes — entry counter is not tracking inflow", sentL3, n)
 	}
-	if backlogVal > int64(tcpOffloadFuseResumeBytes)*8 {
-		t.Fatalf("L3 FAIL: backlog=%d far above resume threshold — fuse metric still wrong", backlogVal)
+	if backlogVal > 8<<20 {
+		t.Fatalf("L3 FAIL: backlog=%d indicates missing entry accounting", backlogVal)
 	}
-	t.Logf("L3 PASS: backlog stays at %d (≪ %d engage threshold) — fuse will not mis-engage on unconstrained transfers", backlogVal, tcpOffloadMaxPeerBacklog)
+	t.Logf("L3 PASS: entry-counter deficit %d (engage threshold %d; actual fuse uses accepted bytes)", backlogVal, tcpOffloadMaxPeerBacklog)
 }
 
 func TestTCPOffloadFINRealSockmapE2E(t *testing.T) {

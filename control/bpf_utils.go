@@ -308,6 +308,7 @@ const (
 // OpenWrt) cannot take down the whole datapath at start. The offload programs
 // are loaded in a separate, fault-tolerant pass (see loadOffloadBpfObjects).
 type bpfDataplanePrograms struct {
+	TproxyTcpListener      *ebpf.Program `ebpf:"tproxy_tcp_listener"`
 	TproxyDae0Ingress      *ebpf.Program `ebpf:"tproxy_dae0_ingress"`
 	TproxyDae0peerIngress  *ebpf.Program `ebpf:"tproxy_dae0peer_ingress"`
 	TproxyLanEgressL2      *ebpf.Program `ebpf:"tproxy_lan_egress_l2"`
@@ -655,6 +656,7 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	if bpf == nil || dp == nil {
 		return
 	}
+	bpf.TproxyTcpListener = dp.TproxyTcpListener
 	bpf.TproxyDae0Ingress = dp.TproxyDae0Ingress
 	bpf.TproxyDae0peerIngress = dp.TproxyDae0peerIngress
 	bpf.TproxyLanEgressL2 = dp.TproxyLanEgressL2

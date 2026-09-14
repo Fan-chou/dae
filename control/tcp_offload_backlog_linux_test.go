@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -103,13 +104,13 @@ func TestTCPOffloadBacklogUsesAcceptedBytes(t *testing.T) {
 	if e = s.pauseMap.Update(&s.rightKey, &one, ebpf.UpdateAny); e != nil {
 		t.Fatal(e)
 	}
-	progress := time.Now()
-	_, lift, e := s.fuseStep(&progress)
+
+	_, ready, e := s.fuseStep()
 	if e != nil {
 		t.Fatal(e)
 	}
-	if lift {
-		t.Fatal("resumed with undelivered data")
+	if ready {
+		t.Fatal("started fallback with undelivered data")
 	}
 	t.Logf("blocked: backlog=%d despite bogus sent counter", debt)
 	up.SetReadBuffer(1 << 20)
@@ -124,7 +125,7 @@ func TestTCPOffloadBacklogUsesAcceptedBytes(t *testing.T) {
 		t.Fatal("payload checksum mismatch")
 	}
 	// SK_PASS bytes waiting in the bounded source queue must not keep
-	// redirection paused after the original kernel tail has drained.
+	// userspace forwarding paused after the original kernel tail has drained.
 	if e = left.SetReadBuffer(4 << 20); e != nil {
 		t.Fatal(e)
 	}
@@ -156,23 +157,127 @@ func TestTCPOffloadBacklogUsesAcceptedBytes(t *testing.T) {
 	}()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, lift, e = s.fuseStep(&progress)
+		_, ready, e = s.fuseStep()
 		if e != nil {
 			t.Fatal(e)
 		}
-		if lift {
+		if ready {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("did not resume after drain")
+			t.Fatal("did not start fallback after drain")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if !s.fused || !s.fallbackReady {
+		t.Fatal("missing permanent fallback state")
+	}
+	for _, key := range []bpfTuplesKey{s.leftKey, s.rightKey} {
+		var paused uint8
+		if e := s.pauseMap.Lookup(&key, &paused); e != nil || paused != 1 {
+			t.Fatalf("redirect reenabled: paused=%d err=%v", paused, e)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { _, _, e := s.Run(ctx); runDone <- e }()
 	if e = <-extraWrite; e != nil {
 		t.Fatal(e)
 	}
 	if e = <-extraRead; e != nil {
 		t.Fatal(e)
 	}
-	t.Log("resumed after complete transfer including queued SK_PASS data")
+	cancel()
+	select {
+	case e := <-runDone:
+		if e != nil {
+			t.Fatal(e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback did not cancel")
+	}
+	t.Log("permanent fallback delivered queued SK_PASS data and canceled")
+}
+
+// A FIN can be received behind queued SK_PASS bytes before epoll is rearmed.
+// Its sequence byte must not keep a fully drained connection paused forever.
+func TestTCPOffloadFallbackQueuedFIN(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root for BPF load/attach")
+	}
+	c := loadOffloadVerifyCollection(t)
+	defer c.Close()
+	fast := c.Maps["fast_sock"]
+	v, err := link.AttachRawLink(link.RawLinkOptions{Target: fast.FD(), Program: c.Programs["tcp_offload_redirect"], Attach: ebpf.AttachSkSKBStreamVerdict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	left, client := offloadTCPPair(t)
+	server, right := offloadTCPPair(t)
+	s, err := newTCPRelayOffloadSession(nil, fast, c.Maps["tcp_offload_pause"], c.Maps["tcp_offload_sent"], left, right, func(int64) {}, func(int64) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	one := uint8(1)
+	for _, key := range []bpfTuplesKey{s.leftKey, s.rightKey} {
+		if err := s.pauseMap.Update(&key, &one, ebpf.UpdateAny); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.fused = true
+	payload := bytes.Repeat([]byte("request-tail"), 4096)
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Second)
+	for {
+		info, err := tcpConnInfo(left)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.State == 8 {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatal("request FIN did not arrive")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_, ready, err := s.fuseStep()
+	if err != nil || !ready {
+		t.Fatalf("queued FIN prevented fallback: ready=%v err=%v", ready, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, _, err := s.Run(ctx); done <- err }()
+	got, err := io.ReadAll(server)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("request: n=%d err=%v", len(got), err)
+	}
+	if _, err := server.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(client)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("reply after FIN: n=%d err=%v", len(got), err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("fallback required forced cancellation")
+	}
+	if !s.fallbackReady || s.finSent != 3 {
+		t.Fatalf("incomplete fallback close: ready=%v fin=%d", s.fallbackReady, s.finSent)
+	}
 }

@@ -375,3 +375,25 @@ func mihomoStringPtr(value string) *string { return &value }
 func mihomoInt64Ptr(value int64) *int64 { return &value }
 
 func mihomoBoolPtr(value bool) *bool { return &value }
+
+func TestIsolatedTransportGroupOverlay(t *testing.T) {
+	options, err := ParseCLIArgs([]string{"-mihomo-routing-config", "test.yaml", "-isolate-transport-groups", "YouTube"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := MihomoConfig{Proxies: []MihomoProxy{{Name: "node"}}, Groups: []MihomoGroup{
+		{Name: "YouTube", Type: "select", Proxies: []string{"node"}},
+		{Name: "Other", Type: "select", Proxies: []string{"node"}},
+	}, IsolateTransportGroups: options.IsolateTransportGroups}
+	output, _, err := generateFullMihomoGroups(cfg, map[string]string{"node": "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "YouTube {\n        isolate_transport: true\n") || strings.Count(output, "isolate_transport:") != 1 {
+		t.Fatal(output)
+	}
+	cfg.IsolateTransportGroups = []string{"missing"}
+	if _, _, err := generateFullMihomoGroups(cfg, map[string]string{"node": "node"}); err == nil {
+		t.Fatal("missing group accepted")
+	}
+}

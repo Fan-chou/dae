@@ -2210,15 +2210,10 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 #undef _dscp
 }
 
-static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
+static __always_inline int assign_udp_listener(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk;
-	const __u32 *key = &one_key;
-
-	if (l4proto == IPPROTO_TCP)
-		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
-
-	sk = bpf_map_lookup_elem(&listen_socket_map, key);
+	sk = bpf_map_lookup_elem(&listen_socket_map, &one_key);
 
 	if (!sk)
 		return -1;
@@ -2227,6 +2222,38 @@ static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
 
 	bpf_sk_release(sk);
 	return ret;
+}
+
+/* TCP must reach the established/TIME_WAIT lookup before selecting a listener.
+ * Assigning a listening socket at TC ingress bypasses that lookup, so a reused
+ * four-tuple can collide with the old TIME_WAIT and silently lose every SYN.
+ * This hook is attached only to our private daens, whose ingress TC hook admits
+ * control-plane redirects. UDP continues to use the TC assignment above.
+ */
+SEC("sk_lookup/tcp_listener")
+int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
+{
+	if (ctx->protocol != IPPROTO_TCP)
+		return SK_PASS;
+
+	const __u32 *key;
+	if (ctx->family == AF_INET)
+		key = &zero_key;
+	else if (ctx->family == AF_INET6)
+		key = &two_key;
+	else
+		return SK_PASS;
+
+	struct bpf_sock *sk = bpf_map_lookup_elem(&listen_socket_map, key);
+	if (!sk)
+		return SK_PASS;
+
+	/* A fresh datapath may overlap the retiring one during reload. The newest
+	 * populated listener map takes precedence; detaching it rolls back cleanly.
+	 */
+	bpf_sk_assign(ctx, sk, BPF_SK_LOOKUP_F_REPLACE | BPF_SK_LOOKUP_F_NO_REUSEPORT);
+	bpf_sk_release(sk);
+	return SK_PASS;
 }
 
 /* get_dae0_ifindex returns the current dae0 ifindex, preferring the
@@ -3791,15 +3818,13 @@ int tproxy_dae0peer_ingress(struct __sk_buff *skb)
 	skb->mark = TPROXY_MARK;
 	bpf_skb_change_type(skb, PACKET_HOST);
 
-	/* listener_l4proto is stored in skb->cb[1] only when the control-plane
-	 * handoff needs an explicit listener assignment (UDP or TCP SYN, including
-	 * first fragments that still expose those headers). Established TCP can
-	 * return to the stack without bpf_sk_assign.
+	/* TCP, including SYN, must retain the kernel's established/TIME_WAIT
+	 * lookup. tproxy_tcp_listener selects its listener later in the stack.
 	 */
 	__u8 l4proto = skb->cb[1];
 
-	if (l4proto != 0)
-		assign_listener(skb, l4proto);
+	if (l4proto == IPPROTO_UDP)
+		assign_udp_listener(skb);
 	return TC_ACT_OK;
 }
 

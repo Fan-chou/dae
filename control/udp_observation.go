@@ -1,6 +1,7 @@
 package control
 
 import (
+	"encoding/json"
 	"expvar"
 	"fmt"
 	"net/netip"
@@ -100,9 +101,11 @@ func recordUDPSlowWrite(ue *UdpEndpoint, addr string, elapsed time.Duration, err
 }
 
 type udpTransportWriteState struct {
-	LockWaiters     int32 `json:"lock_waiters"`
-	LockHeld        bool  `json:"lock_held"`
-	DatagramPending int   `json:"datagram_pending"` // -1 if unavailable; shared QUIC connection
+	ConnectionID        uint64          `json:"connection_id,omitempty"`
+	LastSendObservation json.RawMessage `json:"last_send_observation,omitempty"`
+	LockWaiters         int32           `json:"lock_waiters"`
+	LockHeld            bool            `json:"lock_held"`
+	DatagramPending     int             `json:"datagram_pending"` // -1 if unavailable; shared QUIC connection
 }
 
 type udpOverloadEvent struct {
@@ -139,7 +142,14 @@ func recordUDPOverload(q *UdpTaskQueue, reason string) {
 		var transport *udpTransportWriteState
 		if observer, ok := ue.conn.(interface{ UDPWriteState() (int32, bool, int) }); ok {
 			waiters, held, pending := observer.UDPWriteState()
-			transport = &udpTransportWriteState{waiters, held, pending}
+			transport = &udpTransportWriteState{LockWaiters: waiters, LockHeld: held, DatagramPending: pending}
+			if observer, ok := ue.conn.(interface{ UDPTransportObservation() (uint64, string) }); ok {
+				id, snapshot := observer.UDPTransportObservation()
+				transport.ConnectionID = id
+				if snapshot != "" {
+					transport.LastSendObservation = json.RawMessage(snapshot)
+				}
+			}
 		}
 		// The worker may finish or switch endpoints during this snapshot.
 		// Omit attribution if it no longer describes the same write call.

@@ -44,21 +44,11 @@ const (
 	// kernel-buffered tail that is not charged to socket buffers or memcg,
 	// bpf-next 2025-04 series issue #4). Exceeding it engages the backlog
 	// fuse: the verdict passes data through and the userspace fallback
-	// forwards it while the kernel drains the queue.
+	// forwards it only after the kernel has drained the queue.
 	tcpOffloadMaxPeerBacklog = 64 << 20
 	// relayPassWriteTimeout bounds a userspace-fallback write to a congested
 	// peer socket so one stalled direction cannot wedge the session loop.
 	relayPassWriteTimeout = 5 * time.Second
-	// tcpOffloadFuseDrainWait pauses the userspace fallback after the first
-	// SK_PASS data (the pause signal) so the kernel drains the retry queue
-	// of already-redirected skbs first. Writing immediately would let new
-	// data starve that queue forever (tail debt). While paused, data stays
-	// in the bounded kernel receive queue and TCP flow control freezes the
-	// sender. The wait must exceed the backlog drain time (backlog size
-	// divided by the peer consumption rate).
-	tcpOffloadFuseDrainWait = 10 * time.Second // tcpOffloadFuseResumeBytes is the backlog level below which the fuse
-	// lifts: the pause key is removed and the verdict redirects again.
-	tcpOffloadFuseResumeBytes = 1 << 20
 )
 
 var errTCPRelayOffloadUnavailable = errors.New("tcp relay eBPF offload unavailable")
@@ -115,10 +105,10 @@ type tcpRelayOffloadSession struct {
 	// fusePassBytes records userspace-fallback traffic for relay accounting
 	// checks only; it is not part of the backlog calculation.
 	fusePassBytes uint64
-	// fuseDrainUntil (zero while inactive) marks the drain window after the
-	// fuse engages: the fallback pauses so the kernel drains the retry queue
-	// of already-redirected skbs before userspace writes compete with it.
-	fuseDrainUntil time.Time
+	// fallbackReady is the terminal forwarding state: both pause keys stay
+	// installed and epoll drives userspace reads until this session closes.
+	// Returning to redirection could overtake a queued SK_PASS tail.
+	fallbackReady bool
 
 	forceCloseOnce sync.Once
 	closeOnce      sync.Once
@@ -310,7 +300,7 @@ func (s *tcpRelayOffloadSession) Close() error {
 // offloadBacklog measures input consumed by the relay but not yet accepted by
 // the opposite TCP send path. Entry-probe counters include failed attempts and
 // must never control the fuse. Pending source data is still flow-controlled by
-// TCP: exclude it so SK_PASS data cannot prevent a paused redirect from resuming.
+// TCP: exclude it so SK_PASS data cannot prevent userspace fallback from starting.
 func (s *tcpRelayOffloadSession) offloadBacklog() (uint64, error) {
 	conns := [2]*net.TCPConn{s.left, s.right}
 	bases := [2]uint64{s.leftRxBase, s.rightRxBase}
@@ -322,9 +312,31 @@ func (s *tcpRelayOffloadSession) offloadBacklog() (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		rx, err := tcpConnRxBytes(src)
+		srcInfo, err := tcpConnInfo(src)
 		if err != nil {
 			return 0, err
+		}
+		rx := srcInfo.Bytes_received
+		// bytes_received includes an orderly FIN sequence byte, even while
+		// SK_PASS payload is still queued. Baselines precede FIN. A reset
+		// during a disarmed drain must retire the session, not wait forever.
+		switch srcInfo.State {
+		case 8, 9, 11, 6: // CLOSE_WAIT, LAST_ACK, CLOSING, TIME_WAIT
+			if rx == 0 {
+				return 0, fmt.Errorf("missing offload FIN sequence byte")
+			}
+			rx--
+		case 7: // TCP_CLOSE
+			// Our earlier CloseWrite can make a source reach CLOSE before
+			// its redirected tail drains (early response + upload). Preserve
+			// that tail; CLOSE alone does not mean the destination is dead.
+			if s.finSent == 0 {
+				return 0, net.ErrClosed
+			}
+			if rx == 0 {
+				return 0, fmt.Errorf("missing offload FIN sequence byte")
+			}
+			rx--
 		}
 		dst := conns[1-i]
 		info, err := tcpConnInfo(dst)
@@ -357,15 +369,20 @@ func (s *tcpRelayOffloadSession) offloadBacklog() (uint64, error) {
 		// must not cancel real backlog on the other. Accepted bytes already
 		// include userspace fallback writes; do not subtract those twice.
 		if consumed > sent {
+			if info.State == 7 { // a closed destination cannot accept this tail
+				return 0, net.ErrClosed
+			}
 			backlog += consumed - sent
 		}
 	}
 	return backlog, nil
 }
 
-// fuseStep pauses redirection until the kernel's outstanding relay data drains.
-func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool, err error) {
-	if s.fastSock == nil {
+// fuseStep stops new redirects, then enables userspace forwarding only after
+// every old redirected byte has entered the destination TCP send queue.
+// The pause keys remain installed until Close: this transition is one-way.
+func (s *tcpRelayOffloadSession) fuseStep() (engage, startFallback bool, err error) {
+	if s.fastSock == nil || s.fallbackReady {
 		return false, false, nil
 	}
 	backlog, err := s.offloadBacklog()
@@ -373,55 +390,30 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 		return false, false, err
 	}
 	if s.fused {
-		if backlog <= tcpOffloadFuseResumeBytes {
-			// Drain residual SK_PASS data before lifting: once the verdict
-			// redirects again, late userspace writes would compete with the
-			// kernel redirect on the peer send path and reorder bytes.
-			if s.drainResidual(lastProgress) {
-				return false, false, nil
-			}
-			s.fused = false
-			_ = s.pauseMap.Delete(&s.leftKey)
-			_ = s.pauseMap.Delete(&s.rightKey)
+		if backlog == 0 {
+			s.fallbackReady = true
 			if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
-				s.log.Debugf("TCP relay eBPF offload fuse lifted: %v <-> %v", s.left.RemoteAddr(), s.right.RemoteAddr())
+				s.log.Debugf("TCP relay eBPF offload tail drained; userspace fallback: %v <-> %v", s.left.RemoteAddr(), s.right.RemoteAddr())
 			}
 			return false, true, nil
 		}
 		return false, false, nil
 	}
 	if backlog > tcpOffloadMaxPeerBacklog {
-		s.fused = true
-		s.fuseDrainUntil = time.Now().Add(tcpOffloadFuseDrainWait)
 		one := uint8(1)
-		_ = s.pauseMap.Update(&s.leftKey, &one, ebpf.UpdateAny)
-		_ = s.pauseMap.Update(&s.rightKey, &one, ebpf.UpdateAny)
+		if err := s.pauseMap.Update(&s.leftKey, &one, ebpf.UpdateAny); err != nil {
+			return false, false, fmt.Errorf("pause left redirect: %w", err)
+		}
+		if err := s.pauseMap.Update(&s.rightKey, &one, ebpf.UpdateAny); err != nil {
+			return false, false, fmt.Errorf("pause right redirect: %w", err)
+		}
+		s.fused = true
 		if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
 			s.log.Debugf("TCP relay eBPF offload fuse engaged (backlog=%d): %v <-> %v", backlog, s.left.RemoteAddr(), s.right.RemoteAddr())
 		}
 		return true, false, nil
 	}
 	return false, false, nil
-}
-
-// drainResidual forwards SK_PASS data still queued in the receive queues
-// until both are empty (or a bounded number of iterations elapses). Returns
-// true when data is still pending so fuseStep can defer the lift.
-func (s *tcpRelayOffloadSession) drainResidual(lastProgress *time.Time) bool {
-	for i := 0; i < 64; i++ {
-		lPending, err := tcpConnHasPendingReadData(s.left)
-		if err == nil && lPending {
-			_, _ = s.relayPassData(0, lastProgress)
-			continue
-		}
-		rPending, err := tcpConnHasPendingReadData(s.right)
-		if err == nil && rPending {
-			_, _ = s.relayPassData(1, lastProgress)
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 // Run blocks until both relay sockets are closed (or close their pair on
@@ -512,15 +504,18 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 
 		// Backlog fuse guard: compute the egress retry-queue backlog
 		// (consumed input minus accepted TCP output), engage
-		// or lift the pause, and manage the drain window. Checked at the
+		// the pause or start permanent userspace forwarding. Checked at the
 		// top of every iteration (throttled) so a busy event stream cannot
 		// starve it.
 		if time.Since(lastGuard) >= tcpOffloadEpollWaitCap {
 			lastGuard = time.Now()
-			engage, lift, err := s.fuseStep(&lastProgress)
+			engage, startFallback, err := s.fuseStep()
 			if err != nil {
 				s.forceClose()
-				return 0, 0, nil
+				if errors.Is(err, net.ErrClosed) {
+					return 0, 0, nil
+				}
+				return 0, 0, fmt.Errorf("offload fallback transition: %w", err)
 			}
 			if engage {
 				// Drop the fds from epoll while the kernel drains the
@@ -530,8 +525,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 					s.forceClose()
 					return 0, 0, err
 				}
-			} else if lift || (!s.fuseDrainUntil.IsZero() && time.Now().After(s.fuseDrainUntil)) {
-				s.fuseDrainUntil = time.Time{}
+			} else if startFallback {
 				if err := poller.arm(); err != nil {
 					s.forceClose()
 					return 0, 0, err
@@ -659,7 +653,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 
 // relayPassData forwards SK_PASS data sitting in one relay socket's receive
 // queue to the peer socket. The verdict program declines to redirect when the
-// session's fast_sock entry is detached (backlog fuse) or the peer's send
+// session's pause key is installed (backlog fuse) or the peer's send
 // path is congested; forwarded bytes are already counted by the tcp_info
 // receive baselines used for final accounting.
 // The first return value reports a read EOF (peer half-close); a non-nil

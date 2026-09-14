@@ -211,6 +211,7 @@ type bpfSpecs struct {
 }
 
 type bpfProgramSpecs struct {
+	TproxyTcpListener           *ebpf.ProgramSpec `ebpf:"tproxy_tcp_listener"`
 	TproxyDae0Ingress           *ebpf.ProgramSpec `ebpf:"tproxy_dae0_ingress"`
 	TproxyDae0peerIngress       *ebpf.ProgramSpec `ebpf:"tproxy_dae0peer_ingress"`
 	TproxyLanEgressL2           *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l2"`
@@ -359,6 +360,7 @@ type bpfVariables struct {
 }
 
 type bpfPrograms struct {
+	TproxyTcpListener           *ebpf.Program `ebpf:"tproxy_tcp_listener"`
 	TproxyDae0Ingress           *ebpf.Program `ebpf:"tproxy_dae0_ingress"`
 	TproxyDae0peerIngress       *ebpf.Program `ebpf:"tproxy_dae0peer_ingress"`
 	TproxyLanEgressL2           *ebpf.Program `ebpf:"tproxy_lan_egress_l2"`
@@ -386,6 +388,7 @@ type bpfPrograms struct {
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
+		p.TproxyTcpListener,
 		p.TproxyDae0Ingress,
 		p.TproxyDae0peerIngress,
 		p.TproxyLanEgressL2,

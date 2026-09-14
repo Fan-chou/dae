@@ -1,6 +1,7 @@
 package control
 
 import (
+	"encoding/json"
 	"github.com/stretchr/testify/require"
 	"net/netip"
 	"testing"
@@ -19,7 +20,7 @@ func TestUDPOverloadObservesActiveWriteAndClearsReference(t *testing.T) {
 	recordUDPOverload(q, "packet_limit")
 	e := udpLastOverload.Load()
 	require.Equal(t, int32(3), e.ActiveStage)
-	require.Equal(t, &udpTransportWriteState{LockWaiters: 1, LockHeld: true, DatagramPending: 256}, e.TransportWrite)
+	require.Equal(t, &udpTransportWriteState{LockWaiters: 1, LockHeld: true, DatagramPending: 256, ConnectionID: 42, LastSendObservation: json.RawMessage(`{"connection_id":42,"reason":"congestion"}`)}, e.TransportWrite)
 	require.Equal(t, "direct", e.Dialer)
 	require.NotEmpty(t, e.Endpoint)
 	require.GreaterOrEqual(t, e.WriteCallMilliseconds, float64(0))
@@ -52,3 +53,7 @@ func TestUDPReplyOverloadRecordsConsumerStage(t *testing.T) {
 type observedWritePacketConn struct{ *mockPacketConn }
 
 func (*observedWritePacketConn) UDPWriteState() (int32, bool, int) { return 1, true, 256 }
+
+func (*observedWritePacketConn) UDPTransportObservation() (uint64, string) {
+	return 42, `{"connection_id":42,"reason":"congestion"}`
+}
