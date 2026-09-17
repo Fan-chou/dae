@@ -21,6 +21,7 @@ type RoutingMatcher struct {
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 
 	compiledMatches []compiledRoutingMatch
+	fakeIPRules     []fakeIPRule
 	predicateGroups []routingMatcherPredicateGroupSpan
 	lookupMacAssoc  macAssocLookup
 	// fakeIPLeafIsProxy reports whether a user-defined outbound currently

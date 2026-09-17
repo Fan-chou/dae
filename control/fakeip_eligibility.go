@@ -88,23 +88,78 @@ func (m *RoutingMatcher) fakeIPLpmHit(lpmIndex uint32, bin string) bool {
 	return m.lpmMatcher[lpmIndex].HasPrefix(bin)
 }
 
-func (m *RoutingMatcher) fakeIPEvalSip(match compiledRoutingMatch, src netip.Addr, mac [6]byte) fakeIPKleene {
+// fakeIPRule contains only rules relevant to the existing DNS-time policy.
+// The indices remain those of compiledMatches (and the domain bitmap).
+type fakeIPRule struct{ start, end int }
+
+func compileFakeIPRules(matches []compiledRoutingMatch) []fakeIPRule {
+	rules := make([]fakeIPRule, 0)
+	start, hasDomain := 0, false
+	for i, match := range matches {
+		hasDomain = hasDomain || fakeIPMatchIsDomain(match.matchType)
+		if match.outbound&consts.OutboundLogicalMask == consts.OutboundLogicalMask {
+			continue
+		}
+		if hasDomain || match.outbound == consts.OutboundMustRules || match.matchType == consts.MatchType_Fallback {
+			rules = append(rules, fakeIPRule{start, i + 1})
+		}
+		start, hasDomain = i+1, false
+	}
+	return rules
+}
+
+// Facts live for one DNS query only. Group selections are still read live;
+// reloads and later queries never reuse a previous eligibility decision.
+type fakeIPEligibilityFacts struct {
+	matcher        *RoutingMatcher
+	domainBitmap   []uint32
+	ipVersion      *consts.IpVersionType
+	src            netip.Addr
+	mac            [6]byte
+	srcBin, macBin string
+	macAssoc       []string
+	macAssocLoaded bool
+	sourceResults  map[uint64]fakeIPKleene
+}
+
+func (f *fakeIPEligibilityFacts) sourceBin() string {
+	if f.srcBin == "" {
+		f.srcBin = fakeIPAddrBin(f.src)
+	}
+	return f.srcBin
+}
+func (f *fakeIPEligibilityFacts) sourceMacBin() string {
+	if f.macBin == "" {
+		f.macBin = fakeIPMacBin(f.mac)
+	}
+	return f.macBin
+}
+func (f *fakeIPEligibilityFacts) associatedBins() []string {
+	if !f.macAssocLoaded {
+		f.macAssoc = f.matcher.lookupMacAssoc(f.mac)
+		f.macAssocLoaded = true
+	}
+	return f.macAssoc
+}
+
+func (f *fakeIPEligibilityFacts) evalSip(match compiledRoutingMatch) fakeIPKleene {
+	m, src, mac := f.matcher, f.src, f.mac
 	switch match.matchType {
 	case consts.MatchType_SourceIpSet:
 		if !src.IsValid() {
 			return fakeIPKleeneUnknown
 		}
-		if m.fakeIPLpmHit(match.lpmIndex, fakeIPAddrBin(src)) {
+		if m.fakeIPLpmHit(match.lpmIndex, f.sourceBin()) {
 			return fakeIPKleeneTrue
 		}
 		return fakeIPKleeneFalse
 	case consts.MatchType_SourceIpSetMatchMac:
 		// Same as userspace Route(): sip CIDR hits first, then learned MAC IPs.
-		if src.IsValid() && m.fakeIPLpmHit(match.lpmIndex, fakeIPAddrBin(src)) {
+		if src.IsValid() && m.fakeIPLpmHit(match.lpmIndex, f.sourceBin()) {
 			return fakeIPKleeneTrue
 		}
 		if !fakeIPMacIsZero(mac) && m.lookupMacAssoc != nil {
-			for _, bin := range m.lookupMacAssoc(mac) {
+			for _, bin := range f.associatedBins() {
 				if m.fakeIPLpmHit(match.lpmIndex, bin) {
 					return fakeIPKleeneTrue
 				}
@@ -118,7 +173,7 @@ func (m *RoutingMatcher) fakeIPEvalSip(match compiledRoutingMatch, src netip.Add
 		if fakeIPMacIsZero(mac) {
 			return fakeIPKleeneUnknown
 		}
-		if m.fakeIPLpmHit(match.lpmIndex, fakeIPMacBin(mac)) {
+		if m.fakeIPLpmHit(match.lpmIndex, f.sourceMacBin()) {
 			return fakeIPKleeneTrue
 		}
 		return fakeIPKleeneFalse
@@ -127,7 +182,8 @@ func (m *RoutingMatcher) fakeIPEvalSip(match compiledRoutingMatch, src netip.Add
 	}
 }
 
-func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, domainBitmap []uint32, ipVersion *consts.IpVersionType, src, dest netip.Addr, mac [6]byte) (val fakeIPKleene, known bool) {
+func (f *fakeIPEligibilityFacts) evalKnown(match compiledRoutingMatch, index int, dest netip.Addr) (val fakeIPKleene, known bool) {
+	m, domainBitmap, ipVersion := f.matcher, f.domainBitmap, f.ipVersion
 	switch match.matchType {
 	case consts.MatchType_DomainSet:
 		hit := domainBitmap != nil &&
@@ -163,7 +219,16 @@ func (m *RoutingMatcher) fakeIPEvalKnown(match compiledRoutingMatch, index int, 
 		// Do not treat them as TRUE: that would match the block rule.
 		return fakeIPKleeneFalse, true
 	case consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
-		return m.fakeIPEvalSip(match, src, mac), true
+		key := uint64(match.matchType)<<32 | uint64(match.lpmIndex)
+		if v, ok := f.sourceResults[key]; ok {
+			return v, true
+		}
+		v := f.evalSip(match)
+		if f.sourceResults == nil {
+			f.sourceResults = make(map[uint64]fakeIPKleene)
+		}
+		f.sourceResults[key] = v
+		return v, true
 	case consts.MatchType_Fallback:
 		return fakeIPKleeneTrue, true
 	default:
@@ -183,104 +248,74 @@ func (m *RoutingMatcher) FakeIPEligibility(domain string, ipVersion *consts.IpVe
 }
 
 func (m *RoutingMatcher) FakeIPEligibilityFor(domain string, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte, dests []netip.Addr) FakeIPEligibility {
-	var valid []netip.Addr
+	if m == nil || len(m.compiledMatches) == 0 {
+		return FakeIPEligibilityDirect
+	}
+	rules := m.fakeIPRules
+	if rules == nil {
+		rules = compileFakeIPRules(m.compiledMatches)
+	}
+	facts := fakeIPEligibilityFacts{matcher: m, ipVersion: ipVersion, src: src, mac: mac}
+	if domain != "" && m.domainMatcher != nil {
+		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
+	}
+	sawValid, sawUnknown := false, false
 	for _, dest := range dests {
-		if dest.IsValid() {
-			valid = append(valid, dest)
+		if !dest.IsValid() {
+			continue
 		}
-	}
-	if len(valid) <= 1 {
-		var dest netip.Addr
-		if len(valid) == 1 {
-			dest = valid[0]
-		}
-		return m.fakeIPEligibilityWalk(domain, ipVersion, src, mac, dest)
-	}
-
-	var anyProxy, sawDirect, sawUnknown bool
-	for _, dest := range valid {
-		switch m.fakeIPEligibilityWalk(domain, ipVersion, src, mac, dest) {
+		sawValid = true
+		switch facts.walk(rules, dest) {
 		case FakeIPEligibilityProxy:
-			anyProxy = true
-		case FakeIPEligibilityDirect:
-			sawDirect = true
-		default:
+			return FakeIPEligibilityProxy
+		case FakeIPEligibilityUnknown:
 			sawUnknown = true
 		}
 	}
-	if anyProxy {
-		return FakeIPEligibilityProxy
+	if !sawValid {
+		return facts.walk(rules, netip.Addr{})
 	}
 	if sawUnknown {
 		return FakeIPEligibilityUnknown
 	}
-	if sawDirect {
-		return FakeIPEligibilityDirect
-	}
 	return FakeIPEligibilityDirect
 }
 
-func (m *RoutingMatcher) fakeIPEligibilityWalk(domain string, ipVersion *consts.IpVersionType, src netip.Addr, mac [6]byte, dest netip.Addr) FakeIPEligibility {
-	if m == nil || len(m.compiledMatches) == 0 {
-		return FakeIPEligibilityDirect
-	}
-	var domainBitmap []uint32
-	if domain != "" && m.domainMatcher != nil {
-		domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
-	}
-
-	matches := m.compiledMatches
-	ruleVal := fakeIPKleeneTrue
-	subruleVal := fakeIPKleeneFalse
-	hasDomain := false
-	subruleHasDomain := false
-
-	for i, match := range matches {
-		raw, _ := m.fakeIPEvalKnown(match, i, domainBitmap, ipVersion, src, dest, mac)
-		subruleVal = fakeIPKleeneOr(subruleVal, raw)
-		if fakeIPMatchIsDomain(match.matchType) {
-			subruleHasDomain = true
-			hasDomain = true
+func (f *fakeIPEligibilityFacts) walk(rules []fakeIPRule, dest netip.Addr) FakeIPEligibility {
+	m := f.matcher
+	for _, rule := range rules {
+		action := m.compiledMatches[rule.end-1]
+		// These actions were unconditional in the original DNS-time evaluator.
+		if action.outbound == consts.OutboundMustRules {
+			return FakeIPEligibilityDirect
 		}
-
-		outbound := match.outbound
-		if outbound != consts.OutboundLogicalOr {
-			if match.not {
-				subruleVal = fakeIPKleeneNot(subruleVal)
+		if action.matchType == consts.MatchType_Fallback {
+			if m.fakeIPOutboundIsProxy(action.outbound) {
+				return FakeIPEligibilityProxy
 			}
-			ruleVal = fakeIPKleeneAnd(ruleVal, subruleVal)
-			if subruleHasDomain {
-				hasDomain = true
-			}
-			subruleVal = fakeIPKleeneFalse
-			subruleHasDomain = false
+			return FakeIPEligibilityDirect
 		}
-		if outbound&consts.OutboundLogicalMask != consts.OutboundLogicalMask {
-			if outbound == consts.OutboundMustRules {
-				return FakeIPEligibilityDirect
-			}
-			if match.matchType == consts.MatchType_Fallback {
-				if m.fakeIPOutboundIsProxy(outbound) {
-					return FakeIPEligibilityProxy
+		ruleVal, subruleVal := fakeIPKleeneTrue, fakeIPKleeneFalse
+		for i := rule.start; i < rule.end; i++ {
+			match := m.compiledMatches[i]
+			raw, _ := f.evalKnown(match, i, dest)
+			subruleVal = fakeIPKleeneOr(subruleVal, raw)
+			if match.outbound != consts.OutboundLogicalOr {
+				if match.not {
+					subruleVal = fakeIPKleeneNot(subruleVal)
 				}
-				return FakeIPEligibilityDirect
+				ruleVal = fakeIPKleeneAnd(ruleVal, subruleVal)
+				subruleVal = fakeIPKleeneFalse
 			}
-			if !hasDomain {
-				ruleVal = fakeIPKleeneTrue
-				hasDomain = false
-				continue
+		}
+		switch ruleVal {
+		case fakeIPKleeneUnknown:
+			return FakeIPEligibilityUnknown
+		case fakeIPKleeneTrue:
+			if m.fakeIPOutboundIsProxy(action.outbound) {
+				return FakeIPEligibilityProxy
 			}
-			switch ruleVal {
-			case fakeIPKleeneUnknown:
-				return FakeIPEligibilityUnknown
-			case fakeIPKleeneTrue:
-				if m.fakeIPOutboundIsProxy(outbound) {
-					return FakeIPEligibilityProxy
-				}
-				return FakeIPEligibilityDirect
-			}
-			ruleVal = fakeIPKleeneTrue
-			hasDomain = false
+			return FakeIPEligibilityDirect
 		}
 	}
 	return FakeIPEligibilityDirect

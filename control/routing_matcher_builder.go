@@ -1084,6 +1084,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		lpmMatcher:      lpmMatcher,
 		domainMatcher:   domainMatcher,
 		compiledMatches: compiledMatches,
+		fakeIPRules:     compileFakeIPRules(compiledMatches),
 		needs:           computeRoutingMatcherNeeds(compiledMatches),
 		predicateGroups: append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
 	}

@@ -16,7 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func testFakeIPMatcher(t *testing.T, routingBody string, groups []string) *RoutingMatcher {
+func testFakeIPMatcher(t testing.TB, routingBody string, groups []string) *RoutingMatcher {
 	t.Helper()
 	src := "global {}\nrouting {\n" + routingBody + "\n}\n"
 	sections, err := config_parser.Parse(src)
