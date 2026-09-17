@@ -364,9 +364,14 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 		return nil
 	}
 
+	if c.kernelVersion == nil || !consts.HasTcpSockmapQueueAccounting(*c.kernelVersion) {
+		c.log.Warn("TCP relay offload disabled: backlog accounting requires Linux 6.1.32+, 6.3.6+, or 6.4+; using userspace relay")
+		return nil
+	}
+
 	bpf := c.bpf.Load()
-	if bpf == nil || bpf.FastSock == nil || bpf.TcpOffloadRedirect == nil || bpf.TcpOffloadSent == nil || bpf.TcpOffloadPause == nil || bpf.TcpOffloadSentAccount == nil {
-		return fmt.Errorf("fast_sock, tcp_offload_redirect, tcp_offload_pause, tcp_offload_sent or tcp_offload_sent_account unavailable")
+	if bpf == nil || bpf.FastSock == nil || bpf.TcpOffloadRedirect == nil || bpf.TcpOffloadSent == nil || bpf.TcpOffloadPause == nil {
+		return fmt.Errorf("fast_sock, tcp_offload_redirect, tcp_offload_pause, tcp_offload_sent unavailable")
 	}
 
 	switch {
@@ -394,21 +399,16 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 			return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_redirect to fast_sock: %w", err)
 		}
 		var account io.Closer
-		// Backlog-fuse accounting: count bytes entering each relay socket's
-		// send path, keyed by reversed four-tuple. The selector prefers an
-		// addressable inner implementation over a potentially bypassed wrapper.
-		// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
-		// fuse cannot engage without the accounting).
+		// Optional byte counters for diagnostics. The backlog fuse uses
+		// TCP_INFO and socket queue lengths, independently of this hook.
 		if os.Getenv("DAE_FUSE_ACCOUNT") != "0" {
 			sentLink, hook, err := attachTCPOffloadAccount(bpf.TcpOffloadSentAccount, bpf.TcpOffloadSentAccountKprobe)
 			if err != nil {
-				// Without the accounting the backlog fuse cannot engage, so the
-				// verdict program is useless; drop it so a retry starts clean.
-				_ = rawLink.Close()
-				return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_sent_account: %w", err)
+				c.log.WithError(err).Warn("TCP offload diagnostic accounting unavailable")
+			} else {
+				c.log.Debugf("TCP relay eBPF offload accounting attached to %s", hook)
+				account = sentLink
 			}
-			c.log.Debugf("TCP relay eBPF offload accounting attached to %s", hook)
-			account = sentLink
 		}
 		return tcpOffloadLinks{verdict: rawLink, account: account}, nil
 	})

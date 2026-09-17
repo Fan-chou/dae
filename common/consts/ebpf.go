@@ -157,6 +157,16 @@ func IsRedirectPeerSafeKernel(v internal.Version) bool {
 	return false
 }
 
+// HasTcpSockmapQueueAccounting reports kernels with the copied_seq fix needed
+// to distinguish redirected bytes from an unread SK_PASS tail. Mainline fix:
+// e5c6de5fa025882babf89cecbed80acf49b987fa; stable: 6.1.32 and 6.3.6.
+// Older implementations are not assumed compatible with the backlog fuse.
+func HasTcpSockmapQueueAccounting(v internal.Version) bool {
+	return !v.Less(internal.Version{6, 4, 0}) ||
+		(v[0] == 6 && v[1] == 1 && v[2] >= 32) ||
+		(v[0] == 6 && v[1] == 3 && v[2] >= 6)
+}
+
 // IsTcpSockmapPanicSafeKernel reports whether the kernel is known to contain the
 // CVE-2025-38165 fix (mainline 6.15.3+ or an official stable backport). Only
 // kernels passing this gate enable the TCP relay eBPF offload by default.

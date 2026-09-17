@@ -72,3 +72,16 @@ func TestIsTcpSockmapPanicSafeKernel(t *testing.T) {
 		}
 	}
 }
+
+func TestHasTcpSockmapQueueAccounting(t *testing.T) {
+	for _, v := range []internal.Version{{6, 1, 32}, {6, 1, 142}, {6, 3, 6}, {6, 4, 0}, {6, 12, 94}} {
+		if !HasTcpSockmapQueueAccounting(v) {
+			t.Fatalf("fixed kernel rejected: %v", v)
+		}
+	}
+	for _, v := range []internal.Version{{5, 17, 0}, {6, 0, 0}, {6, 1, 31}, {6, 2, 16}, {6, 3, 5}} {
+		if HasTcpSockmapQueueAccounting(v) {
+			t.Fatalf("unverified kernel accepted: %v", v)
+		}
+	}
+}
