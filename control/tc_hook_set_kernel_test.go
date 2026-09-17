@@ -35,6 +35,9 @@ func TestTCHookSetKernelUpdateAndRollback(t *testing.T) {
 	attrs.Name = name
 	veth := &netlink.Veth{LinkAttrs: attrs, PeerName: peerName}
 	if err := netlink.LinkAdd(veth); err != nil {
+		if stderrors.Is(err, unix.EOPNOTSUPP) {
+			t.Skipf("kernel lacks veth support: %v", err)
+		}
 		if stderrors.Is(err, unix.EPERM) || stderrors.Is(err, unix.EACCES) {
 			t.Skipf("creating veth requires CAP_NET_ADMIN: %v", err)
 		}

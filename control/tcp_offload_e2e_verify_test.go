@@ -38,11 +38,17 @@ const (
 // full tproxy object.
 func loadOffloadVerifyCollection(t *testing.T) *ebpf.Collection {
 	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("requires root for BPF load/attach")
+	}
 	object := os.Getenv("DAE_TCP_OFFLOAD_TEST_OBJECT")
 	if object == "" {
 		object = "bpf_bpfel.o"
 		if binary.NativeEndian.Uint16([]byte{1, 0}) != 1 {
 			object = "bpf_bpfeb.o"
+		}
+		if _, err := os.Stat(object); os.IsNotExist(err) {
+			t.Skip("generated BPF object unavailable; run make ebpf for kernel tests")
 		}
 	}
 	t.Logf("offload object: %s", object)

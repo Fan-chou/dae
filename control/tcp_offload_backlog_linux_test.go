@@ -13,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 )
 
 // A bounded slow-reader regression for retry overcounting and pause recovery.
@@ -129,7 +130,23 @@ func TestTCPOffloadBacklogUsesAcceptedBytes(t *testing.T) {
 	if e = left.SetReadBuffer(4 << 20); e != nil {
 		t.Fatal(e)
 	}
-	extra := bytes.Repeat([]byte{0x5a}, 2<<20)
+	raw, err := left.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receiveBuffer int
+	var sockErr error
+	if err = raw.Control(func(fd uintptr) {
+		receiveBuffer, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if sockErr != nil {
+		t.Fatal(sockErr)
+	}
+	// Reserve room for skb accounting, rather than assuming the request escaped
+	// rmem_max. Any positive SK_PASS input tests the pause/drain invariant.
+	extra := bytes.Repeat([]byte{0x5a}, min(2<<20, max(1, receiveBuffer/8)))
 	extraWrite := make(chan error, 1)
 	go func() { _, e := client.Write(extra); extraWrite <- e }()
 	until := time.Now().Add(3 * time.Second)

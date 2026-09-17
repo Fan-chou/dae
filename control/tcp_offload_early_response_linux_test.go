@@ -58,13 +58,14 @@ func TestTCPOffloadEarlyResponseDrainsUpload(t *testing.T) {
 	}
 	require.Equal(t, "early response", string(got))
 	time.Sleep(100 * time.Millisecond)
-	received := make(chan []byte, 1)
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	received := make(chan readResult, 1)
 	go func() {
 		b, err := io.ReadAll(server)
-		if err != nil {
-			t.Errorf("server read: %v", err)
-		}
-		received <- b
+		received <- readResult{b, err}
 	}()
 	select {
 	case e := <-done:
@@ -75,9 +76,12 @@ func TestTCPOffloadEarlyResponseDrainsUpload(t *testing.T) {
 		t.Error("relay failed to retire")
 	}
 	select {
-	case b := <-received:
-		if !bytes.Equal(b, payload) {
-			t.Errorf("upload tail corrupted: %d/%d", len(b), len(payload))
+	case result := <-received:
+		if result.err != nil {
+			t.Errorf("server read: %v", result.err)
+		}
+		if !bytes.Equal(result.data, payload) {
+			t.Errorf("upload tail corrupted: %d/%d", len(result.data), len(payload))
 		}
 	case <-time.After(15 * time.Second):
 		t.Error("server still waiting")
