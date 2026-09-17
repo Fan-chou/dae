@@ -2547,7 +2547,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// may return the buffer into a wrong size-class and poison the pool.
 			convergeSrc := common.ConvergeAddrPort(src)
 			flowDecision := ClassifyUdpFlow(convergeSrc, realDst, pktBuf)
-			if flowDecision.IsQuicInitial {
+			if flowDecision.IsQuicInitial && c.sniffingTimeout > 0 {
 				flowDecision = flowDecision.EnsureSnifferSession()
 			}
 			// Debug:

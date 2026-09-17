@@ -474,6 +474,7 @@ func (ps *PacketSniffer) stopFlushLocked() {
 // CompactPacketState is called with Mu held after normal sniff completion.
 func (ps *PacketSniffer) CompactPacketState() {
 	ps.stopFlushLocked()
+	ps.createdAt = time.Time{}
 	ps.Sniffer.CompactPacketState()
 }
 
@@ -913,6 +914,9 @@ func (p *PacketSnifferPool) touchLiveSniffer(key PacketSnifferKey, qs *PacketSni
 	cur, ok := p.pool.Load(key)
 	if !ok || cur != qs {
 		return false
+	}
+	if qs.createdAt.IsZero() {
+		qs.createdAt = time.Now()
 	}
 	qs.RefreshTtl()
 	return true

@@ -72,3 +72,39 @@ func TestQUICSniffBudgetPreservesBlockQuic(t *testing.T) {
 		t.Fatal("expiry bypassed block_quic on a reliable carrier")
 	}
 }
+
+func TestQUICSniffBudgetRestartsOnReusedSession(t *testing.T) {
+	defer setupQuicInitialRegressionTestState(t)()
+	first, _ := newSnifferNeedMorePayloads(t)
+	src, dst, flow := newQuicInitialRegressionFlow(t, first)
+	ps := DefaultPacketSnifferSessionMgr.Get(NewPacketSnifferKey(src, dst, first))
+	ps.Mu.Lock()
+	ps.createdAt = time.Now().Add(-time.Hour)
+	ps.CompactPacketState()
+	ps.Mu.Unlock()
+	before := time.Now()
+	flow.EnsureSnifferSession()
+	ps.Mu.Lock()
+	defer ps.Mu.Unlock()
+	if ps.createdAt.Before(before) {
+		t.Fatal("reused sniffer retained the previous attempt's budget")
+	}
+}
+
+func TestQUICDisabledSniffBudgetForwardsImmediately(t *testing.T) {
+	defer setupQuicInitialRegressionTestState(t)()
+	first, _ := newSnifferNeedMorePayloads(t)
+	conn := &udpReuseSimulationConn{reads: make(chan scriptedPacketRead), closeCh: make(chan struct{})}
+	d, _ := newCountingProxyEndpointDialer("hysteria2", "proxy.example:443", conn)
+	cp := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(d))
+	cp.sniffingTimeout = 0
+	src, dst, flow := newQuicInitialRegressionFlow(t, first)
+	primeQuicRegressionAnyfrom(src, dst)
+	route := &bpfRoutingResult{Outbound: uint8(consts.OutboundUserDefinedMin)}
+	if err := cp.handlePktWithPrefetch(nil, first, src, dst, route, flow, false, nil, UdpEndpointKey{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if conn.writeCalls.Load() != 1 {
+		t.Fatal("disabled sniffing held the Initial")
+	}
+}

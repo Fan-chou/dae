@@ -239,7 +239,7 @@ func (d UdpFlowDecision) InitialLookupFallbackKeyWithScope(scope udpEndpointRout
 }
 
 func (d UdpFlowDecision) EnsureSnifferSession() UdpFlowDecision {
-	if d.HasSnifferSession || !d.IsQuicInitial {
+	if !d.IsQuicInitial {
 		return d
 	}
 	key := d.PacketSnifferKey()

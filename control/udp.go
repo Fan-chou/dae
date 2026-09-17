@@ -841,7 +841,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 
 	// To keep consistency with kernel program, we only sniff DNS request sent to 53.
 	var natTimeout time.Duration
-	if domain == "" && !skipSniffing && !ueExists {
+	if domain == "" && !skipSniffing && !ueExists && c.sniffingTimeout > 0 {
 		// Fast path: only sniff-eligible QUIC Initial packets should enter sniffing.
 		// All other UDP traffic should be forwarded immediately without blocking.
 		if !isQuicInitial {
