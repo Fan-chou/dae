@@ -32,11 +32,10 @@ func (d *Dialer) transportForClass(class string) (*Dialer, error) {
 	if transport := d.transportClasses[class]; transport != nil {
 		return transport, nil
 	}
-	option := *d.GlobalOption
-	option.TransportCacheNamespace = newTransportCacheNamespace()
+	option := d.GlobalOption.cloneForTransportClass()
 	// Share the node's resolution cache so its existing failure/health machinery
 	// invalidates the addresses used by both normal and isolated connections.
-	transport, err := NewFromLinkWithProxyCacheContext(d.ctx, &option, d.InstanceOption,
+	transport, err := NewFromLinkWithProxyCacheContext(d.ctx, option, d.InstanceOption,
 		d.property.Link, d.property.SubscriptionTag, d.proxyIpCache)
 	if err != nil {
 		return nil, fmt.Errorf("create transport class %q: %w", class, err)
@@ -66,5 +65,24 @@ func (d *Dialer) closeTransportClasses() {
 	for _, transport := range transports {
 		_ = transport.Close()
 		CleanupTransportCacheNamespace(transport.TransportCacheNamespace)
+	}
+}
+
+// cloneForTransportClass copies configuration, not mutexes or lazy parse state.
+// Runtime resolvers are intentionally shared with the owner for invalidation.
+func (o *GlobalOption) cloneForTransportClass() *GlobalOption {
+	o.metadataMu.Lock()
+	defer o.metadataMu.Unlock()
+	tcp, dns := &o.TcpCheckOptionRaw, &o.CheckDnsOptionRaw
+	// Raw configuration is immutable after construction. Do not wait on lazy
+	// DNS parsing: its locks protect opt, which is deliberately not copied.
+	return &GlobalOption{
+		ExtraOption: o.ExtraOption, Log: o.Log, DaeDNS: o.DaeDNS,
+		DirectDialer: o.DirectDialer, FullconeDirectDialer: o.FullconeDirectDialer,
+		SystemDNSResolver: o.SystemDNSResolver,
+		TcpCheckOptionRaw: TcpCheckOptionRaw{Log: tcp.Log, Raw: append([]string(nil), tcp.Raw...), ResolverNetwork: tcp.ResolverNetwork, Method: tcp.Method, DirectDialer: tcp.DirectDialer, SystemDNSResolver: tcp.SystemDNSResolver},
+		CheckDnsOptionRaw: CheckDnsOptionRaw{Raw: append([]string(nil), dns.Raw...), ResolverNetwork: dns.ResolverNetwork, Somark: dns.Somark, DirectDialer: dns.DirectDialer, SystemDNSResolver: dns.SystemDNSResolver},
+		CheckInterval:     o.CheckInterval, CheckTolerance: o.CheckTolerance, CheckDnsTcp: o.CheckDnsTcp,
+		SoMarkFromDae: o.SoMarkFromDae, Mptcp: o.Mptcp, TransportCacheNamespace: newTransportCacheNamespace(),
 	}
 }

@@ -58,3 +58,32 @@ func TestTransportClassReuseAndRetirement(t *testing.T) {
 		t.Fatal("close retained transports")
 	}
 }
+
+func TestTransportCloneDoesNotCopyOrWaitForLazyState(t *testing.T) {
+	o := &GlobalOption{TcpCheckOptionRaw: TcpCheckOptionRaw{Raw: []string{"https://example.com"}, opt: &TcpCheckOption{}}, CheckDnsOptionRaw: CheckDnsOptionRaw{Raw: []string{"1.1.1.1"}, opt: &CheckDnsOption{}}, TransportCacheNamespace: "owner"}
+	o.TcpCheckOptionRaw.mu.Lock()
+	o.CheckDnsOptionRaw.mu.Lock()
+	defer o.TcpCheckOptionRaw.mu.Unlock()
+	defer o.CheckDnsOptionRaw.mu.Unlock()
+	done := make(chan *GlobalOption, 1)
+	go func() { done <- o.cloneForTransportClass() }()
+	select {
+	case c := <-done:
+		if c.TcpCheckOptionRaw.opt != nil || c.CheckDnsOptionRaw.opt != nil {
+			t.Fatal("copied lazy state")
+		}
+		if c.TransportCacheNamespace == o.TransportCacheNamespace {
+			t.Fatal("shared namespace")
+		}
+		c.TcpCheckOptionRaw.Raw[0] = "changed"
+		if o.TcpCheckOptionRaw.Raw[0] == "changed" {
+			t.Fatal("shared raw configuration backing array")
+		}
+		if !c.TcpCheckOptionRaw.mu.TryLock() {
+			t.Fatal("copied locked mutex")
+		}
+		c.TcpCheckOptionRaw.mu.Unlock()
+	case <-time.After(time.Second):
+		t.Fatal("clone waited for lazy DNS parsing")
+	}
+}

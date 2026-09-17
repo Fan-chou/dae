@@ -59,7 +59,8 @@ func (c *stubEarlyConn) Context() context.Context { return context.Background() 
 func (c *stubEarlyConn) ConnectionState() quic.ConnectionState {
 	return quic.ConnectionState{}
 }
-func (c *stubEarlyConn) SendDatagram([]byte) error { return nil }
+func (c *stubEarlyConn) SendDatagram([]byte) error                         { return nil }
+func (c *stubEarlyConn) SendDatagramContext(context.Context, []byte) error { return nil }
 func (c *stubEarlyConn) ReceiveDatagram(context.Context) ([]byte, error) {
 	return nil, net.ErrClosed
 }
