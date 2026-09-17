@@ -203,7 +203,10 @@ func udpTaskDiscard(task UdpTask) {
 func (q *UdpTaskQueue) popOverflowTask() (UdpTask, bool) {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
+	return q.popOverflowTaskLocked()
+}
 
+func (q *UdpTaskQueue) popOverflowTaskLocked() (UdpTask, bool) {
 	if len(q.overflow) == 0 {
 		q.overflowMode = false
 		return nil, false
@@ -233,12 +236,17 @@ func (q *UdpTaskQueue) popOverflowTask() (UdpTask, bool) {
 }
 
 func (q *UdpTaskQueue) popReadyTask() (UdpTask, bool) {
+	// Select a tier under the same lock as enqueue. Otherwise a producer can
+	// refill the channel after the empty probe and append newer overflow work
+	// before we acquire its lock, allowing that newer work to run first.
+	q.enqueueMu.Lock()
+	defer q.enqueueMu.Unlock()
 	select {
 	case task := <-q.ch:
 		return task, true
 	default:
 	}
-	return q.popOverflowTask()
+	return q.popOverflowTaskLocked()
 }
 
 // drainAndRelease empties any tasks still queued before the channel returns
