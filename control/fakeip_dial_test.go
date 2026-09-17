@@ -863,11 +863,9 @@ func TestPrefetchProxyResolveDNSSkipsWithoutResolveDNSNode(t *testing.T) {
 	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
 	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
 	cp.prefetchProxyResolveDNS("chatgpt.com", false, netip.MustParseAddrPort("192.0.2.10:40000"), [6]uint8{}, 0, [16]uint8{})
-	n := 0
-	cp.resolveDNSPins.prefetch.Range(func(_, _ any) bool {
-		n++
-		return true
-	})
+	cp.resolveDNSPins.mu.Lock()
+	n := len(cp.resolveDNSPins.background)
+	cp.resolveDNSPins.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("scheduled %d prefetch(es), want 0 without resolve_dns", n)
 	}
@@ -909,7 +907,7 @@ func TestApplyProxyResolveDNSStoresAnswerTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	key := resolveDNSResultKey(&proxyDialResult{Dialer: d, Mark: cp.soMarkFromDae}, "chatgpt.com", false)
 	cp.resolveDNSPins.mu.Lock()
 	ent := cp.resolveDNSPins.entries[key]
 	cp.resolveDNSPins.mu.Unlock()
@@ -1110,7 +1108,7 @@ func TestApplyProxyResolveDNSServeStaleWhileRefresh(t *testing.T) {
 	dns := netip.MustParseAddrPort("8.8.8.8:53")
 	d.SetResolveDNS(dns)
 	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
-	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	key := resolveDNSResultKey(&proxyDialResult{Dialer: d, Mark: cp.soMarkFromDae}, "chatgpt.com", false)
 	now := time.Now()
 	old := netip.MustParseAddr("1.1.1.1")
 	cp.resolveDNSPins.mu.Lock()
@@ -1182,7 +1180,7 @@ func TestApplyProxyResolveDNSServeStaleRefreshFailureKeepsPin(t *testing.T) {
 	dns := netip.MustParseAddrPort("8.8.8.8:53")
 	d.SetResolveDNS(dns)
 	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
-	key := proxyResolveDNSPinKey(d, dns, "chatgpt.com", false)
+	key := resolveDNSResultKey(&proxyDialResult{Dialer: d, Mark: cp.soMarkFromDae}, "chatgpt.com", false)
 	now := time.Now()
 	old := netip.MustParseAddr("1.1.1.1")
 	staleUntil := now.Add(time.Minute)

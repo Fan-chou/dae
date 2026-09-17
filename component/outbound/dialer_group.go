@@ -1363,11 +1363,11 @@ func (g *DialerGroup) selectWithExclusionResultCore(networkType *dialer.NetworkT
 	}
 	state := g.currentSelectionState()
 	policy := state.policy
-	d, latency, selectedNetworkType, stable, err = g._select(networkType, state, policy, skip)
+	d, latency, selectedNetworkType, stable, err = g._select(networkType, state, policy, skip, !activateLazy)
 	if !strictIpVersion && errors.Is(err, ErrNoAliveDialer) {
 		nt := *networkType
 		nt.IpVersion = (consts.IpVersion_X - networkType.IpVersion.ToIpVersionType()).ToIpVersionStr()
-		d, latency, selectedNetworkType, stable, err = g._select(&nt, state, policy, skip)
+		d, latency, selectedNetworkType, stable, err = g._select(&nt, state, policy, skip, !activateLazy)
 	}
 	if err == nil {
 		return d, latency, selectedNetworkType, stable, nil
@@ -1522,7 +1522,9 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		if needPicks {
 			best = g.preferNestedIncumbent(networkType, skip, picks, best)
 		}
-		g.storeNestedIncumbent(networkType, best.d)
+		if activateLazy {
+			g.storeNestedIncumbent(networkType, best.d)
+		}
 		path.adopt(best.member, &best.path)
 		return best.d, best.latency, best.network, best.stable, nil
 	default:
@@ -1737,7 +1739,7 @@ func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType,
 	return m.dialer, latency, selectedNetworkType, true, nil
 }
 
-func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGroupSelectionState, policy DialerSelectionPolicy, skip map[*dialer.Dialer]struct{}) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
+func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGroupSelectionState, policy DialerSelectionPolicy, skip map[*dialer.Dialer]struct{}, peek ...bool) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
 	if len(g.Dialers) == 0 {
 		if policy.Policy == consts.DialerSelectionPolicy_FirstAlive ||
 			policy.Policy == consts.DialerSelectionPolicy_Fallback {
@@ -1782,7 +1784,13 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, state *dialerGrou
 		networkTypes, count := g.selectionNetworkTypes(networkType, policy)
 		for i := range count {
 			a := state.aliveDialerSets[networkTypes[i].Index()]
-			d, latency := a.GetMinLatencySkipping(skip)
+			var d *dialer.Dialer
+			var latency time.Duration
+			if len(peek) > 0 && peek[0] {
+				d, latency = a.PeekMinLatencySkipping(skip)
+			} else {
+				d, latency = a.GetMinLatencySkipping(skip)
+			}
 			if d != nil {
 				selected := preferAlternateSelectionNetworkType(d, &networkTypes[i])
 				return d, latency, selected, true, nil
@@ -1993,4 +2001,15 @@ func alternateNetworkType(networkType *dialer.NetworkType) *dialer.NetworkType {
 	default:
 		return nil
 	}
+}
+
+// PeekResolveDNSCandidate avoids sticky/hold-down updates and lazy health
+// activation. Its single speculative leaf never binds the subsequent flow.
+func (g *DialerGroup) PeekResolveDNSCandidate(nt *dialer.NetworkType) (*dialer.Dialer, error) {
+	if g == nil || nt == nil {
+		return nil, ErrNoAliveDialer
+	}
+	var path selectPathBuilder
+	d, _, _, _, err := g.selectWithSkip(nt, false, nil, nil, false, "", false, false, &path)
+	return d, err
 }

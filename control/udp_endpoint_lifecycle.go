@@ -428,6 +428,9 @@ func (ue *UdpEndpoint) rememberFlowIdentityOnRetire() {
 }
 
 func (ue *UdpEndpoint) retire() {
+	if ue.resolveDNSState != nil {
+		ue.resolveDNSState.store.save(ue)
+	}
 	ue.rememberFlowIdentityOnRetire()
 	ue.dead.Store(true)
 	ue.expiresAtNano.Store(1)
@@ -440,6 +443,9 @@ func (ue *UdpEndpoint) retire() {
 // replyQueueDone, which only the sender itself closes, so calling retire()
 // from handleReceivedPacket or replySender would deadlock on <-done.
 func (ue *UdpEndpoint) markRetiredFromReceiver() {
+	if ue.resolveDNSState != nil {
+		ue.resolveDNSState.store.save(ue)
+	}
 	ue.rememberFlowIdentityOnRetire()
 	ue.dead.Store(true)
 	ue.expiresAtNano.Store(1)
@@ -667,6 +673,10 @@ func (ue *UdpEndpoint) closeIdleExpired() error {
 
 func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 	ue.closeOnce.Do(func() {
+		if !ue.dead.Load() && ue.resolveDNSState != nil {
+			ue.resolveDNSState.once.Do(func() {})
+			ue.resolveDNSState.store.discard(ue)
+		}
 		// Reset/Abort/Remove/write-failure call Close() without retire().
 		// Save QUIC identity and sniffed domain before lastPair is cleared.
 		// Natural NAT expiry uses closeIdleExpired() so a dead flow is not

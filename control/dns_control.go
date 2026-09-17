@@ -81,7 +81,7 @@ type DnsControllerOption struct {
 	OptimisticCacheTtl    int // 0 means never expire (rely on LRU eviction)
 	MaxCacheSize          int // maximum number of cache entries (0 = unlimited)
 	FakeIPPolicy          *FakeIPPolicy
-	PrefetchResolveDNS    func(qname string, qtype uint16, req *udpRequest)
+	PrefetchResolveDNS    func(qname string, qtype uint16, req *udpRequest, fakeDestination bool)
 }
 
 type dnsControllerStore struct {

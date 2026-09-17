@@ -51,7 +51,8 @@ const (
 	// It is independent of DefaultDialTimeout so a slow DNS query cannot
 	// starve the subsequent proxy handshake. Sized for a US-node RTT plus a
 	// couple of UDP retries, not a full 3s stall on the first packet.
-	ResolveDNSTimeout = 800 * time.Millisecond
+	ResolveDNSTimeout       = 800 * time.Millisecond
+	ResolveDNSFallbackDelay = 250 * time.Millisecond
 	// ResolveDNSUDPResendInterval is how often a UDP resolve_dns query is
 	// resent while waiting for an answer. Must be well below ResolveDNSTimeout
 	// so a lost packet can retry inside the budget.

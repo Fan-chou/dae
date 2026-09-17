@@ -190,12 +190,21 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 }
 
 func (a *AliveDialerSet) GetMinLatencySkipping(skip map[*Dialer]struct{}) (d *Dialer, latency time.Duration) {
+	return a.minLatencySkipping(skip, false)
+}
+
+// PeekMinLatencySkipping reads a candidate without changing url_test hysteresis.
+func (a *AliveDialerSet) PeekMinLatencySkipping(skip map[*Dialer]struct{}) (*Dialer, time.Duration) {
+	return a.minLatencySkipping(skip, true)
+}
+
+func (a *AliveDialerSet) minLatencySkipping(skip map[*Dialer]struct{}, peek bool) (d *Dialer, latency time.Duration) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	if a.selectionPolicy == consts.DialerSelectionPolicy_UrlTest {
 		d, latency := a.liveMinLatencyLocked(skip)
-		if len(skip) == 0 && d != nil {
+		if !peek && len(skip) == 0 && d != nil {
 			a.urlTestReturned.Store(d)
 		}
 		return d, latency

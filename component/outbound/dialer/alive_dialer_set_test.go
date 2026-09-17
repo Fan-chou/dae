@@ -283,3 +283,17 @@ func TestAliveDialerSetUrlTestKeepsReturnedIncumbentAfterPenaltyClears(t *testin
 		t.Fatalf("after penalty cleared winner = %p, want returned incumbent %p", got, challenger)
 	}
 }
+
+func TestAliveDialerSetPeekDoesNotChangeURLTestIncumbent(t *testing.T) {
+	first := newNamedTestDialer(t, "first")
+	set := NewAliveDialerSet(first.Log, "peek", newTestNetworkType(), 0, consts.DialerSelectionPolicy_UrlTest, []*Dialer{first}, []*Annotation{{}}, func(bool) {}, true)
+	if got, _ := set.PeekMinLatencySkipping(nil); got != first {
+		t.Fatal("peek missed admitted leaf")
+	}
+	if set.urlTestReturned.Load() != nil {
+		t.Fatal("peek changed incumbent")
+	}
+	if got, _ := set.GetMinLatencySkipping(nil); got != first || set.urlTestReturned.Load() != first {
+		t.Fatal("real selection failed to record incumbent")
+	}
+}

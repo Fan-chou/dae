@@ -196,17 +196,19 @@ func (c *ControlPlane) allowConnectionErrorLog(now time.Time) bool {
 }
 
 type DialOption struct {
-	Target        string
-	Dialer        *dialer.Dialer
-	Outbound      *ob.DialerGroup
-	Network       string
-	NetworkType   *dialer.NetworkType
-	SniffedDomain string
-	StickySite    string
-	IsDialIp      bool
-	SelectPath    ob.SelectPath
-	Excluded      *dialer.Dialer
-	Binding       UdpFlowBinding
+	ResolveDNSPinned  bool
+	ResolveDNSInitial PacketSnifferKey
+	Target            string
+	Dialer            *dialer.Dialer
+	Outbound          *ob.DialerGroup
+	Network           string
+	NetworkType       *dialer.NetworkType
+	SniffedDomain     string
+	StickySite        string
+	IsDialIp          bool
+	SelectPath        ob.SelectPath
+	Excluded          *dialer.Dialer
+	Binding           UdpFlowBinding
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
@@ -657,6 +659,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	var domain string
 	var ueKey UdpEndpointKey
 	var excludedDialer *dialer.Dialer
+	var recoveryForRetry *resolveDNSRecovery
 	now := time.Now()
 	nowNano := now.UnixNano()
 	realSrc = src
@@ -825,6 +828,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 					excludedDialer = ue.Dialer
 				}
 				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
+				recoveryForRetry = ue.resolveDNSTargetForRetry(flowDecision)
 				_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 				ue = nil
 				ueExists = false
@@ -1143,6 +1147,19 @@ getNew:
 					IdentifiedQuic: quicIdentified,
 				}
 
+				if recoveryForRetry != nil {
+					dialParam.ResolveDNSRecovery = recoveryForRetry
+					if dialParam.Domain == "" {
+						dialParam.Domain = recoveryForRetry.domain
+					}
+				} else if sessionManager != nil {
+					if recovery, ok := sessionManager.resolveDNSRecovery.lookup(ueKey, flowDecision.PacketSnifferKey(), flowDecision.IsQuicInitial); ok {
+						dialParam.ResolveDNSRecovery = &recovery
+						if dialParam.Domain == "" {
+							dialParam.Domain = recovery.domain
+						}
+					}
+				}
 				res, err := c.chooseProxyDialer(ctx, dialParam)
 				if err != nil {
 					if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
@@ -1176,6 +1193,8 @@ getNew:
 				}
 
 				option = &DialOption{
+					ResolveDNSPinned:  res.ResolveDNSPinned,
+					ResolveDNSInitial: flowDecision.PacketSnifferKey(),
 					// Pass the domain (or resolve_dns-pinned IP) from chooseProxyDialer.
 					// Endpoint key stays on the client destination (including FakeIP).
 					Target:        udpDialTarget(res.DialTarget, realDst.String()),
@@ -1189,6 +1208,9 @@ getNew:
 					SelectPath:    res.SelectPath,
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
+				}
+				if res.ResolveDNSRestored && dialParam.ResolveDNSRecovery != nil {
+					option.ResolveDNSInitial = dialParam.ResolveDNSRecovery.initial
 				}
 				option.Binding = newUdpFlowBinding(c.PolicyEpoch(), res.OutboundIndex, res.Mark, res.Must, option)
 				option.Binding.Mac = routingResult.Mac
@@ -1270,6 +1292,7 @@ getNew:
 				excludedDialer = ue.Dialer
 			}
 			quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
+			recoveryForRetry = ue.resolveDNSTargetForRetry(flowDecision)
 			_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 			retry++
 			goto getNew

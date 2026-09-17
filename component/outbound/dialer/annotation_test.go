@@ -23,6 +23,7 @@ func TestParseResolveDNS(t *testing.T) {
 	}{
 		{name: "bare ipv4", val: "8.8.8.8", want: netip.MustParseAddrPort("8.8.8.8:53")},
 		{name: "ipv4 port", val: "8.8.8.8:5353", want: netip.MustParseAddrPort("8.8.8.8:5353")},
+		{name: "unsupported tcp", val: "tcp://1.1.1.1:53", wantErr: "does not support TCP"},
 		{name: "udp scheme", val: "udp://1.1.1.1:53", want: netip.MustParseAddrPort("1.1.1.1:53")},
 		{name: "quoted ipv6", val: "'2001:4860:4860::8888'", want: netip.MustParseAddrPort("[2001:4860:4860::8888]:53")},
 		{name: "hostname", val: "dns.google", wantErr: "must be an IP address"},

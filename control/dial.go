@@ -32,18 +32,21 @@ type proxyDialParam struct {
 	Network     string         // e.g. "tcp", "udp"
 	Excluded    *dialer.Dialer // Dialer to exclude in selection
 	// IdentifiedQuic is set by the UDP GetDialOption path. TCP leaves it false.
-	IdentifiedQuic bool
+	IdentifiedQuic     bool
+	ResolveDNSRecovery *resolveDNSRecovery
 }
 
 type proxyDialResult struct {
-	OutboundIndex consts.OutboundIndex
-	Outbound      *ob.DialerGroup
-	Dialer        *dialer.Dialer
-	DialTarget    string
-	Network       string
-	Mark          uint32
-	Must          bool
-	SniffedDomain string
+	ResolveDNSPinned   bool
+	ResolveDNSRestored bool
+	OutboundIndex      consts.OutboundIndex
+	Outbound           *ob.DialerGroup
+	Dialer             *dialer.Dialer
+	DialTarget         string
+	Network            string
+	Mark               uint32
+	Must               bool
+	SniffedDomain      string
 	// StickySite is the fallback/url_test pin key. It may be a dest IP when
 	// the flow has no sniffed name; it must not replace SniffedDomain.
 	StickySite string
@@ -330,12 +333,14 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			res.SelectionNetworkType = realType.StringWithoutDns()
 		}
 	}
-	if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
-		return res, err
+	if !c.inheritResolveDNSTarget(p, res) {
+		if err := c.applyProxyResolveDNS(ctx, p, res); err != nil {
+			return res, err
+		}
 	}
-	if p.Network == "tcp" && res.Dialer != nil && res.Dialer.ResolveDNS().IsValid() {
+	if p.Network == "tcp" && p.Dest.Port() == 443 && res.Dialer != nil && res.Dialer.ResolveDNS().IsValid() {
 		preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName)
+		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName, c.destIsFakeIP(p.Dest.Addr()))
 	}
 	if err := c.ensureUdpDialTargetIP(ctx, p, res); err != nil {
 		return res, err

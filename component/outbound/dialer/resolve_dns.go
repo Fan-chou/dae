@@ -24,8 +24,9 @@ func parseResolveDNS(val string) (netip.AddrPort, error) {
 	s = strings.Trim(s, `'"`)
 	s = strings.TrimPrefix(s, "udp://")
 	s = strings.TrimPrefix(s, "UDP://")
-	s = strings.TrimPrefix(s, "tcp://")
-	s = strings.TrimPrefix(s, "TCP://")
+	if strings.HasPrefix(strings.ToLower(s), "tcp://") {
+		return netip.AddrPort{}, fmt.Errorf("resolve_dns does not support TCP; use IP[:port] or udp://IP[:port]")
+	}
 	if s == "" {
 		return netip.AddrPort{}, fmt.Errorf("resolve_dns must be an IP address")
 	}

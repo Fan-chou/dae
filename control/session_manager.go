@@ -151,9 +151,10 @@ func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
 // generationsMu. Refcount maps are sharded by tuple hash. Established packet
 // forwarding does not take these lifecycle locks.
 type SessionManager struct {
-	adminSnapshotID string
-	ctx             context.Context
-	cancel          context.CancelFunc
+	resolveDNSRecovery resolveDNSRecoveryStore
+	adminSnapshotID    string
+	ctx                context.Context
+	cancel             context.CancelFunc
 
 	closed atomic.Bool
 

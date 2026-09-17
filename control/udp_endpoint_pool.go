@@ -111,8 +111,9 @@ type UdpEndpoint struct {
 	flowBindingDialIP bool
 
 	// Non-empty indicates this UDP Endpoint is related with a sniffed domain.
-	SniffedDomain string
-	DialTarget    string
+	SniffedDomain   string
+	DialTarget      string
+	resolveDNSState *udpResolveDNSState
 	// quicIdentified is set when this endpoint forwarded identified QUIC
 	// (Initial, sniffer session, or persisted mark). Later 1-RTT packets
 	// keep that identity after the sniffer expires.
@@ -730,14 +731,15 @@ dialSuccess:
 		return nil, fmt.Errorf("protocol does not support udp")
 	}
 	ue := &UdpEndpoint{
-		crossFamily:       createOption.crossFamily,
-		conn:              packetConn,
-		handler:           createOption.Handler,
-		NatTimeout:        effectiveUdpEndpointNatTimeout(dialOption.Dialer, createOption.NatTimeout),
-		Dialer:            dialOption.Dialer,
-		Outbound:          dialOption.Outbound,
-		SniffedDomain:     dialOption.SniffedDomain,
-		DialTarget:        dialOption.Target,
+		crossFamily:   createOption.crossFamily,
+		conn:          packetConn,
+		handler:       createOption.Handler,
+		NatTimeout:    effectiveUdpEndpointNatTimeout(dialOption.Dialer, createOption.NatTimeout),
+		Dialer:        dialOption.Dialer,
+		Outbound:      dialOption.Outbound,
+		SniffedDomain: dialOption.SniffedDomain,
+		DialTarget:    dialOption.Target,
+
 		lAddr:             key.Src,
 		log:               createOption.Log,
 		poolRef:           p,
@@ -757,12 +759,18 @@ dialSuccess:
 			}
 		}(),
 	}
+	if dialOption.ResolveDNSPinned {
+		ue.resolveDNSState = &udpResolveDNSState{initial: dialOption.ResolveDNSInitial, id: resolveDNSRecoverySequence.Add(1)}
+	}
 	if udpWriteBatchOptedIn() {
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 			ue.writeBatch = newUDPWriteBatchAggregator(ue)
 		}
 	}
 	if createOption.sessionManager != nil {
+		if ue.resolveDNSState != nil {
+			ue.resolveDNSState.store = &createOption.sessionManager.resolveDNSRecovery
+		}
 		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
 			_ = packetConn.Close()
 			return nil, err
