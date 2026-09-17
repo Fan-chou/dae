@@ -77,7 +77,7 @@ func (b *ResponseMatcherBuilder) addIp(f *config_parser.Function, cidrs []netip.
 		Not:      f.Not,
 		Upstream: uint8(upstreamId),
 	}
-	t, err := trie.NewTrieFromPrefixes(cidrs)
+	t, err := trie.NewTrieFromPrefixes(routing.AddressFamilyPrefixes(cidrs))
 	if err != nil {
 		return err
 	}
