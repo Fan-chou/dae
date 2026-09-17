@@ -12,6 +12,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/config"
 	D "github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
@@ -289,5 +290,167 @@ func TestUDPCrossFamilyIPv6FakeIPDirectIPv4(t *testing.T) {
 	restored, err := ue.crossFamily.reply(ue.canonicalReplyFrom(server.LocalAddr().(*net.UDPAddr).AddrPort()), client)
 	if err != nil || restored != original {
 		t.Fatalf("domain reply lost client destination: %s %v", restored, err)
+	}
+}
+
+func TestUDPCrossFamilyDisableRetainsAliasesWithoutNewAllocation(t *testing.T) {
+	s := openCrossFamilyTestStore(t, t.TempDir())
+	client := netip.MustParseAddrPort("[2001:db8::2]:10000")
+	peer := netip.MustParseAddrPort("192.0.2.1:9000")
+	alias, err := s.reply(peer, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := &ControlPlane{}
+	if err := cp.initUDPCrossFamily(WithUDPCrossFamilyStore(context.Background(), s), &config.Global{}, &config.Dns{}); err != nil {
+		t.Fatal(err)
+	}
+	if cp.udpCrossFamilyForDestination(peer) != nil {
+		t.Fatal("new ordinary flow still enables cross-family")
+	}
+	retained := cp.udpCrossFamilyForDestination(alias)
+	if retained == nil {
+		t.Fatal("old alias unavailable")
+	}
+	real, ok, err := retained.decode(alias)
+	if err != nil || !ok || real != peer {
+		t.Fatalf("decode: %v %v %v", real, ok, err)
+	}
+	if got, err := retained.reply(peer, client); err != nil || got != alias {
+		t.Fatalf("old peer reply: %v %v", got, err)
+	}
+	foreign := netip.MustParseAddrPort("192.0.2.2:9001")
+	if _, err := retained.reply(foreign, client); err == nil {
+		t.Fatal("disabled generation allocated new alias")
+	}
+	// An established endpoint keeps its original generation's writable store.
+	if _, err := s.reply(foreign, client); err != nil {
+		t.Fatalf("old session lost mapping capability: %v", err)
+	}
+}
+
+func TestUDPCrossFamilyIndependentCapacityAndExpansion(t *testing.T) {
+	dir := t.TempDir()
+	s := openCrossFamilyTestStore(t, dir)
+	// Exhaust a tiny IPv4 pool while IPv6 still has room.
+	s.store.ApplyRanges(netip.MustParsePrefix("198.19.0.0/30"), netip.MustParsePrefix("fd00:cafe::/120"))
+	client4 := netip.MustParseAddrPort("192.0.2.1:5000")
+	client6 := netip.MustParseAddrPort("[2001:db8::1]:5000")
+	peers := []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::2]:9"), netip.MustParseAddrPort("[2001:db8::3]:9"), netip.MustParseAddrPort("[2001:db8::4]:9")}
+	aliases := make([]netip.AddrPort, len(peers))
+	for i, peer := range peers {
+		var err error
+		aliases[i], err = s.reply(peer, client4)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	next := netip.MustParseAddrPort("[2001:db8::5]:9")
+	if _, err := s.reply(next, client4); err == nil {
+		t.Fatal("expected IPv4 pool exhaustion")
+	}
+	peer4 := netip.MustParseAddrPort("192.0.2.99:9")
+	alias6, err := s.reply(peer4, client6)
+	if err != nil {
+		t.Fatalf("exhausted IPv4 pool blocked an IPv6 alias: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The deployed configuration changes pools only across restart.
+	s = openCrossFamilyTestStore(t, dir)
+	if _, err := s.reply(next, client4); err != nil {
+		t.Fatalf("expansion did not restore allocation: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openCrossFamilyTestStore(t, dir)
+	for i, peer := range peers {
+		got, err := s.reply(peer, client4)
+		if err != nil || got != aliases[i] {
+			t.Fatalf("expansion/restart rebound alias: %v %v", got, err)
+		}
+		real, ok, err := s.decode(aliases[i])
+		if err != nil || !ok || real != peer {
+			t.Fatalf("lost old alias: %v %v", real, err)
+		}
+	}
+	got, err := s.reply(peer4, client6)
+	if err != nil || got != alias6 {
+		t.Fatalf("restart lost single-family IPv6 alias: %v %v", got, err)
+	}
+}
+
+func TestUDPCrossFamilyCapacityConfiguration(t *testing.T) {
+	global := &config.Global{UDPCrossFamilyInet4Range: "198.19.0.0/24", UDPCrossFamilyInet6Range: "fd00:cafe::/120", UDPCrossFamilyPath: filepath.Join(t.TempDir(), "peers"), UDPCrossFamilyMaxEntries: 1}
+	cp := &ControlPlane{}
+	if err := cp.initUDPCrossFamily(context.Background(), global, &config.Dns{}); err != nil {
+		t.Fatal(err)
+	}
+	first := netip.MustParseAddrPort("192.0.2.1:9")
+	second := netip.MustParseAddrPort("192.0.2.2:9")
+	client := netip.MustParseAddrPort("[2001:db8::1]:5000")
+	alias, err := cp.udpCrossFamily.reply(first, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cp.udpCrossFamily.reply(second, client); err == nil {
+		t.Fatal("configured entry limit ignored")
+	}
+	if err := cp.udpCrossFamily.Close(); err != nil {
+		t.Fatal(err)
+	}
+	global.UDPCrossFamilyMaxEntries = 65536
+	cp = &ControlPlane{}
+	if err := cp.initUDPCrossFamily(context.Background(), global, &config.Dns{}); err != nil {
+		t.Fatal(err)
+	}
+	defer cp.udpCrossFamily.Close()
+	if cp.udpCrossFamily.store.maxLive != 65536 || cp.udpCrossFamily.store.maxBytes < 65536*256 {
+		t.Fatal("capacity or persistence limit was clamped to the DNS store limit")
+	}
+	if _, err := cp.udpCrossFamily.reply(second, client); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cp.udpCrossFamily.reply(first, client)
+	if err != nil || got != alias {
+		t.Fatal("capacity increase changed existing identity")
+	}
+}
+
+func TestUDPCrossFamilyLegacyAndSingleFamilyWAL(t *testing.T) {
+	dir := t.TempDir()
+	s := openCrossFamilyTestStore(t, dir)
+	oldPeer := netip.MustParseAddrPort("192.0.2.30:9")
+	_, oldAlias, _, err := s.store.Assign(oldPeer.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPeer := netip.MustParseAddrPort("192.0.2.31:9")
+	client := netip.MustParseAddrPort("[2001:db8::1]:5000")
+	alias, err := s.reply(newPeer, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.ReadFile(filepath.Join(dir, "peers", fakeIPWalName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(replayDir, "peers"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(replayDir, "peers", fakeIPWalName), wal, 0600); err != nil {
+		t.Fatal(err)
+	}
+	recovered := openCrossFamilyTestStore(t, replayDir)
+	got, err := recovered.reply(newPeer, client)
+	if err != nil || got != alias {
+		t.Fatalf("WAL changed single-family identity: %v %v", got, err)
+	}
+	got, err = recovered.reply(oldPeer, client)
+	if err != nil || got.Addr() != oldAlias {
+		t.Fatalf("WAL changed legacy identity: %v %v", got, err)
 	}
 }

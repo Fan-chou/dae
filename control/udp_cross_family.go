@@ -22,6 +22,8 @@ import (
 // across control-plane generations. It never rewrites application payloads.
 type UDPCrossFamilyStore struct {
 	store *FakeIPStore
+	// readOnly is generation-local: old endpoints keep their writable store.
+	readOnly bool
 	// Entries never change identity; established flows avoid string parsing and
 	// persistent-store bookkeeping on every datagram.
 	forward      sync.Map // real netip.Addr -> alias netip.Addr
@@ -81,18 +83,9 @@ func (s *UDPCrossFamilyStore) reply(from, client netip.AddrPort) (netip.AddrPort
 	if s.store.Contains(from.Addr()) {
 		return from, fmt.Errorf("upstream peer belongs to UDP mapping pool: %s", from)
 	}
-	name := from.Addr().String()
-	v4, v6, ok := s.store.Lookup(name)
-	if !ok {
-		var err error
-		v4, v6, _, err = s.store.Assign(name)
-		if err != nil {
-			return from, err
-		}
-	}
-	addr := v6
-	if client.Addr().Unmap().Is4() {
-		addr = v4
+	addr, err := s.store.peerMapping(from.Addr(), !s.readOnly)
+	if err != nil {
+		return from, err
 	}
 	s.reverse.Store(addr, from.Addr())
 	s.forward.Store(from.Addr(), addr)
@@ -107,7 +100,7 @@ func (c *ControlPlane) initUDPCrossFamily(ctx context.Context, global *config.Gl
 	if !v4.IsValid() {
 		// Keep old aliases routable while retained sessions and clients still use them.
 		if s != nil && s.store.Ready() {
-			c.udpCrossFamily = s
+			c.udpCrossFamily = &UDPCrossFamilyStore{store: s.store, readOnly: true}
 		}
 		return nil
 	}
@@ -130,11 +123,25 @@ func (c *ControlPlane) initUDPCrossFamily(ctx context.Context, global *config.Gl
 			}
 		}
 	}
+	limit := global.UDPCrossFamilyMaxEntries
+	if limit == 0 {
+		limit = config.FakeIPHardMaxEntries
+	}
 	if !s.store.Ready() {
+		s.store.mu.Lock()
+		s.store.maxLive = limit
+		s.store.maxBytes = max(2<<20, 64+limit*256)
+		s.store.mu.Unlock()
 		err = s.store.Open(v4, v6)
 	} else {
 		// A live candidate must not mutate the mapping pool used by the serving
 		// generation before its configuration has been accepted.
+		s.store.mu.RLock()
+		currentLimit := s.store.maxLive
+		s.store.mu.RUnlock()
+		if currentLimit != limit {
+			return fmt.Errorf("changing UDP peer mapping capacity requires a restart; retain the mapping files")
+		}
 		active, _ := s.store.Prefixes()
 		if len(active) != 2 || active[0] != v4 || active[1] != v6 {
 			return fmt.Errorf("changing UDP mapping pools requires a restart; retain the mapping files")
@@ -197,4 +204,14 @@ func (s *UDPCrossFamilyStore) allowErrorLog() bool {
 	now := time.Now().UnixNano()
 	last := s.lastErrorLog.Load()
 	return now-last >= int64(5*time.Second) && s.lastErrorLog.CompareAndSwap(last, now)
+}
+
+// Retained aliases remain usable after disabling new cross-family sessions.
+// Only an existing alias destination receives the read-only mapping view.
+func (c *ControlPlane) udpCrossFamilyForDestination(dst netip.AddrPort) *UDPCrossFamilyStore {
+	s := c.udpCrossFamily
+	if s == nil || s.readOnly && !s.store.Contains(dst.Addr()) {
+		return nil
+	}
+	return s
 }

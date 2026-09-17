@@ -741,10 +741,16 @@ func (s *FakeIPStore) allocateLocked(qname string, ipv4 bool) (netip.Addr, error
 	var used map[uint32]struct{}
 	if ipv4 {
 		prefix = gen.inet4
-		used = unionUsed(gen.usedV4, s.retired, true)
+		used = gen.usedV4
+		if !s.stableAliases {
+			used = unionUsed(gen.usedV4, s.retired, true)
+		}
 	} else {
 		prefix = gen.inet6
-		used = unionUsed(gen.usedV6, s.retired, false)
+		used = gen.usedV6
+		if !s.stableAliases {
+			used = unionUsed(gen.usedV6, s.retired, false)
+		}
 	}
 	size := fakeIPPoolSize(prefix)
 	if size == 0 {
@@ -799,7 +805,7 @@ func (s *FakeIPStore) evictIfNeededLocked() (restore func(), err error) {
 	restore = func() {}
 	if s.stableAliases {
 		if len(s.records) >= s.maxLive {
-			return restore, fmt.Errorf("UDP peer mapping table full")
+			return restore, fmt.Errorf("UDP peer mapping table full (limit %d); increase udp_cross_family_max_entries and restart while retaining the mapping files", s.maxLive)
 		}
 		return restore, nil
 	}
@@ -1094,6 +1100,13 @@ func fakeIPv4Key(addr netip.Addr) uint32 {
 	return binary.BigEndian.Uint32(a[:])
 }
 
+func fakeIPAddrFrom4(raw [4]byte) netip.Addr {
+	if raw == [4]byte{} {
+		return netip.Addr{}
+	}
+	return netip.AddrFrom4(raw)
+}
+
 func fakeIPAddrFrom16(raw [16]byte) netip.Addr {
 	var zero [16]byte
 	if raw == zero {
@@ -1351,6 +1364,12 @@ func (s *FakeIPStore) placeRecordLocked(rec fakeIPRecord) {
 		return
 	}
 	rec.qname = canonicalizeFakeIPQname(rec.qname)
+	// Existing on-disk records encode an absent IPv4 address as zero bytes.
+	// DNS records always have IPv4; single-family peer records need this
+	// sentinel restored before reverse indexing or inferring old pools.
+	if s.stableAliases && rec.ipv4.IsUnspecified() {
+		rec.ipv4 = netip.Addr{}
+	}
 	if !rec.origin4.IsValid() && !rec.origin6.IsValid() {
 		rec.origin4, rec.origin6 = inferOrphanFakeIPPrefixes(rec)
 	}
@@ -1420,7 +1439,7 @@ func (s *FakeIPStore) replayWalLocked(body []byte) error {
 		off += 8
 		rec := fakeIPRecord{
 			qname:       canonicalizeFakeIPQname(qname),
-			ipv4:        netip.AddrFrom4(v4raw),
+			ipv4:        fakeIPAddrFrom4(v4raw),
 			ipv6:        fakeIPAddrFrom16(v6raw),
 			updatedUnix: updated,
 			seq:         seq,
@@ -1503,7 +1522,7 @@ func decodeFakeIPRecord(b []byte, ver uint32) (fakeIPRecord, int, error) {
 	off += 8
 	rec := fakeIPRecord{
 		qname:       qname,
-		ipv4:        netip.AddrFrom4(v4raw),
+		ipv4:        fakeIPAddrFrom4(v4raw),
 		ipv6:        fakeIPAddrFrom16(v6raw),
 		updatedUnix: updated,
 	}

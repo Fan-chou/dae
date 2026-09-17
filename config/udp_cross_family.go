@@ -10,6 +10,9 @@ import (
 
 // Both pools are explicit: automatically choosing a prefix could capture a LAN.
 func (g Global) UDPCrossFamilyPrefixes(fake FakeIP) (v4, v6 netip.Prefix, err error) {
+	if g.UDPCrossFamilyMaxEntries < 0 || g.UDPCrossFamilyMaxEntries > (int(^uint(0)>>1)-64)/256 {
+		return v4, v6, fmt.Errorf("udp_cross_family_max_entries is outside the supported integer range")
+	}
 	if g.UDPCrossFamilyInet4Range == "" && g.UDPCrossFamilyInet6Range == "" {
 		return
 	}

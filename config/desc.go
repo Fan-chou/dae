@@ -38,6 +38,7 @@ var SectionDescription = map[string]Desc{
 var GlobalDesc = Desc{
 	"udp_cross_family_inet4_range": "IPv4 mapping pool for IPv6 UDP peers. Configure both pools to enable cross-family forwarding. Must not overlap LAN or DNS FakeIP addresses.",
 	"udp_cross_family_inet6_range": "IPv6 mapping pool for IPv4 UDP peers (at least /96). Clients must route both mapping pools through this gateway.",
+	"udp_cross_family_max_entries": "Maximum retained UDP peer identities. Default: 32768. Increase together with mapping pool capacity when needed; more entries use more memory and disk. Changes require restart. Existing aliases are never reassigned.",
 	"udp_cross_family_path":        "Persistent UDP peer mappings, relative to the configuration directory. Default: persist.d/udp-cross-family. Keep across restarts; allocated addresses are never reassigned to other peers.",
 	"tproxy_port":                  "tproxy port to listen on. It is NOT a HTTP/SOCKS port, and is just used by eBPF program.\nIn normal case, you do not need to use it.",
 	"tproxy_port_protect":          "Set it true to protect tproxy port from unsolicited traffic. Set it false to allow users to use self-managed iptables tproxy rules.",

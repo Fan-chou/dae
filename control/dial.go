@@ -124,6 +124,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	dst := p.Dest
 	mark := p.Mark
 	must := p.Must
+	crossFamily := c.udpCrossFamilyForDestination(dst)
 
 	if c.udpCrossFamily != nil {
 		real, alias, err := c.udpCrossFamily.decode(dst)
@@ -233,7 +234,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	// FakeIP direct pin uses the resolved real family so ipversion() and the
 	// WAN dest follow the real A/AAAA, not the client's FakeIP v4 socket.
 	selectionNetworkType := networkType
-	if p.Network == "udp" && !pinnedFakeIPRealDest && c.udpCrossFamily == nil {
+	if p.Network == "udp" && !pinnedFakeIPRealDest && crossFamily == nil {
 		if clientIpVersion := consts.IpVersionFromAddr(src.Addr()); clientIpVersion != networkType.IpVersion {
 			selectionNetworkType = &dialer.NetworkType{
 				L4Proto:         networkType.L4Proto,
@@ -284,7 +285,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		Dialer:        d,
 		DialTarget:    dialTarget,
 		Network: func() string {
-			if p.Network == "udp" && !(c.udpCrossFamily != nil && !isProxyBackedDialer(d)) {
+			if p.Network == "udp" && !(crossFamily != nil && !isProxyBackedDialer(d)) {
 				return common.MagicNetworkWithIPVersion(p.Network, mark, c.mptcp, string(selectionNetworkType.IpVersion))
 			}
 			return common.MagicNetwork(p.Network, mark, c.mptcp)

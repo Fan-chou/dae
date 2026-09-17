@@ -1114,7 +1114,7 @@ getNew:
 		flowDecision.observeStage(2)
 		ue, isNew, err = DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
 			Ctx:         c.ctx,
-			crossFamily: c.udpCrossFamily,
+			crossFamily: c.udpCrossFamilyForDestination(realDst),
 			// Handler handles response packets and send it to the client.
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
 				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, RecordDownloadTraffic)

@@ -17,6 +17,7 @@ var (
 )
 
 type Global struct {
+	UDPCrossFamilyMaxEntries int    `mapstructure:"udp_cross_family_max_entries" default:"32768"`
 	UDPCrossFamilyInet4Range string `mapstructure:"udp_cross_family_inet4_range"`
 	UDPCrossFamilyInet6Range string `mapstructure:"udp_cross_family_inet6_range"`
 	UDPCrossFamilyPath       string `mapstructure:"udp_cross_family_path"`
