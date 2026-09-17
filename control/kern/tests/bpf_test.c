@@ -3053,3 +3053,53 @@ int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, true);
 	return do_tproxy_lan_ingress(skb, ETH_HLEN);
 }
+
+SEC("tc/pktgen/conntrack_refresh_bypass")
+int testpktgen_conntrack_refresh_bypass(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(1,1,1,1), 19234, 443);
+}
+
+SEC("tc/setup/conntrack_refresh_bypass")
+int testsetup_conntrack_refresh_bypass(struct __sk_buff *skb)
+{
+	struct conntrack_args *args = bpf_map_lookup_elem(&conntrack_args_map, &zero_key);
+	struct tuples_key key = {};
+	struct conn_state *state;
+	struct tcphdr tcp = {};
+
+	if (!args)
+		return TC_ACT_SHOT;
+	args->flags = 0x80;
+	args->dscp = 55;
+	args->pid = 123;
+	key.l4proto = IPPROTO_UDP;
+	key.sport = bpf_htons(19234);
+	key.dport = bpf_htons(443);
+	state = mark_udp_seen(&key, true, NULL, NULL, NULL, NULL, 0, NULL, 0,
+			      ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!state || state->pid || state->meta.data.dscp || args->flags != 0x80 || args->pid != 123)
+		return TC_ACT_SHOT;
+	bpf_map_delete_elem(&conn_state_map, &key);
+
+	key.l4proto = IPPROTO_TCP;
+	tcp.syn = 1;
+	state = mark_tcp_seen(&key, &tcp, true, NULL, NULL, NULL, NULL, 0, NULL, 0,
+			      ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!state || state->pid || state->meta.data.dscp || args->flags != 0x80)
+		return TC_ACT_SHOT;
+	tcp.syn = 0;
+	tcp.fin = 1;
+	state = mark_tcp_seen(&key, &tcp, true, NULL, NULL, NULL, NULL, 0, NULL, 0,
+			      ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!state || state->state != TCP_STATE_CLOSING || args->flags != 0x80)
+		return TC_ACT_SHOT;
+	bpf_map_delete_elem(&conn_state_map, &key);
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/conntrack_refresh_bypass")
+int testcheck_conntrack_refresh_bypass(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}

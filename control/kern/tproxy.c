@@ -1585,10 +1585,20 @@ conntrack_args_set(struct conntrack_args *a,
 	a->flags = flags;
 }
 
+// Reverse-side refreshes have no routing metadata to copy through scratch.
+static __always_inline bool
+conntrack_args_are_empty(__u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
+                         __u8 dscp, const char *pname, __u32 pid,
+                         __u8 routing_epoch_slot)
+{
+	return !outbound && !mark && !must && !mac && !dscp && !pname && !pid &&
+	       routing_epoch_slot == ROUTING_EPOCH_SLOT_UNKNOWN;
+}
+
 static __always_inline const char *
 conntrack_args_pname_or_null(const struct conntrack_args *a)
 {
-	return a->flags & CT_ARGS_HAS_PNAME ? (const char *)a->pname : NULL;
+	return a && (a->flags & CT_ARGS_HAS_PNAME) ? (const char *)a->pname : NULL;
 }
 
 static __always_inline int ip16_is_unspecified(const __u8 *ip)
@@ -2530,8 +2540,6 @@ static __noinline struct conn_state *
 __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		const struct conntrack_args *args)
 {
-	if (!args)
-		return NULL;
 
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
@@ -2548,7 +2556,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			state->last_seen_ns = now;
 
 		// Update routing if provided (e.g., routing decision changed)
-		if (args->flags & CT_ARGS_HAS_ROUTING) {
+		if (args && (args->flags & CT_ARGS_HAS_ROUTING)) {
 			union routing_meta meta =
 				build_routing_meta(args->outbound, args->mark,
 						   args->must, args->dscp);
@@ -2567,13 +2575,13 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	}
 
 	// Slow path: create new entry (either no entry or expired one was deleted)
-	bool has_rt = !!(args->flags & CT_ARGS_HAS_ROUTING);
+	bool has_rt = args && (args->flags & CT_ARGS_HAS_ROUTING);
 	struct conn_state new_state = {};
 
 	new_state.is_wan_ingress_direction = is_wan_ingress_direction;
 	new_state.last_seen_ns = now;
-	new_state.meta.data.dscp = args->dscp;
-	new_state.pid = args->pid;
+	new_state.meta.data.dscp = args ? args->dscp : 0;
+	new_state.pid = args ? args->pid : 0;
 
 	if (has_rt) {
 		new_state.meta = build_routing_meta(args->outbound, args->mark,
@@ -2598,7 +2606,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 		if (overflow_count)
 			__sync_fetch_and_add(overflow_count, 1);
-		send_dae_event(DAE_EVENT_UDP_CONN_OVERFLOW, args->pid,
+		send_dae_event(DAE_EVENT_UDP_CONN_OVERFLOW, args ? args->pid : 0,
 			       conntrack_args_pname_or_null(args), 0,
 			       key->l4proto, key->sip.u6_addr32,
 			       key->dip.u6_addr32, key->sport, key->dport);
@@ -2616,6 +2624,10 @@ mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	      __u8 dscp, const char *pname, __u32 pid,
 	      __u8 routing_epoch_slot)
 {
+	if (conntrack_args_are_empty(outbound, mark, must, mac, dscp, pname, pid,
+				     routing_epoch_slot))
+		return __mark_udp_seen(key, is_wan_ingress_direction, NULL);
+
 	__u32 zero = 0;
 	struct conntrack_args *args =
 		bpf_map_lookup_elem(&conntrack_args_map, &zero);
@@ -2660,8 +2672,6 @@ static __noinline struct conn_state *
 __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		__u8 tcp_flags, const struct conntrack_args *args)
 {
-	if (!args)
-		return NULL;
 
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
@@ -2698,7 +2708,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			state->state = TCP_STATE_CLOSING;
 
 		// Update routing if provided (rare: routing decision changed)
-		if (args->flags & CT_ARGS_HAS_ROUTING) {
+		if (args && (args->flags & CT_ARGS_HAS_ROUTING)) {
 			union routing_meta meta =
 				build_routing_meta(args->outbound, args->mark,
 						   args->must, args->dscp);
@@ -2719,14 +2729,14 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 	// Only create new entry on SYN (new connection)
 	if (new_conn_syn) {
-		bool has_rt = !!(args->flags & CT_ARGS_HAS_ROUTING);
+		bool has_rt = args && (args->flags & CT_ARGS_HAS_ROUTING);
 		struct conn_state new_state = {};
 
 		new_state.is_wan_ingress_direction = is_wan_ingress_direction;
 		new_state.state = TCP_STATE_ACTIVE;
 		new_state.last_seen_ns = now;
-		new_state.meta.data.dscp = args->dscp;
-		new_state.pid = args->pid;
+		new_state.meta.data.dscp = args ? args->dscp : 0;
+		new_state.pid = args ? args->pid : 0;
 
 		if (has_rt) {
 			new_state.meta = build_routing_meta(args->outbound,
@@ -2752,7 +2762,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 			if (overflow_count)
 				__sync_fetch_and_add(overflow_count, 1);
-			send_dae_event(DAE_EVENT_TCP_CONN_OVERFLOW, args->pid,
+			send_dae_event(DAE_EVENT_TCP_CONN_OVERFLOW, args ? args->pid : 0,
 				       conntrack_args_pname_or_null(args), 0,
 				       key->l4proto, key->sip.u6_addr32,
 				       key->dip.u6_addr32, key->sport,
@@ -2776,6 +2786,19 @@ mark_tcp_seen(struct tuples_key *key, const struct tcphdr *tcph,
 	      __u8 dscp, const char *pname, __u32 pid,
 	      __u8 routing_epoch_slot)
 {
+	if (conntrack_args_are_empty(outbound, mark, must, mac, dscp, pname, pid,
+				     routing_epoch_slot)) {
+		__u8 flags = 0;
+
+		if (tcph->syn && !tcph->ack)
+			flags |= 1;
+		if (tcph->fin || tcph->rst)
+			flags |= 2;
+		if (!tcph->syn)
+			flags |= 4;
+		return __mark_tcp_seen(key, is_wan_ingress_direction, flags, NULL);
+	}
+
 	__u32 zero = 0;
 	struct conntrack_args *args =
 		bpf_map_lookup_elem(&conntrack_args_map, &zero);
@@ -3270,7 +3293,9 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 
 	pid_pname = bpf_map_lookup_elem(&cookie_pid_map, &cookie);
 	if (pid_pname) {
-		pid_pname->last_seen_ns = bpf_ktime_get_ns();
+		__u64 now = bpf_ktime_get_ns();
+		if (now - pid_pname->last_seen_ns > 1000000000ULL)
+			pid_pname->last_seen_ns = now;
 		if (p) {
 			// Assign.
 			*p = pid_pname;

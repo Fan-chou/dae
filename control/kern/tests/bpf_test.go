@@ -509,6 +509,10 @@ func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
 }
 
+func TestConntrackRefreshBypass(t *testing.T) {
+	runProgramSetByID(t, "ConntrackRefreshBypass")
+}
+
 func TestLanUdpKernelDirectGroupSkipsUserspace(t *testing.T) {
 	runProgramSetByID(t, "LanUdpKernelDirectGroupSkipsUserspace")
 }
