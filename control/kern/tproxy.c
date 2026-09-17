@@ -2236,6 +2236,28 @@ int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
 	if (ctx->protocol != IPPROTO_TCP)
 		return SK_PASS;
 
+	/* TC writes the owner of every SYN into the process-shared connection
+	 * table. A newly populated listener must not steal an old generation's
+	 * handshake while the interface hooks are being replaced. */
+	struct tuples_key tuple = {};
+	tuple.l4proto = IPPROTO_TCP;
+	tuple.sport = (__u16)ctx->remote_port;
+	tuple.dport = bpf_htons(ctx->local_port);
+	if (ctx->family == AF_INET) {
+		tuple.sip.u6_addr32[2] = bpf_htonl(0xffff);
+		tuple.dip.u6_addr32[2] = bpf_htonl(0xffff);
+		tuple.sip.u6_addr32[3] = ctx->remote_ip4;
+		tuple.dip.u6_addr32[3] = ctx->local_ip4;
+	} else if (ctx->family == AF_INET6) {
+		__builtin_memcpy(tuple.sip.u6_addr32, ctx->remote_ip6, 16);
+		__builtin_memcpy(tuple.dip.u6_addr32, ctx->local_ip6, 16);
+	} else {
+		return SK_PASS;
+	}
+	struct conn_state *state = bpf_map_lookup_elem(&conn_state_map, &tuple);
+	if (!state || state->datapath_generation != PARAM.datapath_generation)
+		return SK_PASS;
+
 	const __u32 *key;
 	if (ctx->family == AF_INET)
 		key = &zero_key;
@@ -2248,9 +2270,7 @@ int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
 	if (!sk)
 		return SK_PASS;
 
-	/* A fresh datapath may overlap the retiring one during reload. The newest
-	 * populated listener map takes precedence; detaching it rolls back cleanly.
-	 */
+	/* Replace the default socket only for the generation selected by TC. */
 	bpf_sk_assign(ctx, sk, BPF_SK_LOOKUP_F_REPLACE | BPF_SK_LOOKUP_F_NO_REUSEPORT);
 	bpf_sk_release(sk);
 	return SK_PASS;

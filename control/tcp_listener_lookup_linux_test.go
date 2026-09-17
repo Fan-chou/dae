@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"syscall"
@@ -50,7 +51,7 @@ func TestTCPListenerLookupTupleReuse(t *testing.T) {
 		}
 	}
 	for name, m := range spec.Maps {
-		if name != "listen_socket_map" && name[0] != '.' {
+		if name != "listen_socket_map" && name != "conn_state_map" && name[0] != '.' {
 			delete(spec.Maps, name)
 			continue
 		}
@@ -71,6 +72,21 @@ func TestTCPListenerLookupTupleReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
+	// Attach a second populated generation before changing TC's owner.
+	nextSpec := spec.Copy()
+	if err := nextSpec.Variables["PARAM"].Set(bpfDaeParam{DatapathGeneration: 1}); err != nil {
+		t.Fatal(err)
+	}
+	next, err := ebpf.NewCollectionWithOptions(nextSpec, ebpf.CollectionOptions{MapReplacements: map[string]*ebpf.Map{"conn_state_map": coll.Maps["conn_state_map"]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	nextLink, err := link.AttachNetNs(int(ns.Fd()), next.Programs["tproxy_tcp_listener"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nextLink.Close()
 	for _, tc := range []struct {
 		network, bind, target, source string
 		key                           uint32
@@ -95,6 +111,31 @@ func TestTCPListenerLookupTupleReuse(t *testing.T) {
 			if err := coll.Maps["listen_socket_map"].Update(tc.key, uint64(file.Fd()), ebpf.UpdateAny); err != nil {
 				t.Fatal(err)
 			}
+			nextListener, err := lc.Listen(context.Background(), tc.network, tc.bind)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nextListener.Close()
+			nextFile, err := dupTCPListenerFile(nextListener)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nextFile.Close()
+			if err := next.Maps["listen_socket_map"].Update(tc.key, uint64(nextFile.Fd()), ebpf.UpdateAny); err != nil {
+				t.Fatal(err)
+			}
+			nextDone := make(chan struct{})
+			go func() {
+				defer close(nextDone)
+				for {
+					conn, err := nextListener.Accept()
+					if err != nil {
+						return
+					}
+					conn.Write([]byte("next"))
+					conn.Close()
+				}
+			}()
 			errs := make(chan error, 1)
 			go func() {
 				for {
@@ -119,7 +160,22 @@ func TestTCPListenerLookupTupleReuse(t *testing.T) {
 				}
 				return sockErr
 			}}
+			tuple := bpfTuplesKeyFromAddrPorts(netip.AddrPortFrom(netip.MustParseAddr(tc.source), 41001), netip.MustParseAddrPort(tc.target), unix.IPPROTO_TCP)
+			if err := coll.Maps["conn_state_map"].Update(tuple, bpfConnState{}, ebpf.UpdateAny); err != nil {
+				t.Fatal(err)
+			}
 			for i := 0; i < 10; i++ {
+				// old -> new -> old covers pre-commit, commit and rollback,
+				// with both lookup links and listener maps populated throughout.
+				owner := uint16(0)
+				want := "ok"
+				if i >= 3 && i < 7 {
+					owner = 1
+					want = "next"
+				}
+				if err := coll.Maps["conn_state_map"].Update(tuple, bpfConnState{DatapathGeneration: owner}, ebpf.UpdateAny); err != nil {
+					t.Fatal(err)
+				}
 				c, err := d.Dial(tc.network, tc.target)
 				if err != nil {
 					t.Fatalf("reuse %d: %v", i, err)
@@ -127,11 +183,13 @@ func TestTCPListenerLookupTupleReuse(t *testing.T) {
 				c.SetDeadline(time.Now().Add(time.Second))
 				data, err := io.ReadAll(c)
 				c.Close()
-				if err != nil || string(data) != "ok" {
+				if err != nil || string(data) != want {
 					t.Fatalf("reuse %d: %q: %v", i, data, err)
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
+			nextListener.Close()
+			<-nextDone
 			listener.Close()
 			select {
 			case <-errs:
