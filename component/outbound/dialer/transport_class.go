@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 
+	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 )
 
 // DialContextForTransportClass keeps selection and health on the original node,
@@ -16,7 +19,34 @@ func (d *Dialer) DialContextForTransportClass(ctx context.Context, network, addr
 	if err != nil {
 		return nil, err
 	}
+	// Capture this dialer's DNS generation in the new association. Publishing
+	// a package-global callback while building a candidate would affect active
+	// connections even if that candidate was subsequently rejected.
+	if transport.GlobalOption != nil && transport.SystemDNSResolver != nil && transport.DirectDialer != nil {
+		ctx = protocol.WithDatapathResolver(ctx, transport.resolveDatapathPeer)
+	}
 	return transport.Dialer.DialContext(ctx, network, addr)
+}
+
+func (d *Dialer) resolveDatapathPeer(ctx context.Context, host string) (netip.Addr, error) {
+	server, err := d.SystemDNSResolver.SystemDNS()
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	ips, err4, err6 := netutils.ResolveIp46(ctx, d.DirectDialer, server, host, "udp", true)
+	if ips.Ip4.IsValid() {
+		return ips.Ip4, nil
+	}
+	if ips.Ip6.IsValid() {
+		return ips.Ip6, nil
+	}
+	if err4 != nil {
+		return netip.Addr{}, err4
+	}
+	if err6 != nil {
+		return netip.Addr{}, err6
+	}
+	return netip.Addr{}, fmt.Errorf("no peer address for %q", host)
 }
 
 func (d *Dialer) transportForClass(class string) (*Dialer, error) {
