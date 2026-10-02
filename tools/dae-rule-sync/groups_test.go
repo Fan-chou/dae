@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package main
 
 import (
@@ -395,5 +400,47 @@ func TestIsolatedTransportGroupOverlay(t *testing.T) {
 	cfg.IsolateTransportGroups = []string{"missing"}
 	if _, _, err := generateFullMihomoGroups(cfg, map[string]string{"node": "node"}); err == nil {
 		t.Fatal("missing group accepted")
+	}
+}
+
+func TestQualityExtensionRoundTripAndValidation(t *testing.T) {
+	parsed, err := ParseMihomoConfig([]byte(`
+proxies:
+  - name: a
+    type: socks5
+  - name: b
+    type: socks5
+proxy-groups:
+  - name: Test
+    type: fallback
+    proxies: [a, b]
+    x-kdae-quality:
+      mode: enforce
+      min-download-bytes: 262144
+      severe-speed-ratio: 0.25
+      recovery-speed-ratio: 0.65
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := GenerateFlatDaeGroups(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []string{"quality_mode:", "enforce", "quality_min_download_bytes:", "262144", "severe_speed_ratio:", "0.25", "recovery_speed_ratio:", "0.65"} {
+		if !strings.Contains(out, part) {
+			t.Fatalf("missing %s: %s", part, out)
+		}
+	}
+	parsed.Groups[0].Quality.Mode = "silently-ignore"
+	if _, _, err := GenerateFlatDaeGroups(parsed); err == nil {
+		t.Fatal("invalid mode accepted")
+	}
+}
+
+func TestQualityExtensionRejectsUnknownKeysInCompatibilityParser(t *testing.T) {
+	_, err := ParseMihomoConfig([]byte("proxy-groups:\n  - name: Download\n    type: fallback\n    proxies: [DIRECT]\n    x-kdae-quality:\n      mode: observe\n      severe-speed-rato: 0.3\n"))
+	if err == nil {
+		t.Fatal("misspelled quality option silently discarded")
 	}
 }

@@ -20,6 +20,7 @@ type patch func(params *Config) error
 
 var patches = []patch{
 	patchBootstrapResolver,
+	patchQuality,
 	patchCheckInterval,
 	patchTcpCheckHttpMethod,
 	patchEmptyDns,

@@ -58,3 +58,32 @@ func stickyIPKey(ip netip.Addr) string {
 	}
 	return ip.String()
 }
+
+// StickyKey isolates complete hostnames without changing legacy SiteKey users.
+func StickyKey(host string) string {
+	if strings.ContainsAny(host, "/\\?#@") {
+		return ""
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return stickyIPKey(ip)
+	}
+	if host == "" || len(host) > 253 {
+		return ""
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return ""
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return ""
+			}
+		}
+	}
+	return host
+}

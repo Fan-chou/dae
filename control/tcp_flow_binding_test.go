@@ -216,7 +216,7 @@ func TestIdleFinishDoesNotFailSiteOrDegrade(t *testing.T) {
 	}
 }
 
-func TestRouteDialRetrySuccessRecordsHandshake(t *testing.T) {
+func TestRouteDialRetrySuccessDoesNotPolluteProbeRTT(t *testing.T) {
 	dFail, _ := newTestEndpointErrorDialer("hysteria2", "proxy.example:443", errors.New("network is unreachable"))
 	dOk := newDelayedTestEndpointDialer(5*time.Millisecond, &memoryLayoutConn{id: 4})
 	defer dFail.Close()
@@ -245,7 +245,37 @@ func TestRouteDialRetrySuccessRecordsHandshake(t *testing.T) {
 	if nt == nil {
 		t.Fatal("retry result missing selection network type")
 	}
-	if got := dOk.HealthSnapshot().Health[nt.Index()].LastSampleRTT; got <= 0 {
-		t.Fatalf("retry success LastSampleRTT = %v, want recorded handshake", got)
+	if got := dOk.HealthSnapshot().Health[nt.Index()].LastSampleRTT; got != 0 {
+		t.Fatalf("retry success LastSampleRTT = %v, business handshake must not write probe RTT", got)
+	}
+}
+
+func TestTCPNodeLoadAccountingAndDuplicateAdoption(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer manager.Close()
+	runtime := newEgressRuntime(nil, nil)
+	defer runtime.releaseOwner()
+	d := newTestEndpointDialer()
+	defer d.Close()
+	conn := &memoryLayoutConn{id: 91}
+	binding := TcpFlowBinding{Egress: TcpEgressBinding{Dialer: d}}
+	src, dst := netip.MustParseAddrPort("192.0.2.1:1234"), netip.MustParseAddrPort("198.51.100.1:443")
+	f, err := manager.adoptTCP(conn, nil, binding, runtime, nil, src, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.adoptTCP(conn, nil, binding, runtime, nil, src, dst); !errors.Is(err, ErrFlowAlreadyRegistered) {
+		t.Fatalf("duplicate: %v", err)
+	}
+	f.recordUpload(4096)
+	f.recordDownload(8192)
+	load := d.LoadContext(time.Now().Add(5 * time.Second))
+	if load.Active != 1 || load.Upload <= 0 || load.Download <= load.Upload {
+		t.Fatalf("bad accounting: %+v", load)
+	}
+	f.finish()
+	f.finish()
+	if got := d.LoadContext(time.Now()); got.Active != 0 {
+		t.Fatalf("finish count: %+v", got)
 	}
 }

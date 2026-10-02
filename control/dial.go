@@ -8,6 +8,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"github.com/daeuniverse/dae/component/observation"
 	"net/netip"
 	"time"
 
@@ -20,17 +21,18 @@ import (
 )
 
 type proxyDialParam struct {
-	Outbound    consts.OutboundIndex
-	Must        bool
-	Domain      string
-	Mac         [6]uint8
-	Dscp        uint8
-	ProcessName [16]uint8
-	Src         netip.AddrPort
-	Dest        netip.AddrPort
-	Mark        uint32
-	Network     string         // e.g. "tcp", "udp"
-	Excluded    *dialer.Dialer // Dialer to exclude in selection
+	captureTrace *observation.Trace
+	Outbound     consts.OutboundIndex
+	Must         bool
+	Domain       string
+	Mac          [6]uint8
+	Dscp         uint8
+	ProcessName  [16]uint8
+	Src          netip.AddrPort
+	Dest         netip.AddrPort
+	Mark         uint32
+	Network      string         // e.g. "tcp", "udp"
+	Excluded     *dialer.Dialer // Dialer to exclude in selection
 	// IdentifiedQuic is set by the UDP GetDialOption path. TCP leaves it false.
 	IdentifiedQuic     bool
 	ResolveDNSRecovery *resolveDNSRecovery
@@ -64,6 +66,7 @@ type proxyDialResult struct {
 	// SelectPath is the nested member and sticky tables used by this Select.
 	// Slow-handshake and established-flow snapshots must keep this token.
 	SelectPath ob.SelectPath
+	Quality    *ob.QualityFlow
 }
 
 func shouldForceMarkUnavailableOnProxyDialError(err error) bool {
@@ -249,12 +252,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	strictIpVersion := dialIp
-	d, _, admissionNetworkType, selectPath, err := outbound.SelectWithPath(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
+	d, _, admissionNetworkType, selectPath, qualityFlow, err := outbound.SelectWithQuality(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
-		d, _, admissionNetworkType, selectPath, err = outbound.SelectWithPath(altType, false, p.Excluded, stickySite)
+		d, _, admissionNetworkType, selectPath, qualityFlow, err = outbound.SelectWithQuality(altType, false, p.Excluded, stickySite)
 		if err == nil {
 			selectionNetworkType = altType
 		}
@@ -305,6 +308,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		SelectionNetworkTypeObj: selectionNetworkType,
 		AdmissionNetworkTypeObj: admissionNetworkType,
 		SelectPath:              selectPath,
+		Quality:                 qualityFlow,
 	}
 	// Reject identified QUIC before resolve_dns. A failing lookup must not
 	// hide REJECT-NO-DROP behind a DNS error (no ICMP, client waits out the
@@ -359,8 +363,17 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 	var lastRes *proxyDialResult
 	var lastErr error
 	for attempt := range 2 {
+		var captureSelectStart time.Time
+		if p.captureTrace != nil {
+			captureSelectStart = time.Now()
+		}
 		res, err := c.chooseProxyDialer(ctx, p)
+		c.captureStage(p, res, "selection_resolution", captureSelectStart, err)
 		if err != nil {
+			if res != nil {
+				res.Quality.Finish()
+				res.SelectPath.RecoveryFinish()
+			}
 			return nil, res, err
 		}
 		lastRes = res
@@ -368,6 +381,7 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		start := time.Now()
 		conn, err := res.Outbound.DialContextWithSelected(ctx, res.Dialer, res.Network, res.DialTarget)
 		handshake := time.Since(start)
+		c.captureStage(p, res, "dial", start, err)
 		if err == nil {
 			// A slow but successful connection is already usable. Record its
 			// quality for future selections without discarding this handshake.
@@ -375,6 +389,12 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 			return conn, res, nil
 		}
 		lastErr = err
+		res.SelectPath.RecoveryFinish()
+		if !commonerrors.IsCanceledOrClosed(err) {
+			res.Quality.Fail()
+		} else {
+			res.Quality.Finish()
+		}
 		if res.Outbound != nil && !commonerrors.IsCanceledOrClosed(err) {
 			res.Outbound.FailSitePath(siteFailDomain(res, p.Domain), res.Dialer, res.SelectPath)
 		}

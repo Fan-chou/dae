@@ -17,6 +17,18 @@ var (
 )
 
 type Global struct {
+	// Passive capture is independent of model and local quality decisions.
+	CaptureEnabled        bool   `mapstructure:"capture_enabled" default:"false"`
+	CaptureSamplePermille uint16 `mapstructure:"capture_sample_permille" default:"100"`
+	CaptureGroup          string `mapstructure:"capture_group"`
+
+	// Laya remains opt-in. Credentials are file paths, never inline secrets.
+	LayaEnabled        bool   `mapstructure:"laya_enabled" default:"false"`
+	LayaMode           string `mapstructure:"laya_mode" default:"shadow"`
+	LayaEndpoint       string `mapstructure:"laya_endpoint"`
+	LayaCredentialFile string `mapstructure:"laya_credential_file"`
+	LayaCAFile         string `mapstructure:"laya_ca_file"`
+
 	UDPCrossFamilyMaxEntries int    `mapstructure:"udp_cross_family_max_entries" default:"32768"`
 	UDPCrossFamilyInet4Range string `mapstructure:"udp_cross_family_inet4_range"`
 	UDPCrossFamilyInet6Range string `mapstructure:"udp_cross_family_inet6_range"`
@@ -121,6 +133,19 @@ func ParseFunctionListOrString(fs FunctionListOrString) ([]*config_parser.Functi
 }
 
 type Group struct {
+	// Local quality policy does not depend on Laya being enabled.
+	QualityMinDownloadBytes      uint64        `mapstructure:"quality_min_download_bytes"`
+	QualityRequiredDownloadBytes uint64        `mapstructure:"quality_required_download_bytes"`
+	QualityMode                  string        `mapstructure:"quality_mode" default:"off"`
+	SevereSpeedRatio             string        `mapstructure:"severe_speed_ratio" default:"0.30"`
+	RecoverySpeedRatio           string        `mapstructure:"recovery_speed_ratio" default:"0.60"`
+	QualityWindow                time.Duration `mapstructure:"quality_window" default:"15s"`
+	SevereSpeedWindows           int           `mapstructure:"severe_speed_windows" default:"3"`
+	RecoverySpeedWindows         int           `mapstructure:"recovery_speed_windows" default:"3"`
+	QualityEvidenceTTL           time.Duration `mapstructure:"quality_evidence_ttl" default:"2m"`
+	SpeedImprovementRatio        string        `mapstructure:"speed_improvement_ratio" default:"1.5"`
+	SpeedImprovementBytes        uint64        `mapstructure:"speed_improvement_bytes" default:"262144"`
+
 	// IsolateTransport gives this explicitly routed group a private proxy
 	// transport per node. It does not infer realtime traffic from packet size.
 	IsolateTransport bool   `mapstructure:"isolate_transport"`

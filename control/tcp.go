@@ -21,6 +21,7 @@ import (
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
 	daerrors "github.com/daeuniverse/dae/common/errors"
+	"github.com/daeuniverse/dae/component/observation"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/sniffing"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -272,7 +273,13 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 
 	dialParam := tcpProxyDialParamFromRoutingResult(routingResult, domain, src, dst)
 	// Dial and relay.
+	dialParam.captureTrace = c.capture.NewFlowTrace()
+	var captureDialStart time.Time
+	if c.capture != nil {
+		captureDialStart = time.Now()
+	}
 	rConn, res, err := c.routeDial(ctx, dialParam)
+	c.captureRoute(res, domain, captureDialStart, ctx, err)
 	if err != nil {
 		if c.destIsFakeIP(dst.Addr()) {
 			return fmt.Errorf("failed to dial FakeIP %v sniffed=%q: %w", dst, domain, err)
@@ -297,14 +304,56 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		ownership.storePendingEgress(rConn)
 	}
 	binding := newTcpFlowBinding(c.PolicyEpoch(), res, routingResult.Mac)
+	var captureAdoptStart time.Time
+	if dialParam.captureTrace != nil {
+		captureAdoptStart = time.Now()
+	}
 	flow, err := c.adoptTCPFlow(ctx, ownership, ingressConn, rConn, binding, src, dst)
 	if err != nil {
+		if dialParam.captureTrace != nil {
+			if scope, ok := c.captureScope(res, domain); ok {
+				outcome := "adopt_abandoned"
+				if ctx.Err() != nil {
+					outcome = "canceled"
+				}
+				dialParam.captureTrace.StageError(scope, res.DialTarget, src.Addr().String(), "relay_end", captureAdoptStart, outcome, "", &observation.ErrorFacts{Class: observation.ErrorClass(err), Stage: "adopt"})
+			}
+		}
+		// Adoption failed locally; the node was never exercised.
+		res.Quality.Abandon()
+		res.SelectPath.RecoveryAbandon()
 		if stderrors.Is(err, ErrSessionManagerClosed) || stderrors.Is(err, errRoutingEpochOwnerUnavailable) {
 			return nil
 		}
 		return fmt.Errorf("adopt TCP flow runtime: %w", err)
 	}
 	defer closeEstablishedTCPFlow(rConn, flow)
+	var captured *observation.Flow
+	var captureOutcome string
+	var captureError *observation.ErrorFacts
+	if dialParam.captureTrace != nil {
+		captured = c.startCaptureLinked(res, domain, dialParam.captureTrace, true)
+		flow.capture.Store(captured)
+		captureRelayStart := time.Now()
+		captureOutcome = "relay_ended"
+		captureError = &observation.ErrorFacts{Class: "none", Stage: "relay"}
+		if scope, ok := c.captureScope(res, domain); ok {
+			outcome := "success"
+			if captured == nil {
+				outcome = "unmeasured"
+			}
+			dialParam.captureTrace.Stage(scope, res.DialTarget, src.Addr().String(), "flow_link", captureRelayStart, outcome, captured.EpisodeID())
+		}
+		defer func() {
+			if ctx.Err() != nil {
+				captureOutcome = "canceled"
+			}
+			captured.Finish(captureOutcome)
+			if scope, ok := c.captureScope(res, domain); ok {
+				dialParam.captureTrace.StageError(scope, res.DialTarget, src.Addr().String(), "relay_end", captureRelayStart, captureOutcome, captured.EpisodeID(), captureError)
+			}
+		}()
+	}
 
 	offloaded := false
 	offloadReason := ""
@@ -316,6 +365,11 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	var offloadErr error
 	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, flow.recordDownload, flow.recordUpload)
 	if offloadErr != nil {
+		captureOutcome = "offload_error"
+		if captureError != nil {
+			captureError.Class = observation.ErrorClass(offloadErr)
+			captureError.Stage = "offload"
+		}
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
 	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
@@ -330,10 +384,26 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	}
 
 	if offloaded {
+		if captureError != nil {
+			captureError.Stage = "offload"
+		}
+		captured.Offloaded()
 		return nil
 	}
 
-	return relayEstablishedTCPFlow(flow, lRelayConn, rConn, c.log, src, dst)
+	captured.Userspace()
+	relayErr := relayEstablishedTCPFlow(flow, lRelayConn, rConn, c.log, src, dst)
+	if captureError != nil {
+		captureError.Class = observation.ErrorClass(relayErr)
+		captureError.Stage = "relay"
+	}
+	if relayErr != nil {
+		captureOutcome = "relay_error"
+	}
+	if flow.Context().Err() != nil {
+		captureOutcome = "canceled"
+	}
+	return relayErr
 }
 
 func closeEstablishedTCPFlow(egress netproxy.Conn, flow *FlowRuntime) {
@@ -353,7 +423,13 @@ func relayEstablishedTCPFlow(
 	src netip.AddrPort,
 	dst netip.AddrPort,
 ) error {
-	if err := RelayTCPContextWithRecords(flow.Context(), ingress, egress, flow.recordDownload, flow.recordUpload); err != nil {
+	var relayErr error
+	if q := flow.binding.Egress.Quality; q != nil {
+		relayErr = newRelayCore(ingress, egress, qualityRelayCopyEngine{ingress: ingress, flow: q}, flow.recordDownload, flow.recordUpload).run(flow.Context())
+	} else {
+		relayErr = RelayTCPContextWithRecords(flow.Context(), ingress, egress, flow.recordDownload, flow.recordUpload)
+	}
+	if err := relayErr; err != nil {
 		if daerrors.IsIgnorableTCPRelayError(err) {
 			return nil // ignore normal connection closure errors
 		}
@@ -387,7 +463,14 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 }
 
 func (c *ControlPlane) RouteDialTcpContext(ctx context.Context, p *RouteDialParam) (conn netproxy.Conn, err error) {
-	conn, _, err = c.routeDial(ctx, p.toProxyDialParam())
+	conn, res, err := c.routeDial(ctx, p.toProxyDialParam())
+	// Callers of this entry point do not adopt a FlowRuntime, so no first-byte
+	// or throughput feedback will ever arrive. Release the per-selection
+	// tokens without recording a failure: lack of observation is not evidence.
+	if res != nil {
+		res.Quality.Abandon()
+		res.SelectPath.RecoveryAbandon()
+	}
 	return conn, err
 }
 

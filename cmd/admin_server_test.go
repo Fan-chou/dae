@@ -279,3 +279,23 @@ func TestTailLogLinesBlockBoundaryAndUnterminatedUTF8(t *testing.T) {
 		t.Fatal("must not return partial oversized line")
 	}
 }
+
+func (s *stubAdminPlane) AdminQuality(group, host string) []map[string]any { return []map[string]any{} }
+
+func TestAdminQualityRequiresAuthAndIsReadOnly(t *testing.T) {
+	plane := &stubAdminPlane{}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.secret = "test-token"
+	for _, tc := range []struct {
+		method, auth string
+		status       int
+	}{{"GET", "", http.StatusUnauthorized}, {"POST", "Bearer test-token", http.StatusMethodNotAllowed}, {"GET", "Bearer test-token", http.StatusOK}} {
+		req := httptest.NewRequest(tc.method, "/v1/quality?group=test&host=a.example.com", nil)
+		req.Header.Set("Authorization", tc.auth)
+		rec := httptest.NewRecorder()
+		server.withAdminAuth(server.handleQuality)(rec, req)
+		if rec.Code != tc.status {
+			t.Fatalf("%s => %d %s", tc.method, rec.Code, rec.Body.String())
+		}
+	}
+}

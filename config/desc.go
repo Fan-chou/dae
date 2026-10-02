@@ -36,6 +36,14 @@ var SectionDescription = map[string]Desc{
 }
 
 var GlobalDesc = Desc{
+	"capture_enabled":              "Enable bounded passive TCP capture in RAM; independent of quality_mode and Laya; default false.",
+	"capture_sample_permille":      "Uniform sampling probability per 1000 route events and flows; 1..1000, default 100.",
+	"capture_group":                "Optional exact outbound group name to restrict passive capture; empty captures all groups.",
+	"laya_enabled":                 "Enable asynchronous model comparisons; default false. Local rules operate independently.",
+	"laya_mode":                    "Model integration mode: shadow or assist. Does not grant automatic action permission.",
+	"laya_endpoint":                "Optional model HTTPS origin; no embedded credentials or environment proxies.",
+	"laya_ca_file":                 "Optional absolute PEM CA file path for model TLS verification. Never read when disabled.",
+	"laya_credential_file":         "Absolute credential file path. Never read when disabled.",
 	"udp_cross_family_inet4_range": "IPv4 mapping pool for IPv6 UDP peers. Configure both pools to enable cross-family forwarding. Must not overlap LAN or DNS FakeIP addresses.",
 	"udp_cross_family_inet6_range": "IPv6 mapping pool for IPv4 UDP peers (at least /96). Clients must route both mapping pools through this gateway.",
 	"udp_cross_family_max_entries": "Maximum retained UDP peer identities. Default: 32768. Increase together with mapping pool capacity when needed; more entries use more memory and disk. Changes require restart. Existing aliases are never reassigned.",
@@ -99,6 +107,17 @@ Available functions: qname, qtype, ip, upstream`,
 }
 
 var GroupDesc = Desc{
+	"quality_min_download_bytes":      "Absolute minimum active download throughput in bytes/s; 0 disables. Recovery requires 1.5 times this floor. Applies only to qualified sustained windows.",
+	"quality_required_download_bytes": "Optional verified demand in bytes/s for this entire group. Zero means unknown; never infer this from a hostname.",
+	"quality_mode":                    "Local TCP quality policy: off (default), observe (record only), or enforce (bounded new-connection probes).",
+	"severe_speed_ratio":              "Severe active-throughput/reference ratio, default 0.30, not a percentage decrease.",
+	"recovery_speed_ratio":            "Recovery ratio, greater than severe ratio and at most 1; default 0.60.",
+	"quality_window":                  "Non-overlapping qualified observation window; default 15s.",
+	"severe_speed_windows":            "Consecutive qualified low windows; default 3.",
+	"recovery_speed_windows":          "Consecutive qualified recovery windows; default 3.",
+	"quality_evidence_ttl":            "Maximum observation evidence age; default 2m.",
+	"speed_improvement_ratio":         "Minimum candidate/current throughput ratio; default 1.5.",
+	"speed_improvement_bytes":         "Minimum absolute throughput improvement in bytes/s; default 262144.",
 	"filter": `Filter nodes from the global node pool defined by the "subscription" and "node" sections.
 Available functions: name, subtag. Not operator is supported.
 Available keys in name function: keyword, regex. No key indicates full match.

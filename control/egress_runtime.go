@@ -109,6 +109,7 @@ type egressRuntimeLease struct {
 }
 
 func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.DialerGroup, path outbound.SelectPath) (*egressRuntimeLease, *outbound.DialerGroup, bool) {
+	path = path.WithoutRecovery()
 	if r == nil {
 		return nil, group, true
 	}

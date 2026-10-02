@@ -280,6 +280,7 @@ func (c *DnsController) resolveForSingleflight(
 	// Another request may have populated the entry after the outer cache miss
 	// and before this singleflight leader starts upstream resolution.
 	if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
+		c.captureDNSCache(resp, req, needRefresh)
 		if needRefresh {
 			go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
 		}
@@ -333,6 +334,7 @@ func (c *DnsController) serveFromRespCacheWithRefresh_(dnsMessage *dnsmessage.Ms
 	if resp == nil {
 		return false, nil
 	}
+	c.captureDNSCache(resp, req, needRefresh)
 	if needRefresh {
 		go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
 	}

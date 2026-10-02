@@ -27,7 +27,9 @@ func TestNodeHealthProbeDegradeAndRecover(t *testing.T) {
 		t.Fatalf("admission after baseline = %v, want Alive", got)
 	}
 
-	h.observeProbe(idx, true, 200*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeProbe(idx, true, 200*time.Millisecond, now)
+	}
 	if got := h.admission(idx, true); got != AdmissionDegraded {
 		t.Fatalf("admission after 4x RTT = %v, want Degraded", got)
 	}
@@ -49,7 +51,9 @@ func TestNodeHealthFallbackAdmissionIgnoresRTTButHonorsFailure(t *testing.T) {
 		h.observeProbe(idx, true, 50*time.Millisecond, now)
 		now = now.Add(time.Second)
 	}
-	h.observeProbe(idx, true, 200*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeProbe(idx, true, 200*time.Millisecond, now)
+	}
 	if got := h.admission(idx, true); got != AdmissionDegraded {
 		t.Fatalf("admission after 4x RTT = %v, want Degraded", got)
 	}
@@ -141,7 +145,9 @@ func TestNodeHealthCongestionRequiresPersistentSaturation(t *testing.T) {
 		now = now.Add(time.Second)
 	}
 	h.pushSpeed(idx, 10<<20, now)
-	h.observeSample(idx, 80*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeSample(idx, 80*time.Millisecond, now)
+	}
 	h.pushSpeed(idx, 9<<20, now)
 	if got := h.admission(idx, true); got != AdmissionDegraded {
 		// sample 80ms vs 40ms baseline is already degrade-by-RTT; congestion
@@ -350,7 +356,9 @@ func TestNodeHealthProbeClassifiesBeforeUpdatingBaseline(t *testing.T) {
 	if got := h.admission(idx, true); got != AdmissionAlive {
 		t.Fatalf("admission after baseline = %v, want Alive", got)
 	}
-	h.observeProbe(idx, true, 76*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeProbe(idx, true, 76*time.Millisecond, now)
+	}
 	if got := h.admission(idx, true); got != AdmissionDegraded {
 		t.Fatalf("admission after 1.52× sample = %v, want Degraded", got)
 	}
@@ -494,7 +502,9 @@ func TestUDPTransportTCPIgnoresMildRTTAndSingleFailure(t *testing.T) {
 		t.Fatalf("admission after 1.52× TCP RTT on UDP transport = %v, want Alive", got)
 	}
 	now = now.Add(time.Second)
-	h.observeProbe(idx, true, 150*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeProbe(idx, true, 150*time.Millisecond, now)
+	}
 	if got := h.admission(idx, true); got != AdmissionDegraded {
 		t.Fatalf("admission after ~3× TCP RTT on UDP transport = %v, want Degraded", got)
 	}
@@ -531,7 +541,9 @@ func TestUDPTransportTCPSkipsCongestion(t *testing.T) {
 	}
 	h.pushSpeed(idx, 10<<20, now)
 	now = now.Add(time.Second)
-	h.observeSample(idx, 80*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeSample(idx, 80*time.Millisecond, now)
+	}
 	h.pushSpeed(idx, 9<<20, now)
 	now = now.Add(nodeHealthCongestionWindow)
 	h.pushSpeed(idx, 9<<20, now)
@@ -631,7 +643,9 @@ func TestAdmissionReasonAndString(t *testing.T) {
 	if got := h.admissionReason(idx, true); got != "ok" {
 		t.Fatalf("reason after baseline = %q, want ok", got)
 	}
-	h.observeProbe(idx, true, 200*time.Millisecond, now)
+	for j := 0; j < nodeHealthRTTSlowSamples; j++ {
+		h.observeProbe(idx, true, 200*time.Millisecond, now)
+	}
 	if got := h.admissionReason(idx, true); got != "rtt" {
 		t.Fatalf("reason after slow probe = %q, want rtt", got)
 	}

@@ -15,11 +15,14 @@ import (
 )
 
 const (
-	siteStickyTTL             = time.Hour
-	siteStickyMaxEntries      = 4096
-	siteStickyMinDwell        = 30 * time.Second
-	siteStickyHoldDown        = 60 * time.Second
+	siteStickyTTL        = time.Hour
+	siteStickyMaxEntries = 4096
+	siteStickyMinDwell   = 30 * time.Second
+	siteStickyHoldDown   = 60 * time.Second
+	// siteStickyReclaimAfter is the legacy UDP reclaim age (unchanged); TCP
+	// uses the longer siteStickyRecoveryAfter before a verified recovery trial.
 	siteStickyReclaimAfter    = 2 * time.Minute
+	siteStickyRecoveryAfter   = 5 * time.Minute
 	siteStickySlowBeforeProbe = 2
 	siteStickyMaxAltTries     = 2
 )
@@ -28,26 +31,37 @@ const (
 // that stops a recovered or slightly-better node from yanking the site back
 // within seconds.
 type siteStickyEntry struct {
-	leaf            *dialer.Dialer
-	pinnedAt        time.Time
-	lastSuccess     time.Time
-	consecutiveSlow int
-	triedAlts       int
-	probeNext       bool
-	probeArmed      bool
-	converged       bool
-	holdDownUntil   map[*dialer.Dialer]time.Time
-	touchedAt       time.Time
-	lru             *list.Element
-	live            bool
+	nextRecovery     time.Time
+	recovery         *stickyRecovery
+	recoveryFailures int
+	recoverySwitches []time.Time
+	recoveryDwell    time.Time
+	leaf             *dialer.Dialer
+	pinnedAt         time.Time
+	lastSuccess      time.Time
+	consecutiveSlow  int
+	triedAlts        int
+	probeNext        bool
+	probeArmed       bool
+	converged        bool
+	holdDownUntil    map[*dialer.Dialer]time.Time
+	touchedAt        time.Time
+	lru              *list.Element
+	live             bool
 }
 
 type siteStickyTable struct {
-	mu       sync.Mutex
-	detached bool
-	entries  map[string]*siteStickyEntry
-	liveLRU  *list.List
-	deadLRU  *list.List
+	recoveryLogAt                           time.Time
+	recoveryLogCount, recoveryLogSuppressed int
+	lastRecoveryProbe                       time.Time
+	recoveryLog                             func(string, string, *stickyRecovery, time.Time)
+	recoverySwitches                        []time.Time
+	lastRecovery                            time.Time
+	mu                                      sync.Mutex
+	detached                                bool
+	entries                                 map[string]*siteStickyEntry
+	liveLRU                                 *list.List
+	deadLRU                                 *list.List
 }
 
 func newSiteStickyTable() *siteStickyTable {
@@ -99,10 +113,11 @@ type internedSelectPath struct {
 // SelectPath is the recorded nested member plus interned sticky tables for
 // one Select. Slow-handshake, PinSite snapshots, and admin identity must use
 // this path. The token is comparable (NestedMember plus interned pointer) so
-// snapshot caches can key on it; the table slice lives once per unique table
+// snapshot caches key on WithoutRecovery(); the table slice lives once per unique table
 // sequence on the group, not per flow or per nested member, and is not
 // truncated.
 type SelectPath struct {
+	recovery     *stickyRecovery
 	NestedMember string
 	p            *internedSelectPath
 }
@@ -116,6 +131,7 @@ const selectPathInlineCap = 8
 // inline so nested Select does not heap-allocate a slice per layer; extra
 // holds tables beyond the inline cap without truncating.
 type selectPathBuilder struct {
+	recovery     *stickyRecovery
 	NestedMember string
 	n            int
 	inline       [selectPathInlineCap]*siteStickyTable
@@ -148,6 +164,7 @@ type nestedSelectMemoKey struct {
 }
 
 type nestedSelectMemoVal struct {
+	recovery     *stickyRecovery
 	d            *dialer.Dialer
 	latency      time.Duration
 	network      *dialer.NetworkType
@@ -171,7 +188,8 @@ func (p SelectPath) stickyTables() []*siteStickyTable {
 	return p.p.tables
 }
 
-func internSelectPath(g *DialerGroup, b selectPathBuilder) SelectPath {
+func internSelectPath(g *DialerGroup, b selectPathBuilder) (result SelectPath) {
+	defer func() { result.recovery = b.recovery }()
 	if b.NestedMember == "" && b.n == 0 {
 		return SelectPath{}
 	}
@@ -268,11 +286,11 @@ func (p *selectPathBuilder) addTable(t *siteStickyTable) {
 	p.n++
 }
 
-func (p *selectPathBuilder) addSticky(g *DialerGroup) {
+func (p *selectPathBuilder) addSticky(g *DialerGroup, nt *dialer.NetworkType) {
 	if p == nil || g == nil || !g.usesSiteSticky() || g.siteSticky == nil {
 		return
 	}
-	p.addTable(g.siteSticky)
+	p.addTable(g.stickyTable(nt))
 }
 
 func (p *selectPathBuilder) adopt(member dialerGroupMember, sub *selectPathBuilder) {
@@ -289,6 +307,7 @@ func (p *selectPathBuilder) adopt(member dialerGroupMember, sub *selectPathBuild
 	if sub == nil {
 		return
 	}
+	p.recovery = sub.recovery
 	for i := 0; i < sub.n; i++ {
 		p.addTable(sub.tableAt(i))
 	}
@@ -384,6 +403,7 @@ func (p *selectPathBuilder) restoreMemoPath(v nestedSelectMemoVal) {
 	if p == nil {
 		return
 	}
+	p.recovery = v.recovery
 	p.NestedMember = v.nestedMember
 	p.n = v.n
 	p.inline = v.inline
@@ -395,6 +415,7 @@ func (p *selectPathBuilder) captureMemo(d *dialer.Dialer, latency time.Duration,
 	if p == nil {
 		return v
 	}
+	v.recovery = p.recovery
 	v.nestedMember = p.NestedMember
 	v.n = p.n
 	v.inline = p.inline
@@ -478,7 +499,7 @@ func (g *DialerGroup) collectStickyTablesOnSelectedPath(d *dialer.Dialer, networ
 	}
 	var out []*siteStickyTable
 	if g.usesSiteSticky() && g.siteSticky != nil && (d == nil || g.hasConcreteMember(d)) {
-		out = append(out, g.siteSticky)
+		out = append(out, g.stickyTable(networkType))
 	}
 	if len(g.nestedMembers) == 0 {
 		return uniqueStickyTables(out)
@@ -523,7 +544,9 @@ func (g *DialerGroup) PinSite(site string, d *dialer.Dialer, slow bool) {
 	now := g.now()
 	stillMember := g.pinStillMember()
 	for _, table := range g.collectStickyTablesContaining(d) {
-		table.pin(site, d, now, slow, stillMember)
+		// Contention makes a slow sample inconclusive, but a confirmed
+		// first byte still updates the successful leaf after failover.
+		table.pin(site, d, now, slow && !d.LoadContext(now).DeferQuality(), stillMember)
 	}
 }
 
@@ -565,7 +588,7 @@ func (t *siteStickyTable) pin(site string, d *dialer.Dialer, now time.Time, slow
 	if t == nil {
 		return
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" || d == nil {
 		return
 	}
@@ -599,6 +622,7 @@ func (t *siteStickyTable) pin(site string, d *dialer.Dialer, now time.Time, slow
 	entry.probeNext = false
 	if !same {
 		entry.pinnedAt = now
+		entry.nextRecovery = now.Add(siteStickyRecoveryAfter)
 		entry.consecutiveSlow = 0
 		if entry.triedAlts >= siteStickyMaxAltTries {
 			entry.converged = true
@@ -609,7 +633,7 @@ func (t *siteStickyTable) pin(site string, d *dialer.Dialer, now time.Time, slow
 	} else {
 		entry.consecutiveSlow = 0
 	}
-	if !entry.converged &&
+	if !entry.converged && entry.recovery == nil && !now.Before(entry.recoveryDwell) && t.recoveryBudget(entry, now) &&
 		entry.consecutiveSlow >= siteStickySlowBeforeProbe &&
 		entry.triedAlts < siteStickyMaxAltTries &&
 		!now.Before(entry.pinnedAt.Add(siteStickyMinDwell)) {
@@ -621,7 +645,7 @@ func (t *siteStickyTable) fail(site string, d *dialer.Dialer, now time.Time) {
 	if t == nil {
 		return
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" || d == nil {
 		return
 	}
@@ -693,6 +717,9 @@ func (t *siteStickyTable) lookupLocked(key string, now time.Time) *siteStickyEnt
 	entry := t.entries[key]
 	if entry == nil {
 		return nil
+	}
+	if r := entry.recovery; r != nil && !now.Before(r.deadline) {
+		t.deferRecovery(entry, r, now, "expired")
 	}
 	stamp := entry.activityStamp()
 	if !stamp.IsZero() && now.Sub(stamp) > siteStickyTTL && !entry.hasActiveHoldDown(now) {
@@ -781,7 +808,7 @@ func (t *siteStickyTable) pinMeta(site string, now time.Time) (pinnedAt time.Tim
 	if t == nil {
 		return time.Time{}, 0, false, false
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" {
 		return time.Time{}, 0, false, false
 	}
@@ -798,7 +825,7 @@ func (t *siteStickyTable) reclaim(site string, d *dialer.Dialer, now time.Time) 
 	if t == nil || d == nil {
 		return
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" {
 		return
 	}
@@ -827,7 +854,7 @@ func (t *siteStickyTable) hit(site string, excluded *dialer.Dialer, now time.Tim
 	if t == nil {
 		return nil, nil, false
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" {
 		return nil, nil, false
 	}
@@ -854,6 +881,10 @@ func (t *siteStickyTable) hit(site string, excluded *dialer.Dialer, now time.Tim
 		t.touchLocked(key, entry)
 		return nil, failed, false
 	}
+	if entry.leaf.LoadContext(now).DeferQuality() {
+		entry.consecutiveSlow = 0
+		entry.probeNext = false
+	}
 	if entry.probeNext {
 		entry.probeNext = false
 		entry.probeArmed = true
@@ -867,7 +898,7 @@ func (t *siteStickyTable) holdDownActive(site string, d *dialer.Dialer, now time
 	if t == nil || d == nil {
 		return false
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" {
 		return false
 	}
@@ -885,7 +916,7 @@ func (t *siteStickyTable) holdDownSet(site string, now time.Time) map[*dialer.Di
 	if t == nil {
 		return nil
 	}
-	key := SiteKey(site)
+	key := t.key(site)
 	if key == "" {
 		return nil
 	}
@@ -925,7 +956,7 @@ func (t *siteStickyTable) holdDownExcludeLocked(entry *siteStickyEntry, excluded
 	return newest
 }
 
-func (g *DialerGroup) stickyOverride(site string, networkType *dialer.NetworkType, excluded *dialer.Dialer) (d *dialer.Dialer, extraExclude *dialer.Dialer, hit bool) {
+func (g *DialerGroup) stickyOverride(site string, networkType *dialer.NetworkType, excluded *dialer.Dialer, path *selectPathBuilder) (d *dialer.Dialer, extraExclude *dialer.Dialer, hit bool) {
 	if g == nil || !g.usesSiteSticky() || g.siteSticky == nil {
 		return nil, nil, false
 	}
@@ -933,35 +964,58 @@ func (g *DialerGroup) stickyOverride(site string, networkType *dialer.NetworkTyp
 	admit := func(leaf *dialer.Dialer) bool {
 		return g.leafSelectable(leaf, networkType)
 	}
-	d, extraExclude, hit = g.siteSticky.hit(site, excluded, now, admit, g.hasConcreteMember)
+	table := g.stickyTable(networkType)
+	d, extraExclude, hit = table.hit(site, excluded, now, admit, g.hasConcreteMember)
 	if !hit {
 		return d, extraExclude, false
 	}
 	if better := g.fallbackStickyReclaim(site, d, networkType, excluded); better != nil {
-		g.siteSticky.reclaim(site, better, g.now())
-		return better, extraExclude, true
+		if networkType.L4Proto != consts.L4ProtoStr_TCP {
+			table.reclaim(site, better, now)
+			return better, extraExclude, true
+		}
+		// Resolve the trial's network type before the token is published so
+		// nothing writes to it once other goroutines can observe it.
+		if trial := table.startRecovery(site, d, better, now, preferAlternateSelectionNetworkType(better, networkType)); trial != nil {
+			path.recovery = trial
+			return better, extraExclude, true
+		}
 	}
 	return d, extraExclude, true
 }
 
 // fallbackStickyReclaim returns an earlier fallback member that new connections
 // may move to after the pin has aged. It does not migrate established flows.
-// Sites that already probed away from a slow first member are left on the pin.
+// Historical slow probes do not permanently suppress recovery eligibility.
 func (g *DialerGroup) fallbackStickyReclaim(site string, pin *dialer.Dialer, networkType *dialer.NetworkType, excluded *dialer.Dialer) *dialer.Dialer {
+	if g != nil && g.quality != nil && g.quality.options.Mode == "enforce" && StickyKey(site) != "" && networkType != nil && networkType.L4Proto == consts.L4ProtoStr_TCP {
+		return nil
+	}
 	if g == nil || pin == nil || g.GetSelectionPolicy() != consts.DialerSelectionPolicy_Fallback {
 		return nil
 	}
 	now := g.now()
-	started, triedAlts, converged, ok := g.siteSticky.pinMeta(site, now)
-	if !ok || triedAlts > 0 || converged || now.Sub(started) < siteStickyReclaimAfter {
+	table := g.stickyTable(networkType)
+	started, triedAlts, converged, ok := table.pinMeta(site, now)
+	minAge := siteStickyReclaimAfter
+	if networkType != nil && networkType.L4Proto == consts.L4ProtoStr_TCP {
+		minAge = siteStickyRecoveryAfter
+	} else if triedAlts > 0 || converged {
+		// Legacy UDP reclaim keeps its original behavior.
 		return nil
 	}
-	skip := mergeDialerSkip(excluded, g.siteHoldDownSet(site))
+	if !ok || now.Sub(started) < minAge {
+		return nil
+	}
+	if networkType.L4Proto == consts.L4ProtoStr_TCP && !table.recoveryEligible(site, pin, now) {
+		return nil
+	}
+	skip := mergeDialerSkip(excluded, g.siteHoldDownSet(site, networkType))
 	preferred, _, _, _, err := g.selectFirstAdmitted(networkType, g.currentSelectionState(), skip, true)
 	if err != nil || preferred == nil || preferred == pin {
 		return nil
 	}
-	if g.fallbackRank(preferred) >= g.fallbackRank(pin) {
+	if (networkType.L4Proto == consts.L4ProtoStr_TCP && preferred.AdmissionState(networkType) != dialer.AdmissionAlive) || g.fallbackRank(preferred) >= g.fallbackRank(pin) {
 		return nil
 	}
 	return preferred
@@ -1004,9 +1058,29 @@ func (g *DialerGroup) siteHoldDownActive(site string, d *dialer.Dialer) bool {
 	return g.siteSticky.holdDownActive(site, d, g.now())
 }
 
-func (g *DialerGroup) siteHoldDownSet(site string) map[*dialer.Dialer]struct{} {
+func (g *DialerGroup) siteHoldDownSet(site string, networks ...*dialer.NetworkType) map[*dialer.Dialer]struct{} {
 	if g == nil || g.siteSticky == nil || !g.usesSiteSticky() {
 		return nil
 	}
-	return g.siteSticky.holdDownSet(site, g.now())
+	var nt *dialer.NetworkType
+	if len(networks) > 0 {
+		nt = networks[0]
+	}
+	return g.stickyTable(nt).holdDownSet(site, g.now())
+}
+
+// key is the sticky table's site identity. It stays eTLD+1 for every
+// protocol and quality mode; the per-host StickyKey belongs only to the TCP
+// quality runtime, which has its own scope map.
+func (t *siteStickyTable) key(site string) string {
+	return SiteKey(site)
+}
+
+// TCP and UDP keep separate pins, hold-downs and recovery state. Snapshots
+// retain the table selected by their path, so late UDP callbacks cannot alter TCP.
+func (g *DialerGroup) stickyTable(nt *dialer.NetworkType) *siteStickyTable {
+	if nt != nil && nt.L4Proto == consts.L4ProtoStr_UDP {
+		return g.siteStickyUDP
+	}
+	return g.siteSticky
 }

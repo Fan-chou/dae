@@ -86,6 +86,7 @@ func CachedTimeNano() int64 {
 }
 
 type Dialer struct {
+	load                    *nodeLoad
 	transportClassMu        sync.Mutex
 	transportClasses        map[string]*Dialer
 	transportClassesRetired bool
@@ -318,6 +319,7 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 
 	ctx, cancel := context.WithCancel(ctx)
 	d := &Dialer{
+		load:             &nodeLoad{},
 		GlobalOption:     option,
 		InstanceOption:   iOption,
 		property:         property,
@@ -361,6 +363,7 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 	if d.property != nil && d.property.Link != "" {
 		clone, err := NewFromLinkWithProxyCacheContext(ctx, option, d.InstanceOption, d.property.Link, d.property.SubscriptionTag, NewProxyIpCache())
 		if err == nil {
+			clone.load = d.load
 			clone.property = cloneProperty(d.property)
 			clone.udpForwardMode = udpForwardModeFromProperty(clone.property)
 			clone.resolveDNS = d.resolveDNS
@@ -374,6 +377,7 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 	}
 
 	clone := NewDialerContext(ctx, d.Dialer, option, d.InstanceOption, cloneProperty(d.property))
+	clone.load = d.load
 	clone.stickyIpDialer = d.stickyIpDialer
 	clone.proxyIpCache = d.proxyIpCache
 	clone.resolveDNS = d.resolveDNS

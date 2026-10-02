@@ -31,8 +31,10 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/component/outbound/quality"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -46,6 +48,8 @@ import (
 )
 
 type ControlPlane struct {
+	capture        *observation.Collector
+	captureGroup   string
 	udpCrossFamily *UDPCrossFamilyStore
 	log            *logrus.Logger
 	directDialer   netproxy.Dialer
@@ -469,6 +473,16 @@ func NewControlPlaneWithContextOptions(
 	}
 	core.addDeferFunc(func() error { stopLocalAddresses(); return nil })
 
+	var qualityModel *quality.ModelWorker
+	if global.LayaEnabled {
+		qualityModel = quality.NewModelWorkerWithCA(global.LayaEndpoint, global.LayaCredentialFile, global.LayaCAFile, func(reason string, fields map[string]any) {
+			fields["event"] = "laya_quality"
+			fields["reason"] = reason
+			log.WithFields(logrus.Fields(fields)).Info("Laya quality comparison")
+		})
+		deferFuncs = append(deferFuncs, qualityModel.Close)
+		log.WithFields(logrus.Fields{"event": "laya_quality", "configured_mode": global.LayaMode, "effective_mode": "shadow", "reason": "model_action_not_validated"}).Info("Laya enabled; local rules remain authoritative")
+	}
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
@@ -649,6 +663,7 @@ func NewControlPlaneWithContextOptions(
 				*policy,
 				callback,
 				outbound.DialerGroupRuntimeOptions{
+					Quality:            localQualityOptions(group, qualityModel),
 					IsolateTransport:   group.IsolateTransport,
 					HealthCheckEnabled: group.EnablesHealthCheck(),
 					Lazy:               group.Lazy,
@@ -715,12 +730,14 @@ func NewControlPlaneWithContextOptions(
 			*policy,
 			callback,
 			outbound.DialerGroupRuntimeOptions{
+				Quality:            localQualityOptions(group, qualityModel),
 				IsolateTransport:   group.IsolateTransport,
 				HealthCheckEnabled: group.EnablesHealthCheck(),
 				Lazy:               group.Lazy,
 				HealthDialers:      healthDialers,
 			},
 		)
+		deferFuncs = append(deferFuncs, builtGroups[group.Name].Close)
 		if len(group.SelectionMembers) > 0 {
 			groupSelectionMembers[group.Name] = append([]string(nil), memberIdentities...)
 		}
@@ -869,14 +886,33 @@ func NewControlPlaneWithContextOptions(
 	}})
 	egressRuntime.configureResources(outbounds, egressDialers, DefaultUdpEndpointPool.forgetDialerEpochs)
 	var planeDeferFuncs []func() error
+	if qualityModel != nil {
+		planeDeferFuncs = append(planeDeferFuncs, qualityModel.Close)
+	}
 	if option.DaeDNS != nil {
 		planeDeferFuncs = append(planeDeferFuncs, option.DaeDNS.Close)
 	}
 	deferFuncs = nil
 
+	var capture *observation.Collector
+	if global.CaptureEnabled {
+		capture, err = observation.New(global.CaptureSamplePermille)
+		if err != nil {
+			// Observation failure must not prevent normal routing.
+			log.WithError(err).Warn("Passive capture unavailable; routing continues")
+		} else {
+			planeDeferFuncs = append(planeDeferFuncs, capture.Close)
+			if err := capture.EvidenceError(); err != nil {
+				log.WithError(err).Warn("Evidence capture unavailable; capture-v1 continues")
+			}
+			log.WithFields(logrus.Fields{"event": "passive_capture", "sample_permille": global.CaptureSamplePermille, "ring_bytes": observation.RingLimit, "evidence_ring_bytes": observation.EvidenceRingLimit, "evidence_schema": observation.EvidenceSchema, "flow_limit": observation.FlowLimit}).Info("Passive TCP capture enabled; RAM only")
+		}
+	}
 	// New control plane.
 	cctx, cancel := context.WithCancel(context.Background())
 	plane = &ControlPlane{
+		capture:       capture,
+		captureGroup:  global.CaptureGroup,
 		log:           log,
 		directDialer:  directDialer,
 		runtimeStats:  newRuntimeStats(),
@@ -1299,6 +1335,7 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 	policyIdentity := c.PolicyIdentity()
 	routeProjectionEpoch := uint64(policyIdentity.Epoch())
 	return &DnsControllerOption{
+		Capture:          c.capture,
 		Log:              c.log,
 		LifecycleContext: c.ctx,
 		ConcurrencyLimit: 0,

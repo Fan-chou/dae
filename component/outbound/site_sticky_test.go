@@ -165,7 +165,7 @@ func TestDialerGroup_FallbackStickyReclaimsHigherPriority(t *testing.T) {
 		t.Fatalf("selected %p before reclaim, want pin %p", selected, dialers[1])
 	}
 
-	now = now.Add(siteStickyReclaimAfter - time.Second)
+	now = now.Add(siteStickyRecoveryAfter - time.Second)
 	selected, _, _, err = g.SelectWithExclusionResultForSite(TestNetworkType, true, nil, "youtube.com")
 	if err != nil {
 		t.Fatalf("SelectForSite() just before reclaim error = %v", err)
@@ -184,7 +184,7 @@ func TestDialerGroup_FallbackStickyReclaimsHigherPriority(t *testing.T) {
 	}
 }
 
-func TestDialerGroup_FallbackStickyDoesNotReclaimAfterSlowProbe(t *testing.T) {
+func TestDialerGroup_FallbackStickyRecoveryAfterSlowProbe(t *testing.T) {
 	g, dialers := newTestGroupForSelection(DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback})
 	defer g.Close()
 	for _, d := range dialers {
@@ -208,13 +208,13 @@ func TestDialerGroup_FallbackStickyDoesNotReclaimAfterSlowProbe(t *testing.T) {
 	}
 	g.PinSite("youtube.com", selected, false)
 
-	now = now.Add(siteStickyReclaimAfter + time.Second)
+	now = now.Add(siteStickyRecoveryAfter + time.Second)
 	selected, _, _, err = g.SelectWithExclusionResultForSite(TestNetworkType, true, nil, "youtube.com")
 	if err != nil {
 		t.Fatalf("SelectForSite() after reclaim window error = %v", err)
 	}
-	if selected != dialers[1] {
-		t.Fatalf("selected %p after slow-probe window, want to stay on alt %p", selected, dialers[1])
+	if selected != dialers[0] {
+		t.Fatalf("selected %p after recovery window, want preferred trial %p", selected, dialers[0])
 	}
 }
 

@@ -39,6 +39,7 @@ const (
 	nodeHealthBaselineMinN     = 3
 	nodeHealthReseedHighStreak = 5
 	nodeHealthRecoverSuccesses = 2
+	nodeHealthRTTSlowSamples   = 3
 	nodeHealthBaselineAlpha    = 0.20
 	nodeHealthSpikeIgnore      = 3.0
 	nodeHealthDegradeFactor    = 1.50
@@ -75,6 +76,9 @@ type nodeHealthSlot struct {
 	recentSuccessDelays []time.Duration
 	reseedDelays        []time.Duration
 	degraded            bool
+	rttSlowStreak       int
+	decisionBaseline    time.Duration
+	rttRunBaseline      time.Duration
 	recoverStreak       int
 	testResults         []bool
 	penaltyLevel        int
@@ -107,6 +111,8 @@ type admissionChange struct {
 	fromFallback, toFallback AdmissionState
 	fromReason, toReason     string
 	rtt, baseline            time.Duration
+	decisionBaseline         time.Duration
+	slowSamples              int
 	failStreak               int
 	congested                bool
 }
@@ -115,6 +121,7 @@ type nodeHealth struct {
 	mu           sync.Mutex
 	udpTransport bool
 	slots        [8]nodeHealthSlot
+	handshakes   [8]nodeHealthSlot
 	logged       [8]loggedAdmission
 }
 
@@ -240,16 +247,18 @@ func (h *nodeHealth) consumeAdmissionChange(idx int, alive bool, now time.Time) 
 		return change, false
 	}
 	change = admissionChange{
-		from:         prev.state,
-		to:           next.state,
-		fromFallback: prev.fallback,
-		toFallback:   next.fallback,
-		fromReason:   prev.reason,
-		toReason:     next.reason,
-		rtt:          slot.lastSampleRTT,
-		baseline:     slot.baseline,
-		failStreak:   slot.failStreak,
-		congested:    slot.congested,
+		from:             prev.state,
+		to:               next.state,
+		fromFallback:     prev.fallback,
+		toFallback:       next.fallback,
+		fromReason:       prev.reason,
+		toReason:         next.reason,
+		rtt:              slot.lastSampleRTT,
+		baseline:         slot.baseline,
+		decisionBaseline: slot.decisionBaseline,
+		slowSamples:      slot.rttSlowStreak,
+		failStreak:       slot.failStreak,
+		congested:        slot.congested,
 	}
 	return change, true
 }
@@ -285,7 +294,7 @@ func (h *nodeHealth) quality(idx int, base time.Duration, hasBase bool, now time
 	}
 	q := base
 	q += slot.lossPenaltyLocked()
-	if slot.degraded || slot.congested {
+	if slot.failDegraded || slot.degraded || slot.congested {
 		q += nodeHealthDegradePenalty
 	}
 	q += slot.timeDecayPenaltyLocked(now)
@@ -314,9 +323,30 @@ func (h *nodeHealth) observeProbe(idx int, success bool, latency time.Duration, 
 		h.maybeUpdateCongestion(idx, slot, now)
 		return
 	}
+	// QUIC stream failures retain the transport-specific streak threshold.
+	// Ordinary TCP nodes degrade on their first failed probe.
 	h.updateSlotDegraded(idx, slot, false, 0)
 	slot.raisePenalty(now)
 	h.maybeUpdateCongestion(idx, slot, now)
+}
+
+// Business dial duration is not an HTTP probe RTT. Keep its baseline private;
+// it may request a probe but must neither degrade nor recover node health.
+func (h *nodeHealth) observeHandshake(idx int, sample time.Duration) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if idx < 0 || idx >= len(h.handshakes) || sample <= 0 {
+		return false
+	}
+	s := &h.handshakes[idx]
+	slow := s.baselineSamples >= nodeHealthBaselineMinN && sample > time.Duration(float64(s.baseline)*h.tcpSlowFactor(idx))
+	if slow {
+		s.rttSlowStreak++
+	} else {
+		s.rttSlowStreak = 0
+	}
+	s.updateBaseline(sample)
+	return s.rttSlowStreak == nodeHealthRTTSlowSamples
 }
 
 func (h *nodeHealth) observeSample(idx int, sample time.Duration, now time.Time) (slow bool) {
@@ -353,9 +383,13 @@ func (h *nodeHealth) ttfbSlow(idx int, ttfb time.Duration) bool {
 	if slot == nil {
 		return false
 	}
-	return slot.baselineSamples >= nodeHealthBaselineMinN &&
-		slot.baseline > 0 &&
-		ttfb > time.Duration(float64(slot.baseline)*h.tcpSlowFactor(idx))
+	base := slot
+	if h.handshakes[idx].baselineSamples >= nodeHealthBaselineMinN {
+		base = &h.handshakes[idx]
+	}
+	return base.baselineSamples >= nodeHealthBaselineMinN &&
+		base.baseline > 0 &&
+		ttfb > time.Duration(float64(base.baseline)*h.tcpSlowFactor(idx))
 }
 
 func (h *nodeHealth) tcpSlowFactor(idx int) float64 {
@@ -487,6 +521,9 @@ func (h *nodeHealth) setDegradedForTest(idx int, degraded bool) {
 		slot.congested = false
 		slot.failDegraded = false
 		slot.recoverStreak = 0
+		slot.rttSlowStreak = 0
+		slot.decisionBaseline = 0
+		h.handshakes[idx] = nodeHealthSlot{}
 		slot.failStreak = 0
 	}
 }
@@ -669,10 +706,16 @@ func (h *nodeHealth) maybeUpdateCongestion(idx int, slot *nodeHealthSlot, now ti
 }
 
 func (s *nodeHealthSlot) updateDegraded(success bool, latency time.Duration, degradeFactor, recoverFactor float64, failNeed int) {
+	base := s.baseline
+	if s.rttSlowStreak > 0 && s.rttSlowStreak < nodeHealthRTTSlowSamples {
+		base = s.rttRunBaseline
+	}
+	s.decisionBaseline = base
 	if failNeed < 1 {
 		failNeed = 1
 	}
 	if !success {
+		s.rttSlowStreak = 0
 		s.failStreak++
 		s.recoverStreak = 0
 		if s.failStreak >= failNeed {
@@ -691,11 +734,18 @@ func (s *nodeHealthSlot) updateDegraded(success bool, latency time.Duration, deg
 		}
 		return
 	}
-	if s.baseline > 0 && latency > time.Duration(float64(s.baseline)*degradeFactor) {
-		s.degraded = true
+	if base > 0 && latency > time.Duration(float64(base)*degradeFactor) {
+		if s.rttSlowStreak == 0 {
+			s.rttRunBaseline = base
+		}
+		s.rttSlowStreak++
+		if s.rttSlowStreak >= nodeHealthRTTSlowSamples {
+			s.degraded = true
+		}
 		s.recoverStreak = 0
 		return
 	}
+	s.rttSlowStreak = 0
 	if s.degraded && (s.baseline == 0 || latency <= time.Duration(float64(s.baseline)*recoverFactor)) {
 		s.recoverStreak++
 		if s.recoverStreak >= nodeHealthRecoverSuccesses {
@@ -785,6 +835,9 @@ func (h *nodeHealth) restore(slots [8]NodeHealthSlotSnapshot) {
 		slot.lastPenaltyAt = time.Time{}
 		slot.penaltyGoodStreak = 0
 		slot.recoverStreak = 0
+		slot.rttSlowStreak = 0
+		slot.decisionBaseline = 0
+		h.handshakes[i] = nodeHealthSlot{}
 		slot.failStreak = 0
 		slot.highLatencyStreak = 0
 		slot.reseedDelays = nil

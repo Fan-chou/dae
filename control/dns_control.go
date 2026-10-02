@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/daeuniverse/dae/component/observation"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,7 @@ var (
 )
 
 type DnsControllerOption struct {
+	Capture              *observation.Collector
 	Log                  *logrus.Logger
 	LifecycleContext     context.Context
 	CacheAccessCallback  func(cache *DnsCache) (err error)

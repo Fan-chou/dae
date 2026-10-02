@@ -328,3 +328,20 @@ func adminInferredSelected(policy consts.DialerSelectionPolicy, members []AdminG
 	}
 	return ""
 }
+
+// AdminQuality is a bounded diagnostics snapshot, independent of group-level selected.
+func (c *ControlPlane) AdminQuality(group, host string) []map[string]any {
+	result := make([]map[string]any, 0)
+	if c == nil {
+		return result
+	}
+	for _, g := range c.outbounds {
+		if g != nil && (group == "" || g.Name == group) {
+			result = append(result, g.QualityStatus(host, 256-len(result))...)
+			if len(result) >= 256 {
+				break
+			}
+		}
+	}
+	return result
+}

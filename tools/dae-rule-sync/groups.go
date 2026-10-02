@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package main
 
 import (
@@ -5,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,11 +57,37 @@ type MihomoProxy struct {
 	UdpMTU            int            `yaml:"udp-mtu"`
 }
 
+// KdaeQuality is an explicit kdae extension, not a Mihomo routing option.
+type KdaeQuality struct {
+	MinDownloadBytes *uint64  `yaml:"min-download-bytes"`
+	Mode             string   `yaml:"mode"`
+	SevereRatio      *float64 `yaml:"severe-speed-ratio"`
+	RecoveryRatio    *float64 `yaml:"recovery-speed-ratio"`
+}
+
+// Reject misspelled extension keys even in compatibility parsing.
+func (q *KdaeQuality) UnmarshalYAML(node *yaml.Node) error {
+	type fields KdaeQuality
+	var value fields
+	data, err := yaml.Marshal(node)
+	if err != nil {
+		return err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	*q = KdaeQuality(value)
+	return nil
+}
+
 type MihomoGroup struct {
-	Name    string   `yaml:"name"`
-	Type    string   `yaml:"type"`
-	Proxies []string `yaml:"proxies"`
-	Use     []string `yaml:"use"`
+	Quality *KdaeQuality `yaml:"x-kdae-quality"`
+	Name    string       `yaml:"name"`
+	Type    string       `yaml:"type"`
+	Proxies []string     `yaml:"proxies"`
+	Use     []string     `yaml:"use"`
 
 	// Pointers are intentional: Mihomo distinguishes an omitted option from an
 	// explicit false/zero value, and conversion must not silently replace either
@@ -291,7 +324,38 @@ func generateMihomoGroups(config MihomoConfig, nodeNames map[string]string, loss
 		if approximate || len(reasons) > 0 {
 			report.Approximated++
 		}
+		if group.Quality != nil {
+			q := group.Quality
+			if q.Mode != "off" && q.Mode != "observe" && q.Mode != "enforce" {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q: invalid x-kdae-quality mode", group.Name)
+			}
+			if q.Mode != "off" && group.Type != "fallback" && group.Type != "url-test" {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q: quality requires fallback or url-test", group.Name)
+			}
+			severe, recovery := .3, .6
+			if q.SevereRatio != nil {
+				severe = *q.SevereRatio
+			}
+			if q.RecoveryRatio != nil {
+				recovery = *q.RecoveryRatio
+			}
+			if math.IsNaN(severe) || math.IsNaN(recovery) || !(severe > 0 && recovery > severe && recovery <= 1) {
+				return "", GroupConversionReport{}, fmt.Errorf("group %q: invalid quality ratios", group.Name)
+			}
+		}
 		fmt.Fprintf(&output, "    %s {\n", report.NameMap[group.Name])
+		if q := group.Quality; q != nil {
+			fmt.Fprintf(&output, "        quality_mode: %s\n", daeQuote(q.Mode))
+			if q.MinDownloadBytes != nil {
+				fmt.Fprintf(&output, "        quality_min_download_bytes: %d\n", *q.MinDownloadBytes)
+			}
+			if q.SevereRatio != nil {
+				fmt.Fprintf(&output, "        severe_speed_ratio: %s\n", daeQuote(strconv.FormatFloat(*q.SevereRatio, 'g', -1, 64)))
+			}
+			if q.RecoveryRatio != nil {
+				fmt.Fprintf(&output, "        recovery_speed_ratio: %s\n", daeQuote(strconv.FormatFloat(*q.RecoveryRatio, 'g', -1, 64)))
+			}
+		}
 		if isolated[report.NameMap[group.Name]] {
 			output.WriteString("        isolate_transport: true\n")
 		}

@@ -51,15 +51,19 @@ func (d *Dialer) maybeLogAdmission(typ *NetworkType) {
 		node = d.property.Name
 	}
 	fields := logrus.Fields{
-		"node":            node,
-		"network":         typ.String(),
-		"from":            change.from.String(),
-		"to":              change.to.String(),
-		"reason":          change.toReason,
-		"previous_reason": change.fromReason,
-		"fallback_from":   change.fromFallback.String(),
-		"fallback_to":     change.toFallback.String(),
-		"behavior":        admissionSelectionBehavior(change.to, change.toFallback),
+		"node":              node,
+		"decision_baseline": change.decisionBaseline.String(),
+		"rtt_slow_samples":  change.slowSamples,
+		"udp_transport":     d.health.udpTransport,
+		"rtt_source":        "active_probe",
+		"network":           typ.String(),
+		"from":              change.from.String(),
+		"to":                change.to.String(),
+		"reason":            change.toReason,
+		"previous_reason":   change.fromReason,
+		"fallback_from":     change.fromFallback.String(),
+		"fallback_to":       change.toFallback.String(),
+		"behavior":          admissionSelectionBehavior(change.to, change.toFallback),
 	}
 	if change.rtt > 0 {
 		fields["rtt"] = change.rtt.Truncate(time.Millisecond).String()
@@ -80,14 +84,16 @@ func (d *Dialer) ObserveHandshake(typ *NetworkType, handshake time.Duration) (sl
 	if d == nil || typ == nil || handshake <= 0 {
 		return false
 	}
+	if d.LoadContext(time.Now()).DeferQuality() {
+		return false
+	}
 	idx := typ.Index()
 	// Hysteria/TUIC/Juicity inner TCP Dial is local QUIC stream-open, not
 	// path RTT. Feeding it would pin the TCP-slot baseline near 1ms.
 	if d.health.relaxedTCP(idx) {
 		return false
 	}
-	slow = d.health.observeSample(idx, handshake, time.Now())
-	d.publishQuality(typ)
+	slow = d.health.observeHandshake(idx, handshake)
 	if slow {
 		d.notifyImmediateCheck(typ)
 	}

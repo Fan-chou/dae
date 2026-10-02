@@ -16,11 +16,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
@@ -36,6 +38,7 @@ const (
 )
 
 type adminPlane interface {
+	AdminQuality(group, host string) []map[string]any
 	AdminGroups() []control.AdminGroup
 	AdminStatusSnapshot(version string) control.AdminStatus
 	SetGroupSelection(groupName, memberName string) error
@@ -131,6 +134,9 @@ func (s *adminServer) refresh(listen, secret string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.withAdminAuth(s.handleStatus))
+	mux.HandleFunc("/v1/evidence", s.withAdminAuth(s.handleEvidence))
+	mux.HandleFunc("/v1/capture", s.withAdminAuth(s.handleCapture))
+	mux.HandleFunc("/v1/quality", s.withAdminAuth(s.handleQuality))
 	mux.HandleFunc("/v1/groups", s.withAdminAuth(s.handleGroups))
 	mux.HandleFunc("/v1/groups/", s.withAdminAuth(s.handleGroup))
 	mux.HandleFunc("/v1/connections", s.withAdminAuth(s.handleConnections))
@@ -569,4 +575,65 @@ func readAdminSyncState() (adminSyncState, error) {
 		return adminSyncState{}, err
 	}
 	return state, nil
+}
+
+func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, map[string]any{"entries": plane.AdminQuality(r.URL.Query().Get("group"), r.URL.Query().Get("host")), "limit": 256})
+}
+
+func (s *adminServer) handleCapture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
+			return
+		}
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminCapture(uint64) observation.Snapshot
+	})
+	if !ok {
+		writeAdminError(w, http.StatusServiceUnavailable, "capture unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminCapture(after))
+}
+
+func (s *adminServer) handleEvidence(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
+			return
+		}
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminEvidence(uint64) observation.EvidenceSnapshot
+	})
+	if !ok {
+		writeAdminError(w, http.StatusServiceUnavailable, "evidence unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminEvidence(after))
 }

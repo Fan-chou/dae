@@ -17,6 +17,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	commonerrors "github.com/daeuniverse/dae/common/errors"
+	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -195,6 +196,7 @@ type SessionManager struct {
 // flow. Its context is independent from the ControlPlane that selected the
 // immutable route and egress binding.
 type FlowRuntime struct {
+	capture atomic.Pointer[observation.Flow]
 	manager *SessionManager
 
 	id            uint64
@@ -484,7 +486,9 @@ func (f *FlowRuntime) recordUpload(n int64) {
 	if f == nil || n <= 0 {
 		return
 	}
+	f.binding.Egress.Dialer.LoadBytes(uint64(n), 0)
 	f.uploadBytes.Add(uint64(n))
+	f.capture.Load().Add(uint64(n), 0)
 }
 
 func (f *FlowRuntime) recordDownload(n int64) {
@@ -492,12 +496,16 @@ func (f *FlowRuntime) recordDownload(n int64) {
 	if f == nil || n <= 0 {
 		return
 	}
+	f.binding.Egress.Dialer.LoadBytes(0, uint64(n))
 	f.downloadBytes.Add(uint64(n))
+	f.capture.Load().Add(0, uint64(n))
 	if f.firstByte.CompareAndSwap(false, true) && f.binding.Egress.Dialer != nil && f.binding.Egress.NetworkType.L4Proto != "" {
 		ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
 		nt := f.binding.Egress.NetworkType
 		slow := f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
-		if g := f.binding.Egress.Outbound; g != nil {
+		f.binding.Egress.Quality.FirstByte(slow)
+		recoveryHandled := f.binding.Egress.SelectPath.RecoveryFirstByte(slow)
+		if g := f.binding.Egress.Outbound; g != nil && !recoveryHandled && !f.binding.Egress.Quality.ControlsPin() {
 			g.PinSite(pinSiteSubject(f.binding.Egress.StickySite, f.binding.Egress.SniffedDomain), f.binding.Egress.Dialer, slow)
 		}
 	}
@@ -508,6 +516,7 @@ func addUDPFlowUpload(ue *UdpEndpoint, n int) {
 		return
 	}
 	if rt := ue.sessionRuntime; rt != nil {
+		rt.binding.Egress.Dialer.LoadBytes(uint64(n), 0)
 		rt.uploadBytes.Add(uint64(n))
 	}
 }
@@ -517,6 +526,7 @@ func addUDPFlowDownload(ue *UdpEndpoint, n int) {
 		return
 	}
 	if rt := ue.sessionRuntime; rt != nil {
+		rt.binding.Egress.Dialer.LoadBytes(0, uint64(n))
 		rt.downloadBytes.Add(uint64(n))
 		if rt.firstByte.CompareAndSwap(false, true) && rt.binding.Egress.Dialer != nil && rt.binding.Egress.NetworkType.L4Proto != "" {
 			ttfb := time.Duration(time.Now().UnixNano() - rt.startUnixNano)
@@ -590,11 +600,13 @@ func (m *SessionManager) adoptTCP(
 	// mutually exclusive with releaseFlow and reload-time snapshots (the
 	// old single mutex covered all three; this small critical section keeps
 	// the identical happens-before over a much narrower surface).
+	binding.Egress.Dialer.LoadStart()
 	m.generationsMu.Lock()
 	if _, loaded := m.flows.LoadOrStore(ingress, flow); loaded {
 		m.generationsMu.Unlock()
 		cancel()
 		_ = lease.release()
+		binding.Egress.Dialer.LoadFinish()
 		return nil, ErrFlowAlreadyRegistered
 	}
 	m.tcpCount.Add(1)
@@ -618,6 +630,9 @@ func (f *FlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
+		f.binding.Egress.Dialer.LoadFinish()
+		f.binding.Egress.Quality.Finish()
+		f.binding.Egress.SelectPath.RecoveryFinish()
 		if d := f.binding.Egress.Dialer; d != nil && f.binding.Egress.NetworkType.L4Proto != "" {
 			elapsed := time.Duration(time.Now().UnixNano() - f.startUnixNano)
 			nt := f.binding.Egress.NetworkType
@@ -762,11 +777,13 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		_ = lease.release()
 		return nil, ErrSessionManagerClosed
 	}
+	binding.Egress.Dialer.LoadStart()
 	m.generationsMu.Lock()
 	if _, loaded := m.udpFlows.LoadOrStore(endpoint, flow); loaded {
 		m.generationsMu.Unlock()
 		cancel()
 		_ = lease.release()
+		binding.Egress.Dialer.LoadFinish()
 		return nil, ErrFlowAlreadyRegistered
 	}
 	m.udpCount.Add(1)
@@ -782,6 +799,7 @@ func (f *UDPFlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
+		f.binding.Egress.Dialer.LoadFinish()
 		if d := f.binding.Egress.Dialer; d != nil && f.binding.Egress.NetworkType.L4Proto != "" {
 			elapsed := time.Duration(time.Now().UnixNano() - f.startUnixNano)
 			nt := f.binding.Egress.NetworkType

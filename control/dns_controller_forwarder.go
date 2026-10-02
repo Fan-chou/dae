@@ -352,7 +352,23 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg 
 	return created, nil
 }
 
-func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (*dnsmessage.Msg, error) {
+func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (result *dnsmessage.Msg, resultErr error) {
+	if rt := c.runtime(); rt != nil && rt.capture != nil {
+		if trace := rt.capture.NewTrace(); trace != nil {
+			start := time.Now()
+			defer func() {
+				var q dnsmessage.Msg
+				if q.Unpack(data) == nil {
+					name := ""
+					if upstream != nil {
+						name = upstream.String()
+					}
+					c.captureDNSSampled(trace, "dns_upstream", name, "", "not_applicable", start, &q, result, resultErr)
+				}
+			}()
+		}
+	}
+
 	c.requireStore()
 	key := newDnsForwarderKey(upstream, dialArg)
 	for range 2 {

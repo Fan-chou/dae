@@ -8,6 +8,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"github.com/daeuniverse/dae/component/observation"
 	"net/netip"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 var lookupSystemDns = netutils.SystemDns
 
 type dnsControllerRuntimeState struct {
+	capture                *observation.Collector
 	routing                *dns.Dns
 	lifecycleCtx           context.Context
 	cacheAccessCallback    func(cache *DnsCache) (err error)
@@ -145,6 +147,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		lifecycleCtx = context.Background()
 	}
 	runtimeState := &dnsControllerRuntimeState{
+		capture:                option.Capture,
 		routing:                routing,
 		lifecycleCtx:           lifecycleCtx,
 		cacheAccessCallback:    option.CacheAccessCallback,
@@ -196,7 +199,17 @@ func fakeIPClientFromReq(req *udpRequest) (netip.Addr, [6]byte) {
 	return netip.Addr{}, mac
 }
 
-func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed []byte, req *udpRequest) []byte {
+func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed []byte, req *udpRequest) (result []byte) {
+	if rt := c.runtime(); rt != nil && rt.capture != nil {
+		if trace := rt.capture.NewTrace(); trace != nil {
+			defer func() {
+				var msg dnsmessage.Msg
+				if msg.Unpack(result) == nil {
+					c.captureDNSReplySampled(trace, &msg, req)
+				}
+			}()
+		}
+	}
 	prefetch := func(answer []byte) {
 		if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
 			return
@@ -230,6 +243,11 @@ func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed [
 }
 
 func (c *DnsController) rewriteClientMsg(msg *dnsmessage.Msg, req *udpRequest) {
+	if rt := c.runtime(); rt != nil && rt.capture != nil {
+		if trace := rt.capture.NewTrace(); trace != nil {
+			defer func() { c.captureDNSReplySampled(trace, msg, req) }()
+		}
+	}
 	policy := c.fakeIPPolicy()
 	if policy == nil || msg == nil {
 		if resolveDNSPrefetchAnswer(msg) && len(msg.Question) > 0 {

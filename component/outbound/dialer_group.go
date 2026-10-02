@@ -85,6 +85,8 @@ func skipBeyondExcluded(skip map[*dialer.Dialer]struct{}, excluded *dialer.Diale
 }
 
 type DialerGroup struct {
+	quality    *qualityRuntime
+	hasQuality bool
 	netproxy.Dialer
 
 	log              *logrus.Logger
@@ -142,6 +144,7 @@ type DialerGroup struct {
 	// Snapshots share the table so first-byte pin still lands on the live map
 	// without retaining the full group on established flows.
 	siteSticky     *siteStickyTable
+	siteStickyUDP  *siteStickyTable
 	siteStickyTree []*siteStickyTable
 	// establishedSnapshot is set on SnapshotForEstablishedFlow views so Close
 	// does not detach the live sticky table, and PinSite uses siteStickyTree
@@ -187,6 +190,7 @@ type dialerGroupMember struct {
 // defers those checks until the group participates in a real selection; it
 // must not invent a second probe layer on its own.
 type DialerGroupRuntimeOptions struct {
+	Quality            QualityOptions
 	IsolateTransport   bool
 	HealthCheckEnabled bool
 	Lazy               bool
@@ -233,7 +237,11 @@ func NewDialerGroupWithRuntimeOptions(
 		healthCheckEnabled: runtimeOptions.HealthCheckEnabled,
 		lazyCheck:          runtimeOptions.Lazy,
 		siteSticky:         newSiteStickyTable(),
+		siteStickyUDP:      newSiteStickyTable(),
 	}
+	group.initStickyRecoveryLog()
+	group.quality = newQualityRuntime(name, runtimeOptions.Quality, log)
+	group.hasQuality = group.quality != nil
 	group.installAlivePublisher(aliveChangeCallback)
 	state := group.buildSelectionState(p, true)
 	group.registerAliveDialerSets(state.aliveDialerSets)
@@ -363,6 +371,11 @@ func NewNestedDialerGroupWithRuntimeOptions(
 	}
 	group := NewDialerGroupWithRuntimeOptions(option, name, groupDialers, groupAnnotations, p, aliveChangeCallback, runtimeOptions)
 	group.nestedMembers = internalMembers
+	for _, member := range internalMembers {
+		if member.group != nil && member.group.hasQuality {
+			group.hasQuality = true
+		}
+	}
 	group.concreteDialers = leafDialers
 	group.parentHealthViews = parentHealthViews
 	group.skipAdmissionFallback = skipAdmissionFallback
@@ -577,6 +590,9 @@ func (g *DialerGroup) Close() error {
 		return nil
 	}
 	g.closeOnce.Do(func() {
+		if g.quality != nil {
+			g.quality.close()
+		}
 		g.unregisterAliveDialerSets(g.currentSelectionState().aliveDialerSets)
 		for _, member := range g.nestedMembers {
 			if member.group != nil {
@@ -588,6 +604,7 @@ func (g *DialerGroup) Close() error {
 		// the replacement group. Established-flow snapshots must not detach.
 		if !g.establishedSnapshot && g.siteSticky != nil {
 			g.siteSticky.detach()
+			g.siteStickyUDP.detach()
 		}
 	})
 	return nil
@@ -624,6 +641,7 @@ func (g *DialerGroup) snapshotForEstablishedFlow(selected *dialer.Dialer, tables
 		IsolateTransport:       g.IsolateTransport,
 		cachedMinCheckInterval: g.cachedMinCheckInterval,
 		siteSticky:             g.siteSticky,
+		siteStickyUDP:          g.siteStickyUDP,
 		siteStickyTree:         uniqueStickyTables(append([]*siteStickyTable(nil), tables...)),
 		establishedSnapshot:    true,
 		nowFn:                  g.nowFn,
@@ -640,6 +658,9 @@ func (g *DialerGroup) snapshotForEstablishedFlow(selected *dialer.Dialer, tables
 
 func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	g.selectionStateMu.Lock()
+	if g.quality != nil {
+		g.quality.reset()
+	}
 	defer func() {
 		g.kernelAliveEpoch.Add(1)
 		g.selectionStateMu.Unlock()
@@ -1317,9 +1338,9 @@ func (g *DialerGroup) SelectWithPath(networkType *dialer.NetworkType, strictIpVe
 func (g *DialerGroup) selectWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, activateLazy bool, site string, path *selectPathBuilder) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
 	if path == nil && len(g.nestedMembers) != 0 {
 		var scratch selectPathBuilder
-		return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site), activateLazy, site, true, true, &scratch)
+		return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site, networkType), activateLazy, site, true, true, &scratch)
 	}
-	return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site), activateLazy, site, true, true, path)
+	return g.selectWithSkip(networkType, strictIpVersion, excluded, g.siteHoldDownSet(site, networkType), activateLazy, site, true, true, path)
 }
 
 func (g *DialerGroup) selectWithSkip(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer, skip map[*dialer.Dialer]struct{}, activateLazy bool, site string, allowLastResort bool, applyHoldDown bool, path *selectPathBuilder) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, stable bool, err error) {
@@ -1338,14 +1359,16 @@ func (g *DialerGroup) selectWithSkip(networkType *dialer.NetworkType, strictIpVe
 	if activateLazy {
 		g.activateLazyCheck()
 	}
-	path.addSticky(g)
+	path.addSticky(g, networkType)
 	combined := mergeDialerSkip(excluded, skip)
-	if applyHoldDown {
-		if pinned, extra, hit := g.stickyOverride(site, networkType, excluded); hit {
+	if applyHoldDown && !(g.quality != nil && g.quality.options.Mode == "enforce" && StickyKey(site) != "" && networkType != nil && networkType.L4Proto == consts.L4ProtoStr_TCP) {
+		if pinned, extra, hit := g.stickyOverride(site, networkType, excluded, path); hit {
 			if !dialerSkipped(pinned, combined) {
-				selected := preferAlternateSelectionNetworkType(pinned, networkType)
-				return pinned, 0, selected, true, nil
+				return pinned, 0, preferAlternateSelectionNetworkType(pinned, networkType), true, nil
 			}
+			// A parent-level skip rejected the trial candidate before any
+			// connection was made; that is not evidence against the node.
+			path.abandonRecovery()
 		} else if extra != nil && extra != excluded {
 			combined = mergeDialerSkip(extra, combined)
 		}
@@ -1472,6 +1495,7 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 			d, latency, selectedNetworkType, stable, sub, err := g.pickNestedMember(networkType, policy.Policy, member, skip, false, activateLazy, site, applyHoldDown, path)
 			if err == nil {
 				if g.nestedLeafFallbackAdmission(d, selectedNetworkType) == dialer.AdmissionAlive {
+					degradedPath.abandonRecovery()
 					path.adopt(member, &sub)
 					return d, latency, selectedNetworkType, stable, nil
 				}
@@ -1479,10 +1503,13 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 					degraded, degradedLatency, degradedNetworkType, degradedStable = d, latency, selectedNetworkType, stable
 					degradedMember = member
 					degradedPath = sub
+				} else {
+					sub.abandonRecovery()
 				}
 				continue
 			}
 			if !errors.Is(err, ErrNoAliveDialer) {
+				degradedPath.abandonRecovery()
 				return nil, latency, selectedNetworkType, false, err
 			}
 		}
@@ -1508,11 +1535,22 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 					picks = append(picks, pick)
 				}
 				if best.d == nil || latency < best.latency {
+					if !needPicks {
+						best.path.abandonRecovery()
+					}
 					best = pick
+				} else if !needPicks {
+					pick.path.abandonRecovery()
 				}
 				continue
 			}
 			if !errors.Is(err, ErrNoAliveDialer) {
+				// Tokens taken while evaluating earlier members will never
+				// get a connection now.
+				best.path.abandonRecovery()
+				for i := range picks {
+					picks[i].path.abandonRecovery()
+				}
 				return nil, latency, memberNetworkType, false, err
 			}
 		}
@@ -1521,6 +1559,11 @@ func (g *DialerGroup) selectNestedForNetworkType(networkType *dialer.NetworkType
 		}
 		if needPicks {
 			best = g.preferNestedIncumbent(networkType, skip, picks, best)
+			for i := range picks {
+				if picks[i].path.recovery != best.path.recovery {
+					picks[i].path.abandonRecovery()
+				}
+			}
 		}
 		if activateLazy {
 			g.storeNestedIncumbent(networkType, best.d)
@@ -1620,6 +1663,7 @@ func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy
 	// Fixed children ignore skip by design, so the concrete leaf must be
 	// rejected here or fallback never reaches the next parent member.
 	if err == nil && d != nil && !fixed && dialerSkipped(d, skip) {
+		first.abandonRecovery()
 		return nil, time.Hour, nil, false, ErrNoAliveDialer
 	}
 	if err == nil && d != nil && activateLazy {
@@ -1631,6 +1675,8 @@ func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy
 	if err != nil || len(g.parentHealthViews) == 0 || policy == consts.DialerSelectionPolicy_Fixed {
 		if err == nil {
 			path.take(&first)
+		} else {
+			first.abandonRecovery()
 		}
 		return d, latency, selectedNetworkType, stable, err
 	}
@@ -1639,6 +1685,9 @@ func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy
 		path.take(&first)
 		return d, latency, selectedNetworkType, stable, nil
 	}
+	// The parent health view rejected this leaf; the child's trial, if any,
+	// never gets a connection.
+	first.abandonRecovery()
 
 	// A parent rejection is local to the parent health view. Give a non-fixed
 	// child one opportunity to select another concrete leaf before this parent
@@ -1652,6 +1701,7 @@ func (g *DialerGroup) selectNestedMember(networkType *dialer.NetworkType, policy
 			path.take(&retry)
 			return d, latency, selectedNetworkType, stable, nil
 		}
+		retry.abandonRecovery()
 		if err != nil && !errors.Is(err, ErrNoAliveDialer) {
 			return nil, latency, selectedNetworkType, false, err
 		}
@@ -1709,7 +1759,7 @@ func (m dialerGroupMember) selectForNestedGroup(networkType *dialer.NetworkType,
 	if m.group != nil {
 		childSkip := skip
 		if applyHoldDown {
-			childSkip = mergeSkipMaps(skip, m.group.siteHoldDownSet(site))
+			childSkip = mergeSkipMaps(skip, m.group.siteHoldDownSet(site, networkType))
 		}
 		return m.group.selectWithSkip(networkType, true, nil, childSkip, activateLazy, site, false, applyHoldDown, path)
 	}

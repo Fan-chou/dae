@@ -24,6 +24,7 @@ type TcpRouteBinding struct {
 // It is intentionally distinct from TcpRouteBinding because dialer health may
 // affect a new selection without rewriting the policy chosen for a live connection.
 type TcpEgressBinding struct {
+	Quality       *outbound.QualityFlow
 	Dialer        *dialer.Dialer
 	Outbound      *outbound.DialerGroup
 	Target        string
@@ -53,6 +54,7 @@ func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult,
 	binding.Route.Must = result.Must
 	binding.Egress = TcpEgressBinding{
 		Dialer:        result.Dialer,
+		Quality:       result.Quality,
 		Outbound:      result.Outbound,
 		Target:        result.DialTarget,
 		Network:       result.Network,
