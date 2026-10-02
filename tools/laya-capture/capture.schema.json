@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kdae-capture-v1",
+  "description": "Transport-only passive facts. validate.py additionally checks cross-field consistency. Not the V4 model contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "active_ms",
+    "adapter_status",
+    "control",
+    "counter_alignment",
+    "demand",
+    "dependency",
+    "down_bytes",
+    "duration_ms",
+    "episode_id",
+    "first_downstream_callback_ms",
+    "generation",
+    "id",
+    "inclusion_probability",
+    "measurement_mode",
+    "missing_reason",
+    "node_down_bytes",
+    "node_up_bytes",
+    "outcome",
+    "partial",
+    "read_paused_ms",
+    "schema",
+    "scope",
+    "sequence",
+    "stage",
+    "start_ms",
+    "trigger",
+    "up_bytes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "kdae-capture-v1"
+    },
+    "partial": {
+      "type": "boolean"
+    },
+    "episode_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9-]{1,160}$"
+    },
+    "active_ms": {
+      "type": "null"
+    },
+    "start_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "read_paused_ms": {
+      "type": "null"
+    },
+    "trigger": {
+      "enum": [
+        "uniform_flow",
+        "uniform_route"
+      ]
+    },
+    "node_up_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "missing_reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_ms",
+        "control",
+        "demand",
+        "dependency",
+        "flow_bytes",
+        "node_bytes",
+        "read_paused_ms"
+      ],
+      "properties": {
+        "control": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "flow_bytes": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "demand": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "active_ms": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "node_bytes": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "dependency": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        },
+        "read_paused_ms": {
+          "type": "string",
+          "pattern": "^[a-z_]*$"
+        }
+      }
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "demand": {
+      "type": "null"
+    },
+    "generation": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9-]{1,160}$"
+    },
+    "down_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "node_down_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9-]{1,160}$"
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "site_id",
+        "node_id",
+        "group_id",
+        "network",
+        "path",
+        "policy_epoch"
+      ],
+      "properties": {
+        "site_id": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{32})?$"
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{32})?$"
+        },
+        "group_id": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{32})?$"
+        },
+        "network": {
+          "enum": [
+            "unknown",
+            "tcp4",
+            "tcp6",
+            "tcp",
+            "tcp(4)",
+            "tcp(6)"
+          ]
+        },
+        "path": {
+          "enum": [
+            "unknown",
+            "direct",
+            "proxy"
+          ]
+        },
+        "policy_epoch": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "counter_alignment": {
+      "enum": [
+        "best_effort_non_atomic_snapshots",
+        "not_applicable"
+      ]
+    },
+    "outcome": {
+      "enum": [
+        "open",
+        "relay_ended",
+        "relay_error",
+        "offload_error",
+        "adopt_abandoned",
+        "canceled",
+        "success",
+        "route_error"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "relay",
+        "route_resolve_dial"
+      ]
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "up_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "first_downstream_callback_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "adapter_status": {
+      "const": "adapter_abstain"
+    },
+    "control": {
+      "type": "null"
+    },
+    "measurement_mode": {
+      "enum": [
+        "userspace_accounting",
+        "offload_or_unmeasured",
+        "stage_only"
+      ]
+    },
+    "inclusion_probability": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1
+    },
+    "dependency": {
+      "type": "null"
+    }
+  }
+}

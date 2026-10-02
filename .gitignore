@@ -36,3 +36,6 @@ control.test
 prof/
 kix-discipline/
 api-divergences.png
+/data/
+/docs/research/
+/tools/laya-dataset/

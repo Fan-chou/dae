@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kdae-evidence-events-v1",
+  "description": "Run evidence.py for required cross-field consistency and provenance checks. Not a model input contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generation",
+    "sequence",
+    "id",
+    "flow_id",
+    "capture_episode_id",
+    "kind",
+    "scope",
+    "target_id",
+    "target_kind",
+    "client_id",
+    "start_ms",
+    "duration_ms",
+    "outcome",
+    "dns",
+    "load",
+    "inclusion_probability",
+    "source",
+    "sampling_frame"
+  ],
+  "properties": {
+    "schema": {
+      "const": "kdae-evidence-events-v1"
+    },
+    "generation": {
+      "type": "string"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "type": "string"
+    },
+    "flow_id": {
+      "type": "string"
+    },
+    "capture_episode_id": {
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "selection_resolution",
+        "dial",
+        "flow_link",
+        "relay_end",
+        "load_window",
+        "dns_upstream",
+        "dns_client_reply",
+        "dns_cache_hit",
+        "smartdns_audit"
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "site_id",
+        "node_id",
+        "group_id",
+        "network",
+        "path",
+        "policy_epoch"
+      ],
+      "properties": {
+        "site_id": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{32})?$"
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{32})?$"
+        },
+        "group_id": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{32})?$"
+        },
+        "network": {
+          "enum": [
+            "unknown",
+            "dns",
+            "tcp",
+            "tcp4",
+            "tcp6",
+            "tcp(4)",
+            "tcp(6)"
+          ]
+        },
+        "path": {
+          "enum": [
+            "unknown",
+            "direct",
+            "proxy"
+          ]
+        },
+        "policy_epoch": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "target_id": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{32})?$"
+    },
+    "target_kind": {
+      "type": "string"
+    },
+    "client_id": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{32})?$"
+    },
+    "start_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 253402300799999
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "dns": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "qtype",
+            "rcode",
+            "answer_ips",
+            "fake_ips",
+            "truncated",
+            "cache_status",
+            "filter_reason",
+            "upstream_id",
+            "answer_ids"
+          ],
+          "properties": {
+            "qtype": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "answer_ips": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fake_ips": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rcode": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4095
+            },
+            "truncated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "cache_status": {
+              "enum": [
+                "unknown",
+                "not_applicable",
+                "hit",
+                "stale_hit"
+              ]
+            },
+            "filter_reason": {
+              "const": "unobserved"
+            },
+            "upstream_id": {
+              "type": "string",
+              "pattern": "^([0-9a-f]{32})?$"
+            },
+            "answer_ids": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "load": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "own_up_bytes",
+            "own_down_bytes",
+            "other_up_bytes",
+            "other_down_bytes",
+            "active_connections_at_snapshot",
+            "starts_total_at_snapshot",
+            "alignment",
+            "missing_reason"
+          ],
+          "properties": {
+            "own_up_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "own_down_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "other_up_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "other_down_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "active_connections_at_snapshot": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "starts_total_at_snapshot": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "alignment": {
+              "const": "best_effort_non_atomic_snapshots"
+            },
+            "missing_reason": {
+              "type": "string",
+              "pattern": "^[a-z_]*$"
+            }
+          }
+        }
+      ]
+    },
+    "inclusion_probability": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0,
+      "maximum": 1
+    },
+    "source": {
+      "type": "string"
+    },
+    "sampling_frame": {
+      "type": "string"
+    },
+    "error_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage"
+      ],
+      "properties": {
+        "class": {
+          "enum": [
+            "none",
+            "canceled",
+            "timeout",
+            "connection_reset",
+            "connection_refused",
+            "network_unreachable",
+            "host_unreachable",
+            "broken_pipe",
+            "closed",
+            "unknown"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "dial",
+            "selection_resolution",
+            "adopt",
+            "relay",
+            "offload"
+          ]
+        }
+      }
+    }
+  }
+}

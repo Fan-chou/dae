@@ -1,0 +1,10 @@
+__pycache__/
+archive/
+archives/
+data/
+*.jsonl
+*.manifest.json
+cursor.json
+latest-status.json
+collector.lock
+*.key
