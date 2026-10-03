@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,22 @@ func TestSpliceCaptureLiveAccounting(t *testing.T) {
 	if os.Getenv("KDAE_SPLICE_LIVE_CHECK") != "1" {
 		t.Skip("target-machine measurement; opt in explicitly")
 	}
+	testSpliceCaptureLiveAccounting(t, false)
+}
+
+func TestSpliceCaptureLiveConcurrentAccounting(t *testing.T) {
+	if os.Getenv("KDAE_SPLICE_LIVE_CHECK") != "1" {
+		t.Skip("target-machine measurement; opt in explicitly")
+	}
+	for _, name := range []string{"download-0", "download-1", "upload-0", "upload-1"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testSpliceCaptureLiveAccounting(t, strings.HasPrefix(name, "upload"))
+		})
+	}
+}
+
+func testSpliceCaptureLiveAccounting(t *testing.T, upload bool) {
 	pair := func() (*net.TCPConn, *net.TCPConn) {
 		ln, err := net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
@@ -105,7 +122,13 @@ func TestSpliceCaptureLiveAccounting(t *testing.T) {
 	defer cancel()
 	started := time.Now()
 	// Calls the same explicit splice loop selected by relayFastCopy in production.
-	transferred, err := relayFastCopy(ctx, destination, source, f.recordDownload, func(int64) {})
+	record := f.recordDownload
+	direction := "download"
+	if upload {
+		record = f.recordUpload
+		direction = "upload"
+	}
+	transferred, err := relayFastCopy(ctx, destination, source, record, func(int64) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,10 +143,17 @@ func TestSpliceCaptureLiveAccounting(t *testing.T) {
 		t.Fatal(received.err)
 	}
 	captured.Finish("relay_ended")
-	if transferred != expected || received.n != expected || f.downloadBytes.Load() != expected {
-		t.Fatalf("transfer=%d receive=%d flow=%d expected=%d", transferred, received.n, f.downloadBytes.Load(), expected)
+	flowBytes := f.downloadBytes.Load()
+	if upload {
+		flowBytes = f.uploadBytes.Load()
 	}
-	_, node, ok := d.LoadTotals()
+	if transferred != expected || received.n != expected || flowBytes != expected {
+		t.Fatalf("transfer=%d receive=%d flow=%d expected=%d", transferred, received.n, flowBytes, expected)
+	}
+	nodeUp, node, ok := d.LoadTotals()
+	if upload {
+		node = nodeUp
+	}
 	if !ok || node != expected {
 		t.Fatalf("node=%d expected=%d", node, expected)
 	}
@@ -149,20 +179,24 @@ func TestSpliceCaptureLiveAccounting(t *testing.T) {
 	valid, partial := 0, 0
 	var maxDifference uint64
 	for _, r := range records {
-		if r.Down == nil {
+		flowWindow, nodeWindow := r.Down, r.NodeDown
+		if upload {
+			flowWindow, nodeWindow = r.Up, r.NodeUp
+		}
+		if flowWindow == nil {
 			t.Fatal("splice bytes marked unmeasured")
 		}
-		sum += *r.Down
+		sum += *flowWindow
 		if r.Partial {
 			partial++
 			continue
 		}
-		if r.NodeDown == nil {
+		if nodeWindow == nil {
 			t.Fatalf("node window missing: %s", r.Missing.Node)
 		}
 		valid++
-		difference := *r.NodeDown - *r.Down
-		if *r.NodeDown < *r.Down {
+		difference := *nodeWindow - *flowWindow
+		if *nodeWindow < *flowWindow {
 			t.Fatal("node count smaller than isolated flow")
 		}
 		if difference > maxDifference {
@@ -179,7 +213,7 @@ func TestSpliceCaptureLiveAccounting(t *testing.T) {
 	if stats.InvalidWindow != 0 || stats.QueueDropped != 0 {
 		t.Fatal(stats)
 	}
-	result := map[string]any{"bytes_sent": expected, "bytes_received": received.n, "splice_bytes": transferred, "node_bytes": node, "flow_bytes": f.downloadBytes.Load(), "archived_bytes": sum, "valid_windows": valid, "partial_windows": partial, "max_window_snapshot_difference_bytes": maxDifference, "snapshot_difference_limit_bytes": relaySpliceMaxStep, "invalid_window": stats.InvalidWindow, "queue_dropped": stats.QueueDropped, "duration_seconds": time.Since(started).Seconds(), "scope": "isolated_loopback_tcp_actual_splice_production_accounting"}
+	result := map[string]any{"test_case": t.Name(), "direction": direction, "bytes_sent": expected, "bytes_received": received.n, "splice_bytes": transferred, "node_bytes": node, "flow_bytes": flowBytes, "archived_bytes": sum, "valid_windows": valid, "partial_windows": partial, "max_window_snapshot_difference_bytes": maxDifference, "snapshot_difference_limit_bytes": relaySpliceMaxStep, "invalid_window": stats.InvalidWindow, "queue_dropped": stats.QueueDropped, "duration_seconds": time.Since(started).Seconds(), "scope": "isolated_loopback_tcp_actual_splice_production_accounting"}
 	raw, _ := json.Marshal(result)
 	fmt.Printf("SPLICE_CAPTURE_RESULT %s\n", raw)
 }
