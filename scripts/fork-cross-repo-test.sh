@@ -61,21 +61,37 @@ per_repo_timeout="${FORK_TEST_TIMEOUT:-600}"
 # must use the selected version, not a stale textual requirement or only the
 # subset of forks represented by replace directives.
 parse_forks() {
-  local modules target version commit
-  modules="$(go list -m -f '{{with .Replace}}{{.Path}} {{.Version}}{{else}}{{.Path}} {{.Version}}{{end}}' all)" || return 1
-  while read -r target version; do
-    case "$target" in
-      github.com/olicesx/*) ;;
+  local modules logical target version commit localdir
+  local outbound_seen=0 quic_seen=0 qpack_seen=0
+  modules="$(go list -m -f '{{.Path}} {{with .Replace}}{{.Path}} {{.Version}}{{else}}{{.Path}} {{.Version}}{{end}}' all)" || return 1
+  while read -r logical target version; do
+    case "$logical" in
+      github.com/daeuniverse/outbound)
+        localdir=outbound
+        outbound_seen=$((outbound_seen + 1))
+        ;;
+      github.com/olicesx/quic-go)
+        localdir=quic-go
+        quic_seen=$((quic_seen + 1))
+        ;;
+      github.com/olicesx/qpack)
+        localdir=qpack
+        qpack_seen=$((qpack_seen + 1))
+        ;;
       *) continue ;;
     esac
     commit="${version##*-}"
-    if [[ "$commit" =~ ^[0-9a-f]{12}$ ]]; then
-      printf '%s|%s|%s\n' "${target##*/}" "$target" "$commit"
+    if [[ "$target" == github.com/*/* && "$commit" =~ ^[0-9a-f]{12}$ ]]; then
+      printf '%s|%s|%s\n' "$localdir" "$target" "$commit"
     else
       echo "fork-cross-repo-test: unsupported owned fork version: $target $version" >&2
       return 1
     fi
   done <<< "$modules"
+  if [[ "$outbound_seen" -ne 1 || "$quic_seen" -ne 1 || "$qpack_seen" -ne 1 ]]; then
+    echo "fork-cross-repo-test: incomplete or duplicate fork graph (outbound=$outbound_seen quic-go=$quic_seen qpack=$qpack_seen)" >&2
+    return 1
+  fi
 }
 
 forks="$(parse_forks)" || exit 2
@@ -108,28 +124,33 @@ while IFS='|' read -r localdir target commit; do
       skipped=$((skipped + 1))
       continue
     fi
-    source_path="$temp_root/source-$localdir"
-    if [[ "$dry_run" -ne 1 ]]; then
-      echo "cloning https://$target.git"
-      git clone --filter=blob:none --no-checkout "https://$target.git" "$source_path"
-    fi
+    source_path=""
   fi
   if [[ "$dry_run" -eq 1 ]]; then
     echo "DRY-RUN: would prepare $target @ $commit and run: ${test_args[*]}"
     continue
   fi
-  if ! git -C "$source_path" cat-file -e "${commit}^{commit}" 2>/dev/null; then
-    echo "commit $commit not present; fetching exact revision from origin..."
-    git -C "$source_path" fetch --depth=1 origin "$commit"
-  fi
   run_path="$temp_root/run-$localdir"
-  git -C "$source_path" worktree add --detach "$run_path" "$commit" >/dev/null
+  if [[ -n "$source_path" ]]; then
+    # A sibling is a read-only object source. Its origin may be another fork,
+    # and tests must not leave worktree metadata or fetched refs in it.
+    git clone --shared --no-checkout "$source_path" "$run_path" >/dev/null
+  else
+    git clone --filter=blob:none --no-checkout "https://$target.git" "$run_path" >/dev/null
+  fi
+  if ! git -C "$run_path" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+    # GitHub does not accept arbitrary abbreviated SHA wants. Fetch branch
+    # history from the effective replacement repository, then resolve the pin.
+    git -C "$run_path" fetch --no-tags "https://$target.git" '+refs/heads/*:refs/remotes/fork-test/*'
+  fi
+  git -C "$run_path" checkout --detach "$commit" >/dev/null
   echo "=== $localdir @ $commit ($run_path) ==="
   if (
     cd "$run_path"
     # QPACK's interoperability corpus is a pinned submodule, not part of
     # the module zip. Prepare it before testing the exact fork worktree.
     git submodule update --init --recursive || exit 1
+    export GOWORK=off
     # Per-repo timeout prevents a hung integration test from hiding the
     # other fork's result.
     timeout "${per_repo_timeout}" "${test_args[@]}"
@@ -138,7 +159,7 @@ while IFS='|' read -r localdir target commit; do
   else
     failures=$((failures + 1))
   fi
-  git -C "$source_path" worktree remove --force "$run_path"
+  rm -rf "$run_path"
 done <<< "$forks"
 if [[ $skipped -gt 0 ]]; then
   echo "fork-cross-repo-test: skipped $skipped/$repo_count fork repo(s)." >&2

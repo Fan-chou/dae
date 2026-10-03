@@ -36,7 +36,7 @@ func TestForkHarnessUsesEffectiveModuleGraph(t *testing.T) {
 }
 
 func TestForkHarnessRejectsUnsupportedOwnedVersion(t *testing.T) {
-	output, err := runForkHarness(t, `printf '%s\n' 'github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260904160206-324aa7fd9b7d' 'github.com/olicesx/qpack v1.0.0'`)
+	output, err := runForkHarness(t, `printf '%s\n' 'github.com/daeuniverse/outbound github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260904160206-324aa7fd9b7d' 'github.com/olicesx/qpack github.com/olicesx/qpack v1.0.0'`)
 	if err == nil {
 		t.Fatalf("unsupported owned fork was silently omitted:\n%s", output)
 	}
@@ -52,6 +52,35 @@ func TestForkHarnessRejectsModuleGraphFailure(t *testing.T) {
 	}
 	if strings.Contains(output, "DRY-RUN:") {
 		t.Fatalf("tested an incomplete module graph:\n%s", output)
+	}
+}
+
+func TestForkHarnessFollowsReplacementRepositories(t *testing.T) {
+	output, err := runForkHarness(t, `printf '%s\n' 'github.com/daeuniverse/outbound github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20260916163737-8a6bd0300c3f' 'github.com/olicesx/quic-go github.com/Fan-chou/quic-go v0.0.0-20260916162732-e64dc7a1252e' 'github.com/olicesx/qpack github.com/another-mirror/header-codec v0.0.0-20260831031549-0844ed36f1cd'`)
+	if err != nil {
+		t.Fatalf("replacement graph failed: %v\n%s", err, output)
+	}
+	for _, target := range []string{"github.com/Fan-chou/outbound @ 8a6bd0300c3f", "github.com/Fan-chou/quic-go @ e64dc7a1252e", "github.com/another-mirror/header-codec @ 0844ed36f1cd"} {
+		if !strings.Contains(output, target) {
+			t.Errorf("missing %q: %s", target, output)
+		}
+	}
+	if strings.Count(output, "DRY-RUN:") != 3 {
+		t.Fatalf("partial graph tested: %s", output)
+	}
+}
+
+func TestForkHarnessRejectsMissingOrDuplicateModules(t *testing.T) {
+	for _, graph := range []string{
+		"github.com/olicesx/qpack github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd",
+		"github.com/daeuniverse/outbound github.com/Fan-chou/outbound v0.0.0-20260916163737-8a6bd0300c3f\ngithub.com/daeuniverse/outbound github.com/olicesx/outbound v0.0.0-20260916163737-8a6bd0300c3f\ngithub.com/olicesx/quic-go github.com/Fan-chou/quic-go v0.0.0-20260916162732-e64dc7a1252e\ngithub.com/olicesx/qpack github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd",
+	} {
+		t.Run(graph, func(t *testing.T) {
+			output, err := runForkHarness(t, `printf '%s\n' `+"'"+graph+"'")
+			if err == nil || strings.Contains(output, "DRY-RUN:") {
+				t.Fatalf("incomplete/duplicate graph accepted: %v\n%s", err, output)
+			}
+		})
 	}
 }
 
@@ -90,10 +119,10 @@ replace (
 	if err := os.WriteFile(filepath.Join(bin, "go"), []byte("#!/usr/bin/env bash\n"+goBody+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	graph := "github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260904160206-324aa7fd9b7d\n" +
-		"github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d\n" +
-		"github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd\n" +
-		"github.com/other/unrelated v0.0.0-20260831031549-0844ed36f1cd"
+	graph := "github.com/daeuniverse/outbound github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260904160206-324aa7fd9b7d\n" +
+		"github.com/olicesx/quic-go github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d\n" +
+		"github.com/olicesx/qpack github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd\n" +
+		"github.com/other/unrelated github.com/other/unrelated v0.0.0-20260831031549-0844ed36f1cd"
 	cmd = exec.Command("bash", filepath.Join(wd, "fork-cross-repo-test.sh"), "--dry-run", "--clone-missing", "--short", "--strict", "--", "-race", "-p=1")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FORK_TEST_MODULE_GRAPH="+graph)
