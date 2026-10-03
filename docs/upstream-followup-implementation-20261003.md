@@ -431,6 +431,43 @@ reload 会保留部分 UDP 路由与 endpoint；observer 新代不接管旧账�
 
 长期候选 `build/upstream-wan-20261003/cs2-sdr-201.dae` 仅包含 201 到 hkg／sgp 的 16 个精确 IPv4、UDP 27015–27060 的 must_direct 规则，计划单独 include 在 `routing.dae` 前。223 使用以 .dae 结尾的暂存 root／fragment 联合验证通过；暂存文件由 EXIT 清理，生产配置哈希不变，未 reload 或加载候选。此前是限时试验，长期保留规则的选择待用户确认。
 
+#### 再次复现与第一跳分片
+
+用户同意只记录包头、不改路由后，13:31–13:34 UTC 在 br-lan 与 IEPL 同期记录有限 IP／UDP 头部文本，未保存 PCAP 或游戏载荷。用户再次搜索后确认相同网络错误；控制台仍是大陆 12 个中继有效、hkg／sgp 没有有效直接测量、No official datacenters pingable，匹配延迟上限 50 ms。
+
+LAN 窗口共 848 包，其中发送 656、回复 192。hkg／sgp 的 **18 条捕获流发送 34 个 1300 字节 UDP 载荷，未见对应回复**；不能用 34÷2 推流数，末尾两条流各只捕获到一个请求。其余捕获流包括大陆中继的双向包。路由日志确认这些 hkg／sgp 流仍是 `Cherry_Proxy` → `HK_GG_IPLC_Dmit_HK`，并通过连接关闭日志中的地址关联到独立 SS carrier 端口。
+
+对应 34 个请求在 IEPL 上均形成 **34 首片＋34 尾片**：SS UDP 载荷 1366 字节，原始外层 IPv4 包 1394 字节，超过接口及 socket 路径 MTU 1320；首片 IPv4 长度 1316、尾片 98、偏移 1296，IP ID 和时序匹配。捕获窗口内未见这些 carrier 的入向首片。LAN／IEPL tcpdump 的 kernel dropped 均为 0；接口抓取仍不能代替远端接收证据。
+
+这确认了实际游戏包长、生产节点选择和本机出向分片，**没有证明远端收到、重组、解密或转发，也没有定位确切丢包跳数**。小包 DNS 健康探测与 SDR 的工作负载不同；分片存在本身不能证明分片导致匹配失败。
+
+#### 独立 UDP 诊断工具与限制
+
+新增 opt-in `TestUDPProxyWANLive` 与 `hack/test-udp-proxy-wan.py`，客户端使用 220；223 原地读取节点凭据，仅允许固定 DNS 目标、固定问题及零填充私有 EDNS 选项 65001。每请求上限 1800 字节、最多 48 次、单次 4 秒，整个 fixture 有期限和内存限制，不创建控制平面、不改路由或接口 MTU。gateway 与 client 独立校验 DNS 事务／问题，并联合比较结果及长度；公网目标仍不可控，结果不能单独证明游戏路径 MTU。
+
+首批使用 EDNS Padding，后发现 [RFC 7830 §6](https://www.rfc-editor.org/rfc/rfc7830.html#section-6) 限定其用于加密 DNS；代理出口仍是普通 UDP DNS，因此这些结果保留为带协议干扰的探索记录，不用于判定 MTU。修正为 [RFC 6891](https://www.rfc-editor.org/rfc/rfc6891.html#section-6.1.2) 要求忽略的未知私有选项后，另做两个节点各 12 次的小批量复核。
+
+| 修正后探针（1.1.1.1、ReadFrom） | 有效 DNS 回复 | 读取超时 | 能力／校验失败 |
+| --- | --- | --- | --- |
+| 香港 SS | 6／12 | 6 | 0 |
+| 美国 Hysteria2 | 7／12 | 5 | 0 |
+
+香港 SS 的 1200 字节查询也两次超时，其观察到的封装外层约 1294 字节，小于 MTU；结果不支持“仅超过 1320 才失败”。TXT 回复全为 43 字节且 TC=1，未验证大回包。修正批次未覆盖 direct、第二 DNS 目标或 PacketReceiver；探索批中 SS receiver 不支持，已单列 capability failure，不能算网络丢包。
+
+Astra 独立离线复核确认上述计数、双端校验与结论边界。诊断日志直接写文件，错误用不含凭据的阶段／原因枚举，避免日志阻塞或把接口不支持混入超时。相关回包校验、查询策略 race 测试及 control vet 通过。生产二进制与依赖 pin 不因诊断工具改变。
+
+#### 香港 Hysteria2 限域对照
+
+用户明确批准五分钟对照后，13:41:28 UTC 仅将 **201 → hkg／sgp 的同一 16 个 IPv4、UDP 27015–27060** 导向新建 `CS2_SDR_Trial`，固定选择 `HK_DMIT_HK_Hysteria`，该临时组 quality off。其他组仍按已有配置工作。候选先用原地配置 validate；试验脚本在 EXIT／信号或五分钟期限结束时原子恢复 local.dae 并 reload，未重启进程。
+
+**13:42:30–13:43:38 UTC** 的 LAN 包头样本中，四条 hkg／sgp 流全部由同期路由日志确认走临时 Hysteria2 组，发送 2438 包、回复 2110 包，其中 1300 字节载荷上下行各 6 包。两个短测量流各为 8／8 包，一个为 17／17 包，另一个为 2405／2077 包。前两个流的 50411／50412 端口曾用于旧 SS 关联，13:41:50 已关闭，捕获中的 13:43:20 流量对应 Hysteria2 重建；不能仅按相同五元组混入旧日志。捕获在 5000 包额度处停止，filter received 为 5078、kernel dropped 为 0；这是截断样本，不能外推整局丢包率。
+
+用户随后确认 **“匹配成功”**，没有提供新的完整 RTT 表，因此不宣称测得特定延迟或更改了 50 ms 门槛。原 SS 路径再次报错、Hysteria2 新流有双向大包且匹配成功，加上此前直连恢复，支持将失败范围收窄到原 SS 节点的链路、服务端策略或协议处理路径。节点、传输和 SDR 五元组同时有所变化，仍不能单独证明 SS 协议、MTU 或某一跳是根因。确切定位需要原 SS 远端的接收／重组、解密后转发、SDR 回包和加密回送证据。
+
+五分钟后自动回滚完成。主代理 SSH 核对 PID 24157，binary／主配置／local／init 四个 SHA256 全符合基线；临时组、候选和配置备份均移除，UDP observer off，主要组继续 observe。已有 UDP 缓存可能延续试验路径，新流回到原规则；此次结果不代表长期规则已经生效。永久 direct 候选仍未加载。
+
+收尾 220 的 Google／Cloudflare 常规请求均为 204。223 status RSS 为 221.7 MiB，可用内存约 234 MiB；短时数据不能证明长期内存稳定。222 可用约 **4.5 GiB**，两个诊断构建均经解压 SHA256 验证后压缩归档，远端诊断二进制及本次临时目录清理，正式 Go／模块缓存保留。证据位于 `build/upstream-wan-20261003/cs2-{retest,hy2}-*`，没有导出配置、密钥或节点 URI。
+
 ### 223 再次观测
 
 **09:13:37–09:16:37 UTC**，七个 30 秒快照：新增 considered 169、sampled 3，10 条 capture、25 条 evidence 均通过 validator；generation 不变、游标缺口 0。两个完成流都是 proxy userspace_accounting，offload_unmeasured **0／2**；queue_dropped **0／10**。invalid_window 增量为 0，但没有可比较窗口，两个 relay 都是 flow_ended_before_node_snapshot，因此 splice 计数偏差仍不可评估。独立 WAN fixture 流量不经过生产 daemon 的采集，不能拿它充当这批 capture 样本。
