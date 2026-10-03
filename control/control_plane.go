@@ -250,6 +250,10 @@ func NewControlPlaneWithContextOptions(
 	if err := checkCtx("prepare"); err != nil {
 		return nil, err
 	}
+	droughtPolicy, err := global.UDPReplyDroughtPolicy()
+	if err != nil {
+		return nil, err
+	}
 
 	refactorFeatures := semanticRefactorFeatureGateSnapshot()
 
@@ -909,6 +913,10 @@ func NewControlPlaneWithContextOptions(
 		}
 	}
 	// New control plane.
+	udpReplyDrought := newUDPReplyDroughtObserver(droughtPolicy)
+	if udpReplyDrought != nil {
+		planeDeferFuncs = append(planeDeferFuncs, udpReplyDrought.Close)
+	}
 	cctx, cancel := context.WithCancel(context.Background())
 	plane = &ControlPlane{
 		capture:       capture,
@@ -956,6 +964,7 @@ func NewControlPlaneWithContextOptions(
 		mptcp:                         global.Mptcp,
 		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),
 		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
+			udpReplyDrought:      udpReplyDrought,
 			failedQuicDcidCache:  newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
 			udpDirectDispatchSem: make(chan struct{}, udpDirectDispatchConcurrency),
 		},
@@ -2999,10 +3008,15 @@ func (c *ControlPlane) DetachBpfHooks() error {
 // check results from the retiring generation cannot clobber the successor's
 // map entries.
 func (c *ControlPlane) MarkRetired() {
-	if c == nil || c.core == nil {
+	if c == nil {
 		return
 	}
-	c.core.markOutboundConnectivityRetired()
+	// Retained endpoints keep their original observer. Late callbacks cannot
+	// populate the successor's ledger or keep the old scanner alive.
+	_ = c.udpReplyDrought.Close()
+	if c.core != nil {
+		c.core.markOutboundConnectivityRetired()
+	}
 }
 
 // ResetGlobalUdpState clears all global UDP-related pools.
@@ -3095,6 +3109,7 @@ func (c *ControlPlane) Close() (err error) {
 	if c == nil {
 		return nil
 	}
+	_ = c.udpReplyDrought.Close()
 	c.closeRoutingEpochExecution()
 	c.ClearReloadDnsCacheSource()
 

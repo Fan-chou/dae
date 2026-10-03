@@ -140,6 +140,11 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 // invalidate the cached proxy IP on connection-refused. Returns true when the
 // error is fatal and delivery must stop.
 func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
+	if ue.replyDrought != nil {
+		// Decode/auth/truncation and transport errors leave reply evidence
+		// incomplete. They are never treated as a valid peer reply or drought.
+		ue.replyDrought.invalidate(time.Now())
+	}
 	switch errors.ClassifyForwardError(err) {
 	case errors.ClassDatagramDropped:
 		return false
@@ -205,10 +210,14 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		packet.Release()
 		return true
 	}
+	now := time.Now()
+	if ue.replyDrought != nil {
+		ue.replyDrought.reply(ue.droughtPeer(packet.From), now)
+	}
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
-		lifecycle.handleReply(ue, time.Now().UnixNano())
+		lifecycle.handleReply(ue, now.UnixNano())
 	} else {
-		ue.markReplied(time.Now().UnixNano())
+		ue.markReplied(now.UnixNano())
 	}
 
 	if !ue.enqueueReceivedReply(packet.Data, from, packet.Release) {
@@ -261,6 +270,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 			continue
 		}
 		ue.softErrorCount = 0
+		rawFrom := from
 		from = ue.canonicalReplyFrom(from)
 		if !ue.hasReply.Load() && !ue.acceptsInitialReplyFrom(from) {
 			if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -273,10 +283,14 @@ func (ue *UdpEndpoint) startReadLoop() {
 			}
 			continue
 		}
+		now := time.Now()
+		if ue.replyDrought != nil {
+			ue.replyDrought.reply(ue.droughtPeer(rawFrom), now)
+		}
 		if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
-			lifecycle.handleReply(ue, time.Now().UnixNano())
+			lifecycle.handleReply(ue, now.UnixNano())
 		} else {
-			ue.markReplied(time.Now().UnixNano())
+			ue.markReplied(now.UnixNano())
 		}
 		// Dispatch reply asynchronously by transferring ownership of the current
 		// read buffer to the sender goroutine. This removes one per-packet copy

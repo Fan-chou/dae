@@ -9,6 +9,7 @@ package control
 // ControlPlane generation: endpoint admission, ingress admission, the
 // direct-dispatch bound, and the QUIC DCID negative cache.
 type controlPlaneUDPRuntime struct {
+	udpReplyDrought      *udpReplyDroughtObserver
 	udpEndpointAdmission udpEndpointAdmissionGate
 	udpIngressAdmission  routingEpochIngressGate
 	// udpDirectDispatchSem bounds the goroutines spawned by the

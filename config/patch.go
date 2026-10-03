@@ -21,6 +21,7 @@ type patch func(params *Config) error
 var patches = []patch{
 	patchBootstrapResolver,
 	patchQuality,
+	patchUDPReplyDrought,
 	patchCheckInterval,
 	patchTcpCheckHttpMethod,
 	patchEmptyDns,

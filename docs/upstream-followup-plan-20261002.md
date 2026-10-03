@@ -116,12 +116,14 @@ C2 对固定索引属于有意修正：消除原先随机选择后，升级时�
 
 来源 S12。该单元先完成诊断和观测，再做受控执行。
 
-建议增加独立的 global.udp_reply_drought_mode，值为 off、observe、enforce，默认 off。这是待实现的配置设计。它不由 quality_mode 隐式启用；如果本轮仅交付 observe，配置校验应拒绝尚未实现的 enforce。
+独立的 global.udp_reply_drought_mode 已按 off／observe 实现，默认 off；配置拒绝尚未实现的 enforce。它不由 quality_mode 隐式启用。client IP、精确 outbound group 与可选 IP:port peer 限定观测范围；这些字段不建立业务回复语义。
 
 | 单元 | 设计 | 历史关系 | 验收 |
 | --- | --- | --- | --- |
-| U1 证据与模式 | 只考虑已有有效回复的代理 data session；DNS、直连、无法判定双向语义的流退出。按 peer 计实际发送／回复；30 秒无回复与至少 2 pps 是待校准初值 | 新行为扩展，保留 6d167837 的静默保护 | H3 视频间歇、WG keepalive、长暂停后的单包、单向数据、回压、旧桶不能触发；observe 不改源端口与 endpoint |
+| U1 证据与模式 | 有界记录代理 data session 的本地成功写与有效回复；DNS、直连退出。unknown 语义始终排除候选；明确服务可声明 request_reply，并限定 IP:port。六个完整 5 秒桶各至少 10 次非空成功写、至少 3 次回复历史、30 秒无回复，仅作为观察初值；队列接受不等于完成发送 | 新行为扩展，保留 6d167837 的静默保护 | H3 视频间歇、WG keepalive、长暂停后的单包、单向数据、回压、旧桶和错误后的当前桶不能触发；observe 不改源端口与 endpoint |
 | U2 执行与 peer 隔离 | 独立 rebuild ledger，按稳定关联身份和 peer 隔离；初始上限沿用 256 项、1 分钟 TTL；重建后再次尝试前要求至少 3 个有效回复；先登记预算再发布 retire | 适配 FIFO、代际、身份与预算历史，来源 S12 的后续排序修复一同引入 | 全锥中故障 peer 拆出，健康 peer 保持；绑定目标协议不 promotion；重载、别名、批量 flush、预算竞争和晚回调测试 |
+
+用户选择 CS2 官方匹配的 SDR 作为业务覆盖目标。[Valve 的 SDR 文档](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay?l=english)描述了中继与连接票据。本项目当前只能看到代理侧 UDP 的 peer 和收发结果，无法确认游戏阶段及此时应有的回复，因此 CS2 保持 unknown。端口、域名、SDR 地址范围和过去曾有回复，都不能替代当前回复资格；没有合格候选时保留排除统计，不放宽条件制造候选。U2 要在真实对局阶段标注、请求／回复义务与暂停保护验证后再设计执行路径。
 
 “客户端持续发送但没有回复”也可能是单向应用、对方策略或丢包，不能标注为节点已坏。在 observe 中先记录候选频率与协议／端口分布。enforce 初期仅覆盖有明确双向语义和已有回复历史的范围；只看端口或 SNI 不能认定 H3、游戏或 WG 的应用状态。
 

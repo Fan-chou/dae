@@ -1131,6 +1131,7 @@ getNew:
 			NowNano:        nowNano,
 			sessionManager: sessionManager,
 			egressRuntime:  c.egressRuntime,
+			replyDrought:   c.udpReplyDrought,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
 					Outbound:       consts.OutboundIndex(routingResult.Outbound),

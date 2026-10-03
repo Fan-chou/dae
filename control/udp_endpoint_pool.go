@@ -58,6 +58,7 @@ type UdpEndpoint struct {
 	// them through the transport's batched writer (netproxy.PacketBatchWriter,
 	// e.g. sendmmsg on direct UDP). See udp_write_batch.go.
 	writeBatch    *udpWriteBatchAggregator
+	replyDrought  *udpReplyDroughtFlow // belongs to the creating generation
 	expiresAtNano atomic.Int64
 	handler       UdpHandler
 	// NatTimeout is guarded by natTimeoutMu after endpoint creation.
@@ -305,6 +306,7 @@ type UdpEndpointOptions struct {
 	// process-owned session lifecycle before it is published in the pool.
 	sessionManager *SessionManager
 	egressRuntime  *egressRuntime
+	replyDrought   *udpReplyDroughtObserver
 }
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -766,6 +768,11 @@ dialSuccess:
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 			ue.writeBatch = newUDPWriteBatchAggregator(ue)
 		}
+	}
+	if createOption.replyDrought != nil && isProxyBackedDialer(ue.Dialer) && !ue.endpointNetworkType.IsDns && ue.Outbound != nil {
+		// Initialize before adoptUDP publishes this endpoint to generation
+		// abort/Close. The observer admits a peer only after a completed write.
+		ue.replyDrought = createOption.replyDrought.newFlow(key.Src.String(), ue.Outbound.Name, ue.Dialer.Property().Name, isStatelessProxyBackedUdpProtocol(ue.Dialer))
 	}
 	if createOption.sessionManager != nil {
 		if ue.resolveDNSState != nil {

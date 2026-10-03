@@ -17,6 +17,13 @@ var (
 )
 
 type Global struct {
+	// UDP reply observation is independent of quality and never retires sessions.
+	UDPReplyDroughtMode     string   `mapstructure:"udp_reply_drought_mode" default:"off"`
+	UDPReplyDroughtGroup    string   `mapstructure:"udp_reply_drought_group"`
+	UDPReplyDroughtClient   string   `mapstructure:"udp_reply_drought_client"`
+	UDPReplyDroughtContract string   `mapstructure:"udp_reply_drought_contract" default:"unknown"`
+	UDPReplyDroughtPeers    []string `mapstructure:"udp_reply_drought_peers"`
+
 	// Passive capture is independent of model and local quality decisions.
 	CaptureEnabled        bool   `mapstructure:"capture_enabled" default:"false"`
 	CaptureSamplePermille uint16 `mapstructure:"capture_sample_permille" default:"100"`

@@ -581,6 +581,9 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	udpWriteWait.finish(writeStarted)
 	recordUDPSlowWrite(ue, addr, carrier.finish(carrierStarted), err)
 	if err != nil {
+		if ue.replyDrought != nil {
+			ue.replyDrought.invalidate(time.Now())
+		}
 		return n, ue.handleWriteError(err)
 	}
 	ue.writeSoftErrorCount.Store(0)
@@ -591,11 +594,16 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// a short write (n < len(b)) is a real failure. Treating n > len(b) as a
 	// short write would retire healthy endpoints and drop packets.
 	if n < len(b) {
+		if ue.replyDrought != nil {
+			ue.replyDrought.invalidate(time.Now())
+		}
 		ue.retire()
 		return n, fmt.Errorf("%w: udp endpoint wrote %d/%d bytes to %s", io.ErrShortWrite, n, len(b), addr)
 	}
 	ue.hasSent.Store(true)
-	ue.lastSendNano.Store(time.Now().UnixNano())
+	now := time.Now()
+	ue.lastSendNano.Store(now.UnixNano())
+	ue.observeDroughtWrite(addr, len(b), now)
 	// Local send completed. This is not peer reachability: only break the
 	// consecutive write-fail streak, never recover Degraded.
 	ue.reportLocalWriteSuccess()
@@ -673,6 +681,7 @@ func (ue *UdpEndpoint) closeIdleExpired() error {
 
 func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 	ue.closeOnce.Do(func() {
+		ue.replyDrought.Close()
 		if !ue.dead.Load() && ue.resolveDNSState != nil {
 			ue.resolveDNSState.once.Do(func() {})
 			ue.resolveDNSState.store.discard(ue)

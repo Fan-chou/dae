@@ -2,7 +2,7 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及最新线上版本见末尾「Astra 审查修正与再次部署」。阶段五已完成初步健康检查、五分钟观测和真实 splice 核对，仍缺长时间业务覆盖。U1／U2 与 P1 至 P3 尚未实施，后续依照方案分别观测和做 A/B，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口和 U1 的 off／observe 实现，结果见末尾。真实 CS2 SDR 对局、U2 执行及 P1 至 P3 的 A/B 仍未验收，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
@@ -162,3 +162,64 @@ outbound `5cb6280` 固定修复后的 QUIC。两个依赖已发布到原跟进�
 保留当前生产构建及主仓库／依赖测试使用的 3,143 个 Go export 对象，持久 Go 缓存约 2.7 GiB，模块缓存约 1.5 GiB。当前 Cursor worker、SmartDNS、Nginx、Docker、SSH 复核正常；业务数据、归档及部署回滚副本保留。
 
 独立用例覆盖固定退避、并发试探、随机 hello 的连接生命周期、H3 活动响应体、重放关闭和 UDP drop 后真实 timeout。新旧 REALITY 服务端互通以及全部 H3 并发交错仍需后续业务覆盖；当前短期上线验收不替代前文列出的阶段五及 A/B 项目。
+
+## U1：UDP 回复观测
+
+新增独立的 off／observe 配置，默认 off。该 ledger 没有 endpoint retire、节点健康或切换预算接口；enforce 配置报错。与历史提交 `6d167837` 的静默期间保留会话决策一致。
+
+`/v1/status` 在开启时返回 `udp_reply_drought`：generation、成功写／有效回复计数、资格排除原因、peer 快照及最多 32 条候选事件。全局最多 256 个 peer，每 association 最多 8 个；60 秒空闲淘汰，候选事件每分钟最多保留 20 条。扫描只在短锁内复制 association 列表，逐流计算在锁外完成。off 不创建 ledger 或 worker，不执行每包解析和计时。
+
+单写完成后计数；批量仅计实际完成的成功前缀，读取在 backing buffer 复用前完成。Append、短写和未完成队列不能冒充发送完成。接收先经过错误分类和首回复保护，再按原始 peer 归因；固定目标的 canonical 映射不会把陌生 peer 计为有效回复。跨地址族别名在收发两端都归一到真实 peer。
+
+候选要求明确的 request_reply 契约和 IP:port 范围、至少 3 次有效回复历史、六个完整 5 秒桶各至少 10 次非空成功写，以及至少 30 秒无回复。队列接受型 transport 排除候选。读写错误、partial flush、回压及异常回拨均使旧证据失效；时间窗口使用单调时间。重载时停止 worker 并清空旧表，保留的 endpoint 继续持有已关闭 observer，不转入新代，因此新代对这些已有会话存在预期覆盖缺口。
+
+用户明确重点为 **CS2 官方匹配 SDR**。当前没有经验证的游戏阶段解析器，所以保持 `unknown`，只记录收发与排除原因。[SDR 的中继机制](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay?l=english)和端口范围不证明当前应有回复。真实对局中应独立记录开始／结束、加载／暂停、掉线及恢复时间，再与 peer 记录对照；不能把普通无回复标为节点故障。
+
+示例配置中的 client IP 需要换成实际游戏电脑。client 和 group 仅限制观测，保持现有选路：
+
+```dae
+global {
+    udp_reply_drought_mode: observe
+    udp_reply_drought_client: '192.0.2.10'
+    udp_reply_drought_contract: unknown
+}
+```
+
+223 的 Game_Game 目前只匹配 9339／9449；SDR 未命中专用规则的流量依照原有规则和 Apple_Proxy 默认出口处理，不把 Game_Game 直接当作 CS2 样本。客户端未确定前保持 UDP 观测 off；已有质量 observe 和 25‰ TCP 采集延续。
+
+Astra 独立静态审查指出并已修正：当前桶错误仍可复用历史满桶、退休代保留 peer 表、adoptUDP 发布之前 observer 未初始化，以及墙钟回拨后旧证据误报。新增测试覆盖 unknown／队列接受排除、暂停／keepalive／单向流、当前及旧桶错误、回拨、peer 隔离、真实 Append／flush、typed drop／陌生回复、跨族收发、并发容量、事件限流和重载晚回调。审查与运行测试分别记录，不把静态审查称为 race 验证。
+
+## 阶段五补充验证
+
+### 共享节点 splice
+
+`TestSpliceCaptureLiveSharedNodeAccounting` 将四条真实 loopback TCP splice 流放在同一节点和 collector 中，两上传、两下载，各 20 MiB。223 与开发机 race 均通过：节点和归档上传／下载分别为 41,943,040 字节；四个完整窗口按同一截止时刻比较，最大快照差为 0，容差为四个 splice step 合计 1 MiB。invalid_window、queue_dropped 均为 0。
+
+原始试验把不同截止时刻的节点窗口直接比较，失败日志已保留。总字节当时已经一致；修正了验收口径后才通过，没有改动计数实现。共享节点窗口重叠，不能将它们求和当成独立流量。该核对覆盖 223 内核的 splice 计数，不代表 WAN 吞吐收益。
+
+### 三十分钟自然流量
+
+固定 `upstream-review-fixes-20261003`，2026-10-03 **05:47:30 至 06:17:30 UTC**，31 个一分钟快照；整个窗口没有部署、重载、generation 变化或游标缺口。
+
+| 指标 | 区间结果与分母 |
+| --- | --- |
+| capture considered／sampled | 新增 1,284／34，导出 89 条 capture、437 条 evidence |
+| offload_unmeasured | 新增 25；34 个完成流中 25 个未测量，73.5%；均为 direct 路径 |
+| invalid_window | 新增 0；23 个可比较节点／本流窗口，0／23；节点少于本流字节的次数为 0 |
+| queue_dropped | 新增 0；89 条导出记录加 dropped／oversize，0／89 |
+| 缺失原因 | 25 个窗口 flow_window_not_measured，9 个短流 flow_ended_before_node_snapshot；不能将缺失当零流量 |
+| observe 事件 | below_sampling_threshold 176、offload_or_unmeasured 5；严重速度触发和质量切换提交均为 0 |
+| 首选恢复 | probe_started 7、slow_first_byte 5、stable_changed 1、recovered 1；成功提交属于 Heart_Proxy |
+| 预算 | 质量 observe 不预留试探／切换预算；按留存恢复日志计，本窗口成功恢复消耗 1 次；日志没有 suppressed，不等同完整内部账本 |
+| 组选中成员 | 四个 observe 组一分钟快照均未见变化；不能排除短暂变化 |
+| RSS／日志 | 120.2–129.9 MiB，末尾 127.7 MiB；error／fatal／panic 0，warning 246 条 |
+
+末尾四个 observe 组共 98 个质量条目，没有可用速度样本或参考。直连未测量占比反映本窗口路径构成；capture 的缺失原因不能进一步区分正常 offload 与 relay 未开始。保持已有采集和 observe，不据此开启 enforce。
+
+### UDP 暂停身份：发现未闭合项
+
+从 220 经 223，复用同一 UDP socket，向同一 Google STUN peer 查询远端看到的 IP／端口。[RFC 8489 的 XOR-MAPPED-ADDRESS](https://www.rfc-editor.org/rfc/rfc8489#section-14.2)用于解析结果。223 日志确认使用 US_Dmit_LAX_Hysteria；222 未参与代理测试。
+
+两次试验中，客户端 socket、目标 peer 和外部 IP 均保持；立即、5 秒、15 秒暂停后的远端源端口保持一致，35 秒后端口改变。日志和失败断言保留。当前证据不足以判断变化来自 dae endpoint、Hysteria UDP 会话还是远端空闲／NAT 策略；需使用 generation＋association 对照，并补足真实 H3／WG 暂停及重载验证。没有调整超时、改端口或引入静默重建，也不把 STUN 当作 CS2 对局验收。
+
+本批主仓库 `make test`、`make test-race` 通过；最终 UDP 增量使用正式 experiment 做定向 race 与 vet 通过。没有改 outbound／quic-go pin。U2、真实 ARM64 重载以及 P1 至 P3 的 A/B 继续保留验收门槛。

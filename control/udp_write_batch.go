@@ -176,11 +176,22 @@ func (a *udpWriteBatchAggregator) flush() {
 		var fallbackErr error
 		sentAny := false
 		for _, it := range items {
-			if _, err := a.ue.conn.WriteTo(it.Data, it.Addr); err != nil {
+			n, err := a.ue.conn.WriteTo(it.Data, it.Addr)
+			if err != nil {
 				fallbackErr = err
 				break
 			}
+			if a.ue.replyDrought != nil {
+				if n >= len(it.Data) {
+					a.ue.observeDroughtWrite(it.Addr, len(it.Data), time.Now())
+				} else {
+					a.ue.replyDrought.invalidate(time.Now())
+				}
+			}
 			sentAny = true
+		}
+		if fallbackErr != nil && a.ue.replyDrought != nil {
+			a.ue.replyDrought.invalidate(time.Now())
 		}
 		a.mu.Unlock()
 		if fallbackErr != nil {
@@ -191,6 +202,9 @@ func (a *udpWriteBatchAggregator) flush() {
 		return
 	}
 	n, err := bw.WriteBatch(items)
+	if a.ue.replyDrought != nil {
+		a.ue.observeDroughtBatch(items, n, err, time.Now())
+	}
 	a.mu.Unlock()
 
 	if err != nil {

@@ -9,24 +9,26 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"time"
 )
 
 // AdminStatus is the JSON body for GET /v1/status. It never includes node
 // URIs or credentials.
 type AdminStatus struct {
-	Version           string               `json:"version"`
-	Running           bool                 `json:"running"`
-	LanInterface      []string             `json:"lan_interface"`
-	WanInterface      []string             `json:"wan_interface"`
-	UploadRate        uint64               `json:"upload_rate"`
-	DownloadRate      uint64               `json:"download_rate"`
-	UploadTotal       uint64               `json:"upload_total"`
-	DownloadTotal     uint64               `json:"download_total"`
-	ActiveConnections int                  `json:"active_connections"`
-	UDPSessions       int                  `json:"udp_sessions"`
-	RssBytes          uint64               `json:"rss_bytes"`
-	FdCount           int                  `json:"fd_count"`
-	TrafficSamples    []AdminTrafficSample `json:"traffic_samples,omitempty"`
+	Version           string                   `json:"version"`
+	Running           bool                     `json:"running"`
+	LanInterface      []string                 `json:"lan_interface"`
+	WanInterface      []string                 `json:"wan_interface"`
+	UploadRate        uint64                   `json:"upload_rate"`
+	DownloadRate      uint64                   `json:"download_rate"`
+	UploadTotal       uint64                   `json:"upload_total"`
+	DownloadTotal     uint64                   `json:"download_total"`
+	ActiveConnections int                      `json:"active_connections"`
+	UDPSessions       int                      `json:"udp_sessions"`
+	RssBytes          uint64                   `json:"rss_bytes"`
+	FdCount           int                      `json:"fd_count"`
+	TrafficSamples    []AdminTrafficSample     `json:"traffic_samples,omitempty"`
+	UDPReplyDrought   *UDPReplyDroughtSnapshot `json:"udp_reply_drought,omitempty"`
 }
 
 // AdminTrafficSample is one overview chart point. Rates are bytes/sec.
@@ -132,6 +134,7 @@ func (c *ControlPlane) AdminStatusSnapshot(version string) AdminStatus {
 	status.DownloadTotal = stats.DownloadTotal
 	status.ActiveConnections = stats.ActiveConnections
 	status.UDPSessions = stats.UDPSessions
+	status.UDPReplyDrought = c.udpReplyDrought.snapshot(time.Now())
 	status.RssBytes, status.FdCount = readSelfRSSAndFDs()
 	if len(stats.Samples) > 0 {
 		status.TrafficSamples = make([]AdminTrafficSample, 0, len(stats.Samples))
