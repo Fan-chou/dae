@@ -225,8 +225,11 @@ func sniffQuicBlock(s *Sniffer, buf []byte) (next []byte, err error) {
 	if err != nil {
 		return nil, ErrNotApplicable
 	}
-	boundary = boundary - quicutils.MaxVarintLen64 + n      // Correct boundary.
-	boundary += int(tokenLength) + quicutils.MaxVarintLen64 // Next fields may have quic.MaxVarintLen64 bytes length
+	boundary = boundary - quicutils.MaxVarintLen64 + n // Correct boundary.
+	if tokenLength > uint64(len(buf)-boundary) || uint64(len(buf)-boundary)-tokenLength < quicutils.MaxVarintLen64 {
+		return nil, ErrNotApplicable
+	}
+	boundary += int(tokenLength) + quicutils.MaxVarintLen64
 	if len(buf) < boundary {
 		return nil, ErrNotApplicable
 	}
@@ -236,6 +239,9 @@ func sniffQuicBlock(s *Sniffer, buf []byte) (next []byte, err error) {
 		return nil, ErrNotApplicable
 	}
 	boundary = boundary - quicutils.MaxVarintLen64 + n // Correct boundary.
+	if length > uint64(len(buf)-boundary) {
+		return nil, ErrNotApplicable
+	}
 	blockEnd := boundary + int(length)
 	if len(buf) < blockEnd {
 		return nil, ErrNotApplicable

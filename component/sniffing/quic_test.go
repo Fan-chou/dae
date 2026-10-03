@@ -480,3 +480,20 @@ func minimalClientHello(sni string) []byte {
 	copy(hs[4:], body)
 	return hs
 }
+
+func TestSniffQuicHugeLengthsRejected(t *testing.T) {
+	prefix := []byte{0xc0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0}
+	huge := []byte{0xc0, 0, 0, 0, 0x80, 0, 0, 0}
+	for _, token := range []bool{true, false} {
+		buf := append([]byte(nil), prefix...)
+		if !token {
+			buf = append(buf, 0)
+		}
+		buf = append(buf, huge...)
+		sniffer := NewPacketSniffer(buf, 50*time.Millisecond)
+		_, err := sniffer.SniffQuic()
+		if err != ErrNotApplicable {
+			t.Fatalf("token=%v err=%v", token, err)
+		}
+	}
+}
