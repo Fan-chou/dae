@@ -31,6 +31,9 @@ OOMScoreAdjust=-100
 # Environment=GOMAXPROCS=    # empty: skip the pin, use Go/cgroup auto parallelism
 # Environment=GOGC=100
 
+# Optional user settings; the package never overwrites this file.
+EnvironmentFile=-/etc/dae/dae.env
+
 # Startup and reload commands
 ExecStartPre=/usr/bin/dae validate -c /etc/dae/config.dae
 ExecStart=/usr/bin/dae run --disable-timestamp -c /etc/dae/config.dae
