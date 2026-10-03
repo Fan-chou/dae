@@ -652,6 +652,7 @@ func (c *DnsController) startDnsCacheJanitor() {
 			case now := <-ticker.C:
 				c.evictExpiredDnsCache(now)
 				c.evictIdleDnsForwarders(now)
+				c.reportDnsDroppedDatagramSummary()
 			}
 		}
 	}()

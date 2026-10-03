@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	commonerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
@@ -67,6 +68,7 @@ func (c *DnsController) forwardWithFallback(
 	upstream *dns.Upstream,
 	primaryDialArg *dialArgument,
 	data []byte,
+	asIs ...bool,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
 	// Bound the whole operation, including fallback selection. Reserve half
 	// the remaining budget for TCP on combined upstreams; UDP-only keeps
@@ -91,19 +93,32 @@ func (c *DnsController) forwardWithFallback(
 	// For tcp+udp upstream, perform immediate same-request fallback:
 	// prefer UDP, fallback to TCP on failure. Remaining parent time is
 	// shared; an already-expired parent skips the second attempt.
-	if upstream == nil || upstream.Scheme != dns.UpstreamScheme_TCP_UDP || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
+	dropped := classifyDnsForwardError(primaryErr) == commonerrors.ClassDatagramDropped
+	truncated := errors.Is(primaryErr, ErrDNSTruncated)
+	isAsIs := len(asIs) > 0 && asIs[0]
+	udpUpgradeable := upstream != nil && upstream.Scheme == dns.UpstreamScheme_UDP && !isAsIs && (dropped || truncated)
+	if upstream == nil || (upstream.Scheme != dns.UpstreamScheme_TCP_UDP && !udpUpgradeable) || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}
 	if ctx.Err() != nil {
 		return nil, primaryDialArg, primaryErr
 	}
 
+	if dropped {
+		c.dnsDroppedRetries.Add(1)
+	}
+	recovered := false
+	defer func() {
+		if dropped && !recovered {
+			c.dnsDroppedRetryFailures.Add(1)
+		}
+	}()
 	fallbackUpstream := *upstream
 	fallbackUpstream.Scheme = dns.UpstreamScheme_TCP
 
 	fallbackDialArg, chooseErr := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), &fallbackUpstream)
 	if chooseErr != nil {
-		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %w", primaryErr, chooseErr)
+		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %v; tcp fallback select failed: %w", primaryErr, chooseErr)
 	}
 	if fallbackDialArg == nil || fallbackDialArg.l4proto != consts.L4ProtoStr_TCP {
 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select returned invalid network", primaryErr)
@@ -122,9 +137,10 @@ func (c *DnsController) forwardWithFallback(
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
 	if err != nil {
-		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %w", primaryErr, err)
+		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %v; tcp fallback failed: %w", primaryErr, err)
 	}
 
+	recovered = true
 	return respMsg, fallbackDialArg, nil
 }
 
@@ -461,6 +477,7 @@ func (c *DnsController) resolveDNSUpstream(
 		}
 	}
 
+	isAsIs := upstream == nil
 	upstreamName := "asis"
 	if upstream == nil {
 		if req == nil || !req.realDst.IsValid() {
@@ -494,7 +511,7 @@ func (c *DnsController) resolveDNSUpstream(
 	// Dial and send.
 	var respMsg *dnsmessage.Msg
 	var usedDialArg *dialArgument
-	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
+	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data, isAsIs)
 	if err != nil {
 		return nil, err
 	}
@@ -558,4 +575,40 @@ func (c *DnsController) resolveDNSUpstream(
 		upstreamIndex: upstreamIndex,
 		dialArgument:  usedDialArg,
 	}, nil
+}
+
+func (c *DnsController) reportDnsDroppedDatagramSummary() {
+	if c == nil || c.dnsControllerStore == nil || c.log == nil {
+		return
+	}
+	drops := c.dnsDroppedDatagrams.Load()
+	retries := c.dnsDroppedRetries.Load()
+	failures := c.dnsDroppedRetryFailures.Load()
+
+	intervalDrops := drops - c.lastReportedDroppedDatagrams.Swap(drops)
+	intervalRetries := retries - c.lastReportedDroppedRetries.Swap(retries)
+	intervalFailures := failures - c.lastReportedDroppedFailures.Swap(failures)
+	if intervalDrops == 0 && intervalRetries == 0 && intervalFailures == 0 {
+		return
+	}
+
+	fields := logrus.Fields{
+		"drops_total":               drops,
+		"drop_retries_total":        retries,
+		"drop_retry_failures_total": failures,
+		"drops":                     intervalDrops,
+		"drop_retries":              intervalRetries,
+		"drop_retry_failures":       intervalFailures,
+	}
+	if intervalFailures > 0 {
+		c.log.WithFields(fields).Warn("DNS datagrams were dropped by the upstream transport and the TCP retry did not " +
+			"deliver an answer; those queries failed. Check whether the upstream transport can carry the answer size " +
+			"(protocol buffer limits) and whether the upstream serves TCP")
+		return
+	}
+	if intervalRetries > 0 {
+		c.log.WithFields(fields).Info("DNS datagrams were dropped by the upstream transport; the TCP retry answered them")
+		return
+	}
+	c.log.WithFields(fields).Info("DNS datagrams were dropped by the upstream transport")
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
+	commonerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
@@ -442,6 +443,11 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	// According https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
 	// msg id should set to 0 when transport over QUIC.
 	// thanks https://github.com/natesales/q/blob/1cb2639caf69bd0a9b46494a3c689130df8fb24a/transport/quic.go#L97
+	if len(data) < 2 {
+		return nil, fmt.Errorf("short DoQ query")
+	}
+	// The caller may reuse a cached wire query concurrently or for fallback.
+	data = append([]byte(nil), data...)
 	binary.BigEndian.PutUint16(data[0:2], 0)
 
 	msg, err := sendStreamDNSFunc(stream, data)
@@ -1196,6 +1202,18 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	for {
 		n, err := netutils.ReadUDPConn(conn, respBuf)
 		if err != nil {
+			if commonerrors.ClassifyForwardError(err) == commonerrors.ClassDatagramDropped {
+				staleResponses++
+				if staleResponses > maxStaleResponses {
+					udpPool.discard(conn)
+					badConn = true
+					return nil, fmt.Errorf("too many dropped UDP DNS datagrams: %w", err)
+				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				continue
+			}
 			// Direct UDP sockets can usually survive a single DNS timeout, but a
 			// proxy-backed UDP timeout often means the relay-side session has gone
 			// stale. Reusing that socket causes timeout loops and stale-response churn.

@@ -103,6 +103,13 @@ type dnsControllerStore struct {
 	// stored in dnsCache; this map is only for lookup failures).
 	ensureRealMiss sync.Map // map[string]ensureRealMissEntry
 
+	dnsDroppedDatagrams          atomic.Uint64
+	dnsDroppedRetries            atomic.Uint64
+	dnsDroppedRetryFailures      atomic.Uint64
+	lastReportedDroppedDatagrams atomic.Uint64
+	lastReportedDroppedRetries   atomic.Uint64
+	lastReportedDroppedFailures  atomic.Uint64
+
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
 	lruScratchMu sync.Mutex

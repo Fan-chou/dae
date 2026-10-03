@@ -6,8 +6,6 @@
 package control
 
 import (
-	stderrors "errors"
-	"io"
 	"net/netip"
 	"time"
 
@@ -15,7 +13,6 @@ import (
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol"
 	"github.com/sirupsen/logrus"
 )
 
@@ -143,16 +140,11 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 // invalidate the cached proxy IP on connection-refused. Returns true when the
 // error is fatal and delivery must stop.
 func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
-	// Protocol readers have consumed the complete datagram before reporting
-	// this error. An unresolvable peer must not close a full-cone association
-	// that also serves other destinations.
-	if stderrors.Is(err, protocol.ErrDomainResolution) {
+	switch errors.ClassifyForwardError(err) {
+	case errors.ClassDatagramDropped:
 		return false
-	}
-	if stderrors.Is(err, io.ErrShortBuffer) {
-		return false
-	}
-	if errors.IsReplayAttackError(err) || errors.IsAuthError(err) {
+	case errors.ClassSoftAuth:
+
 		threshold := 3
 		if ue.hasReply.Load() {
 			threshold = 100
