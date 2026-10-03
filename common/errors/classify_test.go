@@ -13,6 +13,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 )
 
@@ -33,6 +34,7 @@ func TestClassifyForwardError(t *testing.T) {
 		{"wrapped closed", fmt.Errorf("dial tcp: %w", net.ErrClosed), ClassHardFailure},
 
 		{"bare short buffer", io.ErrShortBuffer, ClassDatagramDropped},
+		{"typed drop with other cause", netproxy.DatagramDropped(stderrors.New("unattributable source")), ClassDatagramDropped},
 		{"wrapped short buffer", fmt.Errorf("read udp: %w", io.ErrShortBuffer), ClassDatagramDropped},
 		{"domain resolution", protocol.ErrDomainResolution, ClassDatagramDropped},
 		{"wrapped domain resolution", fmt.Errorf("recv: %w: host.example: no address", protocol.ErrDomainResolution), ClassDatagramDropped},

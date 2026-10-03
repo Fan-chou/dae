@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 )
 
@@ -79,16 +80,13 @@ type classRule struct {
 // forwardErrorRules is the single source of truth for transport/forward
 // error classification. Order is significant: the first matching rule wins.
 //
-// io.ErrShortBuffer also matches the outbound fork's typed
-// netproxy.ErrDatagramDropped (its Cause unwraps to the sentinel), so this
-// one rule classifies producers from pins both before and after the fork
-// introduced the typed contract. When the fork pin advances past it, an
-// explicit errors.As match can be added, but the sentinel match must stay
-// for wrapped legacy producers.
+// Match the typed contract regardless of its cause, and retain the legacy
+// sentinels for producers that do not yet expose the type.
 var forwardErrorRules = []classRule{
 	{func(err error) bool { return errors.Is(err, context.Canceled) }, ClassCallerAbort},
 	{func(err error) bool {
-		return errors.Is(err, io.ErrShortBuffer) ||
+		var dropped *netproxy.ErrDatagramDropped
+		return errors.As(err, &dropped) || errors.Is(err, io.ErrShortBuffer) ||
 			errors.Is(err, protocol.ErrDomainResolution)
 	}, ClassDatagramDropped},
 	{func(err error) bool { return IsReplayAttackError(err) || IsAuthError(err) }, ClassSoftAuth},
