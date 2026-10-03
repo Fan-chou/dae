@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -37,9 +38,12 @@ func ptrToUint32(v uint32) *uint32 {
 }
 
 var (
-	daeNetns     *DaeNetns
-	once         sync.Once
-	setNetnsFunc = netns.Set
+	daeNetns              *DaeNetns
+	once                  sync.Once
+	setNetnsFunc          = netns.Set
+	unmountNamedNetnsFunc = unix.Unmount
+	removeNamedNetnsFunc  = os.Remove
+	deleteNamedNetnsFunc  = DeleteNamedNetns
 )
 
 type DaeNetns struct {
@@ -156,16 +160,25 @@ func (ns *DaeNetns) Close() (err error) {
 	}
 
 	ns.mu.Lock()
-	defer ns.mu.Unlock()
+	defer func() {
+		log := ns.log
+		ns.mu.Unlock()
+		if err != nil && log != nil {
+			log.WithError(err).Warn("Failed to clean up dae network namespace")
+		}
+	}()
 
 	if !ns.handlesInitialized {
 		ns.setupDone.Store(false)
 		return nil
 	}
-	_ = DeleteNamedNetns(NsName)
+	cleanupErr := deleteNamedNetnsFunc(NsName)
 	_ = DeleteLink(HostVethName)
 
 	var errs []error
+	if cleanupErr != nil {
+		errs = append(errs, cleanupErr)
+	}
 	if ns.daeNs.IsOpen() {
 		if e := ns.daeNs.Close(); e != nil {
 			errs = append(errs, e)
@@ -580,7 +593,9 @@ func (ns *DaeNetns) setupVeth() (err error) {
 
 func (ns *DaeNetns) setupNetns() (err error) {
 	// ip netns a daens
-	_ = DeleteNamedNetns(NsName)
+	if err = deleteNamedNetnsFunc(NsName); err != nil {
+		return fmt.Errorf("failed to clean stale named netns %s: %w", NsName, err)
+	}
 	ns.daeNs, err = netns.NewNamed(NsName)
 	if err != nil {
 		return fmt.Errorf("failed to create netns: %w", err)
@@ -756,15 +771,27 @@ func (ns *DaeNetns) setupIPv6Datapath() (err error) {
 }
 
 func DeleteNamedNetns(name string) error {
+	if name == "" || name != path.Base(name) || name == "." || name == ".." || strings.Contains(name, "\\") {
+		return fmt.Errorf("invalid named netns %q", name)
+	}
 	namedPath := path.Join("/run/netns", name)
 	// Try a synchronous unmount first; MNT_DETACH alone is lazy and may leave
 	// the mount point behind (os.Remove then fails with EBUSY), which leaks
 	// /run/netns/<name> and breaks a subsequent restart. Fall back to lazy
 	// unmount only if the synchronous one fails (e.g. device busy).
-	if err := unix.Unmount(namedPath, 0); err != nil {
-		_ = unix.Unmount(namedPath, unix.MNT_DETACH)
+	syncErr := unmountNamedNetnsFunc(namedPath, 0)
+	var lazyErr error
+	if syncErr != nil {
+		lazyErr = unmountNamedNetnsFunc(namedPath, unix.MNT_DETACH)
 	}
-	return os.Remove(namedPath)
+	removeErr := removeNamedNetnsFunc(namedPath)
+	if removeErr == nil || stderrors.Is(removeErr, os.ErrNotExist) {
+		return nil
+	}
+	if syncErr == nil {
+		return fmt.Errorf("remove named netns %s: %w", namedPath, removeErr)
+	}
+	return fmt.Errorf("clean named netns %s: %w", namedPath, stderrors.Join(syncErr, lazyErr, removeErr))
 }
 
 func DeleteLink(name string) error {
