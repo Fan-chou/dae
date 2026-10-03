@@ -468,6 +468,37 @@ Astra 独立离线复核确认上述计数、双端校验与结论边界。诊�
 
 收尾 220 的 Google／Cloudflare 常规请求均为 204。223 status RSS 为 221.7 MiB，可用内存约 234 MiB；短时数据不能证明长期内存稳定。222 可用约 **4.5 GiB**，两个诊断构建均经解压 SHA256 验证后压缩归档，远端诊断二进制及本次临时目录清理，正式 Go／模块缓存保留。证据位于 `build/upstream-wan-20261003/cs2-{retest,hy2}-*`，没有导出配置、密钥或节点 URI。
 
+#### 原 SS 服务端回送失败定位
+
+用户允许检查服务器后，14:00–14:10 UTC 通过 223 跳转，只读检查原 SS 服务器 `10.8.1.4` 及中间网关 `10.8.1.11`。服务器运行 shadowsocks-rust **1.22.0**，服务 PID 1426，自 7 月 8 日持续运行。未修改 socket、路由、MTU、配置或重启服务。
+
+**已定位本次复测的直接失败点：服务端收到 SDR 的 1300 字节回复后，通过 SS 监听 socket 回送客户端失败，返回 `EMSGSIZE`（errno 90）。** 13:31–13:34 的目标日志中有 66 条此类错误，其中 **34 条与此前捕获的 18 条流逐条对应**：carrier 端口、SDR 地址／端口和顺序一致，无重复或缺项。错误时间晚于对应出向首片 12–60 ms；这是跨机日志时间差，不能作为 RTT。
+
+服务端看到的客户端为 `[::ffff:10.8.1.11]:<carrier-port>`，223 抓到的出向源为 `10.8.1.10`。中间网关 `wg-ixp0` 的地址为 `10.8.1.11`，存在该出口的 masquerade 规则，支持地址转换解释；历史 conntrack 映射未留存，关联仍以端口、目标与时间联合核对。
+
+| 证据 | 结果 |
+| --- | --- |
+| 34 条对应错误 | 全部为 1300 字节目标回复，回送 errno 90 |
+| 实际监听 socket | `[::]:34564`；IPv4／IPv6 `MTU_DISCOVER=2`，即 `PMTUDISC_DO` |
+| socket 路由标记 | `SO_MARK=0`，未绑定接口；按此标记查询回程走 `wg11` |
+| 回程接口 | `wg11` MTU **1320**，目标为网关 `10.8.1.11` |
+| 最小包长 | 1300 字节载荷＋IPv4／UDP 头部已为 **1328**，SS 封装继续增加长度 |
+
+回程加密报文没有成功发出，也未捕获其封装长度，不能沿用请求的 1366 字节 UDP 长度。监听选项快照采于 14:06，晚于 13:32 事件；持续运行的同一服务、版本源码和当前选项共同支持禁分片解释。这一证据已足以解释对应 34 次回送失败，不能外推为所有历史匹配失败的唯一原因。
+
+[v1.22 listener 源码](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.22.0/crates/shadowsocks/src/net/sys/unix/mod.rs)无条件禁止 IP 分片；`server/udprelay.rs` 中这些错误仅在收到目标回复、调用 inbound 回送失败后记录。该版本 `outbound_udp_allow_fragmentation` 只作用于服务器到目标的另一组 socket，无法修复此 listener。[上游修复 #2161](https://github.com/shadowsocks/shadowsocks-rust/pull/2161)及 [v1.25.0 发布说明](https://github.com/shadowsocks/shadowsocks-rust/releases/tag/v1.25.0)新增 `inbound_udp_allow_fragmentation`；默认仍为 false，只升级版本不会自动启用。
+
+后续修复方案已明确，尚未实施：
+
+1. 准备支持该修复的官方 v1.25.0 服务端候选，验证产物及现有 JSON5 配置兼容性。该版本包含其他变更，当前未进行候选运行验收。
+2. 在 `servers` 中只给端口 **34564** 的实例增加 `"inbound_udp_allow_fragmentation": true`；保留现有 SS2022 配置、outbound 选项和接口 MTU。已核对 v1.25 配置解析、per-server 覆盖及 listener 创建调用链。
+3. 备份二进制和配置后重建监听 socket；重启同一 service 会影响其全部监听实例及现有连接，须安排验证窗口。失败时恢复备份并重启旧服务。
+4. 核对新 socket 不再强制 `PMTUDISC_DO`，在原 SS 路径复测 1300 字节回复和 CS2 匹配，确认对应 `EMSGSIZE` 消失且客户端收到回复。允许分片后的完整回程仍待验证。
+
+Astra 独立只读复核确认日志关联、错误触发路径、两版本选项范围和上述结论边界。服务端日志仅保存时间、回复长度、客户端、目标、错误和 errno 六个白名单字段，丢弃可能含用户密钥的整个 control 字段；未导出原始日志、配置或凭据。相关材料为 `cs2-ss-server-{send-errors,socket,socket-routing}.json`、`cs2-ss-gateway-return-nat.json`、更新后的 `cs2-retest-fragments.json` 及 `cs2-ss-server-check-manifest.json`，均在上述 build 证据目录。
+
+14:08 UTC 收尾确认 223 PID **24157** 及 binary／主配置／local／init 四个 SHA256 均符合基线，可用内存约 218 MiB；222 可用空间 **4.52 GiB**。本轮只增加排查记录，生产配置保持回滚后的状态。
+
 ### 223 再次观测
 
 **09:13:37–09:16:37 UTC**，七个 30 秒快照：新增 considered 169、sampled 3，10 条 capture、25 条 evidence 均通过 validator；generation 不变、游标缺口 0。两个完成流都是 proxy userspace_accounting，offload_unmeasured **0／2**；queue_dropped **0／10**。invalid_window 增量为 0，但没有可比较窗口，两个 relay 都是 flow_ended_before_node_snapshot，因此 splice 计数偏差仍不可评估。独立 WAN fixture 流量不经过生产 daemon 的采集，不能拿它充当这批 capture 样本。
