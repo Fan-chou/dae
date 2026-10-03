@@ -313,18 +313,39 @@ Linux 增加进程级 `DAE_TCP_WRAPPED_GATHER`，默认 `false`，非法值记�
 
 该基准计时只覆盖持续 TLS 写入，握手、接收端最后排空和核对在计时外。`socket-writes/op` 是底层 `net.Conn.Write` 调用数，不是 syscall 跟踪。基准重复使用一条 TLS 连接，而业务前缀通常每连接仅处理一次；不能据此推断 WAN、真实代理协议的交付时延或尾延迟收益。
 
-220 上使用原路由和真实 Linux 7.2.7 内核运行，三轮顺序为 off／on、on／off、off／on，GOMAXPROCS=2，各子项 250 ms；12 个 workload／round 对照均完成内容与总量校验。表内为三轮中位数：
+220 上使用原路由和真实 Linux 7.2.7 内核运行，CGO=0，三轮顺序为 off／on、on／off、off／on，GOMAXPROCS=2，各子项 250 ms；12 个 workload／round 对照均完成内容与总量校验。表内为三轮中位数：
 
 | 前缀＋正文 | off 持续写入 ns/op | on 持续写入 ns/op | 写入时间变化 | 底层 Write 调用 off → on |
 | --- | --- | --- | --- | --- |
-| 1 KiB＋1 KiB | 10,711 | 5,925 | −44.7% | 2 → 1 |
-| 4 KiB＋4 KiB | 13,289 | 7,822 | −41.1% | 2 → 1 |
-| 1 KiB＋32 KiB | 22,617 | 22,471 | −0.7% | 3 → 3 |
-| 单段 1 KiB | 5,443 | 5,378 | −1.2% | 1 → 1 |
+| 1 KiB＋1 KiB | 10,673 | 5,974 | −44.0% | 2 → 1 |
+| 4 KiB＋4 KiB | 13,406 | 7,782 | −42.0% | 2 → 1 |
+| 1 KiB＋32 KiB | 23,010 | 22,764 | −1.1% | 3 → 3 |
+| 单段 1 KiB | 5,444 | 5,558 | +2.1% | 1 → 1 |
 
 小段有局部收益；大段和单段的差异不足以认定稳定收益。继续默认关闭，后续真实包装协议和每连接前缀验收仍需补充。220 的 gather 正确性测试三轮通过。主仓库正式模块图下 `make test`、`make test-race`、control vet 通过；完整 relay 取消、continuation 和前缀增量 race 五轮通过。Astra 两次只读复核没有发现阻断，新增完整 relay 取消测试补齐其指出的直接覆盖缺口。
 
 原始测试、A/B 和负向回归保存在 `build/upstream-p2-20261003/`。一次 vet 命令漏设正式 experiment，生成了重复对象；已统一工具链后重跑 vet，非正式对象按本次时间窗口和 archive header 筛选，无损归档到 `build/cache-archives/nonformal-vet-cache-20261003.tar.gz`，核对后移除原对象。正式 Go 缓存保持。
+
+### P2 默认关闭部署
+
+| 项目 | 结果 |
+| --- | --- |
+| 主仓库 | `f1867e787a0e6b66c0cced54872c36f500d3c8c6`；无依赖 pin 变更 |
+| 223 版本 | `upstream-gather-candidate-20261003`，部署后 PID 24157 |
+| executable SHA256 | `05ed9034cbfd57fd95dabffe821f3ee298510b559193ef4191de4be273fb42ca` |
+| 构建 | Go 1.27.0、CGO=0、trace、heapminimum512kib／randomizedheapbase64，正式模块图，vcs.modified=false |
+| 模式 | MSS 和 wrapped gather 环境开关均未设置；UDP observer off；主要质量组 observe、采集 25‰ |
+| 配置与内核 | config.dae、local.dae、init 哈希不变；all／br-lan／Home send_redirects 均为 0 |
+| 访问与测试 | 220 经 223 的 Google／Cloudflare 均为 204；本机 DNS 正常；223 实际内核 gather 正确性三轮通过 |
+| 回退 | `/root/upstream-p2-20261003-f1867e78/rollback.sh`；恢复前核对备份哈希，原子恢复 daemon 并重启 |
+
+部署脚本包含 EXIT／信号失败回退和 API 就绪检查。本批没有新增配置字段。最初的诊断测试程序启用了 CGO，在 musl 的 223 上因缺少 glibc loader 未启动；改为 CGO=0 后重新完成 220 的 A/B 和 223 的正确性测试。正式 daemon 始终是静态产物，未受这个测试工具错误影响。失败日志保留，临时测试程序已从两台机器移除。
+
+部署后三分钟为 **08:29:22 至 08:32:22 UTC**，七个 30 秒快照，capture generation 保持一致，游标缺口为 0。新增 159 个 considered、3 个 sampled，导出 6 条 capture、48 条 evidence，全部通过 validator。两个完成流均为 proxy userspace_accounting，offload_unmeasured **0／2**；queue_dropped **0／6**。invalid_window 计数增量为 0，但两个 relay 窗口均为 flow_ended_before_node_snapshot，没有可比较窗口，因此其比例和节点／本流偏差本轮不可评估。
+
+质量日志只有 below_sampling_threshold 37 次，没有严重速度信号、质量切换提交或成功恢复日志；主要 observe 组在快照中未见成员变化。observe 不消耗质量切换预算，站点恢复统计仍限于留存日志。没有可用速度样本／参考，也没有真实 CS2 对局，继续保持 observe。RSS 112.3–123.4 MiB，error／fatal／panic 为 0，既有 warning 13 条。
+
+222 收尾可用空间约 **5.3 GiB**。另外筛出旧缓存中 1,292 个未使用 heapminimum512kib 的对象，818,745,374 字节；先归档并逐文件核对，再移除原对象，归档为 `build/cache-archives/older-nonformal-go-cache-20261003.tar.gz`。正式编译、race、trimpath 缓存以及模块缓存、业务证据和回退产物保留。两份非正式 Go 对象归档均可用 `tar -xzf <归档路径> -C /root/go-cache` 恢复。旧 Cursor 会话缓存位于 tmpfs，压缩档留在 `/tmp/kdae-cursor-cache-c72f6d0a-20261003.tar.gz`；没有将它计作持久盘释放。
 
 ## P3 最终生产调用复核
 
