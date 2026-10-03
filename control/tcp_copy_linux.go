@@ -19,7 +19,10 @@ const (
 	relaySplicePipeTargetSize      = 256 << 10
 	relaySpliceMaxStep             = relaySplicePipeTargetSize
 	relaySplicePipePoolLimit       = 64
-	relaySpliceFlags               = unix.SPLICE_F_MOVE | unix.SPLICE_F_MORE | unix.SPLICE_F_NONBLOCK
+	// Do not promise another write with SPLICE_F_MORE: after draining this
+	// batch we can wait indefinitely for input. MORE corks short TCP requests
+	// until the kernel timer fires, even when NODELAY is enabled.
+	relaySpliceFlags = unix.SPLICE_F_MOVE | unix.SPLICE_F_NONBLOCK
 )
 
 type relaySplicePipe struct {
