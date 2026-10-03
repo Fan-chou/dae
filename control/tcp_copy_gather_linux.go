@@ -77,6 +77,9 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 	if !relayGatherWriteEnabled {
 		return 0, nil, false
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, err, true
+	}
 	var sourceSegScratch [relayGatherInlineSegmentCap][]byte
 	segments := relayTakeSourceSegments(src, &sourceSegScratch)
 	if len(segments) == 0 {
@@ -91,7 +94,7 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 		readErr error
 	)
 
-	if srcTCP, ok := relayGatherWriteTCPConn(src); ok {
+	if srcTCP, ok := relayGatherWriteTCPConn(src); ok && relayGatherReadKeepsPrefix(src, len(buf)) {
 		pending, err := tcpConnHasPendingReadData(srcTCP)
 		if err != nil {
 			return 0, err, true
@@ -140,11 +143,25 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 	return written + n, err, true
 }
 
+func relayGatherReadKeepsPrefix(src netproxy.Conn, bufferSize int) bool {
+	if c, ok := src.(*bufioConn); ok && c.reader != nil {
+		// TakeRelayPrefix aliases the drained reader buffer. bufio.Read only
+		// bypasses that buffer if the destination is at least as large; a
+		// smaller read would refill it and overwrite the pending prefix.
+		return bufferSize >= c.reader.Size()
+	}
+	return true
+}
+
 func relayGatherWriteTCPConn(conn netproxy.Conn) (*net.TCPConn, bool) {
 	return unwrapRelayTCPConn(conn)
 }
 
 func relayGatherWriteTo(dst netproxy.Conn, segs [][]byte) (written int, err error) {
+	return relayGatherWriteToWithOptions(dst, segs, relayWrappedGatherEnabled)
+}
+
+func relayGatherWriteToWithOptions(dst netproxy.Conn, segs [][]byte, coalesce bool) (written int, err error) {
 	if dstTCP, ok := relayGatherWriteTCPConn(dst); ok {
 		rawConn, err := dstTCP.SyscallConn()
 		if err != nil {
@@ -156,6 +173,9 @@ func relayGatherWriteTo(dst netproxy.Conn, segs [][]byte) (written int, err erro
 	segments := relayNonEmptySegments(segs)
 	if len(segments) == 0 {
 		return 0, nil
+	}
+	if coalesce {
+		return relayCoalesceWrappedWrite(dst, segments)
 	}
 
 	buffers := net.Buffers(segments)

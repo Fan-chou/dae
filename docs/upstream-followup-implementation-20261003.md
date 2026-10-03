@@ -2,7 +2,7 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1 的默认关闭候选，结果见末尾。真实 CS2 SDR 对局、U2 执行、P1 的代理／WAN 验证及 P2、P3 的 A/B 仍未验收，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1、P2 的默认关闭候选，结果见末尾。P3 完成生产调用审计，未接入的 GRO／arena 暂不移植。真实 CS2 SDR 对局、U2 执行及 P1、P2 的代理／WAN 验证仍未验收，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
@@ -300,3 +300,42 @@ MTU 和 sysctl 只在 `unshare -n` 的子 namespace 修改，修改前核对真�
 质量日志只有 below_sampling_threshold 7 次，严重速度信号和质量切换提交均为 0；没有成功恢复日志。主要 observe 组选中成员在快照中未变化，质量切换预算不消耗；恢复统计限于保留日志，不能当作完整预算账本。没有速度参考，三分钟也没有覆盖真实 CS2，继续保持 observe。RSS 114.5–123.1 MiB，error／fatal／panic 为 0，既有 warning 18 条。
 
 222 收尾可用空间约 **5.2 GiB**。临时测试程序从 220／223 移除、本地测试产物压缩；本轮完成交叉验证的 FreeBSD 专用编译缓存按平台头和时间筛选后移除，保留正式 Linux Go 缓存。原始观测和最终报告保存在 `build/upstream-p1-20261003/`。
+
+## P2 小段合并候选与前缀保护
+
+Linux 增加进程级 `DAE_TCP_WRAPPED_GATHER`，默认 `false`，非法值记录 warning 并回落到 `false`；修改必须重启。仅在 gather 已拿到数据时，对包装连接的相邻小段尝试合并：单段不超过 4 KiB、每次合并不超过 8 KiB，临时数组池化，调用结束归还。大段直接交给原连接；没有等新数据的延迟或后台聚合队列。裸 TCP 始终走原有 writev，其他平台保持原路径。
+
+没有整体移植上游 32 KiB coalescer，也没有删除读端 onActive。现有 250 ms 活动刷新、exact splice、半关闭和取消仍由原 relay 负责。回压测试确认：读取成功、写端尚未完成时先刷新活动，流量计数仍为零；取消并唤醒写端后，只计实际写出的字节。删除读端刷新会改变这一语义，当前没有足够收益证据支持修改。
+
+新增测试同时复现既有前缀覆盖：bufio 的 prefix 借用 reader 缓冲区，而 gather 会在写前试读内核中已经到达的正文；当 reader 为 64 KiB、复制缓冲为 32 KiB 时，bufio 会重填内部缓冲，覆盖 prefix。旧路径传输量和计数均为 1,152，但内容校验失败。现在仅在 bufio 读可以直接使用复制缓冲时追加读；否则先写 prefix，再沿用 continuation。4 KiB／64 KiB reader 的半关闭测试都核对完整内容和精确计数。
+
+候选测试覆盖顺序、8 KiB 上限、大段原切片、部分写和错误、取消前不消费前缀、continuation、EINTR／EAGAIN 与 partial writev、裸 TCP 优先，以及采集回调只计成功写入。TLS 基准使用可信临时证书和真实 loopback socket，按生产常见的“一段前缀＋一段正文”比较；接收端逐帧核对内容和总量。
+
+该基准计时只覆盖持续 TLS 写入，握手、接收端最后排空和核对在计时外。`socket-writes/op` 是底层 `net.Conn.Write` 调用数，不是 syscall 跟踪。基准重复使用一条 TLS 连接，而业务前缀通常每连接仅处理一次；不能据此推断 WAN、真实代理协议的交付时延或尾延迟收益。
+
+220 上使用原路由和真实 Linux 7.2.7 内核运行，三轮顺序为 off／on、on／off、off／on，GOMAXPROCS=2，各子项 250 ms；12 个 workload／round 对照均完成内容与总量校验。表内为三轮中位数：
+
+| 前缀＋正文 | off 持续写入 ns/op | on 持续写入 ns/op | 写入时间变化 | 底层 Write 调用 off → on |
+| --- | --- | --- | --- | --- |
+| 1 KiB＋1 KiB | 10,711 | 5,925 | −44.7% | 2 → 1 |
+| 4 KiB＋4 KiB | 13,289 | 7,822 | −41.1% | 2 → 1 |
+| 1 KiB＋32 KiB | 22,617 | 22,471 | −0.7% | 3 → 3 |
+| 单段 1 KiB | 5,443 | 5,378 | −1.2% | 1 → 1 |
+
+小段有局部收益；大段和单段的差异不足以认定稳定收益。继续默认关闭，后续真实包装协议和每连接前缀验收仍需补充。220 的 gather 正确性测试三轮通过。主仓库正式模块图下 `make test`、`make test-race`、control vet 通过；完整 relay 取消、continuation 和前缀增量 race 五轮通过。Astra 两次只读复核没有发现阻断，新增完整 relay 取消测试补齐其指出的直接覆盖缺口。
+
+原始测试、A/B 和负向回归保存在 `build/upstream-p2-20261003/`。一次 vet 命令漏设正式 experiment，生成了重复对象；已统一工具链后重跑 vet，非正式对象按本次时间窗口和 archive header 筛选，无损归档到 `build/cache-archives/nonformal-vet-cache-20261003.tar.gz`，核对后移除原对象。正式 Go 缓存保持。
+
+## P3 最终生产调用复核
+
+复核固定版本 dae `fce18b201308d7f7a2ed8edc68da69ed5c834caa` 和 outbound `04be789bbeebff55c2eac3fcc50873398ae7ea07`，并对照当前 fork：
+
+| 能力 | 最终调用情况与处理 |
+| --- | --- |
+| PacketGSOWriter／WriteGSO | 新接口只有库实现和测试，没有业务入口。当前 QUIC 已通过 WriteMsgUDP 传递 UDP_SEGMENT；保留 connected socket 的 control message 修复 |
+| EnableUDPGRO／ProbeUDPGSO | 新 helper 没有生产调用。当前 direct 接收契约是一条 datagram；没有 GRO ancillary 拆分路径，单独开启会破坏边界，因此不启用 |
+| JumboBufferArena／ReleasePhysicalPages | arena 没有生产创建点，页回收仅由未接入的 arena 调用。Close 在 inUse 大于零时仍能 Munmap，不满足设计中的借出所有权要求，暂不移植 |
+| TrimProcessMemory | 无生产调用；没有增加强制 GC／FreeOSMemory，不能声称 RSS 或 GC 改善 |
+| dae 中间 helper | 已被最终上游提交删除，不恢复删除代码 |
+
+Astra 独立确认了上述调用范围和 arena 的关闭问题。P3 的本轮结论是保留现有 GSO 生产能力、暂不接入上游未使用的 GRO 和内存管理 API；这符合方案“只评估最终仍在生产调用的实现”。将来若接入，需先设计 datagram 拆分和借出／归还／关闭所有权，再执行内核与 RSS／GC 对照。当前没有修改 outbound／quic-go pin。
