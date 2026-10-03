@@ -223,3 +223,21 @@ Astra 独立静态审查指出并已修正：当前桶错误仍可复用历史�
 两次试验中，客户端 socket、目标 peer 和外部 IP 均保持；立即、5 秒、15 秒暂停后的远端源端口保持一致，35 秒后端口改变。日志和失败断言保留。当前证据不足以判断变化来自 dae endpoint、Hysteria UDP 会话还是远端空闲／NAT 策略；需使用 generation＋association 对照，并补足真实 H3／WG 暂停及重载验证。没有调整超时、改端口或引入静默重建，也不把 STUN 当作 CS2 对局验收。
 
 本批主仓库 `make test`、`make test-race` 通过；最终 UDP 增量使用正式 experiment 做定向 race 与 vet 通过。没有改 outbound／quic-go pin。U2、真实 ARM64 重载以及 P1 至 P3 的 A/B 继续保留验收门槛。
+
+### U1 部署与 association 对照
+
+| 项目 | 结果 |
+| --- | --- |
+| 提交 | 共享节点测试 `ba732f18`；U1 `5b8ca273e96205a35c5152a858ce966d2e7e9f08` |
+| 223 版本 | `upstream-udp-observe-20261003`，运行 PID 29794 |
+| executable SHA256 | `3be34ff3ebe267966479799001198713f50fab710c292dfcb844bd0c7a4ab273` |
+| 构建 | Go 1.27.0、CGO=0、trace、heapminimum512kib／randomizedheapbase64；固定正式依赖，vcs.modified=false |
+| 配置 | config.dae、local.dae 与 init 哈希恢复为部署前值；质量 observe 及 25‰ 采集保持，UDP 观测最终 off |
+| 访问与内核 | 220 默认路由经过 223；Google／Cloudflare 204；all／br-lan／Home 的 send_redirects 均为 0 |
+| 回退 | `/root/upstream-u1-20261003-5b8ca273/rollback.sh` 校验备份，成套恢复二进制和 config.dae／local.dae；旧版本不支持新 UDP 字段 |
+
+部署后临时仅为 220 开启 unknown／observe，并创建新 UDP socket。29 个快照始终记录同一进程内的 generation=1、association=1、Google 组、US_Dmit_LAX_Hysteria 节点及 STUN peer；本地写完成／接受和有效回复各计 5 次。该 transport 标为 transport_acceptance_only，unknown_reply_semantics 始终排除候选；候选事件为 0。
+
+这轮外部端口在 15 秒及 35 秒暂停后改变，但 association 未变化，因此现象不能归因为 dae endpoint 对象重建。仍需检查底层代理会话及远端策略；没有把固定空闲秒数当成可靠阈值。启用／关闭观测的两次配置重载完成，PID 保持；脚本用 EXIT／信号收尾恢复配置，local.dae 哈希核对通过，状态 API 已不再返回 UDP observer。真实 CS2 客户端 IP 尚待补充，本轮没有对局验收。
+
+222 本批构建后的可用空间约 5.2 GiB。删掉了本轮误用非正式 experiment 生成的重复缓存和已完成实测的测试二进制；65 份重复观测日志经校验后无损压缩，保留最后一份原格式供分析。正式 Go 缓存、业务证据及回滚产物保留。
