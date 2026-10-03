@@ -15,6 +15,7 @@ import (
 	"math/bits"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1197,12 +1198,22 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	respBuf := pool.GetFullCap(dnsUdpMaxResponseSize)
 	defer pool.Put(respBuf)
 	const maxStaleResponses = 8
+	const droppedResponseGrace = 100 * time.Millisecond
 	staleResponses := 0
+	var droppedResponse error
 
 	for {
 		n, err := netutils.ReadUDPConn(conn, respBuf)
 		if err != nil {
 			if commonerrors.ClassifyForwardError(err) == commonerrors.ClassDatagramDropped {
+				if droppedResponse == nil {
+					// A dropped reply may be followed by a usable one, but usually
+					// it was the only response. Keep the cause and leave time for TCP.
+					droppedResponse = err
+					if until := time.Now().Add(droppedResponseGrace); until.Before(deadline) {
+						_ = conn.SetReadDeadline(until)
+					}
+				}
 				staleResponses++
 				if staleResponses > maxStaleResponses {
 					udpPool.discard(conn)
@@ -1210,9 +1221,30 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 					return nil, fmt.Errorf("too many dropped UDP DNS datagrams: %w", err)
 				}
 				if ctx.Err() != nil {
-					return nil, ctx.Err()
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return nil, ctx.Err()
+					}
+					return nil, fmt.Errorf("UDP DNS request deadline after drop: %w", droppedResponse)
 				}
 				continue
+			}
+			if errors.Is(ctx.Err(), context.Canceled) {
+				if errors.Is(err, net.ErrClosed) {
+					udpPool.discard(conn)
+					badConn = true
+				}
+				return nil, ctx.Err()
+			}
+			readDeadline := errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
+			if droppedResponse != nil && readDeadline && !errors.Is(err, net.ErrClosed) {
+				// Waiting for a replacement did not produce new node-fault
+				// evidence. Real reset/closed errors still take the hard path.
+				return nil, fmt.Errorf("UDP DNS replacement wait ended (%v): %w", err, droppedResponse)
+			}
+			if errors.Is(err, net.ErrClosed) {
+				udpPool.discard(conn)
+				badConn = true
+				return nil, err
 			}
 			// Direct UDP sockets can usually survive a single DNS timeout, but a
 			// proxy-backed UDP timeout often means the relay-side session has gone

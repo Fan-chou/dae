@@ -71,12 +71,14 @@ func (c *DnsController) forwardWithFallback(
 	asIs ...bool,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
 	// Bound the whole operation, including fallback selection. Reserve half
-	// the remaining budget for TCP on combined upstreams; UDP-only keeps
-	// the full budget. A fast UDP error still falls back immediately.
+	// the remaining budget for TCP whenever UDP is eligible for an upgrade.
+	// as-is UDP retains its full budget. A fast UDP error falls back immediately.
 	ctx, cancel := childTimeout(ctx, consts.DefaultDialTimeout)
 	defer cancel()
 	primaryBudget := consts.DefaultDialTimeout
-	if upstream != nil && upstream.Scheme == dns.UpstreamScheme_TCP_UDP && primaryDialArg.l4proto == consts.L4ProtoStr_UDP {
+	isAsIs := len(asIs) > 0 && asIs[0]
+	if upstream != nil && primaryDialArg.l4proto == consts.L4ProtoStr_UDP &&
+		(upstream.Scheme == dns.UpstreamScheme_TCP_UDP || upstream.Scheme == dns.UpstreamScheme_UDP && !isAsIs) {
 		deadline, _ := ctx.Deadline()
 		primaryBudget = time.Until(deadline) / 2
 	}
@@ -95,7 +97,6 @@ func (c *DnsController) forwardWithFallback(
 	// shared; an already-expired parent skips the second attempt.
 	dropped := classifyDnsForwardError(primaryErr) == commonerrors.ClassDatagramDropped
 	truncated := errors.Is(primaryErr, ErrDNSTruncated)
-	isAsIs := len(asIs) > 0 && asIs[0]
 	udpUpgradeable := upstream != nil && upstream.Scheme == dns.UpstreamScheme_UDP && !isAsIs && (dropped || truncated)
 	if upstream == nil || (upstream.Scheme != dns.UpstreamScheme_TCP_UDP && !udpUpgradeable) || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
