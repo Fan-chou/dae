@@ -2736,10 +2736,14 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 // Listen opens the ingress listeners without starting the serving loops.
 func (c *ControlPlane) Listen(port uint16) (listener *Listener, err error) {
+	tcpMSS, err := common.ProcessTCPMSS()
+	if err != nil {
+		return nil, err
+	}
 	// Listen.
 	tcpListenConfig := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			return dialer.TproxyControl(c)
+			return tcpIngressListenControl(c, tcpMSS.Listen)
 		},
 	}
 	udpListenConfig := net.ListenConfig{
@@ -2762,7 +2766,12 @@ func (c *ControlPlane) Listen(port uint16) (listener *Listener, err error) {
 		if c.log != nil {
 			c.log.WithError(err).Warn("Failed to open dual-stack UDP listener; fallback to IPv4-only UDP listener")
 		}
-		packetConn, err = tcpListenConfig.ListenPacket(context.Background(), "udp", tcp4ListenAddr)
+		udp4ListenConfig := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return udpIPv4ListenControl(c)
+			},
+		}
+		packetConn, err = udp4ListenConfig.ListenPacket(context.Background(), "udp4", tcp4ListenAddr)
 		if err != nil {
 			_ = tcp4Listener.Close()
 			_ = tcp6Listener.Close()

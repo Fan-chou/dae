@@ -2,7 +2,7 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口和 U1 的 off／observe 实现，结果见末尾。真实 CS2 SDR 对局、U2 执行及 P1 至 P3 的 A/B 仍未验收，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1 的默认关闭候选，结果见末尾。真实 CS2 SDR 对局、U2 执行、P1 的代理／WAN 验证及 P2、P3 的 A/B 仍未验收，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
@@ -241,3 +241,41 @@ Astra 独立静态审查指出并已修正：当前桶错误仍可复用历史�
 这轮外部端口在 15 秒及 35 秒暂停后改变，但 association 未变化，因此现象不能归因为 dae endpoint 对象重建。仍需检查底层代理会话及远端策略；没有把固定空闲秒数当成可靠阈值。启用／关闭观测的两次配置重载完成，PID 保持；脚本用 EXIT／信号收尾恢复配置，local.dae 哈希核对通过，状态 API 已不再返回 UDP observer。真实 CS2 客户端 IP 尚待补充，本轮没有对局验收。
 
 222 本批构建后的可用空间约 5.2 GiB。删掉了本轮误用非正式 experiment 生成的重复缓存和已完成实测的测试二进制；65 份重复观测日志经校验后无损压缩，保留最后一份原格式供分析。正式 Go 缓存、业务证据及回滚产物保留。
+
+## P1 候选与 splice 交互停顿修复
+
+### 实现和历史决策
+
+P1 引入两个进程级环境开关：`DAE_TCP_DIAL_MSS` 和 `DAE_TCP_LISTEN_MSS`。默认均为 `0`，保留内核的 MSS 选择；显式值接受 `88–32767`。范围来自 [Linux TCP 定义](https://github.com/torvalds/linux/blob/master/include/net/tcp.h)。`1380` 用于实验，没有成为新的默认值。
+
+主动连接的选项保存在 generation-scoped direct dialer pair 中。mark、MPTCP dialer clone、本地绑定、取消和 resolver 重试沿用现有实现；内部 resolver 和 UDP socket 不应用 TCP MSS。这个开关会影响经过该 pair 的 TCP 直连及代理底层拨号，也包含探测、订阅下载等调用。非 Linux 的 `0` 保持原有行为，显式非零值报 unsupported，不撤掉 BSD 的 mark 支持。
+
+监听和主动连接分开设置。只在创建新的 TCP listener 时应用 MSS；IPv4 UDP fallback 使用独立 control。listener clone 继续共享原内核 socket，因此环境开关和错误按进程缓存，修改开关必须重启，配置重载不会在准备阶段修改正在运行的 listener。没有增加 TFO 或 NODELAY syscall。
+
+outbound 发布为 `github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261003064605-1651a64a78ac`，主仓库固定正式版本；quic-go／qpack 保持原 pin。
+
+矩阵另复现已有 exact splice 的小包停顿：`SPLICE_F_MORE` 在排空 pipe 后仍承诺后续写入，但 relay 此时可能等待新的请求。旧代码中，保持源连接打开的一字节请求超过 **150 ms** 的读取截止时间；220 的两腿 splice 样本 ping p50 约 **416 ms**。去掉 MORE，保留 MOVE／NONBLOCK、netpoll、部分写处理、pipe 池、exact accounting 和半关闭流程。该修复单独提交为 `012f2cdd`，符合此前保留 splice 与及时发送尾部数据的决策。Go 标准库的 [splice 实现](https://github.com/golang/go/blob/master/src/internal/poll/splice_linux.go)也没有使用 MORE。
+
+### 220 隔离内核矩阵
+
+最终测试有 **96 个条件，每个三轮，共 288 项**：MTU 1280／1500、IPv4／IPv6、timestamps 关／开、dial／listen MSS 的四种组合、direct／生产 splice／生产 buffered 两腿 relay。交替运行候选顺序；每项传输 16 MiB 并核对 CRC，两腿 relay 同时核对复制量和计数回调，总计核对 **4.5 GiB**。
+
+MTU 和 sysctl 只在 `unshare -n` 的子 namespace 修改，修改前核对真实父进程 namespace；父子相同、声明不匹配或读取失败均退出。最终矩阵全部通过，协商 MSS 均满足 MTU 和显式上限，timestamps 状态符合设置。
+
+| 路径 | 每项 ping p50 的范围 | 两个 MSS 均为 1380 相对默认的吞吐变化范围 |
+| --- | --- | --- |
+| direct | 7.7–24.5 µs | −7.7% 至 +14.9% |
+| exact splice relay | 16.9–47.1 µs | −10.6% 至 +17.8% |
+| buffered relay | 15.5–31.8 µs | −7.1% 至 +28.9% |
+
+吞吐变化按各 MTU／timestamps／地址族条件的三轮中位数比较；样本短、范围有正有负，没有据此批准启用 MSS。重传分别记录 client 和 sender，direct 时二者是同一 socket，不能相加；不少条件出现非零重传，不能称无重传或证明重传改善。这是 loopback 实验，尚未覆盖加密代理、WAN、真实 MPTCP 子流与 ARM64 内核。
+
+旧矩阵在 60 秒父超时后退出，仅部分数据留存，用于定位 splice 延迟，不能当作完整吞吐基线。修复后的定向 race 三轮通过；Astra 静态复核通过，并独立解析最终矩阵数量。原始日志和逐条件报告位于忽略目录 `build/upstream-p1-20261003/`。
+
+### 正式验证
+
+发布的 outbound 完整 race 与相关 vet 通过；FreeBSD 的 netproxy 测试包交叉编译和 direct 包构建通过，未在 FreeBSD 执行。主仓库使用 `GOWORK=off` 的正式模块图，`make test`、`make test-race`、相关 vet 及 `make ebpf-test` 通过。223 实际内核上的 listener clone、IPv4 UDP fallback 和小包 splice 回归连续三轮通过。
+
+`make ebpf-lint` 未通过：现有 C 文件有缩进、空行及其他 checkpatch 提示。三个被检查的 C 文件与本轮开始前的 `0ea026d2` 完全一致，这不是新增的 lint 失败；本轮没有混入 C 格式修改。失败日志保留，不能将本批所有检查写成全绿。
+
+222 的旧构建产物无损压缩；APT 的二进制索引缓存已移除，可由现存包列表重建。闲置 pnpm store 经 tar 比较后保存为 `build/cache-archives/pnpm-store-20261003.tar.gz`，可用 `tar -xzf build/cache-archives/pnpm-store-20261003.tar.gz -C /root/.local/share/pnpm` 还原。

@@ -216,6 +216,13 @@ func configureGOMAXPROCS(log *logrus.Logger) {
 }
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	tcpMSS, err := common.ProcessTCPMSS()
+	if err != nil {
+		return nil, err
+	}
+	if tcpMSS.Dial != 0 || tcpMSS.Listen != 0 {
+		log.WithFields(logrus.Fields{"dial_mss": tcpMSS.Dial, "listen_mss": tcpMSS.Listen}).Info("TCP MSS experiment enabled; changes require restart")
+	}
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if cfgFile != "" {
@@ -269,7 +276,10 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 
 	/// Build generation-scoped direct dialers.
-	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
+	directDialers := direct.NewDirectDialersWithOption(direct.Option{
+		FallbackDNS: conf.Global.FallbackResolver,
+		TCPMaxSeg:   tcpMSS.Dial,
+	})
 	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
