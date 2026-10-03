@@ -125,6 +125,8 @@ C2 对固定索引属于有意修正：消除原先随机选择后，升级时�
 
 用户选择 CS2 官方匹配的 SDR 作为业务覆盖目标。[Valve 的 SDR 文档](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay?l=english)描述了中继与连接票据。本项目当前只能看到代理侧 UDP 的 peer 和收发结果，无法确认游戏阶段及此时应有的回复，因此 CS2 保持 unknown。端口、域名、SDR 地址范围和过去曾有回复，都不能替代当前回复资格；没有合格候选时保留排除统计，不放宽条件制造候选。U2 要在真实对局阶段标注、请求／回复义务与暂停保护验证后再设计执行路径。
 
+2026-10-03 的 201 实测新增 U1 验收门槛：先修复 NAT-preserving transport 的实际 peer 归属和 WriteTo 返回前的早到回复，再解释无回复频率。保留向客户端返回原 NAT 地址的契约，通过独立的实际 peer 元数据关联；不能把所有 raw reply 强行归到固定目标。补 Hysteria2 FakeIP 的 push／ReadFrom、写内同步回复、Shadowsocks 不同 IP／端口与 mapped IPv4 隔离回归。未归属计数需要按 association 定位，混合 Google／Steam 流量的全局数不能直接归因给游戏。reload 保留的旧流与新 observer 账本要明确标为覆盖缺失。
+
 “客户端持续发送但没有回复”也可能是单向应用、对方策略或丢包，不能标注为节点已坏。在 observe 中先记录候选频率与协议／端口分布。enforce 初期仅覆盖有明确双向语义和已有回复历史的范围；只看端口或 SNI 不能认定 H3、游戏或 WG 的应用状态。
 
 U2 的预算与站点首选恢复预算分开。UDP 重建不直接写 TCP 或 UDP 的站点 leaf，也不把稳定节点变更作为恢复成功；先保留当前身份和选路结果，经现有故障策略需要重新选路时再处理。旧代不能直接修改新代的关联／ledger，跨重载继承由明确的所有权交接完成。

@@ -395,11 +395,33 @@ Astra 独立确认了上述调用范围和 arena 的关闭问题。P3 的本轮�
 
 Astra 独立静态复核指出并确认修正了联合验收、wrapper 路径、关闭前 TCP_INFO、curl 配置继承和异常留证问题；最终受控分段复核通过。正式模块图下 control vet、相关 relay／gather race 回归通过；远端 live 工具使用 CGO=0。原始结果、工具副本、失败日志和报告位于 `build/upstream-wan-20261003/`。
 
-### H3 客户端暂停
+### H3 请求间隔与关联复用
 
-220 经生产 daemon 对 Cloudflare H3 做了 5／15／35 秒暂停后同进程复用：六次请求均 HTTP 200、HTTP/3，每对 conn_id 和本地端口相同，第二次 num_connects 为 0。这证明客户端连接可复用，没有直接证明 dae 关联身份或远端 NAT 端口；curl 显示的 28.0.87.4 是 FakeIP。
+收到临时仅覆盖 220 的授权后，223 开启 unknown／observe，220 经生产 daemon 向 Cloudflare H3 发出三对请求，启动间隔为 5／15／35 秒。六次均 HTTP 200、HTTP/3，每对 conn_id 和本地端口相同，第二次 num_connects 为 0。间隔中仍可能有传输层包，不能称为 UDP 静默暂停；curl 显示的 28.0.87.4 是 FakeIP。
 
-额外的 223 UDP unknown／observe 关联观测脚本已准备并校验，但未执行。自动审批认为已有 UDP 授权仅覆盖 CS2 SDR，拒绝了为 Cloudflare H3 修改观测配置；已请求临时仅覆盖 220 的授权，未收到答复前保持 UDP observer off。CS2 SDR 仍需要客户端 IP 和真实对局，U2 不启用。
+54 个状态快照中，三对请求分别保持同一 observer generation／association／group／node／真实 peer：generation 1、association 1／2／3，`Cherry_Proxy` → `HK_GG_IPLC_Dmit_HK` → `104.16.123.96:443`。累计本地写完成 26 次、归属回复 77 次，未归属回复、登记丢弃和无效窗口均为 0。确认这些工作负载的 dae 关联复用，未观测远端 NAT 端口。
+
+Astra 独立复核后将结束客户端快照与最后观测快照分开：最后的 `status-50.json` 中 peer_evicted 为 2，存活 unknown peer 为 1；结束客户端时分别为 1 和 2。60 秒空闲 TTL、每 5 秒扫描只回收观测元数据，累计统计保留，不改变 endpoint 的 NAT 租约。所有流均因 unknown_reply_semantics 排除，不进入 U2。
+
+观测结束已恢复 local.dae 原哈希，observer off，PID 24157 未变，binary／主配置／init 哈希不变。PID 由主代理 SSH 核对，离线状态快照没有 PID 字段，不能将其称为 Astra 独立确认。证据及修正后的报告位于 `build/upstream-wan-20261003/h3-*`。
+
+### CS2 官方匹配排查（201）
+
+用户确认客户端为 192.168.124.201，开始搜索后报“遇到未知的网络错误”。客户端日志显示大陆 12 个 SDR 中继可用、香港与新加坡没有有效直接测量，同时报告 No official datacenters pingable。中继可用与完成官方匹配是不同的证据；尚未取得成功对局。
+
+12:19 UTC 起仅覆盖 201 开启 unknown／observe，5 秒快照，20 分钟后自动恢复。大陆中继 conntrack 有双向包；被代理的海外 SDR IP 流进入 `Cherry_Proxy` 的香港 Shadowsocks 节点。Google H3 同时贡献大量写入，global unattributed_replies 不能算到 Steam。扫描许多中继也触及 256 peer 的登记上限；不因此扩大上限或触发节点降级。
+
+Astra 核对出两个观测缺口：Hysteria2／TUIC 等 NAT-preserving transport 可返回原 FakeIP，而 write 记真实 peer；首次回复也可能先于 WriteTo 返回和 peer 登记。现有精确 peer 匹配可能计为未归属。这些是 U1 正确性问题，不能据此认定生产转发失败。U2 继续关闭，后续需加入 transport 的实际 peer 元数据和早到回复回归，并保留跨 peer 隔离。
+
+按 [Valve 的 CS2 SDR 配置](https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730)，revision 1790374330，12:30 UTC 临时仅对 201 到 hkg／sgp 共 16 个 IPv4 的 UDP 27015–27060 加 must_direct 对照。规则位于 local.dae，按 merger 顺序排在 generation 分流前，由本轮外层 EXIT 回退恢复。首轮预验证候选文件没有 .dae 后缀，merger 跳过了它；已修正脚本后缀，并验证实际加载配置通过，PID 不变。仍需重开 CS2 后按新五元组、conntrack 回包和客户端匹配结果联合判断。
+
+12:36:59 UTC 的 conntrack 出现新五元组 `192.168.124.201:53975` → `103.10.124.119:27039`，双向均 12 包、OFFLOAD，回复经 WAN NAT 返回。确认该指定新加坡中继的直连流有回包；尚未收到客户端匹配成功确认，不能把这条流认定为成功对局或代理协议缺陷定位。
+
+12:33:48–12:35:48 UTC 的五个只读快照，capture generation 不变，considered 新增 134、sampled 新增 2、capture 新增 6 条；新增完成 relay 两条、offload_unmeasured 0／2，queue_dropped 0／6。该代全部留存的四条完成 relay 中有一条 offload_or_unmeasured，不应拿窗口增量 0 掩盖已有缺失。invalid_window 没有新增，但可比较 node／flow 窗口为 0，splice 偏差仍不可评估。质量日志 below_sampling_threshold 14、insufficient_activity 1，未见恢复事件；RSS 187.5–188.7 MiB。短窗口不证明长期预算和内存行为。
+
+reload 会保留部分 UDP 路由与 endpoint；observer 新代不接管旧账本，direct 流本身也不进 proxy-only observer。因此统计消失或归零不能证明改善，恢复配置也不能保证已有 UDP socket 立即改回原路线。试验后需新建客户端连接以验证正常路由。
+
+12:39 UTC 测试到期，外层 EXIT 已恢复 baseline local.dae，observer off，临时规则撤销。主代理再次核对 PID 24157、binary／主配置／local／init 四个 SHA256，全部符合基线；已有活跃 direct UDP 缓存仍按上述限制解释。220 的常规 Google／Cloudflare 检查均为 204，222 可用空间约 4.9 GiB。状态快照单独归档，未导出配置备份、节点凭据或密钥。客户端在试验期间是否进入官方匹配仍待确认。
 
 ### 223 再次观测
 
