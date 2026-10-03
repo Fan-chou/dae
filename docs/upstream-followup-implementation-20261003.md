@@ -2,7 +2,7 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1、P2 的默认关闭候选，结果见末尾。P3 完成生产调用审计，未接入的 GRO／arena 暂不移植。真实 CS2 SDR 对局、U2 执行及 P1、P2 的代理／WAN 验证仍未验收，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1、P2 的默认关闭候选，结果见末尾。P3 完成生产调用审计，未接入的 GRO／arena 暂不移植。P1、P2 已有两种真实代理的 WAN 初测，仍不足以批准启用；真实 CS2 SDR 对局和 U2 执行待验收，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
@@ -360,3 +360,53 @@ Linux 增加进程级 `DAE_TCP_WRAPPED_GATHER`，默认 `false`，非法值记�
 | dae 中间 helper | 已被最终上游提交删除，不恢复删除代码 |
 
 Astra 独立确认了上述调用范围和 arena 的关闭问题。P3 的本轮结论是保留现有 GSO 生产能力、暂不接入上游未使用的 GRO 和内存管理 API；这符合方案“只评估最终仍在生产调用的实现”。将来若接入，需先设计 datagram 拆分和借出／归还／关闭所有权，再执行内核与 RSS／GC 对照。当前没有修改 outbound／quic-go pin。
+
+## P1／P2 真实代理 WAN 初测与 H3 暂停
+
+测试客户端仍为 **220**。新增默认跳过的 `TestTCPProxyWANLive` 和 `hack/test-tcp-proxy-wan.py`：独立进程在 223 原地读取选定节点，使用生产 relay，只允许 220 向两个固定 HTTPS 测试域名发起 CONNECT。生产 daemon、选路和配置没有修改。计数 wrapper 要求 upstream 为不透明协议连接，拒绝会被包装器改变裸 TCP 复制路径的节点。节点 URI 留在 223；解析和拨号错误只输出类型，关闭错误仅输出分类。
+
+每轮必须同时通过 fixture 的实际写入计数核对，以及 220 的证书验证、HTTP 200、精确 1 MiB 和完整 SHA256 核对。下载端点为 `speed.cloudflare.com/__down?bytes=1048576`，每批先验证两次完整响应；本次内容为 1 MiB ASCII `0`。fixture PASS 单独不代表下载成功，计数是代理逻辑流字节，没有核对加密后的 wire 字节或 syscall 数量。
+
+### 自然前缀与 MSS
+
+固定 Shadowsocks 节点 `HK_GG_IPLC_Dmit_HK` 和 Hysteria2 节点 `US_Dmit_LAX_Hysteria`，各比较 dial／listen MSS 的四种组合及 gather off／on，三轮交替顺序，共 **48 轮、48 MiB**，全部通过联合验收。
+
+| 路径 | 220→223 的协商 send MSS | 223→节点的协商 send MSS | 各条件三轮下载中位数 |
+| --- | --- | --- | --- |
+| Shadowsocks | listen 默认为 1448，1380 候选为 1368 | dial 默认和 1380 均为 1268 | 0.244–0.286 秒 |
+| Hysteria2 | 同上 | UDP 底层，TCP dial MSS 不适用 | 1.567–1.677 秒 |
+
+实际 MSS 受时间戳、peer 和路径上限影响。这条 Shadowsocks 路径原本已低于 1380，候选没有进一步约束 WAN 分段。被观测的 TCP socket 重传均为 0，不能据此证明其他路径的重传改善；没有测 QUIC 包丢失。样本少、单个测试站点，继续关闭 MSS，尚缺真实 WAN 的 MTU／地址族组合、MPTCP 子流和 ARM64 内核验证。
+
+自然 TLS 前缀每轮都是 **1577 字节单段，追加正文为 0**，没有实际触发 P2 合并。首批 runner 执行期间补齐了禁用 curl 默认配置和异常留证；220 已独立检查，无 curlrc 文件、无代理环境变量，因此该批没有继承覆盖。初始脚本按记录补丁重建保留，并明确标为重建版本；后续批次保留执行前的最终脚本副本。
+
+自然矩阵中 21／24 个 Hysteria2 relay 返回 joinError，完整内容仍通过验证。另用最终验收工具追加八轮错误分类，八轮均完整交付，随后收到远端 QUIC stream reset，错误码为 0，无 deadline／timeout；没有把它改写成 EOF，不能称所有 relay 都正常关闭。
+
+### 受控分段的 P2 对照
+
+另将已经读到的 1577 字节前缀拆成 788＋789 两段，不改变顺序、内容或读取时机。此模式只存在于 opt-in fixture，通过 `--split-prefix --mss 0` 明确启用；自然流量保留原段分布。两个节点各 off／on 三轮，共 **12 轮**，全部通过内容和计数核对，并额外核对实际两段与首次 Write 大小。
+
+| 节点 | 前缀 Write 调用 off→on | 整个逻辑流 Write 调用 off→on | 1 MiB 下载中位数 off→on |
+| --- | --- | --- | --- |
+| Shadowsocks | 2→1 | 5→4 | 0.253→0.252 秒 |
+| Hysteria2 | 2→1 | 5→4 | 1.571→1.587 秒 |
+
+确认候选在真实加密代理上合并了前缀，未取得稳定交付收益。这是测试构造的段分布，不能替代自然流量中多段出现频率或长时间性能证据。P2 继续默认关闭。
+
+Astra 独立静态复核指出并确认修正了联合验收、wrapper 路径、关闭前 TCP_INFO、curl 配置继承和异常留证问题；最终受控分段复核通过。正式模块图下 control vet、相关 relay／gather race 回归通过；远端 live 工具使用 CGO=0。原始结果、工具副本、失败日志和报告位于 `build/upstream-wan-20261003/`。
+
+### H3 客户端暂停
+
+220 经生产 daemon 对 Cloudflare H3 做了 5／15／35 秒暂停后同进程复用：六次请求均 HTTP 200、HTTP/3，每对 conn_id 和本地端口相同，第二次 num_connects 为 0。这证明客户端连接可复用，没有直接证明 dae 关联身份或远端 NAT 端口；curl 显示的 28.0.87.4 是 FakeIP。
+
+额外的 223 UDP unknown／observe 关联观测脚本已准备并校验，但未执行。自动审批认为已有 UDP 授权仅覆盖 CS2 SDR，拒绝了为 Cloudflare H3 修改观测配置；已请求临时仅覆盖 220 的授权，未收到答复前保持 UDP observer off。CS2 SDR 仍需要客户端 IP 和真实对局，U2 不启用。
+
+### 223 再次观测
+
+**09:13:37–09:16:37 UTC**，七个 30 秒快照：新增 considered 169、sampled 3，10 条 capture、25 条 evidence 均通过 validator；generation 不变、游标缺口 0。两个完成流都是 proxy userspace_accounting，offload_unmeasured **0／2**；queue_dropped **0／10**。invalid_window 增量为 0，但没有可比较窗口，两个 relay 都是 flow_ended_before_node_snapshot，因此 splice 计数偏差仍不可评估。独立 WAN fixture 流量不经过生产 daemon 的采集，不能拿它充当这批 capture 样本。
+
+质量日志仅 below_sampling_threshold 16 次，没有严重触发、质量切换提交或恢复日志；主要 observe 组快照未见成员变化。质量切换预算不消耗，站点恢复结论限于留存日志。末尾 106 个质量条目均无速度参考；继续 observe。RSS 117.0–119.7 MiB，error／fatal／panic 为 0，既有 warning 52 条，不能称无告警。
+
+收尾仍为 PID 24157、版本 `upstream-gather-candidate-20261003`；executable、三个配置／init 哈希与 P2 部署一致，send_redirects 均为 0，三个性能环境开关均未设置。本轮仅增加测试工具和记录，不需要重启 daemon 或改变依赖 pin。
+
+220 收尾默认路由仍经 223，Google／Cloudflare 均返回 204；远端测试二进制和临时目录已清理。222 可用空间约 **5.0 GiB**：本地 P1／P2 发布产物压缩为各自目录下的 `dae.gz`，诊断工具为 `control.test.gz`，均先核对解压 SHA256 再移除未压缩副本；可用 `gzip -dc <文件.gz> > <还原路径>` 还原。正式 Go／模块缓存、业务证据和远端回退产物保留。
