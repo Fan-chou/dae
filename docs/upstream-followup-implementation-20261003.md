@@ -488,7 +488,7 @@ Astra 独立离线复核确认上述计数、双端校验与结论边界。诊�
 
 [v1.22 listener 源码](https://github.com/shadowsocks/shadowsocks-rust/blob/v1.22.0/crates/shadowsocks/src/net/sys/unix/mod.rs)无条件禁止 IP 分片；`server/udprelay.rs` 中这些错误仅在收到目标回复、调用 inbound 回送失败后记录。该版本 `outbound_udp_allow_fragmentation` 只作用于服务器到目标的另一组 socket，无法修复此 listener。[上游修复 #2161](https://github.com/shadowsocks/shadowsocks-rust/pull/2161)及 [v1.25.0 发布说明](https://github.com/shadowsocks/shadowsocks-rust/releases/tag/v1.25.0)新增 `inbound_udp_allow_fragmentation`；默认仍为 false，只升级版本不会自动启用。
 
-后续修复方案已明确，尚未实施：
+当时拟定的修复方案如下；实际部署结果见下一节：
 
 1. 准备支持该修复的官方 v1.25.0 服务端候选，验证产物及现有 JSON5 配置兼容性。该版本包含其他变更，当前未进行候选运行验收。
 2. 在 `servers` 中只给端口 **34564** 的实例增加 `"inbound_udp_allow_fragmentation": true`；保留现有 SS2022 配置、outbound 选项和接口 MTU。已核对 v1.25 配置解析、per-server 覆盖及 listener 创建调用链。
@@ -498,6 +498,34 @@ Astra 独立离线复核确认上述计数、双端校验与结论边界。诊�
 Astra 独立只读复核确认日志关联、错误触发路径、两版本选项范围和上述结论边界。服务端日志仅保存时间、回复长度、客户端、目标、错误和 errno 六个白名单字段，丢弃可能含用户密钥的整个 control 字段；未导出原始日志、配置或凭据。相关材料为 `cs2-ss-server-{send-errors,socket,socket-routing}.json`、`cs2-ss-gateway-return-nat.json`、更新后的 `cs2-retest-fragments.json` 及 `cs2-ss-server-check-manifest.json`，均在上述 build 证据目录。
 
 14:08 UTC 收尾确认 223 PID **24157** 及 binary／主配置／local／init 四个 SHA256 均符合基线，可用内存约 218 MiB；222 可用空间 **4.52 GiB**。本轮只增加排查记录，生产配置保持回滚后的状态。
+
+#### 三台 SS 服务端修复与受控回包验收
+
+用户随后授权操作修复，并检查 `10.8.1.5`、`10.8.1.6`。三台的 SS **34564** 监听 socket 均为 `PMTUDISC_DO`，回程 WireGuard MTU 均为 **1320**。`.5` 与 `.4` 同为 shadowsocks-rust 1.22.0；`.6` 使用 sing-box 1.13.12。`.5`、`.6` 初查最近一小时没有“消息过大”记录，不能据此判断大回包正常。
+
+从 **220** 经 223 的实际 SS 客户端，对每台服务器的固定 loopback 响应器做修复前后对照。响应器仅接受合成 DNS 问题、零填充的私有 EDNS 选项 65001、64–1800 字节载荷；绑定 `127.0.0.1:46663`，上限 48 请求／12 分钟，同尺寸返回并设置 DNS 回复标记。凭据继续由测试进程在 223 原地读取；测试绕过 daemon 的选路与采集，不能作为 quality／capture 的样本。此项不依赖公网 DNS 的大回包策略。
+
+每台每轮 10 请求：6 个 64 字节回复，以及 1300、1700 字节各两次。gateway 与 220 独立核对来源、事务、问题及回复长度；三台响应器最终均接受并回复 20 请求，无非法请求，大小分布为 64 字节 12 次、1300 与 1700 各 4 次。
+
+| 服务器／223 节点 | 修改 | 修复前有效回复 | 修复后有效回复 | 当前 PID |
+| --- | --- | --- | --- | --- |
+| `10.8.1.4`／`HK_GG_IPLC_Dmit_HK` | rust 1.22.0 → **1.25.0**；34564 的 inbound 分片 true | 6／10；4 个大回包均超时 | **10／10**，大回包 4／4 | 873979 |
+| `10.8.1.5`／`SG_GG_IPLC_NNC_SG` | rust 1.22.0 → **1.25.0**；34564 的 inbound 分片 true | 6／10；4 个大回包均超时 | **10／10**，大回包 4／4 | 27247 |
+| `10.8.1.6`／`US_GG_IPLC_Dmit_LAX` | 保持 sing-box **1.13.12**；34564 的 `udp_fragment: true` | 6／10；4 个大回包均超时 | **10／10**，大回包 4／4 | 1045349 |
+
+修复前后目标、请求内容、测试客户端、223 诊断二进制和 WireGuard MTU 保持一致；正式服务重启，新建 SS 会话。两轮的全部小回包均正常；修复后共 **12／12** 个大回包通过双端验证。该结果验证了三台受控 IPv4 SS 大回包路径；真实 SDR、IPv6 外层和长期稳定性仍需另行验收。CS2 官方匹配复测已向用户提出，尚未收到结果。
+
+rust 使用 [v1.25.0 官方发布产物](https://github.com/shadowsocks/shadowsocks-rust/releases/tag/v1.25.0)，发布 API digest 与 `.sha256` 双重核对。musl 压缩包 SHA256 为 `8439bf43c324b0fc273e663d0b1f8926fd8f666cbd1e0fd59b35096f0e778e92`，部署 ssserver 为 `d63836978a3d2534f0ea1206ca12502b77b965fcfed2958d327353071b6bbf91`。sing-box 使用其已有版本支持的 [Listen Fields／udp_fragment](https://sing-box.sagernet.org/configuration/shared/listen/#udp_fragment)，未替换程序。
+
+JSON5 配置在服务器原地解析，候选序列化为 JSON；反向语义比对证明每台配置仅增加受影响 34564 实例的分片选项，密码、用户、路由及其他配置值不变。两个 rust 候选以完整配置在独立 `unshare --net` namespace 启动；sing-box 完整配置 `check` 通过，并在独立 namespace 验证目标 SS 入站。隔离修改前核对 namespace 与父进程不同。三台候选以及正式 socket 的主监听 IPv4 `MTU_DISCOVER` 均为 **1（WANT）**，rust 双栈 socket 的 IPv6 值也为 1。
+
+部署依次进行，原子替换前留存二进制／配置备份，保留原文件所有者与权限；文件和目录均 fsync。部署或监听检查失败立即回退，并预先设置 240 秒未验收回退。修复执行器在生产切换前上传回退脚本及依赖，核对远端 SHA256；每台 10／10 回包、四个大回复均通过后才写 accepted 标记并取消 timer。Astra 独立只读审查指出的回退脚本上传缺项已修正。三台备份和回退脚本保留在 root 私有目录 `/var/lib/kdae-ss-repair/20261003T142415Z/`，timer 均 inactive。
+
+修改限定于 SS 34564 实例；34565 的明文入口保持原策略，`.6` 的 Hysteria2 配置保持。重启 sing-box 会重建其 Hysteria2 监听；收尾实际监听检查包含该 UDP 58523 端口。未调整任何接口 MTU、系统分片设置、223 路由、quality 范围或依赖 pin。
+
+14:31 UTC 的新进程日志中，三台“消息过大”及 fatal／panic 文本计数均为 0，统计范围仅为各自新 PID 的保留日志。220 默认路由仍经 223；Google／Cloudflare 均为 HTTP **204**、TLS 校验结果 **0**。223 仍为 PID **24157**，binary／主配置／local／init SHA256 均符合基线。
+
+三个响应器已停止，223 临时诊断二进制已删除；删除后可用内存约 **240 MiB**。本次控制测试二进制压缩并验证解压 SHA256，正式 Go／模块缓存保留；222 收尾可用 **4.41 GiB**。运维记录、前后对照及非敏感哈希位于 `build/upstream-wan-20261003/ss-server-fix/`，汇总见 `repair-manifest.json`；新增可复用 `hack/udp-controlled-responder.py`，UDP 诊断目标仍限定为两台公网 DNS 或这个固定 loopback 端点，并拒绝 direct 使用该端点。相关 control race／vet、Python 请求边界检查通过。
 
 ### 223 再次观测
 

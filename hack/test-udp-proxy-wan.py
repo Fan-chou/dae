@@ -6,6 +6,8 @@ own payload and verifies DNS transaction/question independently; no game data,
 node URI, interface MTU or production daemon configuration is changed.
 Query sizes use a zero-filled private-use EDNS option (65001). Public resolver
 policy can affect delivery; these probes cannot establish a game path MTU.
+For deterministic reply sizes, run udp-controlled-responder.py on the proxy
+server and select --target 127.0.0.1:46663 with an explicit proxy node.
 """
 
 import argparse
@@ -93,12 +95,15 @@ def main():
     p.add_argument('--remote-binary', required=True)
     p.add_argument('--node', action='append', required=True)
     p.add_argument('--receiver-node', action='append', default=[])
-    p.add_argument('--target', choices=['1.1.1.1:53', '8.8.8.8:53'], action='append')
+    p.add_argument('--target', choices=['1.1.1.1:53', '8.8.8.8:53', '127.0.0.1:46663'], action='append',
+                   help='loopback target requires a bounded responder on the selected proxy server')
     p.add_argument('--rounds', type=int, choices=[1, 2], default=2)
     p.add_argument('--size', type=int, metavar='BYTES', action='append',
                    help='override A-query sizes for a smaller follow-up batch')
     p.add_argument('--output', type=Path, required=True)
     args = p.parse_args()
+    if '127.0.0.1:46663' in (args.target or []) and 'direct' in args.node + args.receiver_node:
+        p.error('the controlled loopback responder requires explicit proxy nodes')
     args.output.mkdir(parents=True, exist_ok=False)
     ssh = ['ssh', '-oBatchMode=yes', '-oConnectTimeout=8']
 

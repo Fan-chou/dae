@@ -32,7 +32,8 @@ import (
 )
 
 // The opt-in fixture relays only synthetic DNS requests from one explicit LAN
-// client to two fixed public resolvers. Node links remain on the gateway. It
+// client to two fixed public resolvers or a bounded responder on the proxy
+// server's loopback port 46663. Node links remain on the gateway. It
 // creates no control plane, changes no routes and never handles game payloads.
 func TestUDPProxyWANLive(t *testing.T) {
 	if os.Getenv("DAE_TEST_UDP_PROXY_WAN") != "1" {
@@ -50,8 +51,11 @@ func TestUDPProxyWANLive(t *testing.T) {
 	if e1 != nil || e2 != nil || !bind.Is4() || !client.Is4() || !bind.IsPrivate() || !client.IsPrivate() || ready == "" || e3 != nil || count < 1 || count > 48 {
 		t.Fatal("explicit private bind/client, ready path and 1..48 requests required")
 	}
-	if target != "1.1.1.1:53" && target != "8.8.8.8:53" {
-		t.Fatal("only the two fixed public DNS targets are allowed")
+	if target != "1.1.1.1:53" && target != "8.8.8.8:53" && target != "127.0.0.1:46663" {
+		t.Fatal("only fixed DNS targets or the controlled loopback responder are allowed")
+	}
+	if target == "127.0.0.1:46663" && os.Getenv("DAE_TEST_UDP_WAN_NODE") == "direct" {
+		t.Fatal("controlled replies require an explicit proxy node")
 	}
 	if mode != "read_from" && mode != "packet_receiver" {
 		t.Fatal("explicit read_from or packet_receiver required")
