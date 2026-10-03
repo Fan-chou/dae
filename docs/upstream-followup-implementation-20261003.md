@@ -279,3 +279,24 @@ MTU 和 sysctl 只在 `unshare -n` 的子 namespace 修改，修改前核对真�
 `make ebpf-lint` 未通过：现有 C 文件有缩进、空行及其他 checkpatch 提示。三个被检查的 C 文件与本轮开始前的 `0ea026d2` 完全一致，这不是新增的 lint 失败；本轮没有混入 C 格式修改。失败日志保留，不能将本批所有检查写成全绿。
 
 222 的旧构建产物无损压缩；APT 的二进制索引缓存已移除，可由现存包列表重建。闲置 pnpm store 经 tar 比较后保存为 `build/cache-archives/pnpm-store-20261003.tar.gz`，可用 `tar -xzf build/cache-archives/pnpm-store-20261003.tar.gz -C /root/.local/share/pnpm` 还原。
+
+### P1 默认关闭部署
+
+| 项目 | 结果 |
+| --- | --- |
+| 主仓库 | splice 修复 `012f2cdd`；MSS 候选和依赖 pin `d4325f9096bd8db01a81f146f3a25e331388b86d` |
+| 223 版本 | `upstream-mss-candidate-20261003`，部署后 PID 4691 |
+| executable SHA256 | `1ed3e8bd5639c6433eb1ff051129afffa56b403076203fff7c04c5145add116a` |
+| 构建 | Go 1.27.0、CGO=0、trace、heapminimum512kib／randomizedheapbase64，`GOWORK=off`、`vcs.modified=false` |
+| 模式 | 两个 MSS 环境开关均未设置；UDP observer off；主要质量组 observe、采集 25‰ |
+| 访问和内核 | 220 默认路由经过 223；Google／Cloudflare 204；all／br-lan／Home 的 send_redirects 均为 0 |
+| 配置 | config.dae、local.dae、init.d/dae 哈希与部署前一致 |
+| 回退 | `/root/upstream-p1-20261003-d4325f90/rollback.sh`；备份的 daemon／配置／init 已核对部署前哈希；本批无新增配置字段，回退脚本恢复二进制并重启 |
+
+部署采用原子替换、EXIT／信号失败回退和就绪检查。MSS 的 loopback 数据不足以批准生产启用；后续继续验证 P2／P3 与 P1 的真实代理路径。CS2 SDR 仍待客户端 IP 和真实对局，U2 保持待验收。
+
+部署后三分钟为 **06:54:26 至 06:57:26 UTC**，七个 30 秒快照。capture generation 保持一致，游标缺口为 0；窗口新增 24 条 capture、46 条 evidence，均通过现有 validator。三个完成流中两个 offload_unmeasured，比例 **2／3**，样本很少；17 个节点／本流可比较窗口中 invalid_window **0／17**、节点少于本流 **0／17**；queue_dropped **0／24**。本批没有把未测量流算成零流量，也没有为了改善该比例关闭 offload。
+
+质量日志只有 below_sampling_threshold 7 次，严重速度信号和质量切换提交均为 0；没有成功恢复日志。主要 observe 组选中成员在快照中未变化，质量切换预算不消耗；恢复统计限于保留日志，不能当作完整预算账本。没有速度参考，三分钟也没有覆盖真实 CS2，继续保持 observe。RSS 114.5–123.1 MiB，error／fatal／panic 为 0，既有 warning 18 条。
+
+222 收尾可用空间约 **5.2 GiB**。临时测试程序从 220／223 移除、本地测试产物压缩；本轮完成交叉验证的 FreeBSD 专用编译缓存按平台头和时间筛选后移除，保留正式 Linux Go 缓存。原始观测和最终报告保存在 `build/upstream-p1-20261003/`。
