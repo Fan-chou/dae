@@ -413,15 +413,23 @@ Astra 独立复核后将结束客户端快照与最后观测快照分开：最�
 
 Astra 核对出两个观测缺口：Hysteria2／TUIC 等 NAT-preserving transport 可返回原 FakeIP，而 write 记真实 peer；首次回复也可能先于 WriteTo 返回和 peer 登记。现有精确 peer 匹配可能计为未归属。这些是 U1 正确性问题，不能据此认定生产转发失败。U2 继续关闭，后续需加入 transport 的实际 peer 元数据和早到回复回归，并保留跨 peer 隔离。
 
-按 [Valve 的 CS2 SDR 配置](https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730)，revision 1790374330，12:30 UTC 临时仅对 201 到 hkg／sgp 共 16 个 IPv4 的 UDP 27015–27060 加 must_direct 对照。规则位于 local.dae，按 merger 顺序排在 generation 分流前，由本轮外层 EXIT 回退恢复。首轮预验证候选文件没有 .dae 后缀，merger 跳过了它；已修正脚本后缀，并验证实际加载配置通过，PID 不变。仍需重开 CS2 后按新五元组、conntrack 回包和客户端匹配结果联合判断。
+按 [Valve 的 CS2 SDR 配置](https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730)，revision 1790374330，12:30 UTC 临时仅对 201 到 hkg／sgp 共 16 个 IPv4 的 UDP 27015–27060 加 must_direct 对照。规则位于 local.dae，按 merger 顺序排在 generation 分流前，由本轮外层 EXIT 回退恢复。首轮预验证候选文件没有 .dae 后缀，merger 跳过了它；已修正脚本后缀，并验证实际加载配置通过，PID 不变。此次按重开后的新五元组、conntrack 回包和客户端匹配结果联合判断。
 
-12:36:59 UTC 的 conntrack 出现新五元组 `192.168.124.201:53975` → `103.10.124.119:27039`，双向均 12 包、OFFLOAD，回复经 WAN NAT 返回。确认该指定新加坡中继的直连流有回包；尚未收到客户端匹配成功确认，不能把这条流认定为成功对局或代理协议缺陷定位。
+12:36:59 UTC 的 conntrack 出现新五元组 `192.168.124.201:53975` → `103.10.124.119:27039`，双向均 12 包、OFFLOAD，回复经 WAN NAT 返回。当时确认该指定新加坡中继的直连流有回包；仅这条流不能证明成功对局或定位代理协议缺陷，后续客户端确认见下文。
 
 12:33:48–12:35:48 UTC 的五个只读快照，capture generation 不变，considered 新增 134、sampled 新增 2、capture 新增 6 条；新增完成 relay 两条、offload_unmeasured 0／2，queue_dropped 0／6。该代全部留存的四条完成 relay 中有一条 offload_or_unmeasured，不应拿窗口增量 0 掩盖已有缺失。invalid_window 没有新增，但可比较 node／flow 窗口为 0，splice 偏差仍不可评估。质量日志 below_sampling_threshold 14、insufficient_activity 1，未见恢复事件；RSS 187.5–188.7 MiB。短窗口不证明长期预算和内存行为。
 
 reload 会保留部分 UDP 路由与 endpoint；observer 新代不接管旧账本，direct 流本身也不进 proxy-only observer。因此统计消失或归零不能证明改善，恢复配置也不能保证已有 UDP socket 立即改回原路线。试验后需新建客户端连接以验证正常路由。
 
-12:39 UTC 测试到期，外层 EXIT 已恢复 baseline local.dae，observer off，临时规则撤销。主代理再次核对 PID 24157、binary／主配置／local／init 四个 SHA256，全部符合基线；已有活跃 direct UDP 缓存仍按上述限制解释。220 的常规 Google／Cloudflare 检查均为 204，222 可用空间约 4.9 GiB。状态快照单独归档，未导出配置备份、节点凭据或密钥。客户端在试验期间是否进入官方匹配仍待确认。
+12:39 UTC 测试到期，外层 EXIT 已恢复 baseline local.dae，observer off，临时规则撤销。主代理再次核对 PID 24157、binary／主配置／local／init 四个 SHA256，全部符合基线；已有活跃 direct UDP 缓存仍按上述限制解释。220 的常规 Google／Cloudflare 检查均为 204，222 可用空间约 4.9 GiB。状态快照单独归档，未导出配置备份、节点凭据或密钥。后续客户端确认匹配恢复，见下文。
+
+#### 用户确认匹配恢复
+
+约 12:47 UTC 收到用户确认“匹配已经恢复”，未提供确切恢复时间。12:47:37 UTC 的 conntrack 仍保留直连 SDR 流 `192.168.124.201:53967` → `103.28.54.180:27047`，发送 47,214 包／27,809,287 字节、回复 57,197 包／50,684,647 字节，OFFLOAD、经 WAN NAT；baseline local.dae 哈希和 PID 24157 未变。同时日志中的新源端口已重新经 `Cherry_Proxy` → `HK_GG_IPLC_Dmit_HK` 访问香港／新加坡中继。
+
+客户端结果与直连双向数据支持海外 SDR 路径选择与此次故障有关；仍不能区分代理节点／链路限制、代理协议缺陷或重开客户端的影响。当前活跃直连缓存延续并不代表后续匹配会使用同一路线。CS2 的应用回复语义仍为 unknown，UDP observer off、U2 不启用，quality 保持 observe。
+
+长期候选 `build/upstream-wan-20261003/cs2-sdr-201.dae` 仅包含 201 到 hkg／sgp 的 16 个精确 IPv4、UDP 27015–27060 的 must_direct 规则，计划单独 include 在 `routing.dae` 前。223 使用以 .dae 结尾的暂存 root／fragment 联合验证通过；暂存文件由 EXIT 清理，生产配置哈希不变，未 reload 或加载候选。此前是限时试验，长期保留规则的选择待用户确认。
 
 ### 223 再次观测
 
