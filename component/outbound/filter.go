@@ -8,6 +8,7 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -93,7 +94,8 @@ func NewDialerSetFromLinksContext(ctx context.Context, option *dialer.GlobalOpti
 		dialers:      make([]*dialer.Dialer, 0),
 		nodeToTagMap: make(map[*dialer.Dialer]string),
 	}
-	for subscriptionTag, nodes := range tagToNodeList {
+	for _, subscriptionTag := range sortedSubscriptionTags(tagToNodeList) {
+		nodes := tagToNodeList[subscriptionTag]
 		for _, node := range nodes {
 			d, err := dialer.NewFromLinkContext(ctx, option, dialer.InstanceOption{DisableCheck: false}, node, subscriptionTag)
 			if err != nil {
@@ -320,4 +322,13 @@ func (s *DialerSet) Close() error {
 		}
 	}
 	return err
+}
+
+func sortedSubscriptionTags(nodes map[string][]string) []string {
+	tags := make([]string, 0, len(nodes))
+	for tag := range nodes {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
 }
