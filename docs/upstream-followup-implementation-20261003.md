@@ -2,11 +2,11 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。阶段五已完成初步健康检查、五分钟观测和真实 splice 核对，仍缺长时间业务覆盖。U1／U2 与 P1 至 P3 尚未实施，后续依照方案分别观测和做 A/B，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及最新线上版本见末尾「Astra 审查修正与再次部署」。阶段五已完成初步健康检查、五分钟观测和真实 splice 核对，仍缺长时间业务覆盖。U1／U2 与 P1 至 P3 尚未实施，后续依照方案分别观测和做 A/B，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
-| 项目 | 本次有效版本 |
+| 项目 | 首批部署版本 |
 | --- | --- |
 | 223 dae | `6e0d075c468a179034b558381f13ab0ff759ed91`，版本名 `upstream-followup-20261003` |
 | outbound | `github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261003043055-b642f95f5383` |
@@ -107,3 +107,58 @@ observe 本身不预留候选试探或提交质量切换，因此质量切换预
 后续先补阶段五：长时间业务覆盖、H3／WG 暂停和重载源端口身份、共享节点计数、新旧 REALITY 服务端互通、线上大 DNS 应答及 IPv6 bootstrap 定向核对。ARM64 状态发布／预算／重载还需在实际机器执行。上述缺项登记为未验证，不能用短期健康检查替代。
 
 之后交付 U1 的 off／observe，并按证据决定 U2 执行范围；P1 至 P3 分别完成相同配置与工具链下的 A/B 后再决定启用。当前不启用 UDP 无回复重建或 quality enforce。
+
+## Astra 审查修正与再次部署
+
+Astra 独立审查发现一项 P1、三项 P2 和一项既有 REALITY 生命周期问题。本轮逐项修复，Astra 再次检查代码并运行独立用例，确认五项问题已关闭，未发现需要阻止合入的确定缺陷。
+
+| 问题 | 修复与提交 |
+| --- | --- |
+| HTTP3 client 所有权 | quic-go `42916a97`：流局部错误保留可用连接；退役 client 持续受 Transport 管理，等待活动响应体结束后关闭；Transport.Close 也能关闭退役连接。拨号失败归还引用，重放失败关闭重建的请求体 |
+| DNS 丢包后 deadline | 主仓库 `4a78221a`：首个 typed drop 后最多等待 100 ms 的替代应答，保留丢包分类；可升级 UDP 的请求预留一半 TCP 时间。真实 closed／QUIC timeout 仍按硬故障处理并丢弃连接，最终 TCP 失败保留自身原因 |
+| REALITY 退避 | outbound `a3085ab`：失败期限固定，普通失败不持续延期；两种缓存 hello 都遵守退避，到期只允许一个并发试探 |
+| VMess packetaddr 边界 | outbound `8b92848`：用完整帧 buffer 接收并解析地址，再检查 payload 是否适合调用者 buffer；IPv4／IPv6 的 128 字节 payload 配 128 字节 buffer 均可成功 |
+| REALITY 本地 hello 重建 | outbound `a3085ab`：nil ECDHE 的本地重建保留尚未使用的连接；切换 hello 的重新拨号失败立即返回，避免继续使用已关闭连接 |
+
+outbound `5cb6280` 固定修复后的 QUIC。两个依赖已发布到原跟进分支；主仓库 `4a78221a` 固定正式 pseudo-version。
+
+| 项目 | 当前部署版本 |
+| --- | --- |
+| 223 dae | `4a78221aa26ccd5026840da1b2ff66317d75912f`，`upstream-review-fixes-20261003` |
+| outbound | `github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261003052141-5cb62805177d` |
+| quic-go | `github.com/Fan-chou/quic-go v0.0.0-20261003051923-42916a975611` |
+| qpack | 保留 `0844ed36f1cd` |
+| 二进制 SHA256 | `7736eaeb12a606cc5a2d1e607b84a4ef20463c68c3f34587017cd42390c368f7` |
+
+正式模块图下 `make test`、`make test-race`、相关 vet 及生产构建通过。strict 跨仓库 race 为 3／3 通过；QUIC 完整 self 集成套件在该次检查中耗时 68.2 秒。outbound 完整 race、HTTP3 完整 race 及 HTTP 集成 race 也通过。首次主仓库测试曾因 222 磁盘满中断，清理后重跑通过，失败日志保留。
+
+构建沿用 Go 1.27.0、CGO=0、trace、`heapminimum512kib`，构建信息确认 `vcs.modified=false`。223 原子部署成功，PID 为 19686，配置与 init 脚本校验值保持。220 默认路由经 223，Google／Cloudflare 均返回 204；223 日志分别确认 `US_Dmit_LAX_Hysteria`／`HK_GG_IPLC_Dmit_HK` 承载请求。IPv4 all、br-lan、Home 的 send_redirects 均为 0。
+
+当前保持原有 observe 范围及 25‰ 采集。新批次备份为 `/root/upstream-review-fixes-20261003-4a78221a/before`，回退入口为同目录的 `rollback.sh`；前一批备份也保留。修正、复审、部署与观测证据位于忽略目录 `build/astra-remediation/`。
+
+### 修复版五分钟观测
+
+窗口为 2026-10-03 **05:37:45 至 05:42:45 UTC**，六个快照。服务持续运行，采集无 generation 变化和游标缺口，capture／evidence 记录均经现有 validator 校验。
+
+| 指标 | 区间结果与分母 |
+| --- | --- |
+| capture considered／sampled | 新增 275／12，导出 20 条记录 |
+| offload_unmeasured | 新增 6；12 个完成流中 6 个未测量，占 50%，缺失原因是 offload_or_relay_not_started |
+| invalid_window | 新增 0；4 个可比较窗口，0／4 |
+| queue_dropped | 新增 0；20 条导出记录加 dropped／oversize，0／20 |
+| 计数关系 | 4 个可比较窗口中，节点字节少于本流字节的次数为 0；另有 6 个短流结束时没有节点快照 |
+| evidence | 新导出 84 条 |
+| observe | below_sampling_threshold 56、insufficient_activity 2；严重速度信号与质量切换提交均为 0 |
+| 站点恢复 | 留存日志没有恢复事件或成功提交；质量预算消耗为 0，恢复事件口径不代表完整内部账本 |
+| observe 组选中成员 | 四个组在一分钟快照中均未见变化 |
+| RSS／日志 | RSS 110.0–120.1 MiB，末尾 117.0 MiB；error／fatal／panic 为 0，warning 20 条（peer reset 14、FakeIP 3、拨号超时 3） |
+
+四个 observe 组末尾共 43 个质量条目，没有可用速度样本或参考。本窗口可以确认服务与采集持续运行；未测量比例及质量触发频率仍需更大业务样本。继续 observe，尚未满足 enforce 的证据要求。节点计数与本流计数可比较窗口较少，也不能据此推断长期 splice 偏差。
+
+### 222 磁盘整理
+
+222 根盘从可用空间 0 恢复至约 5.8 GiB。清理了未在用的旧 Cursor 服务端／worker 版本、可重建的 web／web-next 前端依赖、旧 Go 编译对象和旧生成器缓存。前端源码、pnpm 锁文件及 dist 均保留；后续前端构建先按锁文件安装依赖。
+
+保留当前生产构建及主仓库／依赖测试使用的 3,143 个 Go export 对象，持久 Go 缓存约 2.7 GiB，模块缓存约 1.5 GiB。当前 Cursor worker、SmartDNS、Nginx、Docker、SSH 复核正常；业务数据、归档及部署回滚副本保留。
+
+独立用例覆盖固定退避、并发试探、随机 hello 的连接生命周期、H3 活动响应体、重放关闭和 UDP drop 后真实 timeout。新旧 REALITY 服务端互通以及全部 H3 并发交错仍需后续业务覆盖；当前短期上线验收不替代前文列出的阶段五及 A/B 项目。
