@@ -167,9 +167,9 @@ outbound `5cb6280` 固定修复后的 QUIC。两个依赖已发布到原跟进�
 
 新增独立的 off／observe 配置，默认 off。该 ledger 没有 endpoint retire、节点健康或切换预算接口；enforce 配置报错。与历史提交 `6d167837` 的静默期间保留会话决策一致。
 
-`/v1/status` 在开启时返回 `udp_reply_drought`：generation、成功写／有效回复计数、资格排除原因、peer 快照及最多 32 条候选事件。全局最多 256 个 peer，每 association 最多 8 个；60 秒空闲淘汰，候选事件每分钟最多保留 20 条。扫描只在短锁内复制 association 列表，逐流计算在锁外完成。off 不创建 ledger 或 worker，不执行每包解析和计时。
+`/v1/status` 在开启时返回 `udp_reply_drought`：generation、成功写／有效回复计数、资格排除原因、peer 快照、association 级未归属计数及最多 32 条候选事件。全局最多 256 个 peer，每 association 最多 8 个；60 秒空闲淘汰，候选事件每分钟最多保留 20 条。扫描只在短锁内复制 association 列表，逐流计算在锁外完成。off 不创建 ledger 或 worker，不执行每包解析和计时。
 
-单写完成后计数；批量仅计实际完成的成功前缀，读取在 backing buffer 复用前完成。Append、短写和未完成队列不能冒充发送完成。接收先经过错误分类和首回复保护，再按原始 peer 归因；固定目标的 canonical 映射不会把陌生 peer 计为有效回复。跨地址族别名在收发两端都归一到真实 peer。
+实际发送前先登记有界意图，让快速回复能找到对应 peer；单写完成后才计成功发送，批量仅计实际完成的成功前缀，读取在 backing buffer 复用前完成。Append、短写和未完成队列不能冒充发送完成。接收先经过错误分类和首回复保护，再按实际应用 peer 归因；NAT 回复地址另行保留，来源未知时记录未归属。固定目标的 canonical 映射不会把陌生 peer 计为有效回复。跨地址族别名在收发两端都归一到真实 peer。
 
 候选要求明确的 request_reply 契约和 IP:port 范围、至少 3 次有效回复历史、六个完整 5 秒桶各至少 10 次非空成功写，以及至少 30 秒无回复。队列接受型 transport 排除候选。读写错误、partial flush、回压及异常回拨均使旧证据失效；时间窗口使用单调时间。重载时停止 worker 并清空旧表，保留的 endpoint 继续持有已关闭 observer，不转入新代，因此新代对这些已有会话存在预期覆盖缺口。
 
@@ -185,7 +185,7 @@ global {
 }
 ```
 
-223 的 Game_Game 目前只匹配 9339／9449；SDR 未命中专用规则的流量依照原有规则和 Apple_Proxy 默认出口处理，不把 Game_Game 直接当作 CS2 样本。客户端未确定前保持 UDP 观测 off；已有质量 observe 和 25‰ TCP 采集延续。
+223 的 Game_Game 目前只匹配 9339／9449；SDR 未命中专用规则的流量依照原有规则和 Apple_Proxy 默认出口处理，不把 Game_Game 直接当作 CS2 样本。客户端已确认为 201；当前 UDP 观测 off，待新的 CS2 实测再按客户端限定范围开启。已有质量 observe 和 25‰ TCP 采集延续。
 
 Astra 独立静态审查指出并已修正：当前桶错误仍可复用历史满桶、退休代保留 peer 表、adoptUDP 发布之前 observer 未初始化，以及墙钟回拨后旧证据误报。新增测试覆盖 unknown／队列接受排除、暂停／keepalive／单向流、当前及旧桶错误、回拨、peer 隔离、真实 Append／flush、typed drop／陌生回复、跨族收发、并发容量、事件限流和重载晚回调。审查与运行测试分别记录，不把静态审查称为 race 验证。
 
@@ -695,7 +695,7 @@ outbound 本地提交 `0bb08a457f98e9b0126fc041dd7e55bb1a6ab88b`：新增独立�
 
 受影响的六个 outbound 包普通测试、race 和 vet 通过。主仓库 UDP 观测、端点生命周期、批量写、跨地址族回归通过 race；config、outbound、dialer、quality 四包 race 通过；DNS／bootstrap 相关回归和 control vet 通过。REALITY 的现有兼容、hello 和恢复测试通过，尚不能代替新旧实际服务端互通。
 
-**发布状态：** outbound 目前仅本地提交；自动审批拒绝向 `Fan-chou/outbound` 的指定 GitHub 分支导出本轮代码，等待用户明确授权。主仓库 UDP 改动通过忽略目录中的临时 modfile 使用本地 fork 验证，正式 go.mod 仍固定 `1651a64a78ac`，UDP 改动尚未正式提交、固定新版本或部署到 223。quality enforce、UDP 自动重建、MSS 和 gather 的生产状态保持。
+**发布状态：** 用户明确授权后，outbound `0bb08a457f98` 已推送至 `Fan-chou/outbound` 的 `codex/upstream-followup-20261002` 分支，正式 go.mod 固定 `v0.0.0-sticky-ip.0.20261004031250-0bb08a457f98`。主仓库提交为 `5a150027`，使用实际下载的发布模块重新通过上述 UDP／DNS 与受影响 outbound、质量配置包的 race 回归及 vet。QUIC 继续固定 `42916a975611`。223 已安装 `upstream-udp-attribution-20261004-5a150027`，部署验收记录见下节。质量继续 observe；UDP 观测及自动重建、MSS 和 gather 均保持关闭。
 
 #### eBPF、DNS 与 IPv6 验证
 
@@ -711,4 +711,18 @@ outbound 本地提交 `0bb08a457f98e9b0126fc041dd7e55bb1a6ab88b`：新增独立�
 
 **11:00:40–11:16:59** 的最近 4000 行日志没有 local_quality 或 site_recovery 事件，error／fatal／panic 为 0，warning 101 条。恢复预算结论限于所留日志，未声称已读取内部预算余额。daemon 仍为 PID 24157，原 binary／主配置／local／init 哈希保持；IEPL 运行和持久 MTU 均为 1400。222 可用空间约 **4.1 GiB**，正式 Go／模块缓存保留。
 
-仍需后续条件：确认依赖发布授权后固定版本、提交 UDP 改动并部署；用户在 201 复测修复后的 CS2；提供入口服务器可用 SSH 端口／路径；新旧 REALITY 实际服务端与 ARM64 机器验收。继续 observe；UDP 自动重建与性能默认值依照原方案的证据门槛推进。上述脚本、测试日志和非敏感汇总保存在忽略目录 `build/pending-followup-20261004/`。
+仍需后续条件：用户在 201 复测修复后的 CS2；提供入口服务器可用 SSH 端口／路径；新旧 REALITY 实际服务端与 ARM64 机器验收。继续 observe；UDP 自动重建与性能默认值依照原方案的证据门槛推进。上述脚本、测试日志和非敏感汇总保存在忽略目录 `build/pending-followup-20261004/`。
+
+#### 223 正式发布与验收
+
+`5a150027865052f218290185b744da1076666a62` 从干净工作区构建，`GOWORK=off`，没有本地路径替换。产物记录 `vcs.modified=false`，使用 `trace`、CGO=0、linux/amd64 和 `heapminimum512kib`；outbound 固定上述新版本，QUIC 与 QPACK 版本保持。二进制 SHA256 为 `700ed72747ce08eb766f5407ac083708f126e0bcbf9ac8c5a89b33ecde798947`。
+
+部署前验证旧版哈希和生产配置，先备份再原子替换二进制。脚本包含 EXIT／信号失败回滚、启动与 API 就绪检查，以及独立的 15 分钟验收超时回滚。主配置、local、init 和 network 文件的哈希均保持；新进程 PID **14819** 的运行哈希一致。**13:00:11** 完成验收并在锁内写入 accepted，解除超时回滚。旧版备份保留在 `/root/kdae-udp-attribution-20261004/before/`，手动回滚脚本为同目录上层的 `rollback.sh`。
+
+**12:56–12:59**，220 默认经 223，Google／Cloudflare 的 HTTPS 各 **3／3** 返回 204；显式 IPv6 HTTPS 返回 200，TLS 校验均为 0。外部 DNS 的 org DNSKEY 得到 **1043 字节完整 UDP 应答**；512 字节上限得到 **476 字节、TC=1**，自动转 TCP 和显式 TCP 均得到 1043 字节完整应答。
+
+180 秒、七次状态快照均运行正常，39 个组末尾都有可用节点，采集代次稳定，无游标缺口。导出 30 条采集记录，其中 23 个 relay 窗口、7 个完成流；offload_unmeasured 为 **5／7＝71.4%**，全部 direct。invalid_window 为 **0／16 个可比较窗口**，queue_dropped 为 **0／30 条记录**；节点方向计数小于本流的窗口为 0。该小样本不足以比较长期未测量比例；直接 splice 流没有本流字节计数，仍不能从自然样本计算精确偏差。
+
+四个主要组继续 observe，末尾共 16 个质量条目，没有速度样本或参考。日志中的 9 次 local_quality 事件均为 `below_sampling_threshold`，质量切换和 site_recovery 提交为 0，30 秒快照没有观察到组成员变化。observe 不消耗质量切换预算；恢复结果限于所保留日志，未读取内部预算余额。error／fatal／panic 为 0；warning 包括 21 次对端 reset、3 次 unnamed FakeIP、3 次 FakeIP 拨号超时。部署前三分钟已有 26 次对端 reset 和 3 次 unnamed FakeIP。RSS 为 **113.6–123.3 MiB**。
+
+IEPL 的 ifindex 未变，运行与 UCI MTU 都为 **1400**。质量 enforce、UDP 观测与自动重建、MSS 和 gather 继续关闭；本次真实 peer 归因修复已有协议和控制层回归，CS2 的新现场观测仍待 201 实测。发布证据位于忽略目录 `build/udp-attribution-release-20261004/`；本地候选压缩为 `dae.gz`，解压哈希已核对，222 根盘可用空间约 **3.7 GiB**，持久 Go／模块缓存及回滚副本保留。
