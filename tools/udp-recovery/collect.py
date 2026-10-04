@@ -51,6 +51,7 @@ def publish(output, value, budget):
     # budget checks and publication without taking the collector cursor lock.
     with (output / "archive.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        repair_archives_locked(output, budget)
         return publish_locked(output, value, budget)
 
 
@@ -68,11 +69,31 @@ def publish_locked(output, value, budget):
         raise ValueError("archive corruption; cursor retained")
     if manifest.exists() and manifest.read_bytes() != meta:
         raise ValueError("manifest corruption; cursor retained")
-    if not path.exists():
-        atomic_write(path, data)
+    # Publish the manifest first. Until the sample exists the analyzer ignores
+    # it, so interruption cannot leave a new sample without its manifest.
     if not manifest.exists():
         atomic_write(manifest, meta)
+    if not path.exists():
+        atomic_write(path, data)
     return path
+
+
+def repair_archives_locked(output, budget):
+    # Older versions published complete samples first. Recover their immutable
+    # manifest from verified bytes, independently of the next poll timestamp.
+    used = sum(p.stat().st_size for p in output.glob("*.json"))
+    for path in output.glob("sample-*.json"):
+        if path.name.endswith(".manifest.json") or path.with_suffix(".manifest.json").exists():
+            continue
+        data = path.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if path.name != "sample-" + digest + ".json" or json.loads(data).get("schema") != SCHEMA:
+            raise ValueError("orphan archive corruption; cursor retained")
+        meta = encode({"schema": SCHEMA, "sha256": digest, "bytes": len(data)})
+        if used + len(meta) > budget:
+            raise ValueError("archive budget exhausted during repair; cursor retained")
+        atomic_write(path.with_suffix(".manifest.json"), meta)
+        used += len(meta)
 
 
 def ssh(router, command, text=None, timeout=20):

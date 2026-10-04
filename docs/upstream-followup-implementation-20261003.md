@@ -822,7 +822,7 @@ python3 tools/udp-recovery/analyze.py build/udp-recovery-live/ \
   > build/udp-recovery-live/summary.json
 ```
 
-默认每 5 秒读取 UDP 诊断、capture 和 status，每 30 秒读取质量计数与组状态。单次最多 20 分钟，可设置到 1 小时；单轮最多分页四次；数据与 manifest 预算默认 100 MiB。SSH 使用已知主机、公钥认证和期限；token 只经现有读取脚本的 stdin 进入 curl。文件目录 0700，归档原子发布并 fsync，数据及 SHA256 manifest 完成后才一起保存游标。并发阶段标记与采集共用归档发布锁，不竞争采集游标。
+默认每 5 秒读取 UDP 诊断、capture 和 status，每 30 秒读取质量计数与组状态。单次最多 20 分钟，可设置到 1 小时；单轮最多分页四次；数据与 manifest 预算默认 100 MiB。SSH 使用已知主机、公钥认证和期限；token 只经现有读取脚本的 stdin 进入 curl。文件目录 0700，归档原子发布并 fsync，先发布 SHA256 manifest，再发布数据，两者完成后才一起保存游标。分析器忽略尚无数据的 manifest；采集或阶段标记发布前会校验旧版留下的完整孤儿数据并补写 manifest，不依赖下一轮内容相同。并发阶段标记与采集共用归档发布锁，不竞争采集游标。
 
 每轮记录实际运行二进制 SHA256、PID／启动标识、配置目录内 `.dae` 文件摘要，以及请求前后时间。来源变化时保留原始数据并拒绝推进游标；过程重启、ring 丢失、分页预算耗尽、观察代在一轮内变化和采集失败均留存为缺口。服务器 `at_ms` 与本机请求时间给出时钟偏差区间，不假定跨主机时钟已同步。阶段标记区分操作人提供的时间与报到时间。
 
@@ -830,4 +830,10 @@ python3 tools/udp-recovery/analyze.py build/udp-recovery-live/ \
 
 验收仍分两步：信息渠道证明证据完整、覆盖正确、开销受控；U2 执行 fixture 再证明预算／所有权顺序、健康 peer 不变及新关联收到三个有效回复。自动执行部分完成后，需要继续扩展 committed、awaiting_replies、recovered 等实际状态；当前接口不会填入虚构的零值或成功状态。
 
-验证：control、cmd、outbound、config 的 UDP／SessionManager／质量／站点恢复／管理接口相关 race 用例和四包 vet；新增 Python 11 项归档与分析测试、原 laya-capture 29 项测试及读取脚本语法检查。整套三仓 strict 的既有 QUIC 超时待办保持，不将本批测试替代该门槛。
+验证：control、cmd、outbound、config 的 UDP／SessionManager／质量／站点恢复／管理接口相关 race 用例和四包 vet；新增 Python 13 项归档与分析测试、原 laya-capture 29 项测试及读取脚本语法检查。整套三仓 strict 的既有 QUIC 超时待办保持，不将本批测试替代该门槛。
+
+#### Astra 独立审查与修正
+
+Astra 对冻结的 `61dce077..cd62f250` 独立审查，复现两项 P2 问题：发布数据后、写 manifest 前中断，真实重启产生的新 poll 不能修复旧孤儿文件；仅有未知 peer 的 association 未登记到 observer，重载遗漏累计结束记录。审查没有部署或访问生产服务器。
+
+归档修正为 manifest 先于数据发布，并对旧孤儿数据验证文件名摘要与 schema 后补齐 manifest。回归覆盖重启后内容变化，以及 manifest 已完成但数据尚未发布时中断。观察代新增有界 association 登记，未知写入与未知回复均纳入代际收尾；peer 全部淘汰后仍保留未归属累计计数。登记上限为 256，容量不足计入 `admission_dropped`；关闭 observer 保留实际 UDP socket。回归覆盖这三种结束场景和容量上限。

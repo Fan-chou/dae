@@ -55,6 +55,35 @@ class CollectionTests(unittest.TestCase):
             collect.publish(path, value, 10000)
             self.assertEqual(analyze.load(path), [value])
 
+    def test_different_poll_repairs_legacy_orphan_manifest(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)
+            old = {"schema": collect.SCHEMA, "kind": "poll_failure", "started_at_ms": 1}
+            data = collect.encode(old)
+            name = "sample-" + hashlib.sha256(data).hexdigest() + ".json"
+            collect.atomic_write(path/name, data)  # Legacy crash before manifest.
+            new = dict(old, started_at_ms=2)
+            collect.publish(path, new, 10000)
+            self.assertEqual(analyze.load(path), [old, new])
+
+    def test_crash_before_sample_leaves_analyzable_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)
+            value = {"schema": collect.SCHEMA, "kind": "poll_failure", "started_at_ms": 1}
+            original = collect.atomic_write
+            def interrupted(file, data):
+                if file.name.startswith("sample-") and not file.name.endswith(".manifest.json"):
+                    raise OSError("interrupted")
+                original(file, data)
+            with patch.object(collect, "atomic_write", side_effect=interrupted):
+                with self.assertRaises(OSError):
+                    collect.publish(path, value, 10000)
+            self.assertEqual(analyze.load(path), [])
+            new = dict(value, started_at_ms=2)
+            collect.publish(path, new, 10000)
+            self.assertEqual(analyze.load(path), [new])
+
     def test_archive_hash_tampering_and_budget(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root)

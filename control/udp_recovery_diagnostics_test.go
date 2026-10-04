@@ -265,3 +265,68 @@ func TestUDPRecoveryUnattributedOnlyAssociationRemainsAuditable(t *testing.T) {
 		}
 	}
 }
+
+func TestUDPRecoveryUnknownOnlyGenerationClosePreservesCumulativeCounters(t *testing.T) {
+	for _, scenario := range []string{"unknown_writes", "unknown_replies", "evicted_peers"} {
+		t.Run(scenario, func(t *testing.T) {
+			testUnknownGenerationClose(t, scenario)
+		})
+	}
+}
+
+func testUnknownGenerationClose(t *testing.T, scenario string) {
+	m := NewSessionManager(nil)
+	t.Cleanup(func() { _ = m.Close() })
+	o := testDroughtObserver(t, false)
+	c := recoveryTestPlane(m, o, 1)
+	ue := recoveryTestEndpoint(t, m, o, 1, netip.MustParseAddrPort("192.0.2.10:1234"), netip.AddrPort{})
+	var writes, replies uint64
+	for i := 0; i < 10; i++ {
+		if scenario == "unknown_replies" {
+			ue.replyDrought.reply(netip.AddrPort{}, time.Now())
+			replies++
+		} else {
+			_, _ = ue.WriteTo([]byte{1}, "target.example:1234")
+			writes++
+		}
+	}
+	if scenario == "evicted_peers" {
+		base := time.Now()
+		ue.replyDrought.write(droughtTestPeer, 1, base)
+		o.scan(base.Add(udpDroughtIdleTTL + time.Second))
+		if o.peerCount != 0 || len(ue.replyDrought.peers) != 0 {
+			t.Fatal("peer was not evicted")
+		}
+	}
+	if s := o.snapshot(time.Now()); len(s.Associations) != 1 || s.Associations[0].UnattributedWrites != writes || s.Associations[0].UnattributedReplies != replies {
+		t.Fatalf("unknown-only live counters: %+v", s.Associations)
+	}
+	_ = o.Close()
+	if !ue.replyDrought.closed.Load() || ue.dead.Load() {
+		t.Fatal("generation teardown missed observer or closed retained socket")
+	}
+	s := c.AdminUDPRecovery(0, "")
+	if s.EventCounts["association_ended"] != 1 {
+		t.Fatalf("missing generation final counters: %+v", s.EventCounts)
+	}
+	for _, e := range s.Records {
+		if e.Kind == "association_ended" && (e.Reason != "generation_closed" || e.Association.UnattributedWrites != writes || e.Association.UnattributedReplies != replies) {
+			t.Fatalf("wrong final evidence: %+v", e)
+		}
+	}
+}
+
+func TestUDPRecoveryUnknownAssociationStorageIsBounded(t *testing.T) {
+	o := testDroughtObserver(t, false)
+	for i := 0; i < udpDroughtPeerLimit+10; i++ {
+		f := o.newFlow("client", "game", "node", true)
+		f.write(netip.AddrPort{}, 1, time.Now())
+	}
+	s := o.snapshot(time.Now())
+	if len(o.flowList()) != udpDroughtPeerLimit || len(s.Associations) != udpDroughtPeerLimit || s.Stats.AdmissionDropped != 10 {
+		t.Fatalf("unbounded or silent admission loss: %+v", s.Stats)
+	}
+	if s.Stats.UnattributedWrites != udpDroughtPeerLimit+10 {
+		t.Fatal("association capacity erased aggregate counters")
+	}
+}

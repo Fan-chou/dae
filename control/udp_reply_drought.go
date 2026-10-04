@@ -258,10 +258,9 @@ func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *u
 	o := f.observer
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.closed.Load() || o.peerCount >= udpDroughtPeerLimit || len(f.peers) >= udpDroughtAssociationPeerLimit {
+	if o.closed.Load() || o.peerCount >= udpDroughtPeerLimit || len(f.peers) >= udpDroughtAssociationPeerLimit || !o.registerFlowLocked(f) {
 		return nil
 	}
-	o.flows[f.id] = f
 	o.peerCount++
 	if f.peers == nil {
 		f.peers = make(map[netip.AddrPort]*udpDroughtPeerState)
@@ -271,6 +270,28 @@ func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *u
 	return p
 }
 
+// Unknown-only associations also need generation teardown and final counters.
+// Bound association storage independently of peer storage.
+func (o *udpReplyDroughtObserver) registerFlowLocked(f *udpReplyDroughtFlow) bool {
+	if _, exists := o.flows[f.id]; exists {
+		return true
+	}
+	if o.closed.Load() || len(o.flows) >= udpDroughtPeerLimit {
+		return false
+	}
+	o.flows[f.id] = f
+	return true
+}
+
+func (f *udpReplyDroughtFlow) registerUnattributedLocked() {
+	o := f.observer
+	o.mu.Lock()
+	if !o.registerFlowLocked(f) {
+		o.admissionDropped.Add(1)
+	}
+	o.mu.Unlock()
+}
+
 func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time) {
 	if f == nil || f.closed.Load() || f.observer.closed.Load() {
 		return
@@ -278,8 +299,16 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 	o := f.observer
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 	if !validDroughtPeer(peer) {
+		f.mu.Lock()
+		if f.closed.Load() || o.closed.Load() {
+			f.mu.Unlock()
+			return
+		}
+		f.registerUnattributedLocked()
 		o.unattributedWrites.Add(1)
-		if f.unattributedWrites.Add(1) == 1 {
+		first := f.unattributedWrites.Add(1) == 1
+		f.mu.Unlock()
+		if first {
 			f.recordUnattributed("first_unattributed_write", now)
 		}
 		return
@@ -329,6 +358,7 @@ func (f *udpReplyDroughtFlow) reply(peer netip.AddrPort, now time.Time) {
 	}
 	p := f.peers[peer]
 	if p == nil {
+		f.registerUnattributedLocked()
 		f.observer.unattributedReplies.Add(1)
 		first := f.unattributedReplies.Add(1) == 1
 		f.mu.Unlock()
@@ -493,7 +523,7 @@ func (f *udpReplyDroughtFlow) rows(now time.Time, scan bool) (rows, events []UDP
 			delete(f.peers, peer)
 			f.observer.mu.Lock()
 			f.observer.peerCount--
-			if len(f.peers) == 0 {
+			if len(f.peers) == 0 && f.unattributedWrites.Load() == 0 && f.unattributedReplies.Load() == 0 {
 				delete(f.observer.flows, f.id)
 			}
 			f.observer.mu.Unlock()
@@ -574,7 +604,7 @@ func (o *udpReplyDroughtObserver) snapshot(now time.Time) *UDPReplyDroughtSnapsh
 	}
 	for _, f := range o.flowList() {
 		rows, _ := f.rows(now, false)
-		if len(rows) > 0 && len(s.Associations) < udpDroughtPeerLimit {
+		if (len(rows) > 0 || f.unattributedWrites.Load() > 0 || f.unattributedReplies.Load() > 0) && len(s.Associations) < udpDroughtPeerLimit {
 			identity := f.identity.Load()
 			s.Associations = append(s.Associations, UDPReplyDroughtAssociation{
 				Association: f.id, Client: f.client, Group: f.group, Node: f.node,
