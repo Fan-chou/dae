@@ -184,7 +184,7 @@ Go 操作先使用项目的持久缓存：
 
 各单元先执行能覆盖自身风险的测试。依赖 pin 完成后执行：
 
-    scripts/fork-cross-repo-test.sh --strict --short -- -race -p=1
+    scripts/fork-cross-repo-test.sh --strict --short --clone-missing -- -race -p=1
     go vet -tags dae_stub_ebpf ./common/... ./component/... ./config/... ./control/... ./cmd/... ./tools/dae-rule-sync/... ./scripts/...
     make test
     make test-race

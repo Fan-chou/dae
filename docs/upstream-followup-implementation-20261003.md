@@ -734,3 +734,27 @@ IEPL 的 ifindex 未变，运行与 UCI MTU 都为 **1400**。质量 enforce、U
 **15:47（北京时间）**，沿隧道 SSH 只读复核：`.1/.11` 到核心入口的握手持续刷新，`.3` 的直接 peer 握手仍为 0。三个 endpoint 仍为 `165.101.4.113:65008`，`.3` 到入口使用物理口默认网关。RIPEstat 的公开 BGP 数据显示，[`.1` 的 `106.53.65.44`](https://stat.ripe.net/data/network-info/data.json?resource=106.53.65.44) 和 [`.11` 的 `43.136.77.84`](https://stat.ripe.net/data/network-info/data.json?resource=43.136.77.84) 都由 **AS45090** 宣告；[`.3` 的 `39.108.101.120`](https://stat.ripe.net/data/network-info/data.json?resource=39.108.101.120) 由 **AS37963** 宣告。RIPEstat 的[公共视角没有找到入口的路由前缀](https://stat.ripe.net/data/network-info/data.json?resource=165.101.4.113)，这不表示受限网络内部没有路由。
 
 现象与入口只向部分 AS 可达相符，但尚不能证明 AS37963 是否被入口策略排除，也不能由普通 `ip route get` 推断上游 BGP 的回程。保留 `.3 → .11 → .2` 的已验收中继，以及入口／出口限制和 MTU 1400。没有开放端口、扩大来源范围或修改服务器配置。后续如需公网直连，应先核对入口是否向 AS37963 提供必要的双向路由；无需把任意公网来源的 SSH 成功作为前置条件。只读记录保存在 `build/wg-entry-acl-20261004/`。
+
+### 上游跟进待办复核（10 月 4 日）
+
+对照方案的 25 个单元和当前提交：20 个正确性单元及 U1 已实现；P1、P2 已实现默认关闭的候选；P3 已完成评估，决定暂不接入没有生产调用的 GRO／arena；U2 的自动重建、预算和 peer 拆分执行路径尚未实现。相关主仓库实现提交均为当前 HEAD 的祖先。
+
+共享节点的双向并发 splice 字节核对、线上大 DNS 应答／截断升级、IPv6 resolver 的 UDP／TCP bootstrap、eBPF lint／测试及 NAT 真实 peer／早到回复修复已有通过记录，不再列为未完成。自然 splice 样本缺少本流计数，仍不能用它们取代受控字节核对。
+
+| 待办 | 当前状态与剩余条件 |
+| --- | --- |
+| 最终 strict 验证 | 最新 pin 的完整三仓检查中，QUIC 的损坏包握手用例发生 1 秒期限超时；当前版和旧基线的定向重复均通过，整套失败原因仍需定位，详见下文 |
+| CS2 修复后现场验收 | SS 回送与 MTU 已修复，实际 peer 归因已发布；仍需 201 新一轮官方匹配／对局，把游戏阶段与新的 association、真实 peer 和双向流量对应 |
+| UDP 暂停／重载身份 | H3 请求间隔及 association 复用已验证；真正静默的 H3／WG keepalive、暂停与重载组合尚未完整覆盖。STUN 的远端映射端口变化已排除 dae endpoint 对象重建，底层 transport／远端 NAT 原因未闭合 |
+| U2 UDP 自动重建 | 未实现。CS2 回复语义保持 unknown；需证明当前回复义务、暂停保护、独立预算和 peer 隔离后才能实现执行路径，不能仅凭无回复或端口范围启用 |
+| REALITY／bootstrap 场景 | 本地兼容和生命周期测试通过；尚缺新旧真实 REALITY 服务端互通，以及代理节点使用 IPv6-only 名称的完整初始化验证 |
+| ARM64 实机 | 已交叉编译；状态发布、预算竞争、重载和相关内核路径尚未在 ARM64 机器执行 |
+| 质量 observe 的启用门槛 | 223 本次读取的 147 个质量条目均为 observe，仅 3 条有速度样本、1 条有速度参考；仍需有代表性的业务样本、触发频率和恢复提交记录，保持 enforce 关闭 |
+| P1／P2 性能启用 | 两种真实代理的短期 A/B 已完成。MSS 尚缺完整 WAN MTU／IPv4／IPv6／MPTCP 矩阵，gather 尚缺自然多段出现频率和稳定交付收益；两者继续关闭 |
+| 主仓库发布 | 代码及部署记录已提交本地；outbound／quic-go 已推送并固定，主仓库 fdae 尚未推送 GitHub |
+
+**最终依赖验证：** 最新 `0bb08a457f98` 更新后，受影响包 race 和 vet 已通过。此前完整 strict 三仓日志对应旧 outbound `5cb62805177d`；本次指定 `build/upstream-followup/` 下三个实际 fork 工作区，确认最终 outbound／quic-go／qpack 的 dry-run 覆盖，并执行 `--strict --short -- -race -p=1`。outbound 和 qpack 通过；QUIC 的 `TestMITCorruptPackets/towards_the_client` 在客户端 Dial 成功后、服务端 Accept 处超过 1 秒 context 期限，严格检查返回失败。未发现 DATA RACE 报告，不能将本轮写为三仓全部通过。
+
+保持工具链、GOMAXPROCS=2、原始断言及期限，对当前 QUIC `42916a975611` 和旧基线 `e64dc7a1252e` 各运行 20 轮该用例的 race，对照均通过；两版本的 `mitm_test.go` 内容和 SHA256 相同。测试会随机损坏握手及数据包，但目前没有证据把整套超时归因于随机性、调度或本次修改。定向通过不替代整套 strict 通过，失败原因与稳定性仍为待办。没有修改测试、重试至全绿或改变线上参数。
+
+入口对 AS37963 的双向路由范围仍需确认，`.2 ↔ .3` 现有中继已验收；这是关联的网络接入事项。只读核对、最终验证日志与清单保存在 `build/upstream-completion-audit-20261004/`。
