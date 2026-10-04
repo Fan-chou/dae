@@ -674,3 +674,41 @@ Linux 节点原有 `wg-quick@接口` 已启用；对应 `/etc/wireguard/接口.c
 收尾仍为 PID 24157、版本 `upstream-gather-candidate-20261003`；executable、三个配置／init 哈希与 P2 部署一致，send_redirects 均为 0，三个性能环境开关均未设置。本轮仅增加测试工具和记录，不需要重启 daemon 或改变依赖 pin。
 
 220 收尾默认路由仍经 223，Google／Cloudflare 均返回 204；远端测试二进制和临时目录已清理。222 可用空间约 **5.0 GiB**：本地 P1／P2 发布产物压缩为各自目录下的 `dae.gz`，诊断工具为 `control.test.gz`，均先核对解压 SHA256 再移除未压缩副本；可用 `gzip -dc <文件.gz> > <还原路径>` 还原。正式 Go／模块缓存、业务证据和远端回退产物保留。
+
+### 10 月 4 日收尾与 UDP 归因修复
+
+此前 WireGuard 的入口限制、peer 最大 MTU 表、统一 1400 的部署及验收记录已提交为 `cc2bce35`。本节时间采用北京时间。
+
+#### `.1` nftables 持久化修复
+
+原 `/etc/nftables.conf` 的 NAT chain 位于 table 外，语法检查失败；nftables 服务 failed 且已启用开机加载。未生效的示例还包含 input／forward 默认 drop，直接补括号并加载会改变生产策略。运行中的 ip／ip6 filter、nat 表由 iptables、Tailscale 与 WireGuard hook 维护，因此将该文件替换为仅加载已有 `/etc/kdae-wg-paths/entry-guard.nft` 的入口配置。服务 drop-in 设置 RemainAfterExit，reload 同样只加载此配置。
+
+已备份并原子替换，语法检查、start、reload 均通过，服务恢复 active。核对前后规则，排除运行计数和 handle 后，其他表完全一致。新的 SSH 连接成功，WG 服务 active，到核心入口的 1400 字节 DF 包 **3／3**；接口 MTU 1400，核心 endpoint 仍为入口。备份为 `/var/lib/kdae-wg-paths/20261004-nft-repair-v1/`，含旧配置、旧 drop-in、前后规则及 accepted 记录。
+
+`.2 ↔ .3` 入口直连仍缺少管理入口：重试 `165.101.4.113:22`，连接在认证前关闭。当前业务继续经 `.11` 中继，未改 peer 归属或绕过出口限制。
+
+#### UDP 观测的两个归因缺口
+
+outbound 本地提交 `0bb08a457f98e9b0126fc041dd7e55bb1a6ab88b`：新增独立的实际应用 peer 元数据，Hysteria2／TUIC 的 push 和 ReadFrom 路径均保留客户端 NAT 回复地址，同时提供 NAT 改写前的真实 peer。未知域名来源保持未归属。SOCKS5、SS stream 和 SS2022 在解码后更新 peer，避免沿用下层代理地址；分片重组保留同一语义。
+
+主仓库工作区在实际 WriteTo／WriteBatch 调用前登记有界的发送意图，快速回复可立即找到 association 中的 peer。意图不计成功发送，排队不填充观察窗口；返回后仅计成功包或批次的成功前缀，失败仍使窗口失效。未发送的意图同样受每 association 八个／全局 256 个 peer、60 秒 TTL 和代次关闭约束。快照增加 association 级未归属计数，便于区分同时运行的 Steam 与其他流量；不同 IP、端口及未知来源不会合并，mapped IPv4 与对应 IPv4 正常归一。
+
+受影响的六个 outbound 包普通测试、race 和 vet 通过。主仓库 UDP 观测、端点生命周期、批量写、跨地址族回归通过 race；config、outbound、dialer、quality 四包 race 通过；DNS／bootstrap 相关回归和 control vet 通过。REALITY 的现有兼容、hello 和恢复测试通过，尚不能代替新旧实际服务端互通。
+
+**发布状态：** outbound 目前仅本地提交；自动审批拒绝向 `Fan-chou/outbound` 的指定 GitHub 分支导出本轮代码，等待用户明确授权。主仓库 UDP 改动通过忽略目录中的临时 modfile 使用本地 fork 验证，正式 go.mod 仍固定 `1651a64a78ac`，UDP 改动尚未正式提交、固定新版本或部署到 223。quality enforce、UDP 自动重建、MSS 和 gather 的生产状态保持。
+
+#### eBPF、DNS 与 IPv6 验证
+
+历史 checkpatch 提示已整理为 `a78c788a`：调整缩进、空行、布尔指针判断及过长测试行，重写一处被误判为 switch fallthrough 的注释。`make ebpf-lint` 和 `make ebpf-test` 均通过。
+
+**11:11**，220 默认仍经 223。向外部 DNS 地址发送 org DNSKEY 请求，4096 字节 EDNS 上限得到 **1337 字节完整应答**；512 上限、禁止自动重试时得到 **476 字节、TC=1**；允许重试时自动转 TCP，再得到 1337 字节完整应答；显式 TCP 同样成功。向路由器本地 53 查询的另一响应路径未遵循 512 上限，已单独保存，未用作 dae 截断验收。
+
+220 经 223 的显式 IPv6 HTTPS 返回 **200、TLS 校验 0**。客户端 DNS 会被生产策略接管，因此不能用其 FakeIP／AAAA 结果证明 bootstrap。另在 223 运行固定目标、超时的探针，沿用生产 `BootstrapResolvers`、`ResolveIp46`、代次 direct dialer 和内部 socket mark，以 `[2400:3200::1]:53` 分别走 UDP／TCP，四项 A／AAAA 查询均获得真实地址、无错误。探针已从远端清理；生产 resolver 和配置未改。该验证覆盖 IPv6 resolver 链路，未覆盖服务端 IPv6-only 名称及所有订阅初始化场景。
+
+#### 223 观测和后续条件
+
+当前采集代次从 **10 月 3 日 21:47 至 10 月 4 日 11:13** 保持，分页读取无游标缺口，**4884 条记录全部通过 validator**。850 个完成流中，offload_unmeasured 为 **510／850＝60.0%**，全部是 direct，其中包含 90 个 offload_error 终态；不能把“未测量”计为代理失败。queue_dropped 为 **0／4884**；3163 个可比较 userspace 窗口中 invalid_window 为 **0／3163**，没有节点方向计数小于本流的窗口。直接 splice 流仍缺少本流计数，这些自然样本不能给出其精确偏差；此前受控 splice 验收继续作为依据。
+
+**11:00:40–11:16:59** 的最近 4000 行日志没有 local_quality 或 site_recovery 事件，error／fatal／panic 为 0，warning 101 条。恢复预算结论限于所留日志，未声称已读取内部预算余额。daemon 仍为 PID 24157，原 binary／主配置／local／init 哈希保持；IEPL 运行和持久 MTU 均为 1400。222 可用空间约 **4.1 GiB**，正式 Go／模块缓存保留。
+
+仍需后续条件：确认依赖发布授权后固定版本、提交 UDP 改动并部署；用户在 201 复测修复后的 CS2；提供入口服务器可用 SSH 端口／路径；新旧 REALITY 实际服务端与 ARM64 机器验收。继续 observe；UDP 自动重建与性能默认值依照原方案的证据门槛推进。上述脚本、测试日志和非敏感汇总保存在忽略目录 `build/pending-followup-20261004/`。
