@@ -28,15 +28,26 @@ var udpDroughtGeneration atomic.Uint64
 // UDPReplyDroughtSnapshot contains observations only. Neither this ledger nor
 // its scanner has access to endpoint retirement, node health or switch budgets.
 type UDPReplyDroughtSnapshot struct {
-	Mode       string                `json:"mode"`
-	Generation uint64                `json:"generation"`
-	Group      string                `json:"group"`
-	Client     string                `json:"client,omitempty"`
-	Contract   string                `json:"contract"`
-	Stats      UDPReplyDroughtStats  `json:"stats"`
-	Excluded   map[string]int        `json:"excluded"`
-	Peers      []UDPReplyDroughtPeer `json:"peers"`
-	Events     []UDPReplyDroughtPeer `json:"events"`
+	Mode         string                       `json:"mode"`
+	Generation   uint64                       `json:"generation"`
+	Group        string                       `json:"group"`
+	Client       string                       `json:"client,omitempty"`
+	Contract     string                       `json:"contract"`
+	Stats        UDPReplyDroughtStats         `json:"stats"`
+	Excluded     map[string]int               `json:"excluded"`
+	Peers        []UDPReplyDroughtPeer        `json:"peers"`
+	Associations []UDPReplyDroughtAssociation `json:"associations"`
+	Events       []UDPReplyDroughtPeer        `json:"events"`
+}
+
+// Unattributed replies belong to an association, never an inferred peer.
+type UDPReplyDroughtAssociation struct {
+	Association         uint64 `json:"association"`
+	Client              string `json:"client"`
+	Group               string `json:"group"`
+	Node                string `json:"node"`
+	UnattributedWrites  uint64 `json:"unattributed_writes"`
+	UnattributedReplies uint64 `json:"unattributed_replies"`
 }
 
 type UDPReplyDroughtStats struct {
@@ -100,13 +111,14 @@ type udpReplyDroughtObserver struct {
 }
 
 type udpReplyDroughtFlow struct {
-	observer            *udpReplyDroughtObserver
-	id                  uint64
-	client, group, node string
-	completionKnown     bool
-	closed              atomic.Bool
-	mu                  sync.Mutex // one association; no I/O or output under this lock
-	peers               map[netip.AddrPort]*udpDroughtPeerState
+	observer                                *udpReplyDroughtObserver
+	id                                      uint64
+	client, group, node                     string
+	completionKnown                         bool
+	closed                                  atomic.Bool
+	mu                                      sync.Mutex // one association; no I/O or output under this lock
+	peers                                   map[netip.AddrPort]*udpDroughtPeerState
+	unattributedWrites, unattributedReplies atomic.Uint64
 }
 
 func newUDPReplyDroughtObserver(policy config.UDPReplyDroughtPolicy) *udpReplyDroughtObserver {
@@ -190,6 +202,45 @@ func (p *udpDroughtPeerState) checkClock(nano int64) {
 	}
 }
 
+// Admit intent before transport I/O so a fast reply cannot overtake peer
+// registration. Intent never counts as a successful write or a full bucket.
+func (f *udpReplyDroughtFlow) prepare(peer netip.AddrPort, now time.Time) {
+	if f == nil || f.closed.Load() || f.observer.closed.Load() {
+		return
+	}
+	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+	if !validDroughtPeer(peer) || (len(f.observer.peers) > 0 && !f.observer.peers[peer]) {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.closed.Load() && !f.observer.closed.Load() {
+		f.admitLocked(peer, now)
+	}
+}
+
+// The flow lock protects this peer table; the registry lock only reserves
+// bounded space. Rejected intent is counted once when its write completes.
+func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *udpDroughtPeerState {
+	if p := f.peers[peer]; p != nil {
+		return p
+	}
+	o := f.observer
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed.Load() || o.peerCount >= udpDroughtPeerLimit || len(f.peers) >= udpDroughtAssociationPeerLimit {
+		return nil
+	}
+	o.flows[f.id] = f
+	o.peerCount++
+	if f.peers == nil {
+		f.peers = make(map[netip.AddrPort]*udpDroughtPeerState)
+	}
+	p := &udpDroughtPeerState{first: o.stamp(now)}
+	f.peers[peer] = p
+	return p
+}
+
 func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time) {
 	if f == nil || f.closed.Load() || f.observer.closed.Load() {
 		return
@@ -198,6 +249,7 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 	if !validDroughtPeer(peer) {
 		o.unattributedWrites.Add(1)
+		f.unattributedWrites.Add(1)
 		return
 	}
 	if len(o.peers) > 0 && !o.peers[peer] {
@@ -208,22 +260,10 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 	if f.closed.Load() || o.closed.Load() {
 		return
 	}
-	p := f.peers[peer]
+	p := f.admitLocked(peer, now)
 	if p == nil {
-		o.mu.Lock()
-		if o.closed.Load() || o.peerCount >= udpDroughtPeerLimit || len(f.peers) >= udpDroughtAssociationPeerLimit {
-			o.mu.Unlock()
-			o.admissionDropped.Add(1)
-			return
-		}
-		o.flows[f.id] = f
-		o.peerCount++
-		o.mu.Unlock()
-		if f.peers == nil {
-			f.peers = make(map[netip.AddrPort]*udpDroughtPeerState)
-		}
-		p = &udpDroughtPeerState{first: o.stamp(now)}
-		f.peers[peer] = p
+		o.admissionDropped.Add(1)
+		return
 	}
 	p.writes++
 	nano := o.stamp(now)
@@ -257,6 +297,7 @@ func (f *udpReplyDroughtFlow) reply(peer netip.AddrPort, now time.Time) {
 	p := f.peers[peer]
 	if p == nil {
 		f.observer.unattributedReplies.Add(1)
+		f.unattributedReplies.Add(1)
 		return
 	}
 	nano := f.observer.stamp(now)
@@ -366,7 +407,7 @@ func (f *udpReplyDroughtFlow) rows(now time.Time, scan bool) (rows, events []UDP
 	}
 	nano := f.observer.stamp(now)
 	for peer, p := range f.peers {
-		last := max(p.lastWrite, p.lastReply)
+		last := max(p.first, p.lastWrite, p.lastReply)
 		if scan && nano-last >= int64(udpDroughtIdleTTL) {
 			delete(f.peers, peer)
 			f.observer.mu.Lock()
@@ -434,12 +475,18 @@ func (o *udpReplyDroughtObserver) snapshot(now time.Time) *UDPReplyDroughtSnapsh
 	if o.policy.RequestReply {
 		contract = "configured_request_reply"
 	}
-	s := &UDPReplyDroughtSnapshot{Mode: "observe", Generation: o.generation, Group: o.policy.Group, Contract: contract, Excluded: make(map[string]int), Peers: []UDPReplyDroughtPeer{}, Events: []UDPReplyDroughtPeer{}}
+	s := &UDPReplyDroughtSnapshot{Mode: "observe", Generation: o.generation, Group: o.policy.Group, Contract: contract, Excluded: make(map[string]int), Peers: []UDPReplyDroughtPeer{}, Associations: []UDPReplyDroughtAssociation{}, Events: []UDPReplyDroughtPeer{}}
 	if o.policy.Client.IsValid() {
 		s.Client = o.policy.Client.String()
 	}
 	for _, f := range o.flowList() {
 		rows, _ := f.rows(now, false)
+		if len(rows) > 0 && len(s.Associations) < udpDroughtPeerLimit {
+			s.Associations = append(s.Associations, UDPReplyDroughtAssociation{
+				Association: f.id, Client: f.client, Group: f.group, Node: f.node,
+				UnattributedWrites: f.unattributedWrites.Load(), UnattributedReplies: f.unattributedReplies.Load(),
+			})
+		}
 		// A snapshot can span concurrent eviction/admission. Bound output as
 		// well as live storage, even though rows are not a single atomic view.
 		rows = rows[:min(len(rows), udpDroughtPeerLimit-len(s.Peers))]
@@ -456,6 +503,7 @@ func (o *udpReplyDroughtObserver) snapshot(now time.Time) *UDPReplyDroughtSnapsh
 		}
 		return s.Peers[i].Association < s.Peers[j].Association
 	})
+	sort.Slice(s.Associations, func(i, j int) bool { return s.Associations[i].Association < s.Associations[j].Association })
 	o.mu.Lock()
 	s.Events = append(s.Events, o.events...)
 	o.mu.Unlock()
@@ -480,6 +528,14 @@ func (ue *UdpEndpoint) observeDroughtWrite(addr string, size int, now time.Time)
 	}
 	peer, _ := netip.ParseAddrPort(addr)
 	ue.replyDrought.write(ue.droughtPeer(peer), size, now)
+}
+
+func (ue *UdpEndpoint) prepareDroughtWrite(addr string) {
+	if ue.replyDrought == nil {
+		return
+	}
+	peer, _ := netip.ParseAddrPort(addr)
+	ue.replyDrought.prepare(ue.droughtPeer(peer), time.Now())
 }
 
 // Call before releasing the batch mutex: item addresses and payloads still

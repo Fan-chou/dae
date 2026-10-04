@@ -176,6 +176,7 @@ func (a *udpWriteBatchAggregator) flush() {
 		var fallbackErr error
 		sentAny := false
 		for _, it := range items {
+			a.ue.prepareDroughtWrite(it.Addr)
 			n, err := a.ue.conn.WriteTo(it.Data, it.Addr)
 			if err != nil {
 				fallbackErr = err
@@ -200,6 +201,11 @@ func (a *udpWriteBatchAggregator) flush() {
 		}
 		a.ue.applyBatchedFlushResult(nil, true)
 		return
+	}
+	if a.ue.replyDrought != nil {
+		for _, it := range items {
+			a.ue.prepareDroughtWrite(it.Addr)
+		}
 	}
 	n, err := bw.WriteBatch(items)
 	if a.ue.replyDrought != nil {

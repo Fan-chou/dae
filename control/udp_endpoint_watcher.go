@@ -212,7 +212,7 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 	}
 	now := time.Now()
 	if ue.replyDrought != nil {
-		ue.replyDrought.reply(ue.droughtPeer(packet.From), now)
+		ue.replyDrought.reply(ue.droughtPeer(packet.Peer), now)
 	}
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
 		lifecycle.handleReply(ue, now.UnixNano())
@@ -261,7 +261,14 @@ func (ue *UdpEndpoint) startReadLoop() {
 		}
 	}()
 	for {
-		n, from, err := ue.conn.ReadFrom(buf[:])
+		var n int
+		var from, peer netip.AddrPort
+		var err error
+		if ue.replyDrought != nil {
+			n, from, peer, err = netproxy.ReadFromWithPeer(ue.conn, buf[:])
+		} else {
+			n, from, err = ue.conn.ReadFrom(buf[:])
+		}
 		if err != nil {
 			if ue.applyUpstreamReadErrorPolicy(err, ue.retire) {
 				ue.logEndpointExit(err, "read loop")
@@ -270,7 +277,6 @@ func (ue *UdpEndpoint) startReadLoop() {
 			continue
 		}
 		ue.softErrorCount = 0
-		rawFrom := from
 		from = ue.canonicalReplyFrom(from)
 		if !ue.hasReply.Load() && !ue.acceptsInitialReplyFrom(from) {
 			if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -285,7 +291,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 		}
 		now := time.Now()
 		if ue.replyDrought != nil {
-			ue.replyDrought.reply(ue.droughtPeer(rawFrom), now)
+			ue.replyDrought.reply(ue.droughtPeer(peer), now)
 		}
 		if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
 			lifecycle.handleReply(ue, now.UnixNano())

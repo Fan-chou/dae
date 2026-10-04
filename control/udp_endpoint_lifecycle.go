@@ -577,6 +577,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	writeStarted := udpWriteWait.start()
 	carrier := &udpWriteByCarrier[udpCarrierIndex(ue)]
 	carrierStarted := carrier.start()
+	ue.prepareDroughtWrite(addr)
 	n, err := ue.conn.WriteTo(b, addr)
 	udpWriteWait.finish(writeStarted)
 	recordUDPSlowWrite(ue, addr, carrier.finish(carrierStarted), err)
