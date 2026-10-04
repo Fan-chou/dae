@@ -837,3 +837,5 @@ python3 tools/udp-recovery/analyze.py build/udp-recovery-live/ \
 Astra 对冻结的 `61dce077..cd62f250` 独立审查，复现两项 P2 问题：发布数据后、写 manifest 前中断，真实重启产生的新 poll 不能修复旧孤儿文件；仅有未知 peer 的 association 未登记到 observer，重载遗漏累计结束记录。审查没有部署或访问生产服务器。
 
 归档修正为 manifest 先于数据发布，并对旧孤儿数据验证文件名摘要与 schema 后补齐 manifest。回归覆盖重启后内容变化，以及 manifest 已完成但数据尚未发布时中断。观察代新增有界 association 登记，未知写入与未知回复均纳入代际收尾；peer 全部淘汰后仍保留未归属累计计数。登记上限为 256，容量不足计入 `admission_dropped`；关闭 observer 保留实际 UDP socket。回归覆盖这三种结束场景和容量上限。
+
+Astra 再次独立复核 `cd62f250..a585f32e`，确认两项发现均已修复，未发现修正引入的新问题。原先失败的冻结回归在修正后通过；Astra 重跑 Python 13 项测试及相关新增／并发 race 用例均通过。复核未覆盖生产流量、长期内存或观测开销，也不代表 U2 执行与业务恢复验收完成。本轮实现、修正及审查记录均已提交本地，尚未推送或部署。
