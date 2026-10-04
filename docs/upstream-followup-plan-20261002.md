@@ -121,9 +121,9 @@ C2 对固定索引属于有意修正：消除原先随机选择后，升级时�
 | 单元 | 设计 | 历史关系 | 验收 |
 | --- | --- | --- | --- |
 | U1 证据与模式 | 有界记录代理 data session 的本地成功写与有效回复；DNS、直连退出。unknown 语义始终排除候选；明确服务可声明 request_reply，并限定 IP:port。六个完整 5 秒桶各至少 10 次非空成功写、至少 3 次回复历史、30 秒无回复，仅作为观察初值；队列接受不等于完成发送 | 新行为扩展，保留 6d167837 的静默保护 | H3 视频间歇、WG keepalive、长暂停后的单包、单向数据、回压、旧桶和错误后的当前桶不能触发；observe 不改源端口与 endpoint |
-| U2 执行与 peer 隔离 | 独立 rebuild ledger，按稳定关联身份和 peer 隔离；初始上限沿用 256 项、1 分钟 TTL；重建后再次尝试前要求至少 3 个有效回复；先登记预算再发布 retire | 适配 FIFO、代际、身份与预算历史，来源 S12 的后续排序修复一同引入 | 全锥中故障 peer 拆出，健康 peer 保持；绑定目标协议不 promotion；重载、别名、批量 flush、预算竞争和晚回调测试 |
+| U2 执行与 peer 隔离 | 独立 rebuild ledger，按稳定关联身份和 peer 隔离；最多 256 项，已无活跃所有者的记录保留 1 分钟；重建后再次尝试前要求至少 3 个新关联的有效回复；先登记预算再发布所有权变更，具体设计见下节 | 适配 FIFO、代际、身份与预算历史，来源 S12 的后续排序修复一同引入；活跃关联的回复限制不因 TTL 到期而清除 | 全锥中故障 peer 拆出，健康 peer 保持；绑定目标协议不 promotion；重载、别名、批量 flush、预算竞争和晚回调测试 |
 
-用户选择 CS2 官方匹配的 SDR 作为业务覆盖目标。[Valve 的 SDR 文档](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay?l=english)描述了中继与连接票据。本项目当前只能看到代理侧 UDP 的 peer 和收发结果，无法确认游戏阶段及此时应有的回复，因此 CS2 保持 unknown。端口、域名、SDR 地址范围和过去曾有回复，都不能替代当前回复资格；没有合格候选时保留排除统计，不放宽条件制造候选。U2 要在真实对局阶段标注、请求／回复义务与暂停保护验证后再设计执行路径。
+用户选择 CS2 官方匹配的 SDR 作为业务覆盖目标。[Valve 的 SDR 文档](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay?l=english)描述了中继与连接票据。本项目当前只能看到代理侧 UDP 的 peer 和收发结果，无法确认游戏阶段及此时应有的回复，因此 CS2 保持 unknown。端口、域名、SDR 地址范围和过去曾有回复，都不能替代当前回复资格；没有合格候选时保留排除统计，不放宽条件制造候选。通用执行机制先以可控请求／应答服务设计和验证；CS2 的自动执行范围仍需真实对局阶段标注、请求／回复义务与暂停保护证据。
 
 2026-10-03 的 201 实测新增 U1 验收门槛：先修复 NAT-preserving transport 的实际 peer 归属和 WriteTo 返回前的早到回复，再解释无回复频率。保留向客户端返回原 NAT 地址的契约，通过独立的实际 peer 元数据关联；不能把所有 raw reply 强行归到固定目标。补 Hysteria2 FakeIP 的 push／ReadFrom、写内同步回复、Shadowsocks 不同 IP／端口与 mapped IPv4 隔离回归。未归属计数需要按 association 定位，混合 Google／Steam 流量的全局数不能直接归因给游戏。reload 保留的旧流与新 observer 账本要明确标为覆盖缺失。
 
@@ -132,6 +132,127 @@ C2 对固定索引属于有意修正：消除原先随机选择后，升级时�
 “客户端持续发送但没有回复”也可能是单向应用、对方策略或丢包，不能标注为节点已坏。在 observe 中先记录候选频率与协议／端口分布。enforce 初期仅覆盖有明确双向语义和已有回复历史的范围；只看端口或 SNI 不能认定 H3、游戏或 WG 的应用状态。
 
 U2 的预算与站点首选恢复预算分开。UDP 重建不直接写 TCP 或 UDP 的站点 leaf，也不把稳定节点变更作为恢复成功；先保留当前身份和选路结果，经现有故障策略需要重新选路时再处理。旧代不能直接修改新代的关联／ledger，跨重载继承由明确的所有权交接完成。
+
+#### U2 执行设计（10 月 4 日）
+
+**状态：设计完成，执行代码尚未实现。** 先交付默认关闭的通用机制及隔离验收，再决定具体业务范围。223 保持当前配置。正常 CS2 实测补上一次业务验收，不解除 unknown 的执行限制。以下预算与执行时限是候选初值，尚无生产实测依据。
+
+##### 执行资格与模式
+
+- 保留 `off`／`observe` 的语义。U1 扫描器继续只产生证据和事件；执行器通过有界候选通道接收不可变快照。observe 不占真实执行预算，不准备连接。
+- `enforce` 要在下面的执行与隔离用例通过后加入配置。必须同时指定单个客户端 IP、精确组名、明确的 IP:port 列表及 `request_reply`；配置错误直接报错。
+- 执行沿用六个完整 5 秒桶、每桶至少 10 次本地成功发送、至少 3 次有效回复历史、30 秒无回复、最近 5 秒仍有发送的资格。未知回复语义、DNS、直连、未完成发送、窗口失效、身份不明确和暂停继续排除。
+- 执行前按当前时间重新计算资格。回复恢复、发送错误、作用域变化或配置所有权变化都会取消候选。busy／warming 不作为阻断理由。
+- V1 只执行当前代新建、具有本地发送完成和独立关联能力的代理流。Hysteria2／TUIC 的队列接受不能代替发送完成；其实际完成接口补齐前继续 observe。保留的旧代流只报告覆盖缺失，后续所有权交接单独交付。
+- 创建关联不保证远端源端口改变，也不保证恢复有效。传输必须明确提供独立关联能力；真实 fixture 验证关联身份和远端映射的效果。
+
+候选复查与事件日志分开：U1 的 transition 标记和每分钟事件限流只控制日志，不能让预算 defer 后的候选永久停止尝试。执行器到 retry_at 后重新读取完整证据，不能直接重用排队前的旧窗口。限频、票据期限和 TTL 都使用进程内单调时间；UTC 字段仅用于对齐外部记录。
+
+##### 身份、账本和限频
+
+`SessionManager` 是进程级所有者，执行账本归它管理并按需创建。`UDPFlowRuntime.id` 已有进程内稳定身份；U1 的 association 编号仍保留，与 observer generation 配对展示。执行候选额外携带 runtime ID、lineage ID 和 ownership revision，不使用 observer 的局部编号识别所有者。
+
+| 身份 | 内容与用途 |
+| --- | --- |
+| endpoint 所有权 | runtime ID、endpoint 实例、policy epoch、egress lease 与所有权 revision；执行前逐项复核 |
+| recovery lineage | 第一个 endpoint 的 runtime ID；经确认的重建后代沿用，正常新流不能仅按相同五元组被认作后代 |
+| peer | 客户端原始目标、规范化的实际 IP:port、RouteScope 和已固定的 route／egress binding；观察证据不跨身份合并 |
+| 限频键 | 客户端 IP:port、原始目标、实际 peer、稳定组名；不使用会随 reload 改变的 outbound 数字索引 |
+
+同一 IP 的不同端口分别管理。FakeIP／跨地址族别名保留客户端地址，同时用实际 peer 判断证据；只接受明确的一对一对应。多目标歧义、别名过期或实际 peer 未归属时排除执行。mapped IPv4 只按既有规则归一，不改变客户端回复地址。
+
+初始执行限制：每 peer **1 次／60 秒**、每组 **2 次／60 秒**、全进程 **8 次／60 秒**；全进程最多 **2 个并发准备任务**，待处理队列最多 **32 项**。这些限制独立于 TCP／UDP 站点恢复预算。重复候选按身份去重；预算不足只记 defer 和下次可尝试时间，不增加失败次数。
+
+预算分两种计数：开始实际 dial 时占用一次尝试额度，成功发布新所有者时计一次重建提交。尚未开始 dial 的取消退回预留额度；dial 已开始后即使回复恢复而取消，也保留尝试额度，但不计重建失败。准备失败保留原关联，下一次至少等待该 peer 的 60 秒限频窗口。排队与有效预留最多保留 10 秒，过期后需重新取证。
+
+账本总容量 **256 项**。有活跃 endpoint、正在执行或等待新回复的条目不能淘汰；容量满时拒绝新执行。全部所有者结束后，记录作为 tombstone 保留 **60 秒**，防止紧接着创建同目标关联绕过限频或回复限制。正常重建继承剩余限制，不继承旧观察桶和回复历史。进程重启时清空内存账本；配置重载不会清空尝试额度。
+
+每次提交后进入 `awaiting_replies`，至少收到 **3 次新 endpoint、对应实际 peer 的有效回复**才恢复执行资格；期间仍需满足限频和新的完整观察窗口。活跃记录的这项限制不因 60 秒 TTL 到期而消失。旧 endpoint 的晚回复不能增加新 endpoint 的回复计数。
+
+##### 状态与提交顺序
+
+```text
+qualified → reserved → preparing → fencing → committed → awaiting_replies
+                            │          │                       │
+                            └─ cancel ─┘                  3 次新回复
+                                 ↓                            ↓
+                        保留旧关联及限频                 新窗口可再评估
+```
+
+1. 候选包含原 endpoint、peer、binding 和回复／失效版本。执行器预留预算，准备时间受 **2 秒 dial 上限**及调用者剩余期限共同约束。准备不持有 pool、观察、预算或 SessionManager 的数据锁。
+2. 使用原节点、原选路路径和网络参数创建候选 PacketConn。full-cone 拆分时将新 target 固定为该 peer；客户端回复地址仍为原始目标。准备路径不会运行质量重选、写站点 leaf 或将推测性 dial 失败记入节点健康。普通数据面错误保留现有处理。
+3. 将候选封装为尚不可选中的 prepared endpoint，保存独立 egress lease 和所需别名引用；完成 receiver／read loop 的初始化，失败则取消。当前 `createEndpointLocked` 混合了 dial、adopt 和发布，需拆出准备／发布步骤，避免候选提前被 pool 或 retained 查找命中。prepared 接收不得向新账本贡献合法回复，第一包的发送意图仍先于实际 I/O 登记。
+4. 只对故障 peer 进入写入屏障，停止发放旧所有者的新写入 claim，等待已在执行的写和 pending batch 完成。屏障最多等待 **100 ms**；超时则取消本次切换并继续旧路径。健康 peer 使用自己的 claim，不等待该屏障。
+5. 在提交所需的配置所有权读租约下，再次检查模式、作用域、endpoint、binding、回复版本、窗口资格、预算票据，以及原所有者和目标专用 pool 槽。取得相关 create 锁失败时 defer；需同时检查两个 shard 时按索引排序，锁内只复核和发布。发现原槽已移除／更换或其他正常关联已占用目标槽时取消，不覆盖它。
+6. 在短临界区完成新 endpoint 的注册、BPF tuple 引用准备和账本状态；**先记录新回复限制与预算提交，再发布 peer 的新所有者**。这个发布是切换的唯一生效点。pool 项、detached 标记和所有权 revision 必须与之保持一致，发送端不能使用半发布候选。发布前的失败可撤销预提交记录和新引用；发布后的取消只能保留已提交新所有者，并按正常生命周期退出，不能撤回已被发送端使用的关联。
+7. 提交后释放旧 peer 的 tuple／别名引用；目标专用旧 endpoint 在锁外退出，共享旧 endpoint 继续服务其他 peer。候选取消时释放其 conn、observer、egress lease、别名 lease 和预留资源各一次。
+
+切换只影响后续真实数据。准备过程不发送复制的业务包，不重放已成功发送或完成情况不明的包。选路之后、真正调用 WriteTo 前仍要验证 claim；过期 prefetch 需重新取得所有者，且只允许在确认尚未调用 I/O 时重试一次本地查找。
+
+新写入遇到正在切换的 peer 时，利用原 ingress task 持有的有界 buffer 等待屏障结果，最长 100 ms。超时按已有 UDP 丢包契约处理并单独计数，不生成额外重放队列。该超时及 pending batch 未完成会令本次提交取消。所有等待都支持取消；不用每候选一个额外 goroutine 等锁。
+
+##### full-cone、FIFO 与回复
+
+假设共享 endpoint S 服务 A、B，只有 B 合格：候选 endpoint T 绑定 B，A 保留 S。提交后 B 的所有查找返回 T；S 对 B 拒绝新的写入 claim。T 结束时，B 在有界 tombstone 有效期间也不能悄悄回落到 S，必须由当前所有者明确释放或按既有错误路径处理。
+
+目标专用 endpoint 可以整体替换。source-only endpoint 一律按可能共享处理，即使账本只登记了一个 peer；只有传输支持独立目标发送时才拆出 B。目标绑定协议不做 full-cone promotion，未登记的其他 peer 不因观测容量不足而被当作不存在。
+
+需要接入的入口包括 `lookupCachedRoutingBinding`、普通／prefetch endpoint 查找、`handleRetainedUDPEndpoint`、`SessionManager.retainedUDPEndpoint` 和实际写入。现有目标专用 key 优先级可以复用，但单靠 key 不足以覆盖 retained 和缓存路径；它们都要核对同一 peer 所有权。retained 扫描在打分前排除已 detached 的 peer，避免选择旧共享 endpoint。
+
+claim 在实际 I/O 完成后释放。batch 的 Append 只是接受，claim 要保留到实际 flush／取消；部分 flush 只给成功前缀记发送，其余使窗口失效。等待 batch 排空时不持有 batch mutex、pool 锁或观察锁。第一版不支持某类 batch／传输屏障时必须明确排除并通过保护用例，不能默认为安全。
+
+每个流继续使用原有 `UdpTaskPool` 的 FIFO 和有界溢出处理。直接分发的流同样要经过 peer claim；不能只依靠 ordered queue 避免切换竞态。prepare 可以与旧写入并行，发布需要等该 peer 的实际写入完成，不能通过打断共享 conn 让等待结束。
+
+接收端同时携带实际 peer 和接收时的所有者 revision。发布前已经入队的回复按原有规则排空、返回客户端，记在旧 endpoint；发布后的 detached peer 回复不能恢复新账本。共享 S 上 A 的回复照常处理。未知实际 peer 时不执行切换。Close 仍在接收回调／replySender 栈之外运行，保留已有防自等待和 buffer 回收规则。
+
+BPF tuple 交接先增加新所有者引用，再释放旧 peer 的引用，不删除仍有人持有的 tuple。清除旧 endpoint 的该 peer tuple、lastPair 和路由缓存关联时使用身份复核，不能因旧 endpoint 日后关闭而删除新引用或恢复旧别名。客户端 NAT 地址、resolve_dns 固定 target 和 QUIC 身份继续由既有机制管理。
+
+普通 retire、hard error、transport 结束、NAT expiry 与 U2 共用所有权 revision 的变更规则。关闭先使相应所有权失效并取消未提交任务，再在锁外运行现有 Close；执行器不能在检查存活之后覆盖一个已经正常退出或被替换的 endpoint。已启动实际 I/O 的包只走原有完成／错误路径，不能因切换再发送一次。
+
+##### 重载与覆盖
+
+V1 的执行 owner 只属于创建它的活跃代。reload 发布前冻结旧执行器的提交入口，取消并等待未提交任务；已提交 endpoint 继续由进程级 SessionManager 持有。所有权读租约不能跨 dial／屏障等待持有，提交完成后先释放租约，再进行 Close。预算与回复限制保留在进程级账本，旧执行器不能改新 owner。
+
+observe 增加 `retained_owner_not_observed` 覆盖统计，使用 runtime ID 去重且仍有容量上限；不能把缺少观测显示成零回复。后续跨代观察采用明确交接：暂停该 peer 的 claim、取旧 owner 快照、发布新观察 owner、以空观察窗口重新积累。保留 binding／egress lease 和预算限制，旧回调只属于旧观察 owner。没有这套交接时继续排除旧代自动执行。
+
+关闭开关停止候选、准备和新提交；已经提交的关联按正常生命周期保留，避免关开关再次改变远端映射。已有 detached 所有权在关闭期间仍需维持到关联结束。冷启动 off 和从未执行过的流不创建新 ledger／worker，也不增加地址解析、计时或写入锁；已参与恢复的流只保留必要的所有权检查。
+
+##### 接口与文件职责
+
+| 位置 | 实施内容 |
+| --- | --- |
+| `config/udp_reply_drought.go` | 保持 off／observe；执行验收后加入 enforce 的严格作用域校验 |
+| `control/udp_reply_drought.go` | 只读候选快照、runtime／lineage／revision、覆盖缺失统计；不调用 retire |
+| 新 `control/udp_rebuild.go` | 模式与资格复核、有界执行器、票据、状态和取消 |
+| 新 `control/udp_rebuild_ledger.go` | 进程级限频、live pin、tombstone、新回复限制与一次性提交 |
+| `control/session_manager.go` | 稳定 lineage、配置提交租约、prepared／active 区分、所有权索引 |
+| `control/udp_endpoint_pool.go`、`udp_endpoint_lifecycle.go` | 准备／发布分离、peer claim、detached、目标专用切换、普通关闭的 revision 失效与 tuple 交接 |
+| `control/udp.go`、`udp_ingress_task.go`、`udp_write_batch.go` | 查找与 prefetch 复核、FIFO、实际 I/O claim 与 batch 屏障 |
+| `control/udp_endpoint_reply.go`、相关 read／push 路径 | 回复所属 revision、旧队列排空、晚回调和 buffer 所有权 |
+| outbound `netproxy` 及已核实的实现 | 明确声明本地发送完成、独立关联、peer 归属及目标绑定能力；缺省能力为不支持 |
+
+传输能力须由实际 PacketConn 与包装层显式声明，不能只按 protocol 名称放行；包装层不得把底层能力自动扩展成自己未证明的能力。V1 不需要修改 QUIC 协议实现；以后加入 QUIC 发送完成通知时再单独跟进 outbound／quic-go 固定版本。
+
+锁顺序实施前逐处核对：提交租约 → peer 屏障状态 → 观察证据 → ledger → pool 发布。SessionManager 的注册／lease 准备在观察锁前完成。等待 I/O、batch 排空、Close、日志和 buffer 回收均在这些数据锁之外。正常 packet 路径不获取全局 ledger 锁；仅候选、实际尝试和发布使用它。
+
+##### 验收与交付顺序
+
+| 批次 | 交付与必须通过的用例 |
+| --- | --- |
+| U2-A 身份与预算 | runtime／lineage、能力与覆盖统计，账本接入真实准备路径；并发只获一个票据、跨 reload 限频不清零、live 记录不因 TTL 消失、容量满拒绝、未开始 dial 退款、迟到完成不重复提交 |
+| U2-B 单目标执行 | 先准备再提交；dial 失败保留旧关联，回复在提交前到达则取消，预算先于所有权可见，发送未知／错误／暂停排除，prepared 不可命中，ctx 取消无泄漏 |
+| U2-C peer 与生命周期 | A 健康／B 故障共用 source；只拆 B、A 身份与包序保持；所有缓存／retained／prefetch 入口、新旧代、直接分发、batch 部分 flush、晚回复与 tuple 引用均覆盖 |
+| U2-D 隔离验收与开关 | 用真实 SS／SOCKS5 fixture 制造服务端旧映射失效，确认 B 恢复有效应答、A 无额外重建；off／observe 完全不准备或切换；随后加入 enforce 校验和状态计数 |
+
+同一客户端 socket 交替发 A／B、各包带唯一序号；B 服务先正常回复，之后仅忽略旧映射的包，A 始终应答。检查实际目标端看到的映射、B 新关联至少 3 次有效回复、A 的映射／内容／顺序保持。测试对旧回复、复制业务包、遗漏预算登记和遗漏 claim 的实现必须能失败。没有完成的批次不能以只有测试引用的草稿生产文件提交。
+
+计时单元使用可控时钟，不把真实等待 30 秒写进普通用例；真实传输 fixture 保留少量期限检查。测试范围包括 config、control 的 UDP 生命周期／FIFO／batch／跨地址族／session manager，以及涉及的 outbound 包 race、vet 和正式模块图检查。准备、发布和关闭的资源使用最终回收计数核对，热路径用 scoped／off 的分配和 p99 比较。
+
+现场先用 **220 → 223 → 自管请求／应答服务**，每次只覆盖一个客户端、一个组和精确目标；222 的本机测试不替代该链路。实际 CS2 继续 unknown，下一轮在启动游戏长流前启用 observe，并取得搜索、进入、暂停、结束时间。整套 strict 的既有 QUIC 超时待办继续保留。
+
+状态接口分开显示 qualified、reserved、attempt_started、committed、awaiting_replies、recovered 和各种 cancel／defer；独立计数 late_reply、claim_retry、handoff_wait_timeout、ledger_full 和 coverage_missing。`recovered` 只在新关联有足够有效回复时记录。日志在锁外、按事件限流；预算等待以 Debug 记录，不能用事件限流替代执行预算。
+
+历史复核结论：保留 `6d167837` 的静默保护、`672418c5` 的 FIFO 修复、进程级保留关联与 egress 所有权、真实 peer 归属和早到回复修复。采用 S12 的独立目标拆分与预算发布顺序，继续使用本项目更严格的连续窗口证据。新增的先准备后提交、活跃账本保留和冷启动 off 是本项目执行边界；不恢复按端口／空闲时长判定游戏或预先销毁活跃关联的旧策略。
 
 ### 性能和构建能力
 
