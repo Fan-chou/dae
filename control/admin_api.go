@@ -348,3 +348,27 @@ func (c *ControlPlane) AdminQuality(group, host string) []map[string]any {
 	}
 	return result
 }
+
+func (c *ControlPlane) AdminRecoveryDiagnostics() []outbound.RecoveryDiagnostics {
+	result := make([]outbound.RecoveryDiagnostics, 0)
+	if c == nil {
+		return result
+	}
+	now := time.Now()
+	for _, g := range c.outbounds {
+		if g != nil && usesAdminRecoveryGroup(g) {
+			s := g.RecoveryDiagnostics(now)
+			s.PolicyEpoch = uint64(c.PolicyEpoch())
+			result = append(result, s)
+			if len(result) == 256 {
+				break
+			}
+		}
+	}
+	return result
+}
+
+func usesAdminRecoveryGroup(g *outbound.DialerGroup) bool {
+	p := g.GetSelectionPolicy()
+	return p == consts.DialerSelectionPolicy_Fallback || p == consts.DialerSelectionPolicy_UrlTest
+}

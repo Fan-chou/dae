@@ -101,6 +101,7 @@ func (t *siteStickyTable) recoveryBudget(e *siteStickyEntry, now time.Time) bool
 	return len(e.recoverySwitches) < 2 && len(t.recoverySwitches) < 10 && now.Sub(t.lastRecovery) >= 5*time.Second
 }
 func (t *siteStickyTable) recoveryEvent(reason, key string, r *stickyRecovery, next time.Time) {
+	t.diagnosticReasons = countRecoveryReason(t.diagnosticReasons, reason)
 	if t.recoveryLog != nil {
 		now := time.Now()
 		if now.Sub(t.recoveryLogAt) >= time.Minute {

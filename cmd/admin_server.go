@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/daeuniverse/dae/component/observation"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
@@ -134,6 +135,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/status", s.withAdminAuth(s.handleStatus))
+	mux.HandleFunc("/v1/udp-recovery", s.withAdminAuth(s.handleUDPRecovery))
 	mux.HandleFunc("/v1/evidence", s.withAdminAuth(s.handleEvidence))
 	mux.HandleFunc("/v1/capture", s.withAdminAuth(s.handleCapture))
 	mux.HandleFunc("/v1/quality", s.withAdminAuth(s.handleQuality))
@@ -587,7 +589,14 @@ func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"entries": plane.AdminQuality(r.URL.Query().Get("group"), r.URL.Query().Get("host")), "limit": 256})
+	body := map[string]any{"entries": plane.AdminQuality(r.URL.Query().Get("group"), r.URL.Query().Get("host")), "limit": 256}
+	if diagnostics, ok := plane.(interface {
+		AdminRecoveryDiagnostics() []outbound.RecoveryDiagnostics
+	}); ok {
+		body["recovery_diagnostics"] = diagnostics.AdminRecoveryDiagnostics()
+		body["recovery_diagnostics_limit"] = 256
+	}
+	writeAdminJSON(w, http.StatusOK, body)
 }
 
 func (s *adminServer) handleCapture(w http.ResponseWriter, r *http.Request) {
@@ -612,6 +621,35 @@ func (s *adminServer) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, plane.AdminCapture(after))
+}
+
+func (s *adminServer) handleUDPRecovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
+			return
+		}
+	}
+	process := r.URL.Query().Get("process")
+	if len(process) > 64 {
+		writeAdminError(w, http.StatusBadRequest, "invalid process cursor")
+		return
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminUDPRecovery(uint64, string) control.UDPRecoverySnapshot
+	})
+	if !ok {
+		writeAdminError(w, http.StatusServiceUnavailable, "UDP recovery diagnostics unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminUDPRecovery(after, process))
 }
 
 func (s *adminServer) handleEvidence(w http.ResponseWriter, r *http.Request) {

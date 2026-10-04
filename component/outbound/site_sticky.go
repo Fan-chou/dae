@@ -51,6 +51,7 @@ type siteStickyEntry struct {
 }
 
 type siteStickyTable struct {
+	diagnosticReasons                       map[string]uint64
 	recoveryLogAt                           time.Time
 	recoveryLogCount, recoveryLogSuppressed int
 	lastRecoveryProbe                       time.Time

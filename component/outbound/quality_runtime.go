@@ -45,6 +45,7 @@ type qualityRecord struct {
 	rates                 map[*dialer.Dialer]*qualityRate
 }
 type qualityRate struct {
+	diagnosticReportAt             time.Time
 	load                           dialer.LoadContext
 	relativeSevere, absoluteSevere bool
 	absoluteLow, absoluteRecovered int
@@ -71,6 +72,7 @@ type qualityRuntime struct {
 	logCount, suppressed int
 	rejected             uint64
 	rateCount            int
+	diagnosticReasons    map[string]uint64
 	switches             []time.Time
 	lastSwitch           time.Time
 	closed               bool
@@ -149,6 +151,7 @@ func (q *qualityRuntime) event(key qualityScope, reason string, fields logrus.Fi
 // eventAt logs state changes at Info. Per-flow bookkeeping outcomes use Debug
 // and do not consume the Info budget, so steady-state traffic stays quiet.
 func (q *qualityRuntime) eventAt(level logrus.Level, key qualityScope, reason string, fields logrus.Fields) {
+	q.diagnosticReasons = countRecoveryReason(q.diagnosticReasons, reason)
 	if q.log == nil || !q.log.IsLevelEnabled(level) {
 		return
 	}
@@ -836,6 +839,10 @@ func (q *qualityRuntime) sampleEntry(key qualityScope, e *qualityRecord, now tim
 
 }
 func (q *qualityRuntime) report(f *QualityFlow, r *qualityRate) {
+	if !r.at.Equal(r.diagnosticReportAt) {
+		r.diagnosticReportAt = r.at
+		q.diagnosticReasons = countRecoveryReason(q.diagnosticReasons, "verify_alternative_windows")
+	}
 	if q.options.Report != nil {
 		q.options.Report(map[string]any{"group": q.group, "evidence_id": f.id, "observed_at": r.at, "measurement_validity": "relative_activity_only", "network": f.key.network.StringWithoutDns(), "current_bytes_per_second": r.current, "reference_bytes_per_second": r.baseline, "minimum_bytes_per_second": q.options.MinDownloadBytes, "local_decision": "verify_alternative", "scope": "single_host", "capacity_claim": false, "load": r.load})
 	}

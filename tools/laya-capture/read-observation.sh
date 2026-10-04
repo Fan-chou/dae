@@ -3,8 +3,10 @@ set -eu
 umask 077
 endpoint=${1:-status}
 after=${2:-0}
-case "$endpoint" in status|groups|capture|evidence) ;; *) exit 2 ;; esac
+process=${3:-}
+case "$endpoint" in status|groups|capture|evidence|quality|udp-recovery) ;; *) exit 2 ;; esac
 case "$after" in ''|*[!0-9]*) exit 2 ;; esac
+case "$process" in *[!0-9]*) exit 2 ;; esac
 secret=$(awk '
 /^[[:space:]]*admin_secret:/ {
     sub(/^[^:]*:[[:space:]]*/, "")
@@ -25,4 +27,4 @@ secret=$(awk '
     print value; exit
 }' /etc/dae/local.dae)
 [ -n "$secret" ]
-printf 'header = "Authorization: Bearer %s"\n' "$secret" | curl -fsS --max-time 10 -K - "http://192.168.124.223:2025/v1/$endpoint?after=$after"
+printf 'header = "Authorization: Bearer %s"\n' "$secret" | curl -fsS --max-time 10 -K - "http://192.168.124.223:2025/v1/$endpoint?after=$after&process=$process"

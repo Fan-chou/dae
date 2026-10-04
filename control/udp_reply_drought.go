@@ -42,6 +42,9 @@ type UDPReplyDroughtSnapshot struct {
 
 // Unattributed replies belong to an association, never an inferred peer.
 type UDPReplyDroughtAssociation struct {
+	RuntimeID           uint64 `json:"runtime_id"`
+	PolicyEpoch         uint64 `json:"policy_epoch"`
+	StartedAtMS         int64  `json:"started_at_ms"`
 	Association         uint64 `json:"association"`
 	Client              string `json:"client"`
 	Group               string `json:"group"`
@@ -64,23 +67,44 @@ type UDPReplyDroughtStats struct {
 }
 
 type UDPReplyDroughtPeer struct {
-	Association      uint64 `json:"association"`
-	Client           string `json:"client"`
-	Group            string `json:"group"`
-	Node             string `json:"node"`
-	Peer             string `json:"peer"`
-	WriteCompletion  string `json:"write_completion"`
-	SuccessfulWrites uint64 `json:"successful_writes"`
-	Replies          uint64 `json:"replies"`
-	LastWriteMS      int64  `json:"last_write_ms"`
-	LastReplyMS      int64  `json:"last_reply_ms"`
-	AtMS             int64  `json:"at_ms"`
-	Eligibility      string `json:"eligibility"`
+	RuntimeID        uint64                  `json:"runtime_id"`
+	PolicyEpoch      uint64                  `json:"policy_epoch"`
+	Association      uint64                  `json:"association"`
+	Client           string                  `json:"client"`
+	Group            string                  `json:"group"`
+	Node             string                  `json:"node"`
+	Peer             string                  `json:"peer"`
+	WriteCompletion  string                  `json:"write_completion"`
+	SuccessfulWrites uint64                  `json:"successful_writes"`
+	Replies          uint64                  `json:"replies"`
+	LastWriteMS      int64                   `json:"last_write_ms"`
+	LastReplyMS      int64                   `json:"last_reply_ms"`
+	AtMS             int64                   `json:"at_ms"`
+	Eligibility      string                  `json:"eligibility"`
+	InvalidatedAtMS  int64                   `json:"invalidated_at_ms,omitempty"`
+	CandidateEpisode uint64                  `json:"candidate_episode"`
+	FirstObservedMS  int64                   `json:"first_observed_ms"`
+	ReplyContract    string                  `json:"reply_contract"`
+	Windows          []UDPReplyDroughtWindow `json:"windows"`
+}
+
+// Complete describes the time interval, Present describes recorded evidence.
+// A missing bucket is not evidence of a completed, empty transport window.
+type UDPReplyDroughtWindow struct {
+	StartMS        int64  `json:"start_ms"`
+	EndMS          int64  `json:"end_ms"`
+	Complete       bool   `json:"complete"`
+	Present        bool   `json:"present"`
+	NonemptyWrites int    `json:"nonempty_successful_writes"`
+	Replies        uint64 `json:"replies"`
+	Invalid        bool   `json:"invalid"`
+	Saturated      bool   `json:"writes_saturated"`
 }
 
 type udpDroughtBucket struct {
 	epoch   int64
 	writes  int
+	replies uint64
 	invalid bool
 }
 type udpDroughtPeerState struct {
@@ -89,6 +113,7 @@ type udpDroughtPeerState struct {
 	writes, replies             uint64
 	buckets                     [udpDroughtFullBuckets + 1]udpDroughtBucket
 	candidate                   bool
+	episode                     uint64
 }
 
 type udpReplyDroughtObserver struct {
@@ -106,6 +131,8 @@ type udpReplyDroughtObserver struct {
 	events                                                                        []UDPReplyDroughtPeer
 	rateMinute                                                                    int64
 	rateCount                                                                     int
+	diagnostics                                                                   atomic.Pointer[udpDroughtDiagnosticsBinding]
+	coverageSeen                                                                  map[uint64]struct{}
 	writes, replies, unattributedWrites, unattributedReplies                      atomic.Uint64
 	admissionDropped, invalidated, evicted, candidates, rateLimited, eventEvicted atomic.Uint64
 }
@@ -119,6 +146,8 @@ type udpReplyDroughtFlow struct {
 	mu                                      sync.Mutex // one association; no I/O or output under this lock
 	peers                                   map[netip.AddrPort]*udpDroughtPeerState
 	unattributedWrites, unattributedReplies atomic.Uint64
+	identity                                atomic.Pointer[udpDroughtIdentity]
+	nextEpisode                             uint64 // association-local, under mu
 }
 
 func newUDPReplyDroughtObserver(policy config.UDPReplyDroughtPolicy) *udpReplyDroughtObserver {
@@ -156,8 +185,9 @@ func (o *udpReplyDroughtObserver) Close() error {
 		// Retained endpoints still hold their flow pointer after reload. Clear
 		// each ledger outside the registry lock so those pointers retain no table.
 		for _, f := range o.flowList() {
-			f.Close()
+			f.closeWithReason("generation_closed")
 		}
+		o.recordDiagnostic(UDPRecoveryEvent{Kind: "generation_closed", AtMS: time.Now().UnixMilli()})
 		o.mu.Lock()
 		o.flows = nil
 		o.peerCount = 0
@@ -249,7 +279,9 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 	if !validDroughtPeer(peer) {
 		o.unattributedWrites.Add(1)
-		f.unattributedWrites.Add(1)
+		if f.unattributedWrites.Add(1) == 1 {
+			f.recordUnattributed("first_unattributed_write", now)
+		}
 		return
 	}
 	if len(o.peers) > 0 && !o.peers[peer] {
@@ -277,8 +309,9 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 		if b.epoch != epoch {
 			*b = udpDroughtBucket{epoch: epoch}
 		}
-		// Saturate: qualification does not need an unbounded packet counter.
-		if b.writes < udpDroughtWritesPerBucket {
+		// Keep actual activity for diagnostics, with an explicit lower-bound
+		// flag at saturation. Qualification still uses the original threshold.
+		if b.writes < udpDroughtBucketWriteLimit {
 			b.writes++
 		}
 	}
@@ -290,22 +323,41 @@ func (f *udpReplyDroughtFlow) reply(peer netip.AddrPort, now time.Time) {
 	}
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.closed.Load() || f.observer.closed.Load() {
+		f.mu.Unlock()
 		return
 	}
 	p := f.peers[peer]
 	if p == nil {
 		f.observer.unattributedReplies.Add(1)
-		f.unattributedReplies.Add(1)
+		first := f.unattributedReplies.Add(1) == 1
+		f.mu.Unlock()
+		if first {
+			f.recordUnattributed("first_unattributed_reply", now)
+		}
 		return
 	}
+	wasCandidate := p.candidate
 	nano := f.observer.stamp(now)
 	p.checkClock(nano)
 	p.lastReply = max(p.lastReply, nano)
 	p.replies++
+	epoch := nano / int64(udpDroughtBucketDuration)
+	b := &p.buckets[epoch%int64(len(p.buckets))]
+	if b.epoch != epoch {
+		*b = udpDroughtBucket{epoch: epoch}
+	}
+	b.replies++
 	p.candidate = false
 	f.observer.replies.Add(1)
+	var ended UDPReplyDroughtPeer
+	if wasCandidate {
+		ended = f.rowLocked(peer, p, nano)
+	}
+	f.mu.Unlock()
+	if wasCandidate {
+		f.observer.recordDiagnostic(UDPRecoveryEvent{Kind: "candidate_ended", Reason: "reply_resumed_on_original", AtMS: ended.AtMS, Peer: &ended})
+	}
 }
 
 // A partial flush or local backpressure makes this entire observation bucket
@@ -315,13 +367,15 @@ func (f *udpReplyDroughtFlow) invalidate(now time.Time) {
 		return
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.closed.Load() || f.observer.closed.Load() {
+		f.mu.Unlock()
 		return
 	}
 	nano := f.observer.stamp(now)
 	epoch := nano / int64(udpDroughtBucketDuration)
-	for _, p := range f.peers {
+	var ended []UDPReplyDroughtPeer
+	for peer, p := range f.peers {
+		wasCandidate := p.candidate
 		p.checkClock(nano)
 		p.invalidatedAt = max(p.invalidatedAt, nano)
 		b := &p.buckets[epoch%int64(len(p.buckets))]
@@ -330,17 +384,33 @@ func (f *udpReplyDroughtFlow) invalidate(now time.Time) {
 		}
 		b.invalid = true
 		p.candidate = false
+		if wasCandidate {
+			ended = append(ended, f.rowLocked(peer, p, nano))
+		}
 	}
 	f.observer.invalidated.Add(1)
+	f.mu.Unlock()
+	for i := range ended {
+		f.observer.recordDiagnostic(UDPRecoveryEvent{Kind: "candidate_ended", Reason: "local_window_invalidated", AtMS: ended[i].AtMS, Peer: &ended[i]})
+	}
 }
 
 func (f *udpReplyDroughtFlow) Close() {
+	f.closeWithReason("endpoint_closed")
+}
+
+func (f *udpReplyDroughtFlow) closeWithReason(reason string) {
 	if f == nil || f.closed.Swap(true) {
 		return
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	o := f.observer
+	// Final evidence survives peer eviction, endpoint teardown and reload.
+	rows := make([]UDPReplyDroughtPeer, 0, len(f.peers))
+	nano := o.stamp(time.Now())
+	for peer, p := range f.peers {
+		rows = append(rows, f.rowLocked(peer, p, nano))
+	}
 	o.mu.Lock()
 	if _, ok := o.flows[f.id]; ok {
 		o.peerCount -= len(f.peers)
@@ -348,6 +418,14 @@ func (f *udpReplyDroughtFlow) Close() {
 	}
 	f.peers = nil
 	o.mu.Unlock()
+	f.mu.Unlock()
+	association := f.associationSnapshot()
+	for i := range rows {
+		o.recordDiagnostic(UDPRecoveryEvent{Kind: "observation_ended", Reason: reason, AtMS: nano / int64(time.Millisecond), Peer: &rows[i], Association: &association})
+	}
+	if len(rows) == 0 && (association.UnattributedWrites > 0 || association.UnattributedReplies > 0) {
+		o.recordDiagnostic(UDPRecoveryEvent{Kind: "association_ended", Reason: reason, AtMS: nano / int64(time.Millisecond), Association: &association})
+	}
 }
 
 func (f *udpReplyDroughtFlow) eligibility(p *udpDroughtPeerState, now int64) string {
@@ -409,6 +487,9 @@ func (f *udpReplyDroughtFlow) rows(now time.Time, scan bool) (rows, events []UDP
 	for peer, p := range f.peers {
 		last := max(p.first, p.lastWrite, p.lastReply)
 		if scan && nano-last >= int64(udpDroughtIdleTTL) {
+			ended := f.rowLocked(peer, p, nano)
+			ended.Eligibility = "idle_peer_evicted"
+			events = append(events, ended)
 			delete(f.peers, peer)
 			f.observer.mu.Lock()
 			f.observer.peerCount--
@@ -419,19 +500,21 @@ func (f *udpReplyDroughtFlow) rows(now time.Time, scan bool) (rows, events []UDP
 			f.observer.evicted.Add(1)
 			continue
 		}
-		completion := "local_write_completed"
-		if !f.completionKnown {
-			completion = "transport_acceptance_only"
-		}
-		row := UDPReplyDroughtPeer{Association: f.id, Client: f.client, Group: f.group, Node: f.node, Peer: peer.String(), WriteCompletion: completion, SuccessfulWrites: p.writes, Replies: p.replies, LastWriteMS: p.lastWrite / int64(time.Millisecond), LastReplyMS: p.lastReply / int64(time.Millisecond), AtMS: nano / int64(time.Millisecond), Eligibility: f.eligibility(p, nano)}
+		row := f.rowLocked(peer, p, nano)
 		rows = append(rows, row)
 		if scan {
 			candidate := row.Eligibility == "candidate"
 			if candidate && !p.candidate {
+				f.nextEpisode++
+				p.episode = f.nextEpisode
+				row.CandidateEpisode = p.episode
+				events = append(events, row)
+			} else if !candidate && p.candidate {
 				events = append(events, row)
 			}
 			p.candidate = candidate
 		}
+		rows[len(rows)-1].CandidateEpisode = p.episode
 	}
 	return
 }
@@ -440,6 +523,16 @@ func (o *udpReplyDroughtObserver) scan(now time.Time) {
 	for _, f := range o.flowList() {
 		_, events := f.rows(now, true)
 		for _, e := range events {
+			if e.Eligibility == "idle_peer_evicted" {
+				o.recordDiagnostic(UDPRecoveryEvent{Kind: "observation_ended", Reason: e.Eligibility, AtMS: e.AtMS, Peer: &e})
+				continue
+			}
+			if e.Eligibility != "candidate" {
+				o.recordDiagnostic(UDPRecoveryEvent{Kind: "candidate_ended", Reason: e.Eligibility, AtMS: e.AtMS, Peer: &e})
+				continue
+			}
+			// The process journal is independent of legacy event log limiting.
+			o.recordDiagnostic(UDPRecoveryEvent{Kind: "qualified", AtMS: e.AtMS, Peer: &e})
 			o.mu.Lock()
 			if o.closed.Load() {
 				o.mu.Unlock()
@@ -482,10 +575,15 @@ func (o *udpReplyDroughtObserver) snapshot(now time.Time) *UDPReplyDroughtSnapsh
 	for _, f := range o.flowList() {
 		rows, _ := f.rows(now, false)
 		if len(rows) > 0 && len(s.Associations) < udpDroughtPeerLimit {
+			identity := f.identity.Load()
 			s.Associations = append(s.Associations, UDPReplyDroughtAssociation{
 				Association: f.id, Client: f.client, Group: f.group, Node: f.node,
 				UnattributedWrites: f.unattributedWrites.Load(), UnattributedReplies: f.unattributedReplies.Load(),
 			})
+			if identity != nil {
+				a := &s.Associations[len(s.Associations)-1]
+				a.RuntimeID, a.PolicyEpoch, a.StartedAtMS = identity.RuntimeID, identity.PolicyEpoch, identity.StartedAtMS
+			}
 		}
 		// A snapshot can span concurrent eviction/admission. Bound output as
 		// well as live storage, even though rows are not a single atomic view.

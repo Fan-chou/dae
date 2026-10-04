@@ -152,10 +152,11 @@ func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
 // generationsMu. Refcount maps are sharded by tuple hash. Established packet
 // forwarding does not take these lifecycle locks.
 type SessionManager struct {
-	resolveDNSRecovery resolveDNSRecoveryStore
-	adminSnapshotID    string
-	ctx                context.Context
-	cancel             context.CancelFunc
+	udpRecoveryDiagnostics atomic.Pointer[udpRecoveryJournal]
+	resolveDNSRecovery     resolveDNSRecoveryStore
+	adminSnapshotID        string
+	ctx                    context.Context
+	cancel                 context.CancelFunc
 
 	closed atomic.Bool
 
@@ -341,6 +342,7 @@ func (m *SessionManager) prepareControlPlane(c *ControlPlane) error {
 	if bpf := c.PeekBpf(); bpf != nil {
 		m.udpBPF.CompareAndSwap(nil, bpf)
 	}
+	c.udpReplyDrought.bindDiagnostics(m, c.PolicyEpoch())
 	return nil
 }
 
@@ -361,6 +363,7 @@ func (c *ControlPlane) sessionManagerForFlow(parent context.Context) *SessionMan
 		manager: c.sessionManager,
 		owned:   c.ownsSessionManager,
 	})
+	c.udpReplyDrought.bindDiagnostics(c.sessionManager, c.PolicyEpoch())
 	return c.sessionManager
 }
 
@@ -771,6 +774,9 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		cancel:        cancel,
 		egressLease:   lease,
 	}
+	if f := endpoint.replyDrought; f != nil {
+		f.observer.bindDiagnostics(m, binding.Route.PolicyEpoch)
+	}
 
 	if m.closed.Load() {
 		cancel()
@@ -785,6 +791,9 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		_ = lease.release()
 		binding.Egress.Dialer.LoadFinish()
 		return nil, ErrFlowAlreadyRegistered
+	}
+	if f := endpoint.replyDrought; f != nil {
+		f.identity.Store(&udpDroughtIdentity{RuntimeID: flow.id, PolicyEpoch: uint64(binding.Route.PolicyEpoch), StartedAtMS: flow.startUnixNano / int64(time.Millisecond)})
 	}
 	m.udpCount.Add(1)
 	m.appendUDPFlowSourceLocked(endpoint.poolKey.Src, flow)

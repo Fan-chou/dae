@@ -19,6 +19,11 @@ See [evidence collection and correlation](../../docs/zh/evidence-correlation.md)
 - `annotations.py`: review provenance, citations, disagreements and incident split validation across all supplied annotation files; reviewer identities are normalized. Pass every related annotation file in one invocation; never supplies gold labels.
 - `read-observation.sh`: root-only authenticated read helper for 223; key/token never enters command arguments.
 
+The helper also permits the read-only `quality` and `udp-recovery` endpoints.
+The separate [UDP recovery collector](../udp-recovery/collect.py) keeps process
+cursors, complete windows, coverage gaps and phase markers; see the
+[field and collection guide](../../docs/upstream-followup-implementation-20261003.md#u2-信息获取渠道10-月-4-日).
+
 `deploy-223.sh` records the one-time 2026-09-26 deployment. Its binary hashes,
 backup path and expected version are specific to that release; it refuses other
 starting binaries. Use it only to reproduce that deployment. The 2026-10-02

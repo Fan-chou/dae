@@ -746,7 +746,7 @@ IEPL 的 ifindex 未变，运行与 UCI MTU 都为 **1400**。质量 enforce、U
 | 最终 strict 验证 | 最新 pin 的完整三仓检查中，QUIC 的损坏包握手用例发生 1 秒期限超时；当前版和旧基线的定向重复均通过，整套失败原因仍需定位，详见下文 |
 | CS2 修复后现场验收 | 201 本轮匹配成功，用户报告无卡顿、无掉线；原 SS 路径的 13 个新 SDR 目标有有效回复。仍需从游戏长流建立前覆盖观测并标注游戏阶段，详见下节 |
 | UDP 暂停／重载身份 | H3 请求间隔及 association 复用已验证；真正静默的 H3／WG keepalive、暂停与重载组合尚未完整覆盖。STUN 的远端映射端口变化已排除 dae endpoint 对象重建，底层 transport／远端 NAT 原因未闭合 |
-| U2 UDP 自动重建 | 执行设计已完成，代码未实现。先用可控请求／应答服务交付身份与预算、单目标、peer 隔离和生命周期验收；CS2 保持 unknown，自动执行资格仍需回复义务和暂停保护证据 |
+| U2 UDP 自动重建 | 执行设计及信息获取渠道已完成；执行账本、准备与发布尚未实现。先用可控请求／应答服务交付身份与预算、单目标、peer 隔离和生命周期验收；CS2 保持 unknown，自动执行资格仍需回复义务和暂停保护证据 |
 | REALITY／bootstrap 场景 | 本地兼容和生命周期测试通过；尚缺新旧真实 REALITY 服务端互通，以及代理节点使用 IPv6-only 名称的完整初始化验证 |
 | ARM64 实机 | 已交叉编译；状态发布、预算竞争、重载和相关内核路径尚未在 ARM64 机器执行 |
 | 质量 observe 的启用门槛 | 223 本次读取的 147 个质量条目均为 observe，仅 3 条有速度样本、1 条有速度参考；仍需有代表性的业务样本、触发频率和恢复提交记录，保持 enforce 关闭 |
@@ -782,3 +782,52 @@ IEPL 的 ifindex 未变，运行与 UCI MTU 都为 **1400**。质量 enforce、U
 设计确定先准备候选、再隔离故障 peer 写入、复核证据后发布新所有者；原节点与 binding 保留，健康 peer 继续原关联。预算与站点恢复分开，重建后的三个新回复限制随活跃 lineage 保留；预留、实际 dial 和发布分开计数。所有查找入口及普通 Close 需要复核相同 revision，解决只创建目标专用 key 仍会被 retained／prefetch 绕过的问题。旧接收队列保留排空，晚回复不更新新账本；tuple 与别名按引用交接。
 
 按 U2-A 身份与预算、U2-B 单目标、U2-C peer／生命周期、U2-D 隔离验收交付；执行开关在验收完成后加入。候选限频／期限已明确写为未实测初值。本次只有设计与状态记录变更，执行代码尚未落地；223、依赖 pin 和业务配置保持，未启用 enforce 或 UDP 自动重建。
+
+### U2 信息获取渠道（10 月 4 日）
+
+这批实现后续验收所需的信息渠道，尚未实现执行账本、dial 准备、peer 屏障或提交。配置仍只接受 off／observe，CS2 仍为 unknown。未修改 223，也未改变 outbound／quic-go 的 pin。
+
+#### 接口与证据
+
+| 渠道 | 可确认的信息 | 边界 |
+| --- | --- | --- |
+| 认证只读 `GET /v1/udp-recovery?after=N&process=P` | 进程 ID、采集时刻、候选门槛、当前 peer、覆盖范围及事件游标 | `execution_implemented=false`；没有执行预算或恢复成功指标 |
+| peer 的 `windows` | 六个完整桶与当前部分桶，非空成功写入次数、回复次数、失效标记、证据是否存在 | 资格条件不变；计数到 1,048,576 后标记下界，未记录桶不冒充有效空窗口 |
+| `runtime_id`、`policy_epoch`、generation／association | 把新流、旧代长流、候选与结束记录关联起来 | 当前没有重建后代，尚不提供 lineage／revision 的执行承诺 |
+| `coverage` | 开启观察前建立的流、实际 peer 归属不足、尚无 peer 证据 | 旧 source-only 流在指定 peer 范围内标为 `retained_peer_scope_unresolved`，不按记忆的首个目标推断全部 peer |
+| 进程级事件账本 | `qualified`、`candidate_ended`、`observation_ended`、未归属 association、代际开关和覆盖缺失 | 256 条，分页 128 条；reload 保留，进程重启重置；明确返回丢失数量、最早／最新／下一条游标 |
+| `/v1/quality` 的 `recovery_diagnostics` | 质量原因计数、独立验证窗口数、TCP／UDP 站点恢复的试探结果与 30 分钟切换预算用量 | 计数不依赖日志级别和限流；只读，不过期试探或裁剪预算；最多 256 个 fallback／url_test 组 |
+
+结束记录保留最后一次 peer 计数和 association 的未归属计数。`candidate_ended: reply_resumed_on_original` 表示原关联自行恢复回复，不能算作 U2 重建成功。同一窗口同时触发相对与绝对劣化时，`verify_alternative_windows` 只计一次。站点恢复的 `probe_started` 与 `recovered` 分开计数，失败试探不冒充预算提交。
+
+账本按事件到达顺序编号，回调可并发；用 process、generation、association、peer、`candidate_episode` 关联一次候选的开始和结束，结合 `at_ms` 对齐阶段。旧代关闭的是观察账本，`generation_closed` 不表示活跃 UDP socket 关闭。覆盖缺失事件每代按 runtime ID 去重，最多 256 项；快照注明输出截断和去重容量耗尽。
+
+本轮仍使用 U1 既有的协议分类区分本地写完成和队列接受。这不是独立关联能力声明；后续执行资格还必须通过实际 PacketConn 的能力接口和隔离 fixture。无候选、无事件、没有字节参考或没有实际回复义务时，不能给出“自动恢复有效”的结论。
+
+#### 现场采集
+
+更新二进制及已审查的 `tools/laya-capture/read-observation.sh` 后，可用现有 SSH 认证采集；工具自身不修改配置或路由。应在创建游戏长流前启用限定客户端的 observe。先检查 `coverage`，不能用开启前保留的流补足无回复证据。
+
+```sh
+python3 tools/udp-recovery/collect.py collect \
+  --router root@192.168.124.223 \
+  --output build/udp-recovery-live/ --seconds 1200
+
+python3 tools/udp-recovery/collect.py mark \
+  --output build/udp-recovery-live/ --phase search
+# 进入、暂停、结束或报错时分别记录 playing / paused / ended / error。
+# 补报时间须包含时区：--at '2026-10-04T23:00:00+08:00'。
+
+python3 tools/udp-recovery/analyze.py build/udp-recovery-live/ \
+  > build/udp-recovery-live/summary.json
+```
+
+默认每 5 秒读取 UDP 诊断、capture 和 status，每 30 秒读取质量计数与组状态。单次最多 20 分钟，可设置到 1 小时；单轮最多分页四次；数据与 manifest 预算默认 100 MiB。SSH 使用已知主机、公钥认证和期限；token 只经现有读取脚本的 stdin 进入 curl。文件目录 0700，归档原子发布并 fsync，数据及 SHA256 manifest 完成后才一起保存游标。并发阶段标记与采集共用归档发布锁，不竞争采集游标。
+
+每轮记录实际运行二进制 SHA256、PID／启动标识、配置目录内 `.dae` 文件摘要，以及请求前后时间。来源变化时保留原始数据并拒绝推进游标；过程重启、ring 丢失、分页预算耗尽、观察代在一轮内变化和采集失败均留存为缺口。服务器 `at_ms` 与本机请求时间给出时钟偏差区间，不假定跨主机时钟已同步。阶段标记区分操作人提供的时间与报到时间。
+
+分析器先验证归档哈希，重算候选所需窗口与回复历史，按代整理质量触发频率与预算。capture 比例注明分母是归档下界；节点计数包括其他流，正差不能当成本流计数误差。自然 splice 流没有本流字节参考时不计算偏差，skew 后被排除的窗口另列。阶段标记只提供业务上下文，不把 unknown 自动改为 request_reply。
+
+验收仍分两步：信息渠道证明证据完整、覆盖正确、开销受控；U2 执行 fixture 再证明预算／所有权顺序、健康 peer 不变及新关联收到三个有效回复。自动执行部分完成后，需要继续扩展 committed、awaiting_replies、recovered 等实际状态；当前接口不会填入虚构的零值或成功状态。
+
+验证：control、cmd、outbound、config 的 UDP／SessionManager／质量／站点恢复／管理接口相关 race 用例和四包 vet；新增 Python 11 项归档与分析测试、原 laya-capture 29 项测试及读取脚本语法检查。整套三仓 strict 的既有 QUIC 超时待办保持，不将本批测试替代该门槛。

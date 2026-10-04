@@ -1,0 +1,6 @@
+__pycache__/
+archives/
+*.jsonl
+cursor.json
+collector.lock
+archive.lock
