@@ -29,6 +29,11 @@ func (c *ControlPlane) publishActiveControlPlane() {
 	if c == nil {
 		return
 	}
+	if previous := activeControlPlanePublication.plane.Load(); previous != nil && previous != c {
+		// Cancel/drain speculative work before publishing a new policy owner.
+		// Never wait while holding the publication mutex needed by commits.
+		previous.udpReplyDrought.stopExecution()
+	}
 	activeControlPlanePublication.mu.Lock()
 	if activeControlPlanePublication.owners == nil {
 		activeControlPlanePublication.owners = make(map[*ControlPlane]routingEpochExecutionOwnerPublication, 2)
@@ -36,6 +41,9 @@ func (c *ControlPlane) publishActiveControlPlane() {
 	activeControlPlanePublication.owners[c] = routingEpochExecutionOwnerPublished
 	activeControlPlanePublication.plane.Store(c)
 	activeControlPlanePublication.mu.Unlock()
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		c.udpReplyDrought.bindExecution(c, manager)
+	}
 }
 
 // RegisterProvisionalRoutingEpochExecutionOwner exposes a ready isolated

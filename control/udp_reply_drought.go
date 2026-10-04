@@ -67,6 +67,8 @@ type UDPReplyDroughtStats struct {
 }
 
 type UDPReplyDroughtPeer struct {
+	LineageID        uint64                  `json:"lineage_id"`
+	Revision         uint64                  `json:"ownership_revision"`
 	RuntimeID        uint64                  `json:"runtime_id"`
 	PolicyEpoch      uint64                  `json:"policy_epoch"`
 	Association      uint64                  `json:"association"`
@@ -117,6 +119,8 @@ type udpDroughtPeerState struct {
 }
 
 type udpReplyDroughtObserver struct {
+	execution                                                                     atomic.Pointer[udpRebuildExecutor]
+	executionMu                                                                   sync.Mutex
 	policy                                                                        config.UDPReplyDroughtPolicy
 	peers                                                                         map[netip.AddrPort]bool
 	generation                                                                    uint64
@@ -138,6 +142,7 @@ type udpReplyDroughtObserver struct {
 }
 
 type udpReplyDroughtFlow struct {
+	endpoint                                *UdpEndpoint // immutable before adoption
 	observer                                *udpReplyDroughtObserver
 	id                                      uint64
 	client, group, node                     string
@@ -179,6 +184,7 @@ func (o *udpReplyDroughtObserver) Close() error {
 		return nil
 	}
 	o.closeOnce.Do(func() {
+		o.stopExecution()
 		o.closed.Store(true)
 		close(o.stop)
 		<-o.done
@@ -266,6 +272,21 @@ func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *u
 		f.peers = make(map[netip.AddrPort]*udpDroughtPeerState)
 	}
 	p := &udpDroughtPeerState{first: o.stamp(now)}
+	if o.policy.Enforce && f.endpoint != nil {
+		if f.endpoint.rebuildPeer(peer) == nil {
+			ue := f.endpoint
+			if ue.sessionRuntime == nil {
+				o.peerCount--
+				return nil
+			}
+			s := &udpRebuildPeer{peer: peer, original: peer, lineageID: ue.rebuildLineage, manager: ue.sessionRuntime.manager, changed: make(chan struct{})}
+			s.owner.Store(&udpRebuildOwnership{endpoint: ue, revision: ue.rebuildRevision})
+			if !ue.installRebuildPeer(peer, s) {
+				o.peerCount--
+				return nil
+			}
+		}
+	}
 	f.peers[peer] = p
 	return p
 }
@@ -551,7 +572,14 @@ func (f *udpReplyDroughtFlow) rows(now time.Time, scan bool) (rows, events []UDP
 
 func (o *udpReplyDroughtObserver) scan(now time.Time) {
 	for _, f := range o.flowList() {
-		_, events := f.rows(now, true)
+		rows, events := f.rows(now, true)
+		if x := o.execution.Load(); x != nil {
+			for _, row := range rows {
+				if row.Eligibility == "candidate" {
+					x.enqueue(f, row, now)
+				}
+			}
+		}
 		for _, e := range events {
 			if e.Eligibility == "idle_peer_evicted" {
 				o.recordDiagnostic(UDPRecoveryEvent{Kind: "observation_ended", Reason: e.Eligibility, AtMS: e.AtMS, Peer: &e})
@@ -599,6 +627,9 @@ func (o *udpReplyDroughtObserver) snapshot(now time.Time) *UDPReplyDroughtSnapsh
 		contract = "configured_request_reply"
 	}
 	s := &UDPReplyDroughtSnapshot{Mode: "observe", Generation: o.generation, Group: o.policy.Group, Contract: contract, Excluded: make(map[string]int), Peers: []UDPReplyDroughtPeer{}, Associations: []UDPReplyDroughtAssociation{}, Events: []UDPReplyDroughtPeer{}}
+	if o.policy.Enforce {
+		s.Mode = "enforce"
+	}
 	if o.policy.Client.IsValid() {
 		s.Client = o.policy.Client.String()
 	}

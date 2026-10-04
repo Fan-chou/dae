@@ -746,7 +746,7 @@ IEPL 的 ifindex 未变，运行与 UCI MTU 都为 **1400**。质量 enforce、U
 | 最终 strict 验证 | 最新 pin 的完整三仓检查中，QUIC 的损坏包握手用例发生 1 秒期限超时；当前版和旧基线的定向重复均通过，整套失败原因仍需定位，详见下文 |
 | CS2 修复后现场验收 | 201 本轮匹配成功，用户报告无卡顿、无掉线；原 SS 路径的 13 个新 SDR 目标有有效回复。仍需从游戏长流建立前覆盖观测并标注游戏阶段，详见下节 |
 | UDP 暂停／重载身份 | H3 请求间隔及 association 复用已验证；真正静默的 H3／WG keepalive、暂停与重载组合尚未完整覆盖。STUN 的远端映射端口变化已排除 dae endpoint 对象重建，底层 transport／远端 NAT 原因未闭合 |
-| U2 UDP 自动重建 | 执行设计及信息获取渠道已完成；执行账本、准备与发布尚未实现。先用可控请求／应答服务交付身份与预算、单目标、peer 隔离和生命周期验收；CS2 保持 unknown，自动执行资格仍需回复义务和暂停保护证据 |
+| U2 UDP 自动重建 | 10 月 5 日完成执行、预算、peer 拆分、生命周期及真实 SS／SOCKS5 隔离验收，Astra 复核通过。尚未部署及完成 220 → 223 现场验收；CS2 保持 unknown |
 | REALITY／bootstrap 场景 | 本地兼容和生命周期测试通过；尚缺新旧真实 REALITY 服务端互通，以及代理节点使用 IPv6-only 名称的完整初始化验证 |
 | ARM64 实机 | 已交叉编译；状态发布、预算竞争、重载和相关内核路径尚未在 ARM64 机器执行 |
 | 质量 observe 的启用门槛 | 223 本次读取的 147 个质量条目均为 observe，仅 3 条有速度样本、1 条有速度参考；仍需有代表性的业务样本、触发频率和恢复提交记录，保持 enforce 关闭 |
@@ -839,3 +839,71 @@ Astra 对冻结的 `61dce077..cd62f250` 独立审查，复现两项 P2 问题：
 归档修正为 manifest 先于数据发布，并对旧孤儿数据验证文件名摘要与 schema 后补齐 manifest。回归覆盖重启后内容变化，以及 manifest 已完成但数据尚未发布时中断。观察代新增有界 association 登记，未知写入与未知回复均纳入代际收尾；peer 全部淘汰后仍保留未归属累计计数。登记上限为 256，容量不足计入 `admission_dropped`；关闭 observer 保留实际 UDP socket。回归覆盖这三种结束场景和容量上限。
 
 Astra 再次独立复核 `cd62f250..a585f32e`，确认两项发现均已修复，未发现修正引入的新问题。原先失败的冻结回归在修正后通过；Astra 重跑 Python 13 项测试及相关新增／并发 race 用例均通过。复核未覆盖生产流量、长期内存或观测开销，也不代表 U2 执行与业务恢复验收完成。本轮实现、修正及审查记录均已提交本地，尚未推送或部署。
+
+## U2 自动重建执行（10 月 5 日）
+
+执行逻辑已接入生产代码，默认仍为 off。`enforce` 必须同时给出单个客户端 IP、精确组名、数字 IP:port peer 列表和 `request_reply`。配置缺项直接报错；质量模式不会隐式启用它。223 尚未部署本批，CS2 官方 SDR 继续按 unknown 排除执行。
+
+### 执行与隔离
+
+- 六个完整 5 秒窗口、每窗至少 10 个非空成功发送、至少 3 个历史回复、30 秒回复干旱及最近 5 秒仍有发送继续作为资格。排队、准备和发布前重新核对证据、存活、实际所有者及活跃配置代；回复恢复或错误使候选取消。
+- SessionManager 持有 256 项有界账本。peer／组／进程分别最多 1／2／8 次每分钟；实际 dial 计尝试，发布计提交。拨号前取消不消耗尝试，拨号后取消保留尝试。活跃所有者、票据和等待新回复的记录不能淘汰；所有所有者结束后保留 60 秒墓碑。
+- 活跃执行器使用 2 个准备 worker、32 项队列、10 秒票据和 2 秒准备期限。使用原节点及已固定的 egress binding 准备独立关联，prepared 不能被查找或承载业务包。未知能力、队列接受型传输、batch、DNS、直连、旧代、跨地址族、resolve_dns、域名和不明确的目标别名均排除。
+- 能力由实际 PacketConn 声明。direct 提供底层本地完成和独立 socket；SS 保留底层承诺；SOCKS5 还要求独立 UDP ASSOCIATE control。没有声明则不执行。Hysteria2／TUIC 没有被此批放行。新关联不保证远端端口一定改变。
+- source-only 共享关联 S 中，只将故障 B 拆成目标专用 T，A 继续使用 S。查找、路由缓存、prefetch、retained 和实际写入均遵循 peer 所有者。每个 endpoint 生命周期最多保留 8 个 peer claim，容量满时拒绝新增，避免无限保留 detached 身份。
+- claim 覆盖实际 I/O。仅 B 的发布屏障等待当前 I/O，最长 100 毫秒；提交锁忙、等待超时、所有者变化或证据变化均取消。准备及发布不复制或重放业务包。先增加 T 的 tuple 引用，再释放 S 的 B 引用，旧缓存和晚到 tuple 登记不能重新挂回 S。
+- 原关联的晚回复照常排空并返回客户端，单独计数，不恢复新账本。新所有者收到非空业务发送后的 3 个实际 peer 回复，才解除再次执行限制。普通 hard error／NAT 后代保持 lineage、revision、专用 key 和回复门槛；关闭开关也保留这些所有权。
+- reload 在发布新代前取消并等待未提交工作；已提交关联由进程持有。回滚重新启用仍存活的旧执行器，预算不重置。冷启动 off／observe 不分配执行 worker、账本或 claim map。
+
+### 信息渠道
+
+`/v1/udp-recovery` 保留原游标、覆盖和窗口证据，增加 `execution`：实际尝试／提交／恢复、各种取消和 defer、group/process 预算、live owner、runtime／lineage／revision／policy epoch、下一次 peer 预算时间以及执行上限。`retry_at_ms` 只表示 peer 预算最早时间，组预算、容量或回复门槛仍可继续阻止执行。
+
+committed 事件保留原证据和 successor runtime ID；recovered 绑定实际后代及 peer。即使普通后代没有 observer，也写入已有进程 journal，以 `generation: 0` 表示无观察代，并保留它的实际 policy epoch。不会因关闭 observe 丢掉回复确认。热路径的 claim retry／late reply／handoff timeout 使用原子计数，不获取全局账本锁。
+
+Python 分析工具显示进程执行快照及可与已归档 commit 对应的新回复确认。缺失 commit 不会被补造；应用验收继续要求操作人结果。档案中的恢复计数不等同于 CS2 匹配或对局通过。
+
+### 本地验收与 Astra 审查
+
+真实本地 SS AEAD／SOCKS5 fixture 使用一个客户端关联交替访问两个真实 UDP 请求／应答服务，只丢弃 B 原映射的应答。已核对 B 新映射及三个有效回复、A 原映射不变、唯一业务序号只出现一次、旧回复不进入新账本、普通后代及 off 后的门槛和事件、所有查找入口、tuple 引用及预算。只重排已经实际发送的 datagram 的观察时间，避免普通测试等待 30 秒；真实网络、内容、计数与映射没有合成。
+
+准备失败、准备期间旧回复恢复、reload／rollback、B 的实际 I/O 卡住时 A 仍可收发、等待上限、未知能力／batch 排除、并发票据、容量满、活跃记录长期保留、墓碑和关闭竞争均有保护用例。
+
+Astra 独立审查发现并修正三项问题：
+
+1. Close 提前设置 dead 导致原 resolve_dns 的 discard 和禁止晚 save 分支失效；保留 `wasLive`，行政关闭和自然到期都覆盖。
+2. 旧 S 指针转到 T 后的硬错误，可能使上层仍清理 S；实际 T 承担失败与原有退休处理，上层仅丢弃该包，健康 A 保留共享关联。
+3. Close 与首次 reserve 竞争可能永久登记已结束 owner；生命周期锁排序登记／结束，拒绝 dead owner，取消时保留无 owner 墓碑。
+
+Astra 修正后及收尾后分别独立复核，正式模块 pin 下四类相关回归 `-race -count=3` 通过，未发现新增问题。主 agent 完成 control／cmd 的 UDP、FIFO、batch、跨地址族、SessionManager、配置代、resolve_dns／FakeIP／QUIC 相关 race 回归，outbound／dialer／quality／config 四包全量 race，以及六包 vet。受影响 outbound netproxy／direct／SS／SOCKS5 的完整 short race 和 vet 通过；UDP 归档 Python 14 项、原归档 Python 29 项及读取脚本语法检查通过。
+
+### 延迟对照
+
+基线为 `f1ef34f1`。在同一 QEMU 主机、相同 Go 工具链、`heapminimum512kib`、GOMAXPROCS=2、固定 CPU 0／1 上预编译测试，按基线／当前交错 3 轮，表格为各轮中位数。两边真实 fixture 使用相同 outbound 源码，新增能力方法不改变数据收发实现。模拟路径每例取 100,000 次分布；真实 fixture 每例预热 100 次后取 2,000 次，回复等待在计时区间之外。原始日志与环境记录在忽略目录 `build/udp-rebuild-performance/`。
+
+| 稳态写入 | 基线均值 ns/包 | 当前均值 ns/包 | 基线 p99 ns | 当前 p99 ns | 当前堆分配 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | 111.5 | 114.0 | 241 | 250 | 0 |
+| observe | 268.9 | 273.8 | 401 | 410 | 0 |
+| 限定范围 enforce | 尚未实现 | 329.4 | 尚未实现 | 461 | 0 |
+
+off／observe 均值增量约 2.5／4.9 ns，分别为 2.2%／1.8%；enforce 相比当前 observe 增加约 56 ns，包含地址解析和 peer claim。
+
+| 真实本地写入 | 基线 p50／p95／p99 μs | 当前 p50／p95／p99 μs |
+| --- | ---: | ---: |
+| SS off | 8.367／12.905／19.046 | 8.287／11.252／15.419 |
+| SS observe | 8.746／14.057／16.812 | 8.666／12.064／15.239 |
+| SS enforce | 尚未实现 | 8.836／14.126／18.726 |
+| SOCKS5 off | 2.104／4.910／7.023 | 2.114／3.347／7.665 |
+| SOCKS5 observe | 2.355／4.930／7.845 | 2.444／5.881／7.794 |
+| SOCKS5 enforce | 尚未实现 | 2.535／5.240／7.434 |
+
+既有完整 ingress → FIFO → 选路 → 建流 → 首包 benchmark：单 producer 16.550 → 16.424 μs；8 producer 15.713 → 16.006 μs（约 +1.9%）。分配次数分别维持 72／71，建流总分配增加约 100 B；稳态写入未新增每包堆分配。
+
+这些对照未发现显著稳态延迟退化或新增阻塞。真实尾延迟受本机调度影响，不能证明公网或生产 p99；主动切换时 B 最长 100 毫秒等待是明确的执行上限，A 的隔离用例验证其不等待 B 的屏障。
+
+### 版本与待办
+
+outbound `8647a14b7f3691b596eaf37f3fb6bb86e9e45876` 已发布至 `Fan-chou/outbound` 的跟进分支；正式 pin 为 `v0.0.0-sticky-ip.0.20261004163218-8647a14b7f36`。QUIC 保持 `42916a975611`，无需新增提交。正式模块校验和验证、tidy 差异及模块图检查通过，无本地路径替换。
+
+后续是 220 → 223 → 自管请求／应答服务的有界现场验收，先 observe 取得窗口与覆盖，再针对单客户端、单组、精确目标考虑 enforce。CS2 SDR 不能据端口、一次成功对局或 UDP 静默自动获得执行资格。既有全套 QUIC strict 的 `TestMITCorruptPackets/towards_the_client` 超时待办仍保留，本批定向测试没有替代该门槛。

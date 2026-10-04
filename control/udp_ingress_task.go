@@ -42,6 +42,17 @@ type cachedRoutingLookup struct {
 // still has to probe the live NAT key independently.
 func lookupCachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) cachedRoutingLookup {
 	out := cachedRoutingLookup{}
+	if ue, has := DefaultUdpEndpointPool.rebuildLookup(flowDecision.SymmetricNatEndpointKey()); has {
+		if ue == nil {
+			return out
+		}
+		out.owner = ue
+		if bound, hit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); hit {
+			out.bound = bound
+			out.bindingHit = true
+		}
+		return out
+	}
 	primaryKey := flowDecision.CachedRoutingEndpointKey()
 	if ue, ok := DefaultUdpEndpointPool.Get(primaryKey); ok {
 		out.owner = ue

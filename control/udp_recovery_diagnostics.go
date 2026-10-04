@@ -34,21 +34,28 @@ type udpDroughtDiagnosticsBinding struct {
 }
 
 type udpDroughtIdentity struct {
+	LineageID   uint64 `json:"lineage_id"`
+	Revision    uint64 `json:"ownership_revision"`
 	RuntimeID   uint64 `json:"runtime_id"`
 	PolicyEpoch uint64 `json:"policy_epoch"`
 	StartedAtMS int64  `json:"started_at_ms"`
 }
 
 type UDPRecoveryEvent struct {
-	Sequence    uint64                      `json:"sequence"`
-	Generation  uint64                      `json:"generation"`
-	PolicyEpoch uint64                      `json:"policy_epoch"`
-	AtMS        int64                       `json:"at_ms"`
-	Kind        string                      `json:"kind"`
-	Reason      string                      `json:"reason,omitempty"`
-	Peer        *UDPReplyDroughtPeer        `json:"peer,omitempty"`
-	Coverage    *UDPRecoveryCoverageFlow    `json:"coverage,omitempty"`
-	Association *UDPReplyDroughtAssociation `json:"association,omitempty"`
+	SuccessorRuntimeID uint64                      `json:"successor_runtime_id,omitempty"`
+	RuntimeID          uint64                      `json:"runtime_id,omitempty"`
+	LineageID          uint64                      `json:"lineage_id,omitempty"`
+	Revision           uint64                      `json:"ownership_revision,omitempty"`
+	ActualPeer         string                      `json:"actual_peer,omitempty"`
+	Sequence           uint64                      `json:"sequence"`
+	Generation         uint64                      `json:"generation"`
+	PolicyEpoch        uint64                      `json:"policy_epoch"`
+	AtMS               int64                       `json:"at_ms"`
+	Kind               string                      `json:"kind"`
+	Reason             string                      `json:"reason,omitempty"`
+	Peer               *UDPReplyDroughtPeer        `json:"peer,omitempty"`
+	Coverage           *UDPRecoveryCoverageFlow    `json:"coverage,omitempty"`
+	Association        *UDPReplyDroughtAssociation `json:"association,omitempty"`
 }
 
 type UDPRecoveryCoverageFlow struct {
@@ -82,6 +89,7 @@ type UDPRecoveryThresholds struct {
 }
 
 type UDPRecoverySnapshot struct {
+	Execution            *UDPRebuildSnapshot      `json:"execution,omitempty"`
 	Schema               string                   `json:"schema"`
 	Process              string                   `json:"process"`
 	AtMS                 int64                    `json:"at_ms"`
@@ -141,7 +149,14 @@ func (o *udpReplyDroughtObserver) recordDiagnostic(e UDPRecoveryEvent) {
 		return
 	}
 	e.Generation, e.PolicyEpoch = o.generation, uint64(b.epoch)
-	j := b.journal
+	b.journal.record(e)
+}
+
+// Execution ownership outlives its generation-local observer.
+func (j *udpRecoveryJournal) record(e UDPRecoveryEvent) {
+	if j == nil {
+		return
+	}
 	j.mu.Lock()
 	j.sequence++
 	e.Sequence = j.sequence
@@ -185,6 +200,7 @@ func (f *udpReplyDroughtFlow) rowLocked(peer netip.AddrPort, p *udpDroughtPeerSt
 	}
 	if identity := f.identity.Load(); identity != nil {
 		r.RuntimeID, r.PolicyEpoch = identity.RuntimeID, identity.PolicyEpoch
+		r.LineageID, r.Revision = identity.LineageID, identity.Revision
 	}
 	epoch := nano / int64(udpDroughtBucketDuration)
 	r.Windows = make([]UDPReplyDroughtWindow, 0, len(p.buckets))
@@ -239,6 +255,8 @@ func (o *udpReplyDroughtObserver) coverage(now time.Time) UDPRecoveryCoverage {
 			row.OriginalTarget = ue.poolKey.Dst.String()
 		}
 		switch {
+		case ue.prepared.Load():
+			row.State = "prepared_not_selectable"
 		case ue.replyDrought == nil || ue.replyDrought.observer != o || ue.replyDrought.closed.Load():
 			row.State = "retained_owner_not_observed"
 		case ue.replyDrought.unattributedWrites.Load() > 0:
@@ -284,7 +302,7 @@ func (o *udpReplyDroughtObserver) coverage(now time.Time) UDPRecoveryCoverage {
 
 func (c *ControlPlane) AdminUDPRecovery(after uint64, process string) UDPRecoverySnapshot {
 	now := time.Now()
-	s := UDPRecoverySnapshot{Schema: "kdae-udp-recovery-v1", AtMS: now.UnixMilli(), Mode: "off", Records: []UDPRecoveryEvent{}, EventCounts: make(map[string]uint64), Coverage: UDPRecoveryCoverage{Flows: []UDPRecoveryCoverageFlow{}, States: make(map[string]int)}, Thresholds: UDPRecoveryThresholds{BucketMS: 5000, FullBuckets: udpDroughtFullBuckets, WritesPerBucket: udpDroughtWritesPerBucket, ReplyHistory: 3, ReplyDroughtMS: 30000, RecentWriteMS: 5000, PeerLimit: udpDroughtPeerLimit, AssociationPeerLimit: udpDroughtAssociationPeerLimit, JournalLimit: udpRecoveryJournalLimit}}
+	s := UDPRecoverySnapshot{ExecutionImplemented: true, Schema: "kdae-udp-recovery-v1", AtMS: now.UnixMilli(), Mode: "off", Records: []UDPRecoveryEvent{}, EventCounts: make(map[string]uint64), Coverage: UDPRecoveryCoverage{Flows: []UDPRecoveryCoverageFlow{}, States: make(map[string]int)}, Thresholds: UDPRecoveryThresholds{BucketMS: 5000, FullBuckets: udpDroughtFullBuckets, WritesPerBucket: udpDroughtWritesPerBucket, ReplyHistory: 3, ReplyDroughtMS: 30000, RecentWriteMS: 5000, PeerLimit: udpDroughtPeerLimit, AssociationPeerLimit: udpDroughtAssociationPeerLimit, JournalLimit: udpRecoveryJournalLimit}}
 	if c == nil {
 		return s
 	}
@@ -293,8 +311,12 @@ func (c *ControlPlane) AdminUDPRecovery(after uint64, process string) UDPRecover
 		return s
 	}
 	s.Process = m.adminSnapshotID
+	s.Execution = m.udpRebuild.Load().snapshot(now)
 	if o := c.udpReplyDrought; o != nil && !o.closed.Load() {
 		s.Mode = "observe"
+		if o.policy.Enforce {
+			s.Mode = "enforce"
+		}
 		s.Observation = o.snapshot(now)
 		s.Coverage = o.coverage(now)
 	}

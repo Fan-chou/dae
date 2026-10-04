@@ -17,6 +17,7 @@ func TestUDPReplyDroughtConfiguration(t *testing.T) {
 		{"", true},
 		{"udp_reply_drought_mode: observe\nudp_reply_drought_group: proxy", true},
 		{"udp_reply_drought_mode: enforce", false},
+		{"udp_reply_drought_mode: enforce\nudp_reply_drought_group: proxy\nudp_reply_drought_client: 192.0.2.10\nudp_reply_drought_contract: request_reply\nudp_reply_drought_peers: '192.0.2.1:27015'", true},
 		{"udp_reply_drought_contract: request_reply", false},
 		{"udp_reply_drought_contract: cs2", false},
 		{"udp_reply_drought_group: typo", false},
@@ -58,8 +59,30 @@ func TestUDPReplyDroughtConfiguration(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, err := again.Global.UDPReplyDroughtPolicy()
-			if err != nil || got.Observe != p.Observe || got.RequestReply != p.RequestReply || got.Group != p.Group || got.Client != p.Client || len(got.Peers) != len(p.Peers) {
+			if err != nil || got.Enforce != p.Enforce || got.Observe != p.Observe || got.RequestReply != p.RequestReply || got.Group != p.Group || got.Client != p.Client || len(got.Peers) != len(p.Peers) {
 				t.Fatalf("round trip: %+v %v", got, err)
+			}
+		})
+	}
+}
+
+func TestUDPReplyDroughtEnforceRequiresCompleteScope(t *testing.T) {
+	full := Global{UDPReplyDroughtMode: "enforce", UDPReplyDroughtGroup: "game", UDPReplyDroughtClient: "192.0.2.201", UDPReplyDroughtContract: "request_reply", UDPReplyDroughtPeers: []string{"192.0.2.1:27015"}}
+	for _, missing := range []string{"client", "group", "peers", "contract"} {
+		t.Run(missing, func(t *testing.T) {
+			g := full
+			switch missing {
+			case "client":
+				g.UDPReplyDroughtClient = ""
+			case "group":
+				g.UDPReplyDroughtGroup = ""
+			case "peers":
+				g.UDPReplyDroughtPeers = nil
+			case "contract":
+				g.UDPReplyDroughtContract = "unknown"
+			}
+			if _, err := g.UDPReplyDroughtPolicy(); err == nil {
+				t.Fatal("incomplete enforce scope accepted")
 			}
 		})
 	}

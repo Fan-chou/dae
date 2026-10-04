@@ -140,6 +140,10 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 // invalidate the cached proxy IP on connection-refused. Returns true when the
 // error is fatal and delivery must stop.
 func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
+	if ue.prepared.Load() {
+		retire()
+		return true
+	}
 	if ue.replyDrought != nil {
 		// Decode/auth/truncation and transport errors leave reply evidence
 		// incomplete. They are never treated as a valid peer reply or drought.
@@ -203,6 +207,10 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		packet.Release()
 		return true
 	}
+	if ue.prepared.Load() {
+		packet.Release()
+		return true
+	}
 
 	ue.softErrorCount = 0
 	from := ue.canonicalReplyFrom(packet.From)
@@ -214,6 +222,7 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 	if ue.replyDrought != nil {
 		ue.replyDrought.reply(ue.droughtPeer(packet.Peer), now)
 	}
+	ue.recordRebuildReply(ue.droughtPeer(packet.Peer))
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
 		lifecycle.handleReply(ue, now.UnixNano())
 	} else {
@@ -264,7 +273,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 		var n int
 		var from, peer netip.AddrPort
 		var err error
-		if ue.replyDrought != nil {
+		if ue.replyDrought != nil || ue.rebuildPeers.Load() != nil {
 			n, from, peer, err = netproxy.ReadFromWithPeer(ue.conn, buf[:])
 		} else {
 			n, from, err = ue.conn.ReadFrom(buf[:])
@@ -277,6 +286,9 @@ func (ue *UdpEndpoint) startReadLoop() {
 			continue
 		}
 		ue.softErrorCount = 0
+		if ue.prepared.Load() {
+			continue
+		}
 		from = ue.canonicalReplyFrom(from)
 		if !ue.hasReply.Load() && !ue.acceptsInitialReplyFrom(from) {
 			if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -293,6 +305,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 		if ue.replyDrought != nil {
 			ue.replyDrought.reply(ue.droughtPeer(peer), now)
 		}
+		ue.recordRebuildReply(ue.droughtPeer(peer))
 		if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
 			lifecycle.handleReply(ue, now.UnixNano())
 		} else {

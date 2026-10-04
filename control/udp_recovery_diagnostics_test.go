@@ -61,7 +61,7 @@ func TestUDPRecoveryJournalPreservesFinalEvidenceAcrossReload(t *testing.T) {
 	ue.replyDrought.write(droughtTestPeer, 100, base.Add(26*time.Second))
 	o.scan(base.Add(30 * time.Second))
 	s := c.AdminUDPRecovery(0, "")
-	if s.ExecutionImplemented || len(s.Records) != 2 || s.Records[1].Kind != "qualified" {
+	if !s.ExecutionImplemented || s.Execution != nil || len(s.Records) != 2 || s.Records[1].Kind != "qualified" {
 		t.Fatalf("events: %+v", s)
 	}
 	r := s.Records[1].Peer

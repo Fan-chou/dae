@@ -17,7 +17,8 @@ var (
 )
 
 type Global struct {
-	// UDP reply observation is independent of quality and never retires sessions.
+	// UDP recovery is independent of quality. Enforce requires explicit scope;
+	// off and observe preserve association identity.
 	UDPReplyDroughtMode     string   `mapstructure:"udp_reply_drought_mode" default:"off"`
 	UDPReplyDroughtGroup    string   `mapstructure:"udp_reply_drought_group"`
 	UDPReplyDroughtClient   string   `mapstructure:"udp_reply_drought_client"`

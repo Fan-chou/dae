@@ -68,6 +68,7 @@ def summarize(values):
     events, peers, captures, associations = {}, {}, {}, {}
     observations, capture_stats, budgets, budget_history = {}, {}, {}, {}
     missing = {}
+    executions = {}
     gaps, errors, phases, invalid_candidates = [], [], [], []
     polls, offsets = [], []
     execution_available = False
@@ -89,6 +90,8 @@ def summarize(values):
         for page in value["pages"].get("udp-recovery", []):
             process = page["process"]
             execution_available |= page["execution_implemented"]
+            if page.get("execution") is not None:
+                executions[process] = page["execution"]
             observation = page.get("observation")
             if observation:
                 observations[(process, observation["generation"])] = observation
@@ -178,6 +181,15 @@ def summarize(values):
                 "queue_drop_fraction_of_observed_submissions": ratio(stats["queue_dropped"], exported + stats["queue_dropped"]),
                 "invalid_events_per_archived_relay_window": ratio(stats["invalid_window"], relay_by_gen[gen]),
                 "denominators_are_archive_lower_bounds": True})
+    committed = {(p, e.get("successor_runtime_id"), e.get("actual_peer"), e.get("ownership_revision")): e
+                 for (p, _), e in events.items() if e["kind"] == "committed" and e.get("successor_runtime_id")}
+    confirmations = []
+    for (p, _), e in events.items():
+        if e["kind"] != "recovered":
+            continue
+        commit = committed.get((p, e.get("runtime_id"), e.get("actual_peer"), e.get("ownership_revision")))
+        confirmations.append({"process": p, "event": e,
+                              "archived_commit_sequence": commit["sequence"] if commit and commit["sequence"] < e["sequence"] else None})
     return {"schema": "kdae-udp-recovery-summary-v1", "polls": len(polls),
             "provenance": [p["provenance_before"] for p in polls[:1]],
             "phase_markers": phases, "clock_offset_brackets": offsets,
@@ -195,6 +207,8 @@ def summarize(values):
             "quality_budget_channel_available": budget_channel_available,
             "quality_budget_history_by_generation": list(budget_history.values()),
             "execution_implemented": execution_available,
+            "execution_last_seen_by_process": [dict(e, process=p) for p, e in executions.items()],
+            "successor_reply_confirmations_archived": confirmations,
             "execution_acceptance": "not_evaluated", "application_acceptance": "requires_operator_result",
             "limitations": ["Unknown application reply obligations remain excluded.",
                 "Node counters include concurrent flows; positive difference is not measurement error.",

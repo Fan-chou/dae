@@ -6,6 +6,7 @@
 package control
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
 	"io"
@@ -80,6 +81,9 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue == nil || !src.IsValid() || !dst.IsValid() {
 		return
 	}
+	if ue.detachedRebuildPeer(dst) || ue.detachedRebuildPeer(src) {
+		return
+	}
 	if ue.udpConnStateLastPair.Load().matches(src, dst) {
 		return
 	}
@@ -90,7 +94,7 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	ue.udpConnStateMu.Lock()
 	defer ue.udpConnStateMu.Unlock()
 
-	if ue.udpConnStateClosed || ue.udpConnStateOwner == nil {
+	if ue.udpConnStateClosed || ue.udpConnStateOwner == nil || ue.detachedRebuildPeer(dst) || ue.detachedRebuildPeer(src) {
 		return
 	}
 	if ue.udpConnStateTuples == nil {
@@ -388,7 +392,7 @@ func (ue *UdpEndpoint) markDeadIfOwnedBy(owner udpConnStateOwner) bool {
 	if ue.udpConnStateClosed || !sameUdpConnStateOwner(ue.udpConnStateOwner, owner) {
 		return false
 	}
-	ue.dead.Store(true)
+	ue.markDead()
 	ue.expiresAtNano.Store(1)
 	return true
 }
@@ -432,7 +436,7 @@ func (ue *UdpEndpoint) retire() {
 		ue.resolveDNSState.store.save(ue)
 	}
 	ue.rememberFlowIdentityOnRetire()
-	ue.dead.Store(true)
+	ue.markDead()
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
 	_ = ue.Close()
@@ -447,7 +451,7 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 		ue.resolveDNSState.store.save(ue)
 	}
 	ue.rememberFlowIdentityOnRetire()
-	ue.dead.Store(true)
+	ue.markDead()
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
 	// The conn still has to be released, and after selfRemoveFromPool nobody
@@ -522,6 +526,70 @@ func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 }
 
 func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
+	return ue.writeTo(b, addr, false)
+}
+
+func (ue *UdpEndpoint) writeToRebuildPeer(b []byte, addr string, peers *udpRebuildPeerMap) (int, error, bool) {
+	peer, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return 0, nil, false
+	}
+	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+	s := (*peers)[peer]
+	if s == nil {
+		if f := ue.replyDrought; f != nil && f.observer.policy.Enforce && !f.observer.closed.Load() {
+			ue.prepareDroughtWrite(addr)
+			s = ue.rebuildPeer(peer)
+		}
+		if s == nil {
+			return 0, nil, false
+		}
+	}
+	ctx := context.Background()
+	if ue.sessionRuntime != nil {
+		ctx = ue.sessionRuntime.ctx
+	}
+	owner, err := s.claim(ctx, len(b) > 0)
+	if err != nil {
+		return 0, err, true
+	}
+	defer s.release()
+	target := addr
+	if owner != ue {
+		if l := s.manager.udpRebuild.Load(); l != nil {
+			l.count("claim_retry")
+		}
+		owner.TrackUdpConnStateTuplePair(owner.poolKey.Src, s.original)
+		target = owner.dialTargetForWrite(peer)
+	}
+	n, err := owner.writeTo(b, target, true)
+	if owner != ue && err != nil && !isUdpEndpointWriteTolerated(err) {
+		// Actual I/O and retirement belong to the successor. The ingress caller
+		// still holds the shared ancestor pointer and must only drop this packet.
+		owner.reportLocalWriteFailure(err)
+		return n, &udpEndpointWriteToleratedError{err: err}, true
+	}
+	return n, err, true
+}
+
+func (ue *UdpEndpoint) writeTo(b []byte, addr string, claimed bool) (int, error) {
+	if !claimed {
+		peers := ue.rebuildPeers.Load()
+		if peers == nil {
+			if f := ue.replyDrought; f != nil && f.observer.policy.Enforce && !f.observer.closed.Load() {
+				ue.prepareDroughtWrite(addr)
+				peers = ue.rebuildPeers.Load()
+			}
+		}
+		if peers != nil {
+			if n, err, ok := ue.writeToRebuildPeer(b, addr, peers); ok {
+				return n, err
+			}
+		}
+	}
+	if ue.prepared.Load() {
+		return 0, &udpEndpointWriteToleratedError{err: net.ErrClosed}
+	}
 	// Fast dead check: avoid work on an already-dead endpoint.
 	if ue.dead.Load() {
 		return 0, net.ErrClosed
@@ -567,6 +635,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			// queues the datagram; flush() is the sole writer of
 			// those fields after WriteBatch actually succeeds. A
 			// premature stamp would misreport a later failed flush as activity.
+			addUDPFlowUpload(ue, len(b))
 			return len(b), nil
 		}
 	}
@@ -608,6 +677,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Local send completed. This is not peer reachability: only break the
 	// consecutive write-fail streak, never recover Degraded.
 	ue.reportLocalWriteSuccess()
+	addUDPFlowUpload(ue, len(b))
 	return n, nil
 }
 
@@ -682,8 +752,9 @@ func (ue *UdpEndpoint) closeIdleExpired() error {
 
 func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 	ue.closeOnce.Do(func() {
+		wasLive := ue.markDead()
 		ue.replyDrought.Close()
-		if !ue.dead.Load() && ue.resolveDNSState != nil {
+		if wasLive && ue.resolveDNSState != nil {
 			ue.resolveDNSState.once.Do(func() {})
 			ue.resolveDNSState.store.discard(ue)
 		}
@@ -694,7 +765,7 @@ func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 		if keepIdentity {
 			ue.rememberFlowIdentityOnRetire()
 		}
-		ue.dead.Store(true)
+		ue.endRebuildOwnership()
 		ue.expiresAtNano.Store(0)
 		ue.stopTransportReceiver()
 		ue.releaseCachedResponseConns()
@@ -930,6 +1001,9 @@ func (ue *UdpEndpoint) IsDead() bool {
 // result remains valid for the endpoint lifetime so ordinary flow packets do
 // not re-read the BPF handoff map after their initial policy evaluation.
 func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
+	if ue.prepared.Load() || ue.detachedRebuildPeer(dst) {
+		return nil, false
+	}
 	ue.routingMu.RLock()
 	defer ue.routingMu.RUnlock()
 	if !ue.hasRoutingCache || ue.routingCacheProto != l4proto || ue.routingCacheDst != dst {
@@ -945,6 +1019,10 @@ func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uin
 	}
 
 	ue.routingMu.Lock()
+	if ue.detachedRebuildPeer(dst) {
+		ue.routingMu.Unlock()
+		return
+	}
 	ue.routingCacheDst = dst
 	ue.routingCacheProto = l4proto
 	ue.routingCache = *result

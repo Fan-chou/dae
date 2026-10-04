@@ -157,6 +157,25 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(result["execution_implemented"])
         self.assertEqual(result["node_flow_comparable_windows"], 0)
 
+    def test_recovery_confirmation_requires_matching_committed_owner(self):
+        page = empty_page()
+        page["execution_implemented"] = True
+        page["execution"] = {"counts": {"committed": 1, "recovered": 1}}
+        page["records"] = [
+            {"sequence": 1, "generation": 1, "kind": "committed", "successor_runtime_id": 8,
+             "actual_peer": "192.0.2.1:27015", "ownership_revision": 2},
+            {"sequence": 2, "generation": 1, "kind": "recovered", "runtime_id": 8,
+             "actual_peer": "192.0.2.1:27015", "ownership_revision": 2},
+            {"sequence": 3, "generation": 1, "kind": "recovered", "runtime_id": 9,
+             "actual_peer": "192.0.2.1:27015", "ownership_revision": 2}]
+        value = {"kind": "poll", "started_at_ms": 0, "gaps": [], "errors": [],
+                 "fetch_brackets": [], "provenance_stable": True, "provenance_before": {},
+                 "pages": {"udp-recovery": [page]}}
+        result = analyze.summarize([value])
+        self.assertEqual([r["archived_commit_sequence"] for r in result["successor_reply_confirmations_archived"]], [1, None])
+        self.assertEqual(result["execution_last_seen_by_process"][0]["counts"]["committed"], 1)
+        self.assertEqual(result["application_acceptance"], "requires_operator_result")
+
     def test_missing_splice_reference_has_no_fabricated_bias(self):
         page = empty_page()
         value = {"kind": "poll", "started_at_ms": 0, "gaps": [], "errors": [],

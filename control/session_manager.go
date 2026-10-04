@@ -153,6 +153,7 @@ func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
 // forwarding does not take these lifecycle locks.
 type SessionManager struct {
 	udpRecoveryDiagnostics atomic.Pointer[udpRecoveryJournal]
+	udpRebuild             atomic.Pointer[udpRebuildLedger]
 	resolveDNSRecovery     resolveDNSRecoveryStore
 	adminSnapshotID        string
 	ctx                    context.Context
@@ -343,6 +344,7 @@ func (m *SessionManager) prepareControlPlane(c *ControlPlane) error {
 		m.udpBPF.CompareAndSwap(nil, bpf)
 	}
 	c.udpReplyDrought.bindDiagnostics(m, c.PolicyEpoch())
+	c.udpReplyDrought.bindExecution(c, m)
 	return nil
 }
 
@@ -364,6 +366,7 @@ func (c *ControlPlane) sessionManagerForFlow(parent context.Context) *SessionMan
 		owned:   c.ownsSessionManager,
 	})
 	c.udpReplyDrought.bindDiagnostics(c.sessionManager, c.PolicyEpoch())
+	c.udpReplyDrought.bindExecution(c, c.sessionManager)
 	return c.sessionManager
 }
 
@@ -777,6 +780,12 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 	if f := endpoint.replyDrought; f != nil {
 		f.observer.bindDiagnostics(m, binding.Route.PolicyEpoch)
 	}
+	if endpoint.rebuildLineage == 0 {
+		endpoint.rebuildLineage = flow.id
+	}
+	if endpoint.rebuildRevision == 0 {
+		endpoint.rebuildRevision = 1
+	}
 
 	if m.closed.Load() {
 		cancel()
@@ -793,7 +802,7 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		return nil, ErrFlowAlreadyRegistered
 	}
 	if f := endpoint.replyDrought; f != nil {
-		f.identity.Store(&udpDroughtIdentity{RuntimeID: flow.id, PolicyEpoch: uint64(binding.Route.PolicyEpoch), StartedAtMS: flow.startUnixNano / int64(time.Millisecond)})
+		f.identity.Store(&udpDroughtIdentity{LineageID: endpoint.rebuildLineage, Revision: endpoint.rebuildRevision, RuntimeID: flow.id, PolicyEpoch: uint64(binding.Route.PolicyEpoch), StartedAtMS: flow.startUnixNano / int64(time.Millisecond)})
 	}
 	m.udpCount.Add(1)
 	m.appendUDPFlowSourceLocked(endpoint.poolKey.Src, flow)
@@ -854,7 +863,7 @@ func (f *UDPFlowRuntime) abort() error {
 			f.cancel()
 		}
 		if f.endpoint != nil {
-			f.endpoint.dead.Store(true)
+			f.endpoint.markDead()
 			f.endpoint.selfRemoveFromPool()
 			err = f.endpoint.Close()
 		}
@@ -868,6 +877,9 @@ func (m *SessionManager) retainedUDPEndpoint(src, dst netip.AddrPort, result *bp
 		return nil, false
 	}
 	desiredScope := newUdpEndpointRouteScope(result)
+	if ue, has := DefaultUdpEndpointPool.rebuildLookup(UdpEndpointKey{Src: src, Dst: dst, RouteScope: desiredScope}); has {
+		return ue, ue != nil
+	}
 	value, ok := m.udpBySource.Load(src)
 	if !ok {
 		return nil, false
@@ -890,6 +902,9 @@ func (m *SessionManager) retainedUDPEndpoint(src, dst netip.AddrPort, result *bp
 			continue
 		}
 		key := flow.endpoint.poolKey
+		if flow.endpoint.prepared.Load() || flow.endpoint.detachedRebuildPeer(dst) {
+			continue
+		}
 		if key.Dst.IsValid() && key.Dst != dst {
 			continue
 		}

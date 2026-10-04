@@ -11,10 +11,10 @@ import (
 // declares that this entire peer scope expects replies to client data; it is
 // unsuitable for opaque, state-dependent game traffic such as CS2 SDR.
 type UDPReplyDroughtPolicy struct {
-	Observe, RequestReply bool
-	Group                 string
-	Client                netip.Addr
-	Peers                 []netip.AddrPort
+	Observe, Enforce, RequestReply bool
+	Group                          string
+	Client                         netip.Addr
+	Peers                          []netip.AddrPort
 }
 
 func (g Global) UDPReplyDroughtPolicy() (UDPReplyDroughtPolicy, error) {
@@ -31,8 +31,10 @@ func (g Global) UDPReplyDroughtPolicy() (UDPReplyDroughtPolicy, error) {
 	case "", "off":
 	case "observe":
 		p.Observe = true
+	case "enforce":
+		p.Observe, p.Enforce = true, true
 	default:
-		return p, fmt.Errorf("udp_reply_drought_mode must be off or observe; enforce is not implemented")
+		return p, fmt.Errorf("udp_reply_drought_mode must be off, observe or enforce")
 	}
 	switch g.UDPReplyDroughtContract {
 	case "", "unknown":
@@ -61,6 +63,9 @@ func (g Global) UDPReplyDroughtPolicy() (UDPReplyDroughtPolicy, error) {
 	}
 	if p.RequestReply && len(p.Peers) == 0 {
 		return p, fmt.Errorf("request_reply requires an explicit udp_reply_drought_peers scope")
+	}
+	if p.Enforce && (!p.Client.IsValid() || p.Group == "" || !p.RequestReply || len(p.Peers) == 0) {
+		return p, fmt.Errorf("udp_reply_drought_mode enforce requires a client IP, exact group, explicit peers and request_reply contract")
 	}
 	return p, nil
 }

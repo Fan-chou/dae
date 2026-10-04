@@ -582,7 +582,6 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		return true, nil
 	}
 	c.recordUploadTraffic(int64(len(data)))
-	addUDPFlowUpload(ue, len(data))
 	return true, nil
 }
 
@@ -677,6 +676,9 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	if c.udpRouteScopeSensitive {
 		routeScope = newUdpEndpointRouteScope(routingResult)
 		forceSymmetricKey = udpRouteScopeNeedsDestinationAffinity(routingResult)
+	}
+	if _, has := DefaultUdpEndpointPool.rebuildOverride(flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)); has {
+		forceSymmetricKey = true
 	}
 
 	// DNS FakeIP identity is destination-specific even without metadata rules.
@@ -1299,7 +1301,6 @@ getNew:
 			goto getNew
 		}
 		c.recordUploadTraffic(int64(len(payloads[packetIndex])))
-		addUDPFlowUpload(ue, len(payloads[packetIndex]))
 		packetIndex++
 	}
 
@@ -1333,6 +1334,10 @@ func lookupUdpEndpointForFlow(flowDecision UdpFlowDecision, routeScope udpEndpoi
 }
 
 func lookupUdpEndpointForFlowWithPrefetch(flowDecision UdpFlowDecision, routeScope udpEndpointRouteScope, forceSymmetric bool, realDst netip.AddrPort, identified bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (UdpEndpointKey, *UdpEndpoint, bool) {
+	recoveryKey := flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
+	if owner, has := DefaultUdpEndpointPool.rebuildLookup(recoveryKey); has {
+		return recoveryKey, owner, owner != nil
+	}
 	// Reuse ingress prefetch and repeated probes without skipping the local
 	// destination-scoped precedence required for off-port QUIC.
 	var keys [3]UdpEndpointKey

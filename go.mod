@@ -119,5 +119,5 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026100
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
 
 // Published outbound includes UDP lifecycle fixes, actual reply peer attribution,
-// explicit BBR supply state and opt-in TCP MSS.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261004031250-0bb08a457f98
+// explicit BBR supply state, opt-in TCP MSS and verified UDP recovery capabilities.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261004163218-8647a14b7f36

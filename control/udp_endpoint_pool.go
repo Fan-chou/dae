@@ -57,10 +57,14 @@ type UdpEndpoint struct {
 	// writeBatch, when non-nil, aggregates outgoing datagrams and flushes
 	// them through the transport's batched writer (netproxy.PacketBatchWriter,
 	// e.g. sendmmsg on direct UDP). See udp_write_batch.go.
-	writeBatch    *udpWriteBatchAggregator
-	replyDrought  *udpReplyDroughtFlow // belongs to the creating generation
-	expiresAtNano atomic.Int64
-	handler       UdpHandler
+	writeBatch                      *udpWriteBatchAggregator
+	replyDrought                    *udpReplyDroughtFlow // belongs to the creating generation
+	prepared                        atomic.Bool
+	rebuildPeers                    atomic.Pointer[udpRebuildPeerMap]
+	rebuildLifecycleMu              sync.Mutex // retirement versus recovery publication only
+	rebuildLineage, rebuildRevision uint64     // immutable before adoption
+	expiresAtNano                   atomic.Int64
+	handler                         UdpHandler
 	// NatTimeout is guarded by natTimeoutMu after endpoint creation.
 	NatTimeout   time.Duration
 	natTimeoutMu sync.RWMutex
@@ -231,14 +235,16 @@ type udpEndpointDialerNetworkKey struct {
 
 // UdpEndpointPool is a UDP connection pool.
 type UdpEndpointPool struct {
-	shards           [udpEndpointCreateShardCount]udpEndpointPoolShard
-	janitorOnce      sync.Once
-	janitorStop      chan struct{}
-	janitorDone      chan struct{}
-	dialerIndex      sync.Map // map[udpEndpointDialerNetworkKey]*udpEndpointDialerBucket
-	dialerEpoch      sync.Map // map[udpEndpointDialerNetworkKey]*atomic.Uint64
-	transportIndex   sync.Map // map[<-chan struct{}]*udpEndpointTransportBucket
-	transportWatchMu sync.RWMutex
+	rebuildOverrides    sync.Map // target-specific key -> process-owned peer claim
+	hasRebuildOverrides atomic.Bool
+	shards              [udpEndpointCreateShardCount]udpEndpointPoolShard
+	janitorOnce         sync.Once
+	janitorStop         chan struct{}
+	janitorDone         chan struct{}
+	dialerIndex         sync.Map // map[udpEndpointDialerNetworkKey]*udpEndpointDialerBucket
+	dialerEpoch         sync.Map // map[udpEndpointDialerNetworkKey]*atomic.Uint64
+	transportIndex      sync.Map // map[<-chan struct{}]*udpEndpointTransportBucket
+	transportWatchMu    sync.RWMutex
 }
 
 // udpEndpointAdmissionGate keeps endpoint publication ordered with forced
@@ -732,6 +738,72 @@ dialSuccess:
 		_ = udpConn.Close()
 		return nil, fmt.Errorf("protocol does not support udp")
 	}
+	ue := newUDPEndpointFromConn(p, key, createOption, dialOption, packetConn)
+	rebound, hasRebound := p.rebuildOverride(key)
+	if hasRebound {
+		ue.prepared.Store(true)
+		ue.rebuildLineage = rebound.lineageID
+		ue.rebuildRevision = rebound.owner.Load().revision + 1
+		if !ue.installRebuildPeer(key.Dst, rebound) {
+			_ = ue.Close()
+			return nil, errUdpEndpointAdmissionClosed
+		}
+	}
+	if createOption.sessionManager != nil {
+		if ue.resolveDNSState != nil {
+			ue.resolveDNSState.store = &createOption.sessionManager.resolveDNSRecovery
+		}
+		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
+			_ = packetConn.Close()
+			return nil, err
+		}
+	} else {
+		ue.setFlowBinding(dialOption.Binding)
+	}
+	if createOption.DrainTracker != nil {
+		ue.drainRelease = createOption.DrainTracker.Acquire()
+	}
+	ue.dialerGenerationRef = p.dialerEpochCounter(dialOption.Dialer, ue.endpointNetworkType)
+	if ue.dialerGenerationRef != nil {
+		ue.dialerGeneration = ue.dialerGenerationRef.Load()
+	}
+
+	// Prewarm the initial Anyfrom socket used to reinject replies back to the
+	// client. Symmetric endpoints can pin a single fixed socket. Full-cone
+	// endpoints still keep their bind-address cache keyed by remote peer, but
+	// priming the first dial target removes the cold bind syscall from the
+	// earliest reply path that games are sensitive to.
+	ue.prewarmResponseConn(dialOption.Target)
+
+	ue.RefreshTtlWithTime(createOption.NowNano)
+	if hasRebound {
+		if !ue.startTransportReceiver() {
+			go ue.startReadLoop()
+		}
+		if !p.rebindNormalRebuildOwner(key, rebound, ue) {
+			_ = ue.Close()
+			return nil, errUdpEndpointAdmissionClosed
+		}
+		return ue, nil
+	}
+
+	shard := p.shardFor(key)
+	shard.mu.Lock()
+	shard.pool[key] = ue
+	shard.mu.Unlock()
+	p.registerEndpoint(ue)
+
+	// Receive UDP messages. Transports that own a packet receiver register
+	// synchronously and reuse the protocol's existing reader; everything else
+	// gets a dedicated blocking ReadFrom loop.
+	if !ue.startTransportReceiver() {
+		go ue.startReadLoop()
+	}
+	return ue, nil
+}
+
+// Builds a connection capsule without adopting it or making it selectable.
+func newUDPEndpointFromConn(p *UdpEndpointPool, key UdpEndpointKey, createOption *UdpEndpointOptions, dialOption *DialOption, packetConn netproxy.PacketConn) *UdpEndpoint {
 	ue := &UdpEndpoint{
 		crossFamily:   createOption.crossFamily,
 		conn:          packetConn,
@@ -773,48 +845,11 @@ dialSuccess:
 		// Initialize before adoptUDP publishes this endpoint to generation
 		// abort/Close. The observer admits a peer only after a completed write.
 		ue.replyDrought = createOption.replyDrought.newFlow(key.Src.String(), ue.Outbound.Name, ue.Dialer.Property().Name, isStatelessProxyBackedUdpProtocol(ue.Dialer))
-	}
-	if createOption.sessionManager != nil {
-		if ue.resolveDNSState != nil {
-			ue.resolveDNSState.store = &createOption.sessionManager.resolveDNSRecovery
+		if ue.replyDrought != nil {
+			ue.replyDrought.endpoint = ue
 		}
-		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
-			_ = packetConn.Close()
-			return nil, err
-		}
-	} else {
-		ue.setFlowBinding(dialOption.Binding)
 	}
-	if createOption.DrainTracker != nil {
-		ue.drainRelease = createOption.DrainTracker.Acquire()
-	}
-	ue.dialerGenerationRef = p.dialerEpochCounter(dialOption.Dialer, ue.endpointNetworkType)
-	if ue.dialerGenerationRef != nil {
-		ue.dialerGeneration = ue.dialerGenerationRef.Load()
-	}
-
-	// Prewarm the initial Anyfrom socket used to reinject replies back to the
-	// client. Symmetric endpoints can pin a single fixed socket. Full-cone
-	// endpoints still keep their bind-address cache keyed by remote peer, but
-	// priming the first dial target removes the cold bind syscall from the
-	// earliest reply path that games are sensitive to.
-	ue.prewarmResponseConn(dialOption.Target)
-
-	ue.RefreshTtlWithTime(createOption.NowNano)
-
-	shard := p.shardFor(key)
-	shard.mu.Lock()
-	shard.pool[key] = ue
-	shard.mu.Unlock()
-	p.registerEndpoint(ue)
-
-	// Receive UDP messages. Transports that own a packet receiver register
-	// synchronously and reuse the protocol's existing reader; everything else
-	// gets a dedicated blocking ReadFrom loop.
-	if !ue.startTransportReceiver() {
-		go ue.startReadLoop()
-	}
-	return ue, nil
+	return ue
 }
 
 func reportUdpEndpointDialCreateFailure(key UdpEndpointKey, dialOption *DialOption, err error) {
@@ -986,6 +1021,11 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.Unlock()
 
 	// Create a new endpoint under the creation lock.
+	if staleToClose != nil {
+		if _, has := p.rebuildOverride(key); has {
+			staleToClose.markDead()
+		}
+	}
 	newUe, createErr := p.createEndpointLocked(key, createOption)
 	shard.createMu.Unlock()
 	createMuLocked = false

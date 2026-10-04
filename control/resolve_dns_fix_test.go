@@ -179,19 +179,35 @@ func TestResolveDNSPrefetchBudgetDoesNotBlockDemand(t *testing.T) {
 }
 
 func TestResolveDNSRecoveryAdministrativeCloseDoesNotRestore(t *testing.T) {
-	d := newTestEndpointDialer()
-	d.Property().Address = "proxy.example:443"
-	var s resolveDNSRecoveryStore
-	key := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.10:40000"), Dst: netip.MustParseAddrPort("198.51.100.10:443")}
-	old := &UdpEndpoint{Dialer: d, poolKey: key, DialTarget: "203.0.113.10:443", SniffedDomain: "quic.example", resolveDNSState: &udpResolveDNSState{id: 1}}
-	old.hasSent.Store(true)
-	s.save(old)
-	active := &UdpEndpoint{Dialer: d, poolKey: key, resolveDNSState: &udpResolveDNSState{store: &s, id: 2}}
-	if err := active.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := s.lookup(key, PacketSnifferKey{}, false); ok {
-		t.Fatal("administrative close retained old recovery record")
+	for _, idle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("idle=%v", idle), func(t *testing.T) {
+			d := newTestEndpointDialer()
+			t.Cleanup(func() { _ = d.Close() })
+			d.Property().Address = "proxy.example:443"
+			var store resolveDNSRecoveryStore
+			key := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.10:40000"), Dst: netip.MustParseAddrPort("198.51.100.10:443")}
+			old := &UdpEndpoint{Dialer: d, poolKey: key, DialTarget: "203.0.113.10:443", SniffedDomain: "quic.example", resolveDNSState: &udpResolveDNSState{id: 1}}
+			old.hasSent.Store(true)
+			store.save(old)
+			active := &UdpEndpoint{Dialer: d, poolKey: key, DialTarget: old.DialTarget, resolveDNSState: &udpResolveDNSState{store: &store, id: 2}}
+			active.hasSent.Store(true)
+			var err error
+			if idle {
+				err = active.closeIdleExpired()
+			} else {
+				err = active.Close()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := store.lookup(key, PacketSnifferKey{}, false); ok {
+				t.Fatal("close retained old recovery record")
+			}
+			active.retire()
+			if _, ok := store.lookup(key, PacketSnifferKey{}, false); ok {
+				t.Fatal("late retire restored closed recovery record")
+			}
+		})
 	}
 }
 
