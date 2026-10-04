@@ -3078,7 +3078,8 @@ int testsetup_conntrack_refresh_bypass(struct __sk_buff *skb)
 	key.dport = bpf_htons(443);
 	state = mark_udp_seen(&key, true, NULL, NULL, NULL, NULL, 0, NULL, 0,
 			      ROUTING_EPOCH_SLOT_UNKNOWN);
-	if (!state || state->pid || state->meta.data.dscp || args->flags != 0x80 || args->pid != 123)
+	if (!state || state->pid || state->meta.data.dscp || args->flags != 0x80 ||
+	    args->pid != 123)
 		return TC_ACT_SHOT;
 	bpf_map_delete_elem(&conn_state_map, &key);
 

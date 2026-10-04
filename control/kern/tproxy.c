@@ -391,7 +391,7 @@ static __always_inline bool fakeip_hit_v4(__be32 daddr)
 	key.data[2] = bpf_htonl(0x0000ffff);
 	key.data[3] = daddr;
 	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
-	return val != NULL;
+	return !!val;
 }
 
 static __always_inline bool fakeip_hit_v6(const union ip6 *daddr)
@@ -402,7 +402,7 @@ static __always_inline bool fakeip_hit_v6(const union ip6 *daddr)
 	key.prefixlen = 128;
 	__builtin_memcpy(key.data, daddr, 16);
 	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
-	return val != NULL;
+	return !!val;
 }
 
 static __always_inline bool fakeip_hit_dest(const struct tuples *t, __u16 eth_proto)
@@ -414,7 +414,7 @@ static __always_inline bool fakeip_hit_dest(const struct tuples *t, __u16 eth_pr
 	__builtin_memcpy(key.data, &t->five.dip, 16);
 	val = bpf_map_lookup_elem(&fakeip_lpm_map, &key);
 	(void)eth_proto;
-	return val != NULL;
+	return !!val;
 }
 
 /* Dest-only LPM from the IP header. Used when L4 parse fails, and as a
@@ -1588,8 +1588,8 @@ conntrack_args_set(struct conntrack_args *a,
 // Reverse-side refreshes have no routing metadata to copy through scratch.
 static __always_inline bool
 conntrack_args_are_empty(__u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
-                         __u8 dscp, const char *pname, __u32 pid,
-                         __u8 routing_epoch_slot)
+			 __u8 dscp, const char *pname, __u32 pid,
+			 __u8 routing_epoch_slot)
 {
 	return !outbound && !mark && !must && !mac && !dscp && !pname && !pid &&
 	       routing_epoch_slot == ROUTING_EPOCH_SLOT_UNKNOWN;
@@ -1623,7 +1623,7 @@ static __always_inline int mac6_is_learnable(const __u8 *mac)
 }
 
 static __always_inline void mac_assoc_key_from_mac(struct mac_assoc_key *key,
-						     const __u8 *mac)
+						   const __u8 *mac)
 {
 	__builtin_memcpy(key->mac, mac, 6);
 	key->pad[0] = 0;
@@ -2223,6 +2223,7 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 static __always_inline int assign_udp_listener(struct __sk_buff *skb)
 {
 	struct bpf_sock *sk;
+
 	sk = bpf_map_lookup_elem(&listen_socket_map, &one_key);
 
 	if (!sk)
@@ -2250,6 +2251,7 @@ int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
 	 * table. A newly populated listener must not steal an old generation's
 	 * handshake while the interface hooks are being replaced. */
 	struct tuples_key tuple = {};
+
 	tuple.l4proto = IPPROTO_TCP;
 	tuple.sport = (__u16)ctx->remote_port;
 	tuple.dport = bpf_htons(ctx->local_port);
@@ -2265,10 +2267,12 @@ int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
 		return SK_PASS;
 	}
 	struct conn_state *state = bpf_map_lookup_elem(&conn_state_map, &tuple);
+
 	if (!state || state->datapath_generation != PARAM.datapath_generation)
 		return SK_PASS;
 
 	const __u32 *key;
+
 	if (ctx->family == AF_INET)
 		key = &zero_key;
 	else if (ctx->family == AF_INET6)
@@ -2277,6 +2281,7 @@ int tproxy_tcp_listener(struct bpf_sk_lookup *ctx)
 		return SK_PASS;
 
 	struct bpf_sock *sk = bpf_map_lookup_elem(&listen_socket_map, key);
+
 	if (!sk)
 		return SK_PASS;
 
@@ -2540,7 +2545,6 @@ static __noinline struct conn_state *
 __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		const struct conntrack_args *args)
 {
-
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
 		bpf_map_lookup_elem(&conn_state_map, key);
@@ -2672,7 +2676,6 @@ static __noinline struct conn_state *
 __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		__u8 tcp_flags, const struct conntrack_args *args)
 {
-
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
 		bpf_map_lookup_elem(&conn_state_map, key);
@@ -3000,7 +3003,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		// No cached state for an established packet: keep the historical
 		// passthrough behavior instead of recomputing routing.
 		// FakeIP must not take that passthrough: 28.x/198.18 is not a
-		// real on-wire destination (RFC 6890). Fall through and tproxy.
+		// real on-wire destination (RFC 6890). Continue to routing below.
 		if (!tcp_state) {
 			if (dest_is_fakeip)
 				goto lan_new_flow_route;
@@ -3294,6 +3297,7 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 	pid_pname = bpf_map_lookup_elem(&cookie_pid_map, &cookie);
 	if (pid_pname) {
 		__u64 now = bpf_ktime_get_ns();
+
 		if (now - pid_pname->last_seen_ns > 1000000000ULL)
 			pid_pname->last_seen_ns = now;
 		if (p) {
