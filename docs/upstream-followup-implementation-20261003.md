@@ -907,3 +907,17 @@ off／observe 均值增量约 2.5／4.9 ns，分别为 2.2%／1.8%；enforce 相
 outbound `8647a14b7f3691b596eaf37f3fb6bb86e9e45876` 已发布至 `Fan-chou/outbound` 的跟进分支；正式 pin 为 `v0.0.0-sticky-ip.0.20261004163218-8647a14b7f36`。QUIC 保持 `42916a975611`，无需新增提交。正式模块校验和验证、tidy 差异及模块图检查通过，无本地路径替换。
 
 后续是 220 → 223 → 自管请求／应答服务的有界现场验收，先 observe 取得窗口与覆盖，再针对单客户端、单组、精确目标考虑 enforce。CS2 SDR 不能据端口、一次成功对局或 UDP 静默自动获得执行资格。既有全套 QUIC strict 的 `TestMITCorruptPackets/towards_the_client` 超时待办仍保留，本批定向测试没有替代该门槛。
+
+### 10 月 5 日首次现场验收与 native peer 修正
+
+223 首先安装正式依赖构建 `unstable-20261005.r1277.90fe9b59`（SHA256 `a8bb63716ce3f9b8d1feb2daef046bd24fb2ffc6453de8182576cef8635aa19a`）。备份旧二进制和读取脚本，设置独立自动回滚；生产配置、init、网络配置保持。220 默认路由经 223，222 保持原直出规则。Google／Cloudflare HTTPS 均返回 204、TLS 校验为 0。
+
+临时 `U2_Live` 组复制现有 SS 节点，凭据仅在 223 处理，去掉 `resolve_dns`；其实际数字 underlay 为 `10.8.1.6:34564`。仅 `192.168.124.220` 到自管 `.5` 公网 `185.248.186.73:46671/46672` 的 UDP 被导向该组。两端口运行带随机令牌、时间及包数上限的 256 字节请求／应答服务。客户端同一个 socket 每 peer 每秒发送五次；observe／enforce 中，B 从第 100 个请求后仅屏蔽首个代理映射，A 始终回复。off 阶段不注入故障，只是正常基线。测试配置有独立恢复 watchdog。
+
+首轮结果：off A／B 各 175／175 回复；observe 和 enforce 均为 A 550／550、B 550／100，服务端逐包确认各屏蔽 B 的 450 个请求。所有请求到达，无重复、无每 peer 序号逆序。observe 产生一个经归档窗口校验的候选，执行器为空。enforce 同样产生候选，但有 12 次 `peer_alias_unsupported`，实际 attempt／commit 均为零，没有新映射；因此首轮没有验证恢复成功。各阶段归档无游标缺口或读取错误。配置已恢复 off，测试服务已停止并清理。
+
+原因是全局启用跨地址族映射时，普通 native IP 的 endpoint 同样持有 writable store；直接用 `crossFamily != nil` 排除执行，误把映射能力当成了实际 alias。修正只允许源和 peer 同族、身份明确的 native peer；真实 foreign peer、映射池中的目标或 DialTarget、固定目标或原始 peer 不一致、未知／未打开的 store、域名和 resolve_dns 继续排除。prepare 继承旧 endpoint 的 store，保留其回复映射视图。未关闭全局跨族功能，也未修改每包写入路径。配置说明同步更新为实际支持的 scoped enforce。
+
+真实 SS／SOCKS5 回归新增全局 mapping 启用场景，验证 B 获得新映射及三个新回复、A 映射保持、同一 store 保留、tuple 引用仍为一。native IPv4／IPv6／mapped IPv4 和已分配／未分配 alias、foreign、原始 peer 不一致及未 Ready 的正反用例通过。五类执行回归 `-race -count=3`、较宽 UDP 恢复／跨族／观测／诊断／resolve_dns race 回归及 control／config／cmd vet 通过。Astra 独立确认过宽排除的原因，修正的静态审查通过。下一轮继续相同范围的现场验收。
+
+首轮脚本、逐包应用记录、服务端记录和可校验 API 归档位于忽略目录 `build/udp-rebuild-live-20261005/`。阶段顺序运行且使用不同客户端源端口，现场 RTT 只能描述样本，不能用来归因执行开销；延迟判断仍以此前交错本地对照为依据。

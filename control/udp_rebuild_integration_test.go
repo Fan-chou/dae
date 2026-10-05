@@ -361,6 +361,9 @@ func newRebuildFixture(t *testing.T, kind, mode string) *rebuildFixture {
 	return newRebuildFixtureWithGate(t, kind, mode, false)
 }
 func newRebuildFixtureWithGate(t *testing.T, kind, mode string, gated bool) *rebuildFixture {
+	return newRebuildFixtureWithStore(t, kind, mode, gated, nil)
+}
+func newRebuildFixtureWithStore(t *testing.T, kind, mode string, gated bool, store *UDPCrossFamilyStore) *rebuildFixture {
 	t.Helper()
 	f := &rebuildFixture{a: rebuildEcho(t), b: rebuildEcho(t), replies: make(chan rebuildReply, 256)}
 	r, base := newRebuildRelay(t, kind, f.b)
@@ -386,13 +389,14 @@ func newRebuildFixtureWithGate(t *testing.T, kind, mode string, gated bool) *reb
 		t.Cleanup(func() { _ = f.o.Close() })
 	}
 	f.c = recoveryTestPlane(f.m, f.o, 1)
+	f.c.udpCrossFamily = store
 	resetActiveControlPlanePublicationForTest(t)
 	f.c.publishActiveControlPlane()
 	f.pool = NewUdpEndpointPool()
 	t.Cleanup(f.pool.Close)
 	nt := componentdialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, UdpHealthDomain: componentdialer.UdpHealthDomainData}
 	binding := UdpFlowBinding{Route: UdpRouteBinding{PolicyEpoch: routing.PolicyEpoch(1)}, Egress: UdpEgressBinding{Dialer: d, Outbound: g, Network: "udp", Target: f.a.String(), NetworkType: nt}}
-	f.options = &UdpEndpointOptions{Ctx: context.Background(), Log: log, NatTimeout: time.Minute, ConnStateOwner: f.m, sessionManager: f.m, replyDrought: f.o, Handler: func(e *UdpEndpoint, b []byte, p netip.AddrPort) error {
+	f.options = &UdpEndpointOptions{Ctx: context.Background(), crossFamily: f.c.udpCrossFamilyForDestination(f.a), Log: log, NatTimeout: time.Minute, ConnStateOwner: f.m, sessionManager: f.m, replyDrought: f.o, Handler: func(e *UdpEndpoint, b []byte, p netip.AddrPort) error {
 		f.replies <- rebuildReply{string(b), p, e}
 		return nil
 	}, GetDialOption: func(context.Context) (*DialOption, error) {

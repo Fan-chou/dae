@@ -140,7 +140,7 @@ func (x *udpRebuildExecutor) exclusion(ue *UdpEndpoint, peer netip.AddrPort) str
 	if !isProxyBackedDialer(ue.Dialer) || ue.endpointNetworkType.IsDns || ue.Outbound == nil {
 		return "not_proxy_data"
 	}
-	if ue.crossFamily != nil || ue.resolveDNSState != nil || ue.SniffedDomain != "" || (ue.poolKey.Dst.IsValid() && ue.poolKey.Dst != peer) {
+	if ue.resolveDNSState != nil || ue.SniffedDomain != "" || udpRebuildPeerUsesAlias(ue, peer) {
 		return "peer_alias_unsupported"
 	}
 	if _, err := netip.ParseAddrPort(ue.DialTarget); err != nil {
@@ -157,6 +157,31 @@ func (x *udpRebuildExecutor) exclusion(ue *UdpEndpoint, peer netip.AddrPort) str
 		return "shared_target_bound"
 	}
 	return ""
+}
+
+// A writable mapping store is attached to native flows too. Reject aliases
+// for this peer without disabling recovery of an independent native peer on
+// the same shared association.
+func udpRebuildPeerUsesAlias(ue *UdpEndpoint, peer netip.AddrPort) bool {
+	client := ue.poolKey.Src.Addr().Unmap()
+	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+	if !client.IsValid() || !validDroughtPeer(peer) || client.Is4() != peer.Addr().Is4() || (ue.poolKey.Dst.IsValid() && ue.poolKey.Dst != peer) {
+		return true
+	}
+	if slot := ue.rebuildPeer(peer); slot != nil && netip.AddrPortFrom(slot.original.Addr().Unmap(), slot.original.Port()) != peer {
+		return true
+	}
+	if ue.crossFamily == nil {
+		return false
+	}
+	s := ue.crossFamily.store
+	if s == nil || !s.Ready() || s.Contains(peer.Addr()) {
+		return true
+	}
+	if target, err := netip.ParseAddrPort(ue.DialTarget); err == nil && s.Contains(target.Addr().Unmap()) {
+		return true
+	}
+	return false
 }
 func (x *udpRebuildExecutor) evidenceLocked(q udpRebuildCandidate, peer netip.AddrPort) bool {
 	f := q.flow
@@ -281,7 +306,7 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 	key := old.poolKey
 	key.Dst = peer
 	dialOption := &DialOption{Dialer: binding.Egress.Dialer, Outbound: group, Target: target, Network: binding.Egress.Network, NetworkType: &binding.Egress.NetworkType, Binding: binding, IsDialIp: true}
-	options := &UdpEndpointOptions{Handler: old.handler, NatTimeout: old.natTimeout(), Log: old.log, ConnStateOwner: old.udpConnStateOwner, replyDrought: x.observer}
+	options := &UdpEndpointOptions{Handler: old.handler, NatTimeout: old.natTimeout(), Log: old.log, ConnStateOwner: old.udpConnStateOwner, replyDrought: x.observer, crossFamily: old.crossFamily}
 	next := newUDPEndpointFromConn(old.poolRef, key, options, dialOption, pc)
 	next.prepared.Store(true)
 	next.rebuildLineage = old.rebuildLineage
