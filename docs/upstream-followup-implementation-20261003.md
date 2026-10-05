@@ -2,7 +2,7 @@
 
 日期：2026 年 10 月 3 日。对应[设计与历史复核](upstream-followup-plan-20261002.md)。
 
-阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1、P2 的默认关闭候选，结果见末尾。P3 完成生产调用审计，未接入的 GRO／arena 暂不移植。P1、P2 已有两种真实代理的 WAN 初测，仍不足以批准启用。修复后的 CS2 官方匹配本轮成功，用户报告没有卡顿或掉线；完整游戏阶段观测和 U2 执行仍待验收，不能将本记录理解为全部 25 个单元已经验收。
+阶段一至四的 20 个单元已落地并提交；正确性批次已部署到 223。Astra 复核修正及版本见「Astra 审查修正与再次部署」。后续补充共享节点 splice、较长自然流量窗口、U1 的 off／observe 和 P1、P2 的默认关闭候选，结果见末尾。P3 完成生产调用审计，未接入的 GRO／arena 暂不移植。P1、P2 已有两种真实代理的 WAN 初测，仍不足以批准启用。修复后的 CS2 官方匹配本轮成功，用户报告没有卡顿或掉线；U2 已完成受控 SS AEAD 请求／应答现场验收，完整游戏阶段观测及实际业务执行资格仍待验证，不能将本记录理解为全部 25 个单元已经验收。
 
 ## 固定版本与历史约束
 
@@ -842,14 +842,14 @@ Astra 再次独立复核 `cd62f250..a585f32e`，确认两项发现均已修复�
 
 ## U2 自动重建执行（10 月 5 日）
 
-执行逻辑已接入生产代码，默认仍为 off。`enforce` 必须同时给出单个客户端 IP、精确组名、数字 IP:port peer 列表和 `request_reply`。配置缺项直接报错；质量模式不会隐式启用它。223 尚未部署本批，CS2 官方 SDR 继续按 unknown 排除执行。
+执行逻辑已接入生产代码，默认仍为 off。`enforce` 必须同时给出单个客户端 IP、精确组名、数字 IP:port peer 列表和 `request_reply`。配置缺项直接报错；质量模式不会隐式启用它。223 已部署并完成下述受控验收，生产配置恢复 off；CS2 官方 SDR 继续按 unknown 排除执行。
 
 ### 执行与隔离
 
 - 六个完整 5 秒窗口、每窗至少 10 个非空成功发送、至少 3 个历史回复、30 秒回复干旱及最近 5 秒仍有发送继续作为资格。排队、准备和发布前重新核对证据、存活、实际所有者及活跃配置代；回复恢复或错误使候选取消。
 - SessionManager 持有 256 项有界账本。peer／组／进程分别最多 1／2／8 次每分钟；实际 dial 计尝试，发布计提交。拨号前取消不消耗尝试，拨号后取消保留尝试。活跃所有者、票据和等待新回复的记录不能淘汰；所有所有者结束后保留 60 秒墓碑。
 - 活跃执行器使用 2 个准备 worker、32 项队列、10 秒票据和 2 秒准备期限。使用原节点及已固定的 egress binding 准备独立关联，prepared 不能被查找或承载业务包。未知能力、队列接受型传输、batch、DNS、直连、旧代、跨地址族、resolve_dns、域名和不明确的目标别名均排除。
-- 能力由实际 PacketConn 声明。direct 提供底层本地完成和独立 socket；SS 保留底层承诺；SOCKS5 还要求独立 UDP ASSOCIATE control。没有声明则不执行。Hysteria2／TUIC 没有被此批放行。新关联不保证远端端口一定改变。
+- 能力由实际 PacketConn 声明。direct 提供底层本地完成和独立 socket；SS AEAD 保留底层承诺；SOCKS5 还要求独立 UDP ASSOCIATE control。没有声明则不执行。SS2022、SS stream、Hysteria2／TUIC 没有被此批放行。新关联不保证远端端口一定改变。
 - source-only 共享关联 S 中，只将故障 B 拆成目标专用 T，A 继续使用 S。查找、路由缓存、prefetch、retained 和实际写入均遵循 peer 所有者。每个 endpoint 生命周期最多保留 8 个 peer claim，容量满时拒绝新增，避免无限保留 detached 身份。
 - claim 覆盖实际 I/O。仅 B 的发布屏障等待当前 I/O，最长 100 毫秒；提交锁忙、等待超时、所有者变化或证据变化均取消。准备及发布不复制或重放业务包。先增加 T 的 tuple 引用，再释放 S 的 B 引用，旧缓存和晚到 tuple 登记不能重新挂回 S。
 - 原关联的晚回复照常排空并返回客户端，单独计数，不恢复新账本。新所有者收到非空业务发送后的 3 个实际 peer 回复，才解除再次执行限制。普通 hard error／NAT 后代保持 lineage、revision、专用 key 和回复门槛；关闭开关也保留这些所有权。
@@ -906,7 +906,7 @@ off／observe 均值增量约 2.5／4.9 ns，分别为 2.2%／1.8%；enforce 相
 
 outbound `8647a14b7f3691b596eaf37f3fb6bb86e9e45876` 已发布至 `Fan-chou/outbound` 的跟进分支；正式 pin 为 `v0.0.0-sticky-ip.0.20261004163218-8647a14b7f36`。QUIC 保持 `42916a975611`，无需新增提交。正式模块校验和验证、tidy 差异及模块图检查通过，无本地路径替换。
 
-后续是 220 → 223 → 自管请求／应答服务的有界现场验收，先 observe 取得窗口与覆盖，再针对单客户端、单组、精确目标考虑 enforce。CS2 SDR 不能据端口、一次成功对局或 UDP 静默自动获得执行资格。既有全套 QUIC strict 的 `TestMITCorruptPackets/towards_the_client` 超时待办仍保留，本批定向测试没有替代该门槛。
+220 → 223 → 自管请求／应答服务的有界现场验收已完成，结果见下方。SS2022 能力声明与实际恢复验收、CS2 的回复义务及暂停保护仍待完成。CS2 SDR 不能据端口、一次成功对局或 UDP 静默自动获得执行资格。既有全套 QUIC strict 的 `TestMITCorruptPackets/towards_the_client` 超时待办仍保留，本批定向测试没有替代该门槛。
 
 ### 10 月 5 日首次现场验收与 native peer 修正
 
@@ -921,3 +921,49 @@ outbound `8647a14b7f3691b596eaf37f3fb6bb86e9e45876` 已发布至 `Fan-chou/outbo
 真实 SS／SOCKS5 回归新增全局 mapping 启用场景，验证 B 获得新映射及三个新回复、A 映射保持、同一 store 保留、tuple 引用仍为一。native IPv4／IPv6／mapped IPv4 和已分配／未分配 alias、foreign、原始 peer 不一致及未 Ready 的正反用例通过。五类执行回归 `-race -count=3`、较宽 UDP 恢复／跨族／观测／诊断／resolve_dns race 回归及 control／config／cmd vet 通过。Astra 独立确认过宽排除的原因，修正的静态审查通过。下一轮继续相同范围的现场验收。
 
 首轮脚本、逐包应用记录、服务端记录和可校验 API 归档位于忽略目录 `build/udp-rebuild-live-20261005/`。阶段顺序运行且使用不同客户端源端口，现场 RTT 只能描述样本，不能用来归因执行开销；延迟判断仍以此前交错本地对照为依据。
+
+### 10 月 5 日受控现场验收完成
+
+native peer 修正提交为 `f6b1e63d902d28fe1c3d85216934f0b54f8f1d1c`。正式依赖构建 `unstable-20261005.r1278.f6b1e63d` 已部署到 223，SHA256 为 `1eb68161de5744a19f2ad4060de829d437c2a59da23a6e559e81bb447e5868ec`；构建时源码干净，无本地依赖替换。安装前保留二进制及独立回滚脚本。Astra 静态复核通过，并独立重跑 native mapping 回归 `-race -count=3`。
+
+第二轮仍使用原节点，native alias 排除消失，但出现 12 次 `transport_capability_missing`，attempt／commit 均为零。安全检查确认原节点使用 `2022-blake3-aes-256-gcm`，其实际 PacketConn 尚未声明恢复所需能力。服务端确认所有请求到达，失败按预期保守拒绝；没有按协议名称绕过检查。证据保存在 `build/udp-rebuild-live-20261005-r2/`。
+
+第三轮在自管 `.5` 临时建立 `aes-128-gcm` relay，仅绑定 WireGuard `10.8.1.5:46680`，设置 900 秒期限；生产 shadowsocks-rust 服务保持。独立随机凭据仅通过 SSH 在两端私有文件中传递，没有进入本地证据、日志或提交。应用服务、220 客户端、精确路由范围及故障注入方式与前两轮相同；223 无须再次更换二进制。off 35 秒，observe 和 enforce 各 110 秒，阶段使用不同客户端源端口。
+
+| 阶段 | 健康 A 回复／发送 | B 回复／发送 | B 服务端主动丢回复 | 映射与执行 |
+| --- | ---: | ---: | ---: | --- |
+| off 正常基线 | 175／175 | 175／175 | 0 | A、B 共用原映射，新增尝试 0 |
+| observe 故障 | 550／550 | 100／550 | 450 | 记录候选，映射保持，新增尝试 0 |
+| enforce 故障 | 550／550 | 379／550 | 171 | B 新映射收到 279 次回复；一次尝试、提交、恢复 |
+
+enforce 中 A 始终使用 `185.248.186.73:7291`；B 序号 0–99 经原映射回复，100–270 被服务端规则丢弃，271–549 经新映射 `185.248.186.73:6696` 回复。服务端逐包核对所有 550 个请求均到达，每 peer 序号完整且有序，无重复、重放或无法解释的丢回复。A 无缺失，未被 B 的重建改变映射。
+
+执行候选包含六个完整 5 秒窗口，每窗 25 次本地完成发送、零回复，历史回复 100 次，回复干旱 34.177 秒。同一 B peer 的 lineage 824 从旧 runtime 824／revision 1 转至新 runtime 862／revision 2；journal 序号 40 的 committed 与序号 41 的 recovered 对应，提交后 623 毫秒取得三个新关联回复。客户端最后一个旧回复到第一个新回复间隔 34.400 秒，包含策略要求的 30 秒干旱和扫描等待，不表示即时恢复。
+
+本轮预算增量为 peer、组及进程各一次尝试，attempt／commit／recovered 各新增一；没有 claim retry、发布等待超时或晚回复。第二轮累计的 `transport_capability_missing: 12` 保持不变，不能算成本轮新排除。读取工具及分析器按进程、观察代、客户端源端口和事件序号核对；第三轮 57 份采样的 manifest、哈希及来源均通过，无归档缺口或读取错误。`live-summary.json` 将应用序号、映射、服务端故障与实际 commit／recovered 交叉核对，结果为通过。
+
+#### 延迟与观测结果
+
+| 阶段 | 健康 A RTT p50／p95／p99，ms | B 有效回复 RTT p50／p95／p99，ms |
+| --- | ---: | ---: |
+| off | 53.626／54.161／57.671 | 53.569／54.111／57.117 |
+| observe | 53.638／54.346／55.999 | 53.633／54.589／55.293 |
+| enforce | 53.634／54.267／55.028 | 53.596／54.204／54.996 |
+
+这是顺序运行的公网 RTT 样本，不能隔离 dae 的处理开销或证明生产尾延迟；B 的统计只包含有效回复，不包含故障等待。处理开销判断继续依据上面的交错本地对照，未发现显著稳态退化；native peer 修正只改候选资格及准备路径，没有增加每包检查。健康 A 的收发和映射隔离获得本轮现场证据。
+
+enforce 阶段归档 9 个 capture relay 窗口，`offload_unmeasured`、`invalid_window`、`queue_dropped` 均为零。恢复后采样再归档 5 个可比较窗口，节点计数没有小于本流；节点包含并发流，正差不能当成本流计数偏差。自然 splice 流没有独立本流字节参考，本轮仍不能计算其精确偏差。主质量组 Heart_Proxy、Cherry、Heart_YouTuBe 保持 observe；短窗口内质量切换和站点恢复预算均为零，Cherry 出现一次 `below_sampling_threshold`。reload 改变质量观察代，不能把本轮零计数外推为长期触发频率。
+
+#### 恢复、审查与证据
+
+测试结束已恢复 UDP 自动重建 off，移除 `U2_Live` 作用域；config、local 及 routing 文件哈希与安装作用域前基线相同，网络、init、生产节点和组保持。223 PID 9150、版本及正式二进制哈希一致，HTTPS 检查通过。`.5` 临时 relay／应用服务、监听及私有凭据均已清理，生产 shadowsocks-rust 仍运行。
+
+恢复后采集任务运行 60 秒，获得 12 份有效采样，首末覆盖 55.541 秒；全部 mode off、observation null，历史 attempt／commit／recovered 始终各一，tombstone 的 live owners 为零。服务持续 running，FD 从 304 降至 288，UDP sessions 从 38 降至 33，RSS 约 223.64–223.69 MB。采集丢弃及窗口错误计数保持零。短样本未见新增执行或资源增长迹象，不能替代长期内存和负载验收。
+
+Astra 独立读取第三轮逐包应用／服务端记录、57 份阶段归档、恢复文件及 12 份恢复后采样，确认健康 peer 隔离、三个新关联回复、事件与预算、清理及 off 恢复均成立，无待修发现。验收结论限定为受控 SS AEAD 请求／应答；SS2022 和 CS2 仍不具执行资格。
+
+安全证据、脚本和分析位于忽略目录 `build/udp-rebuild-live-20261005-r3/`，主要文件为 `live-summary.json`、`restore-verification.json`、`server-cleanup-verification.json`、`relay-cleanup.json` 和 `after-restore/analysis.json`。发布 manifest 位于 `build/udp-rebuild-native-20261005/manifest.json`。223 二进制回退副本与脚本保留在 `/root/kdae-udp-rebuild-live-r2-20261005/`，测试配置恢复脚本保留在 `/root/kdae-udp-rebuild-live-r3-20261005/`。
+
+222 当前磁盘约余 2.1 GiB。旧 benchmark／诊断二进制压缩后校验；四份旧缓存归档复制至 220 的 `/root/kdae-222-cache-archives-20261005/`，校验 SHA256 后删除本地重复副本。当前正式 Go／模块缓存、现场证据和回退副本保留；转存及压缩 manifest 分别在 `build/cache-archives/offloaded-20261005.json`、`build/udp-rebuild-20261005/compressed-artifacts.json`。
+
+后续仍需按实际 SS2022 的独立关联和发送完成语义补齐能力声明、互操作及隔离验收；CS2 先补完整游戏阶段与暂停／keepalive 的回复义务证据，再决定是否可建立精确执行范围。保持生产 UDP 重建 off、主要质量组 observe；本轮受控通过不自动放行其他传输或业务。
