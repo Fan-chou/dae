@@ -192,6 +192,7 @@ func (ue *UdpEndpoint) recordRebuildReply(peer netip.AddrPort) {
 	s.mu.Unlock()
 	if recovered && ue.sessionRuntime != nil {
 		e := UDPRecoveryEvent{RuntimeID: ue.sessionRuntime.id, PolicyEpoch: uint64(ue.sessionRuntime.binding.Route.PolicyEpoch), LineageID: s.lineageID, Revision: owner.revision, ActualPeer: peer.String(), Kind: "recovered", Reason: "three_fresh_successor_replies", AtMS: time.Now().UnixMilli()}
+		ue.fillPinnedRecoveryEvent(&e)
 		if ue.replyDrought != nil {
 			e.Generation = ue.replyDrought.observer.generation
 		}
@@ -223,7 +224,7 @@ func (ue *UdpEndpoint) endRebuildOwnership() {
 }
 
 func (ue *UdpEndpoint) detachedRebuildPeer(original netip.AddrPort) bool {
-	s := ue.rebuildPeer(original)
+	s := ue.rebuildPeerForOriginal(original)
 	return s != nil && s.record.Load() != nil && s.owner.Load().endpoint != ue
 }
 
@@ -280,13 +281,21 @@ func (p *UdpEndpointPool) rebindNormalRebuildOwner(key UdpEndpointKey, s *udpReb
 	if existing := shard.pool[key]; existing != nil && existing != previous.endpoint {
 		return false
 	}
-	l.mu.Lock()
+	unlockPin, reason := lockPinnedDNSTransfer(previous.endpoint, next)
+	if reason != "" {
+		return false
+	}
+	defer unlockPin()
+	if !l.mu.TryLock() {
+		return false
+	}
 	r.owners[next] = struct{}{}
 	s.tombstoneUntil.Store(nil)
 	r.endedAt = time.Time{}
 	r.replies = 0
 	r.state = "awaiting_replies"
 	l.counts["ordinary_successor"]++
+	transferPinnedDNSLocked(previous.endpoint, next)
 	l.mu.Unlock()
 	s.freshReplies = 0
 	s.successorIntent = false

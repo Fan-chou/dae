@@ -188,6 +188,33 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["capture"][0]["offload_fraction_of_archived_relay_windows"], 1)
         self.assertEqual(result["node_flow_counter_differences"], [])
 
+    def test_dns_pin_confirmation_requires_complete_matching_identity(self):
+        page = empty_page()
+        identity = {"original_target": "198.51.100.10:27015", "target_kind": "resolve_dns_native",
+                    "dns_pin_owner_id": 9, "flow_identity_revision": 1, "pin_inherited": True}
+        commit = dict(identity, sequence=1, generation=1, kind="committed", successor_runtime_id=8,
+                      actual_peer="192.0.2.1:27015", ownership_revision=2)
+        reply = dict(identity, sequence=2, generation=1, kind="recovered", runtime_id=8,
+                     actual_peer="192.0.2.1:27015", ownership_revision=2)
+        value = {"kind": "poll", "started_at_ms": 0, "gaps": [], "errors": [],
+                 "fetch_brackets": [], "provenance_stable": True, "provenance_before": {},
+                 "pages": {"udp-recovery": [page]}}
+        for field in identity:
+            for change in ("missing", "different"):
+                with self.subTest(field=field, change=change):
+                    altered = dict(reply)
+                    if change == "missing":
+                        altered.pop(field)
+                    else:
+                        altered[field] = "different"
+                    page["records"] = [commit, altered]
+                    result = analyze.summarize([value])["successor_reply_confirmations_archived"][0]
+                    self.assertIsNone(result["archived_commit_sequence"])
+        page["records"] = [commit, reply]
+        result = analyze.summarize([value])["successor_reply_confirmations_archived"][0]
+        self.assertEqual(result["archived_commit_sequence"], 1)
+        self.assertEqual(result["pin_identity_validation"], "matched")
+
     def test_quality_counter_frequency_keeps_generation_separate(self):
         values = []
         for at, epoch, count in ((1000, 1, 5), (61000, 1, 7), (62000, 2, 0)):

@@ -18,6 +18,7 @@ type udpResolveDNSState struct {
 	store   *resolveDNSRecoveryStore
 	once    sync.Once
 	id      uint64
+	phase   atomic.Uint32
 }
 
 type resolveDNSRecovery struct {
@@ -63,6 +64,9 @@ func (s *resolveDNSRecoveryStore) save(ue *UdpEndpoint) {
 	ue.resolveDNSState.once.Do(func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if ue.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+			return
+		}
 		if old, ok := s.entries[ue.poolKey]; ok && old.owner > ue.resolveDNSState.id {
 			return
 		}
@@ -89,11 +93,26 @@ func (s *resolveDNSRecoveryStore) save(ue *UdpEndpoint) {
 	})
 }
 func (s *resolveDNSRecoveryStore) discard(ue *UdpEndpoint) {
-	if s == nil || ue == nil || ue.resolveDNSState == nil {
+	if ue == nil || ue.resolveDNSState == nil {
+		return
+	}
+	// Prepared owners have no cache authority. Their Close first marks them
+	// dead under the lifecycle mutex, so they cannot race successful publication.
+	if ue.resolveDNSState.phase.CompareAndSwap(udpDNSPinPrepared, udpDNSPinClosed) {
+		return
+	}
+	if ue.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+		return
+	}
+	if s == nil {
+		ue.resolveDNSState.phase.CompareAndSwap(udpDNSPinCurrent, udpDNSPinClosed)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !ue.resolveDNSState.phase.CompareAndSwap(udpDNSPinCurrent, udpDNSPinClosed) {
+		return
+	}
 	if r, ok := s.entries[ue.poolKey]; ok && r.owner <= ue.resolveDNSState.id {
 		delete(s.entries, ue.poolKey)
 	}
@@ -115,7 +134,7 @@ func (c *ControlPlane) inheritResolveDNSTarget(p *proxyDialParam, res *proxyDial
 // Immediate retries carry the target directly, independently of bounded store
 // admission. This snapshot never keeps the old connection alive.
 func (ue *UdpEndpoint) resolveDNSTargetForRetry(decision ...UdpFlowDecision) *resolveDNSRecovery {
-	if ue == nil || ue.resolveDNSState == nil || !ue.poolKey.Dst.IsValid() || !isProxyBackedDialer(ue.Dialer) || (!ue.hasSent.Load() && !ue.hasReply.Load()) {
+	if ue == nil || ue.resolveDNSState == nil || ue.resolveDNSState.phase.Load() != udpDNSPinCurrent || !ue.poolKey.Dst.IsValid() || !isProxyBackedDialer(ue.Dialer) || (!ue.hasSent.Load() && !ue.hasReply.Load()) {
 		return nil
 	}
 	if len(decision) > 0 && decision[0].IsQuicInitial {

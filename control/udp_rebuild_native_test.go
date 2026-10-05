@@ -118,7 +118,7 @@ func TestUDPRebuildPeerAliasEligibility(t *testing.T) {
 	}
 	f.old.SniffedDomain = ""
 	f.old.resolveDNSState = &udpResolveDNSState{}
-	if got := x.exclusion(f.old, f.b); got != "peer_alias_unsupported" {
+	if got := x.exclusion(f.old, f.b); got != "resolve_dns_identity_uncertain" {
 		t.Fatalf("resolveDNS exclusion=%s", got)
 	}
 }

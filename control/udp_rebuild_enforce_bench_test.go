@@ -51,3 +51,22 @@ func TestUDPRebuildScopedEnforceLatency(t *testing.T) {
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 	t.Logf("mode=enforce n=%d p50_ns=%d p95_ns=%d p99_ns=%d", len(samples), samples[50000], samples[95000], samples[99000])
 }
+
+func BenchmarkUDPRebuildPinnedEnforceWrite(b *testing.B) {
+	ue, close := udpRebuildEnforceBenchmarkEndpoint()
+	defer close()
+	ue.poolKey = UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.201:32000"), Dst: netip.MustParseAddrPort("198.51.100.10:27015")}
+	ue.DialTarget = droughtTestPeer.String()
+	ue.SniffedDomain = "pinned.example"
+	ue.resolveDNSState = &udpResolveDNSState{id: 1}
+	ue.pinnedTarget = newUDPPinnedTarget(ue, &DialOption{Target: ue.DialTarget, SniffedDomain: ue.SniffedDomain, ResolveDNSOriginalNative: true})
+	ue.rebuildPeer(droughtTestPeer).original = ue.poolKey.Dst
+	payload := make([]byte, 256)
+	addr := ue.dialTargetForWrite(ue.poolKey.Dst)
+	udpRebuildBenchmarkWrite(ue, payload, addr)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		udpRebuildBenchmarkWrite(ue, payload, addr)
+	}
+}

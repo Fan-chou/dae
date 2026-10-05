@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package control
+
+import (
+	"net/netip"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+const (
+	udpDNSPinCurrent uint32 = iota
+	udpDNSPinPrepared
+	udpDNSPinSuperseded
+	udpDNSPinClosed
+)
+
+// Only scoped enforce flows allocate this identity. The original address is
+// the client's NAT identity; peer is the immutable application destination.
+type udpPinnedTargetIdentity struct {
+	original, peer netip.AddrPort
+	domain         string
+	native         bool
+	initial        PacketSnifferKey
+	flow           *udpPinnedFlowIdentity
+}
+
+// No packet write takes this mutex. It serializes publication, connection
+// identity changes, and retirement memory writes across transport successors.
+type udpPinnedFlowIdentity struct {
+	mu        sync.Mutex
+	owner     *UdpEndpoint
+	revision  atomic.Uint64
+	revoked   atomic.Bool
+	uncertain atomic.Bool
+}
+
+func newUDPPinnedTarget(ue *UdpEndpoint, option *DialOption) *udpPinnedTargetIdentity {
+	peer, err := netip.ParseAddrPort(option.Target)
+	if err != nil || !ue.poolKey.Dst.IsValid() {
+		return nil
+	}
+	f := &udpPinnedFlowIdentity{owner: ue}
+	f.revision.Store(1)
+	return &udpPinnedTargetIdentity{original: ue.poolKey.Dst, peer: netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()), domain: strings.ToLower(strings.TrimSuffix(option.SniffedDomain, ".")), native: option.ResolveDNSOriginalNative, initial: option.ResolveDNSInitial, flow: f}
+}
+
+func (ue *UdpEndpoint) pinnedDNSExclusion(peer netip.AddrPort) string {
+	p := ue.pinnedTarget
+	if p == nil || ue.resolveDNSState == nil || p.flow.revoked.Load() || p.flow.uncertain.Load() {
+		return "resolve_dns_identity_uncertain"
+	}
+	if !p.native {
+		return "resolve_dns_fakeip_unleased"
+	}
+	target, err := netip.ParseAddrPort(ue.DialTarget)
+	if err != nil {
+		return "resolve_dns_target_unresolved"
+	}
+	if p.domain == "" || p.domain != strings.ToLower(strings.TrimSuffix(ue.SniffedDomain, ".")) || ue.resolveDNSState.initial != p.initial || (ue.identifiedQuic() && !p.initial.HasCacheableDcid()) {
+		return "resolve_dns_identity_uncertain"
+	}
+	if ue.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+		return "resolve_dns_pin_owner_changed"
+	}
+	src := ue.poolKey.Src.Addr().Unmap()
+	original := netip.AddrPortFrom(p.original.Addr().Unmap(), p.original.Port())
+	if !src.IsValid() || p.original != ue.poolKey.Dst || peer != p.peer || netip.AddrPortFrom(target.Addr().Unmap(), target.Port()) != p.peer || !validDroughtPeer(original) || !validDroughtPeer(peer) || original.Port() != peer.Port() || src.Is4() != peer.Addr().Is4() || original.Addr().Is4() != peer.Addr().Is4() {
+		return "resolve_dns_peer_mismatch"
+	}
+	if ue.crossFamily != nil {
+		s := ue.crossFamily.store
+		if s == nil || !s.Ready() || s.Contains(original.Addr()) || s.Contains(peer.Addr()) {
+			return "peer_alias_unsupported"
+		}
+	}
+	if slot := ue.rebuildPeer(peer); slot != nil && slot.original != p.original {
+		return "resolve_dns_peer_mismatch"
+	}
+	return ""
+}
+
+func (ue *UdpEndpoint) rebuildOriginal(peer netip.AddrPort) netip.AddrPort {
+	if p := ue.pinnedTarget; p != nil && p.peer == peer {
+		return p.original
+	}
+	return peer
+}
+
+func (ue *UdpEndpoint) rebuildPeerForOriginal(original netip.AddrPort) *udpRebuildPeer {
+	if p := ue.pinnedTarget; p != nil && p.original == original {
+		return ue.rebuildPeer(p.peer)
+	}
+	return ue.rebuildPeer(original)
+}
+
+// Called before normal successor admission. A new target or business identity
+// must not become a successor of a claim for the previous application peer.
+func (ue *UdpEndpoint) inheritPinnedRebuildTarget(old *UdpEndpoint, option *DialOption) bool {
+	if old.pinnedTarget == nil {
+		return true
+	}
+	p, ds := old.pinnedTarget, ue.resolveDNSState
+	peer, err := netip.ParseAddrPort(ue.DialTarget)
+	if ds == nil || err != nil || netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()) != p.peer || ue.poolKey != old.poolKey || strings.ToLower(strings.TrimSuffix(ue.SniffedDomain, ".")) != p.domain || ds.initial != p.initial || old.resolveDNSState.phase.Load() != udpDNSPinCurrent || p.flow.revoked.Load() || option.Binding.Route != old.flowRouteBinding || !option.ResolveDNSOriginalNative {
+		return false
+	}
+	copy := *p
+	ue.pinnedTarget = &copy
+	ds.phase.Store(udpDNSPinPrepared)
+	return true
+}
+
+// Keep the boxed key and identity-validation temporaries out of the ordinary
+// create frame. Most new flows have no recovery override.
+func (p *UdpEndpointPool) prepareOrdinaryRebuildSuccessor(ue *UdpEndpoint, slot *udpRebuildPeer, option *DialOption) bool {
+	ue.prepared.Store(true)
+	old := slot.owner.Load().endpoint
+	if ue.inheritPinnedRebuildTarget(old, option) {
+		return true
+	}
+	// A closed pin/new target starts a new business flow.
+	old.revokePinnedDNSIdentity()
+	p.rebuildOverrides.CompareAndDelete(ue.poolKey, slot)
+	ue.prepared.Store(false)
+	return false
+}
+
+// store and ledger are acquired only with TryLock after pool publication locks.
+// The caller validates its ticket before calling transferPinnedDNSLocked.
+func lockPinnedDNSTransfer(old, next *UdpEndpoint) (func(), string) {
+	if old.pinnedTarget == nil {
+		return func() {}, ""
+	}
+	p := old.pinnedTarget
+	if !p.flow.mu.TryLock() {
+		return nil, "resolve_dns_pin_busy"
+	}
+	unlock := func() { p.flow.mu.Unlock() }
+	if next.pinnedTarget == nil || next.pinnedTarget.flow != p.flow || p.flow.owner != old || p.flow.revoked.Load() || old.resolveDNSState.phase.Load() != udpDNSPinCurrent || next.resolveDNSState.phase.Load() != udpDNSPinPrepared {
+		unlock()
+		return nil, "resolve_dns_pin_owner_changed"
+	}
+	s := old.resolveDNSState.store
+	if s == nil || next.resolveDNSState.store != s {
+		unlock()
+		return nil, "resolve_dns_pin_owner_changed"
+	}
+	if !s.mu.TryLock() {
+		unlock()
+		return nil, "resolve_dns_pin_busy"
+	}
+	// A concurrent Close/discard can change phase before we acquire store.mu.
+	if old.resolveDNSState.phase.Load() != udpDNSPinCurrent || next.resolveDNSState.phase.Load() != udpDNSPinPrepared {
+		s.mu.Unlock()
+		unlock()
+		return nil, "resolve_dns_pin_owner_changed"
+	}
+	return func() { s.mu.Unlock(); unlock() }, ""
+}
+
+func transferPinnedDNSLocked(old, next *UdpEndpoint) {
+	if old.pinnedTarget == nil {
+		return
+	}
+	// Never wait for Once while holding store.mu: save holds Once before mu.
+	old.resolveDNSState.phase.Store(udpDNSPinSuperseded)
+	next.resolveDNSState.phase.Store(udpDNSPinCurrent)
+	s := old.resolveDNSState.store
+	if r, ok := s.entries[old.poolKey]; ok && r.owner <= old.resolveDNSState.id {
+		delete(s.entries, old.poolKey)
+	}
+	old.pinnedTarget.flow.owner = next
+}
+
+// A retired owner can still have delayed cache/memory callbacks. End its
+// business identity before publishing an ordinary flow with a different pin.
+func (ue *UdpEndpoint) revokePinnedDNSIdentity() {
+	if ue == nil || ue.pinnedTarget == nil {
+		return
+	}
+	ue.rebuildLifecycleMu.Lock()
+	defer ue.rebuildLifecycleMu.Unlock()
+	p := ue.pinnedTarget
+	p.flow.mu.Lock()
+	defer p.flow.mu.Unlock()
+	if p.flow.owner == ue && !p.flow.revoked.Load() {
+		ue.revokePinnedDNSIdentityLocked()
+	}
+}
+
+func (ue *UdpEndpoint) revokePinnedDNSIdentityLocked() {
+	i := ue.pinnedTarget
+	i.flow.revoked.Store(true)
+	i.flow.revision.Add(1)
+	ue.resolveDNSState.store.discard(ue)
+	flowKey := NewUdpFlowKey(ue.poolKey.Src, ue.poolKey.Dst)
+	shard := defaultQuicRejectMemory.shard(flowKey)
+	shard.mu.Lock()
+	delete(shard.flows, flowKey)
+	shard.mu.Unlock()
+	DefaultPacketSnifferSessionMgr.RemoveFlowFamilySessions(i.initial)
+}
+
+func (ue *UdpEndpoint) fillPinnedRecoveryRow(row *UDPReplyDroughtPeer) {
+	if p := ue.pinnedTarget; p != nil {
+		row.OriginalTarget = p.original.String()
+		row.TargetKind = "resolve_dns_native"
+		if !p.native {
+			row.TargetKind = "resolve_dns_fakeip"
+		}
+		row.DNSPinOwnerID = ue.resolveDNSState.id
+		row.FlowIdentityRevision = p.flow.revision.Load()
+	}
+}
+
+func (ue *UdpEndpoint) fillPinnedRecoveryEvent(event *UDPRecoveryEvent) {
+	var row UDPReplyDroughtPeer
+	ue.fillPinnedRecoveryRow(&row)
+	event.OriginalTarget, event.TargetKind = row.OriginalTarget, row.TargetKind
+	event.DNSPinOwnerID, event.FlowIdentityRevision = row.DNSPinOwnerID, row.FlowIdentityRevision
+	event.PinInherited = ue.pinnedTarget != nil && ue.rebuildRevision > 1
+}
+
+// Keep the large key/decision copies out of the usual ingress stack frame.
+// Cold off/observe callers skip these helpers before constructing the key.
+func (c *ControlPlane) checkPinnedDNSInitial(result *bpfRoutingResult, decision *UdpFlowDecision) bool {
+	scope := udpEndpointRouteScope{}
+	if c.udpRouteScopeSensitive {
+		scope = newUdpEndpointRouteScope(result)
+	}
+	return DefaultUdpEndpointPool.checkPinnedRebuildInitial(decision.SymmetricNatEndpointKeyWithScope(scope), *decision)
+}
+
+func (p *UdpEndpointPool) checkPinnedDNSInitialUnscoped(decision *UdpFlowDecision) bool {
+	return p.checkPinnedRebuildInitial(decision.SymmetricNatEndpointKey(), *decision)
+}
+
+// Initial checks precede retained/override/prefetch selection. Unknown Initial
+// identity disables automatic execution but never destroys the live endpoint.
+func (p *UdpEndpointPool) checkPinnedRebuildInitial(key UdpEndpointKey, decision UdpFlowDecision) bool {
+	if !decision.IsQuicInitial || !p.hasPinnedDNSRebuild.Load() {
+		return false
+	}
+	var ue *UdpEndpoint
+	if slot, ok := p.rebuildOverride(key); ok {
+		if owner := slot.owner.Load(); owner != nil {
+			ue = owner.endpoint
+		}
+	} else {
+		s := p.shardFor(key)
+		s.mu.RLock()
+		ue = s.pool[key]
+		s.mu.RUnlock()
+	}
+	if ue == nil || ue.pinnedTarget == nil {
+		return false
+	}
+	i := ue.pinnedTarget
+	initial := decision.PacketSnifferKey()
+	if !initial.HasCacheableDcid() || !i.initial.HasCacheableDcid() {
+		i.flow.mu.Lock()
+		i.flow.uncertain.Store(true)
+		i.flow.revision.Add(1)
+		i.flow.mu.Unlock()
+		return false
+	}
+	if initial == i.initial {
+		return false
+	}
+	for {
+		ue.rebuildLifecycleMu.Lock()
+		i.flow.mu.Lock()
+		if i.flow.owner == ue || i.flow.revoked.Load() {
+			break
+		}
+		// Publication may have completed since the initial pool lookup.
+		current := i.flow.owner
+		i.flow.mu.Unlock()
+		ue.rebuildLifecycleMu.Unlock()
+		ue = current
+	}
+	if i.flow.revoked.Load() {
+		i.flow.mu.Unlock()
+		ue.rebuildLifecycleMu.Unlock()
+		return true
+	}
+	ue.revokePinnedDNSIdentityLocked()
+	ue.dead.Store(true)
+	i.flow.mu.Unlock()
+	ue.rebuildLifecycleMu.Unlock()
+	if slot, ok := p.rebuildOverride(key); ok {
+		if owner := slot.owner.Load(); owner != nil && owner.endpoint == ue {
+			p.rebuildOverrides.CompareAndDelete(key, slot)
+		}
+	}
+	ue.selfRemoveFromPool()
+	go func() { _ = ue.Close() }()
+	return true
+}

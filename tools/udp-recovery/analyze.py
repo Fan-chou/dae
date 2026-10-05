@@ -64,6 +64,19 @@ def ratio(n, d):
     return n / d if d else None
 
 
+def pin_identity_validation(commit, reply):
+    fields = ("original_target", "target_kind", "dns_pin_owner_id", "flow_identity_revision")
+    if not any(k in e for e in (commit, reply) for k in fields):
+        return "not_recorded"
+    if not all(e.get(k) for e in (commit, reply) for k in fields):
+        return "incomplete"
+    if any(commit[k] != reply[k] for k in fields):
+        return "mismatch"
+    if commit.get("pin_inherited") is not True or reply.get("pin_inherited") is not True:
+        return "inheritance_not_confirmed"
+    return "matched"
+
+
 def summarize(values):
     events, peers, captures, associations = {}, {}, {}, {}
     observations, capture_stats, budgets, budget_history = {}, {}, {}, {}
@@ -188,8 +201,10 @@ def summarize(values):
         if e["kind"] != "recovered":
             continue
         commit = committed.get((p, e.get("runtime_id"), e.get("actual_peer"), e.get("ownership_revision")))
+        pin_validation = pin_identity_validation(commit, e) if commit else "commit_not_archived"
         confirmations.append({"process": p, "event": e,
-                              "archived_commit_sequence": commit["sequence"] if commit and commit["sequence"] < e["sequence"] else None})
+                              "pin_identity_validation": pin_validation,
+                              "archived_commit_sequence": commit["sequence"] if commit and commit["sequence"] < e["sequence"] and pin_validation in ("matched", "not_recorded") else None})
     return {"schema": "kdae-udp-recovery-summary-v1", "polls": len(polls),
             "provenance": [p["provenance_before"] for p in polls[:1]],
             "phase_markers": phases, "clock_offset_brackets": offsets,

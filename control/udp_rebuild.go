@@ -124,9 +124,12 @@ func (x *udpRebuildExecutor) work() {
 }
 func (x *udpRebuildExecutor) event(kind, reason string, row *UDPReplyDroughtPeer, successor ...*UdpEndpoint) {
 	e := UDPRecoveryEvent{Kind: kind, Reason: reason, AtMS: x.now().UnixMilli(), Peer: row, RuntimeID: row.RuntimeID, LineageID: row.LineageID, Revision: row.Revision, ActualPeer: row.Peer}
+	e.OriginalTarget, e.TargetKind = row.OriginalTarget, row.TargetKind
+	e.DNSPinOwnerID, e.FlowIdentityRevision = row.DNSPinOwnerID, row.FlowIdentityRevision
 	if len(successor) > 0 {
 		e.SuccessorRuntimeID = successor[0].sessionRuntime.id
 		e.Revision = successor[0].rebuildRevision
+		successor[0].fillPinnedRecoveryEvent(&e)
 	}
 	x.observer.recordDiagnostic(e)
 }
@@ -140,7 +143,11 @@ func (x *udpRebuildExecutor) exclusion(ue *UdpEndpoint, peer netip.AddrPort) str
 	if !isProxyBackedDialer(ue.Dialer) || ue.endpointNetworkType.IsDns || ue.Outbound == nil {
 		return "not_proxy_data"
 	}
-	if ue.resolveDNSState != nil || ue.SniffedDomain != "" || udpRebuildPeerUsesAlias(ue, peer) {
+	if ue.resolveDNSState != nil {
+		if reason := ue.pinnedDNSExclusion(peer); reason != "" {
+			return reason
+		}
+	} else if ue.SniffedDomain != "" || udpRebuildPeerUsesAlias(ue, peer) {
 		return "peer_alias_unsupported"
 	}
 	if _, err := netip.ParseAddrPort(ue.DialTarget); err != nil {
@@ -185,6 +192,11 @@ func udpRebuildPeerUsesAlias(ue *UdpEndpoint, peer netip.AddrPort) bool {
 }
 func (x *udpRebuildExecutor) evidenceLocked(q udpRebuildCandidate, peer netip.AddrPort) bool {
 	f := q.flow
+	if f.endpoint != nil {
+		if target := f.endpoint.pinnedTarget; target != nil && (target.flow.revoked.Load() || target.flow.uncertain.Load() || q.row.FlowIdentityRevision != target.flow.revision.Load() || q.row.DNSPinOwnerID != f.endpoint.resolveDNSState.id) {
+			return false
+		}
+	}
 	p := f.peers[peer]
 	identity := f.identity.Load()
 	return !f.closed.Load() && !x.observer.closed.Load() && identity != nil && identity.RuntimeID == q.row.RuntimeID && p != nil && p.replies == q.row.Replies && p.invalidatedAt/int64(time.Millisecond) == q.row.InvalidatedAtMS && f.eligibility(p, x.observer.stamp(x.now())) == "candidate"
@@ -288,7 +300,8 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 	}
 	defer lease.release()
 	target := peer.String()
-	conn, err := group.DialContextWithSelected(netproxy.ContextWithUDPReplyAddr(ctx, target, peer), binding.Egress.Dialer, binding.Egress.Network, target)
+	original := old.rebuildOriginal(peer)
+	conn, err := group.DialContextWithSelected(netproxy.ContextWithUDPReplyAddr(ctx, target, original), binding.Egress.Dialer, binding.Egress.Network, target)
 	if err != nil {
 		return nil, err
 	}
@@ -304,11 +317,27 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 	}
 	binding.Egress.Target = target
 	key := old.poolKey
-	key.Dst = peer
+	key.Dst = original
 	dialOption := &DialOption{Dialer: binding.Egress.Dialer, Outbound: group, Target: target, Network: binding.Egress.Network, NetworkType: &binding.Egress.NetworkType, Binding: binding, IsDialIp: true}
+	if old.pinnedTarget != nil {
+		dialOption.ResolveDNSPinned = true
+		dialOption.ResolveDNSInitial = old.resolveDNSState.initial
+		dialOption.ResolveDNSOriginalNative = old.pinnedTarget.native
+		dialOption.SniffedDomain = old.SniffedDomain
+		dialOption.StickySite = binding.Egress.StickySite
+	}
 	options := &UdpEndpointOptions{Handler: old.handler, NatTimeout: old.natTimeout(), Log: old.log, ConnStateOwner: old.udpConnStateOwner, replyDrought: x.observer, crossFamily: old.crossFamily}
 	next := newUDPEndpointFromConn(old.poolRef, key, options, dialOption, pc)
 	next.prepared.Store(true)
+	if old.pinnedTarget != nil {
+		copy := *old.pinnedTarget
+		next.pinnedTarget = &copy
+		next.resolveDNSState.phase.Store(udpDNSPinPrepared)
+		next.resolveDNSState.store = old.resolveDNSState.store
+		if old.identifiedQuic() {
+			next.markIdentifiedQuic()
+		}
+	}
 	next.rebuildLineage = old.rebuildLineage
 	next.rebuildRevision = old.rebuildPeer(peer).owner.Load().revision + 1
 	if next.writeBatch != nil {
@@ -402,9 +431,25 @@ func (x *udpRebuildExecutor) commit(ctx context.Context, q udpRebuildCandidate, 
 	if slot.fenceTimedOut || time.Since(slot.fenceStarted) >= udpRebuildFenceTimeout || ctx.Err() != nil {
 		return "fence_expired"
 	}
-	if !x.ledger.commit(ticket, next, x.now()) {
+	unlockPin, reason := lockPinnedDNSTransfer(old, next)
+	if reason != "" {
+		return reason
+	}
+	defer unlockPin()
+	if !x.ledger.mu.TryLock() {
+		return "ledger_busy"
+	}
+	defer x.ledger.mu.Unlock()
+	if old.pinnedTarget != nil && old.pinnedTarget.flow.uncertain.Load() {
+		return "resolve_dns_identity_uncertain"
+	}
+	if slot.fenceTimedOut || time.Since(slot.fenceStarted) >= udpRebuildFenceTimeout || ctx.Err() != nil {
+		return "fence_expired"
+	}
+	if !x.ledger.commitLocked(ticket, next, x.now()) {
 		return "ticket_expired"
 	}
+	transferPinnedDNSLocked(old, next)
 	slot.freshReplies = 0
 	slot.successorIntent = false
 	next.prepared.Store(false)

@@ -57,8 +57,20 @@ func listenRebuildUDP(t *testing.T) *net.UDPConn {
 }
 
 func rebuildEcho(t *testing.T) netip.AddrPort {
+	return rebuildEchoFamily(t, false)
+}
+
+func rebuildEchoFamily(t *testing.T, v6 bool) netip.AddrPort {
 	t.Helper()
 	c := listenRebuildUDP(t)
+	if v6 {
+		_ = c.Close()
+		var err error
+		c, err = net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -150,12 +162,19 @@ func (r *rebuildRelay) accept() {
 			if _, e := c.Write([]byte{5, 0}); e != nil {
 				return
 			}
-			var q [10]byte
+			var q [4]byte
 			if _, e := io.ReadFull(c, q[:]); e != nil {
 				return
 			}
-			if q[0] != 5 || q[1] != 3 || q[3] != 1 {
+			if q[0] != 5 || q[1] != 3 || (q[3] != 1 && q[3] != 4) {
 				r.err <- fmt.Errorf("unexpected UDP associate: %x", q)
+				return
+			}
+			addressBytes := 6
+			if q[3] == 4 {
+				addressBytes = 18
+			}
+			if _, e := io.CopyN(io.Discard, c, int64(addressBytes)); e != nil {
 				return
 			}
 			p := r.udp.LocalAddr().(*net.UDPAddr).AddrPort()
@@ -196,6 +215,9 @@ func (r *rebuildRelay) decode(b []byte) (netip.AddrPort, []byte, error) {
 }
 func (r *rebuildRelay) reply(client, peer netip.AddrPort, b []byte) error {
 	m := ss.Metadata{Metadata: protocol.Metadata{Type: protocol.MetadataTypeIPv4, IP: peer.Addr(), Port: peer.Port()}}
+	if peer.Addr().Is6() {
+		m.Type = protocol.MetadataTypeIPv6
+	}
 	h, e := m.Bytes()
 	if e != nil {
 		return e
@@ -238,7 +260,7 @@ func (r *rebuildRelay) serve() {
 		key := client.String() + "/" + peer.String()
 		c := r.mappings[key]
 		if c == nil {
-			c, e = net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(peer))
+			c, e = net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(peer))
 			if e == nil {
 				r.mappings[key] = c
 			}
@@ -364,8 +386,16 @@ func newRebuildFixtureWithGate(t *testing.T, kind, mode string, gated bool) *reb
 	return newRebuildFixtureWithStore(t, kind, mode, gated, nil)
 }
 func newRebuildFixtureWithStore(t *testing.T, kind, mode string, gated bool, store *UDPCrossFamilyStore) *rebuildFixture {
+	return newRebuildFixtureFamily(t, kind, mode, gated, store, false)
+}
+
+func newRebuildFixtureFamily(t *testing.T, kind, mode string, gated bool, store *UDPCrossFamilyStore, v6 bool) *rebuildFixture {
 	t.Helper()
-	f := &rebuildFixture{a: rebuildEcho(t), b: rebuildEcho(t), replies: make(chan rebuildReply, 256)}
+	f := &rebuildFixture{a: rebuildEchoFamily(t, v6), b: rebuildEchoFamily(t, v6), replies: make(chan rebuildReply, 256)}
+	client := netip.MustParseAddr("192.0.2.201")
+	if v6 {
+		client = netip.MustParseAddr("2001:db8::201")
+	}
 	r, base := newRebuildRelay(t, kind, f.b)
 	f.relay = r
 	f.dial = &rebuildDialer{next: base}
@@ -383,7 +413,7 @@ func newRebuildFixtureWithStore(t *testing.T, kind, mode string, gated bool, sto
 	t.Cleanup(func() { g.Close(); _ = d.Close() })
 	f.m = NewSessionManager(context.Background())
 	t.Cleanup(func() { _ = f.m.Close() })
-	p := config.UDPReplyDroughtPolicy{Observe: mode != "off", Enforce: mode == "enforce", RequestReply: true, Group: "game", Client: netip.MustParseAddr("192.0.2.201"), Peers: []netip.AddrPort{f.a, f.b}}
+	p := config.UDPReplyDroughtPolicy{Observe: mode != "off", Enforce: mode == "enforce", RequestReply: true, Group: "game", Client: client, Peers: []netip.AddrPort{f.a, f.b}}
 	f.o = newUDPReplyDroughtObserver(p)
 	if f.o != nil {
 		t.Cleanup(func() { _ = f.o.Close() })
@@ -403,7 +433,7 @@ func newRebuildFixtureWithStore(t *testing.T, kind, mode string, gated bool, sto
 		return &DialOption{Dialer: d, Outbound: g, Network: "udp", Target: f.a.String(), NetworkType: &nt, Binding: binding}, nil
 	}}
 	var err error
-	f.old, _, err = f.pool.GetOrCreate(UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.201:32000")}, f.options)
+	f.old, _, err = f.pool.GetOrCreate(UdpEndpointKey{Src: netip.AddrPortFrom(client, 32000)}, f.options)
 	if err != nil {
 		t.Fatal(err)
 	}

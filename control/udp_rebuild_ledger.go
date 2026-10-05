@@ -197,6 +197,10 @@ func (l *udpRebuildLedger) start(t *udpRebuildTicket, now time.Time) bool {
 func (l *udpRebuildLedger) commit(t *udpRebuildTicket, next *UdpEndpoint, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.commitLocked(t, next, now)
+}
+
+func (l *udpRebuildLedger) commitLocked(t *udpRebuildTicket, next *UdpEndpoint, now time.Time) bool {
 	if t.finished || !t.started || t.committed || t.record.ticket != t || !now.Before(t.expires) {
 		return false
 	}

@@ -42,20 +42,25 @@ type udpDroughtIdentity struct {
 }
 
 type UDPRecoveryEvent struct {
-	SuccessorRuntimeID uint64                      `json:"successor_runtime_id,omitempty"`
-	RuntimeID          uint64                      `json:"runtime_id,omitempty"`
-	LineageID          uint64                      `json:"lineage_id,omitempty"`
-	Revision           uint64                      `json:"ownership_revision,omitempty"`
-	ActualPeer         string                      `json:"actual_peer,omitempty"`
-	Sequence           uint64                      `json:"sequence"`
-	Generation         uint64                      `json:"generation"`
-	PolicyEpoch        uint64                      `json:"policy_epoch"`
-	AtMS               int64                       `json:"at_ms"`
-	Kind               string                      `json:"kind"`
-	Reason             string                      `json:"reason,omitempty"`
-	Peer               *UDPReplyDroughtPeer        `json:"peer,omitempty"`
-	Coverage           *UDPRecoveryCoverageFlow    `json:"coverage,omitempty"`
-	Association        *UDPReplyDroughtAssociation `json:"association,omitempty"`
+	OriginalTarget       string                      `json:"original_target,omitempty"`
+	TargetKind           string                      `json:"target_kind,omitempty"`
+	DNSPinOwnerID        uint64                      `json:"dns_pin_owner_id,omitempty"`
+	FlowIdentityRevision uint64                      `json:"flow_identity_revision,omitempty"`
+	PinInherited         bool                        `json:"pin_inherited,omitempty"`
+	SuccessorRuntimeID   uint64                      `json:"successor_runtime_id,omitempty"`
+	RuntimeID            uint64                      `json:"runtime_id,omitempty"`
+	LineageID            uint64                      `json:"lineage_id,omitempty"`
+	Revision             uint64                      `json:"ownership_revision,omitempty"`
+	ActualPeer           string                      `json:"actual_peer,omitempty"`
+	Sequence             uint64                      `json:"sequence"`
+	Generation           uint64                      `json:"generation"`
+	PolicyEpoch          uint64                      `json:"policy_epoch"`
+	AtMS                 int64                       `json:"at_ms"`
+	Kind                 string                      `json:"kind"`
+	Reason               string                      `json:"reason,omitempty"`
+	Peer                 *UDPReplyDroughtPeer        `json:"peer,omitempty"`
+	Coverage             *UDPRecoveryCoverageFlow    `json:"coverage,omitempty"`
+	Association          *UDPReplyDroughtAssociation `json:"association,omitempty"`
 }
 
 type UDPRecoveryCoverageFlow struct {
@@ -141,6 +146,11 @@ func (o *udpReplyDroughtObserver) bindDiagnostics(m *SessionManager, epoch routi
 }
 
 func (o *udpReplyDroughtObserver) recordDiagnostic(e UDPRecoveryEvent) {
+	if e.Peer != nil && e.TargetKind == "" {
+		e.OriginalTarget, e.TargetKind = e.Peer.OriginalTarget, e.Peer.TargetKind
+		e.DNSPinOwnerID, e.FlowIdentityRevision = e.Peer.DNSPinOwnerID, e.Peer.FlowIdentityRevision
+		e.PinInherited = e.TargetKind != "" && e.Peer.Revision > 1
+	}
 	if o == nil {
 		return
 	}
@@ -201,6 +211,9 @@ func (f *udpReplyDroughtFlow) rowLocked(peer netip.AddrPort, p *udpDroughtPeerSt
 	if identity := f.identity.Load(); identity != nil {
 		r.RuntimeID, r.PolicyEpoch = identity.RuntimeID, identity.PolicyEpoch
 		r.LineageID, r.Revision = identity.LineageID, identity.Revision
+	}
+	if f.endpoint != nil {
+		f.endpoint.fillPinnedRecoveryRow(&r)
 	}
 	epoch := nano / int64(udpDroughtBucketDuration)
 	r.Windows = make([]UDPReplyDroughtWindow, 0, len(p.buckets))

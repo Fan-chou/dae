@@ -196,19 +196,20 @@ func (c *ControlPlane) allowConnectionErrorLog(now time.Time) bool {
 }
 
 type DialOption struct {
-	ResolveDNSPinned  bool
-	ResolveDNSInitial PacketSnifferKey
-	Target            string
-	Dialer            *dialer.Dialer
-	Outbound          *ob.DialerGroup
-	Network           string
-	NetworkType       *dialer.NetworkType
-	SniffedDomain     string
-	StickySite        string
-	IsDialIp          bool
-	SelectPath        ob.SelectPath
-	Excluded          *dialer.Dialer
-	Binding           UdpFlowBinding
+	ResolveDNSPinned         bool
+	ResolveDNSOriginalNative bool
+	ResolveDNSInitial        PacketSnifferKey
+	Target                   string
+	Dialer                   *dialer.Dialer
+	Outbound                 *ob.DialerGroup
+	Network                  string
+	NetworkType              *dialer.NetworkType
+	SniffedDomain            string
+	StickySite               string
+	IsDialIp                 bool
+	SelectPath               ob.SelectPath
+	Excluded                 *dialer.Dialer
+	Binding                  UdpFlowBinding
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
@@ -618,6 +619,10 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 }
 
 func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
+	if flowDecision.IsQuicInitial && DefaultUdpEndpointPool.hasPinnedDNSRebuild.Load() && c.checkPinnedDNSInitial(routingResult, &flowDecision) {
+		prefetched, prefetchOK = nil, false
+		routingResult = currentPolicyUDPRoutingResult(routingResult)
+	}
 	if handled, retainedErr := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision); handled {
 		return retainedErr
 	}
@@ -686,7 +691,9 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	// local reverse lookup, not a real DNS query. Keep sniffing available so
 	// an observed SNI may still take precedence over the DNS name.
 	var fakeDomain string
-	if c.destIsFakeIP(realDst.Addr()) {
+	fakeDestination := c.destIsFakeIP(realDst.Addr())
+	originalNative := !fakeDestination && !alias
+	if fakeDestination {
 		fakeDomain, err = c.resolveFakeIPDomain("", realDst.Addr())
 		if err != nil {
 			return err
@@ -831,7 +838,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 				quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 				recoveryForRetry = ue.resolveDNSTargetForRetry(flowDecision)
-				_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
+				_ = DefaultUdpEndpointPool.removeForRetry(ueKey, ue)
 				ue = nil
 				ueExists = false
 			}
@@ -1196,8 +1203,9 @@ getNew:
 				}
 
 				option = &DialOption{
-					ResolveDNSPinned:  res.ResolveDNSPinned,
-					ResolveDNSInitial: flowDecision.PacketSnifferKey(),
+					ResolveDNSPinned:         res.ResolveDNSPinned,
+					ResolveDNSInitial:        flowDecision.PacketSnifferKey(),
+					ResolveDNSOriginalNative: originalNative,
 					// Pass the domain (or resolve_dns-pinned IP) from chooseProxyDialer.
 					// Endpoint key stays on the client destination (including FakeIP).
 					Target:        udpDialTarget(res.DialTarget, realDst.String()),
@@ -1296,7 +1304,7 @@ getNew:
 			}
 			quicIdentified = c.preserveIdentifiedQuic(ue, quicIdentified, realSrc, realDst)
 			recoveryForRetry = ue.resolveDNSTargetForRetry(flowDecision)
-			_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
+			_ = DefaultUdpEndpointPool.removeForRetry(ueKey, ue)
 			retry++
 			goto getNew
 		}

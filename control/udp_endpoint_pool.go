@@ -185,6 +185,8 @@ type UdpEndpoint struct {
 	// indexed. atomic.Value avoids carrying a mutex in every endpoint.
 	transportDone  atomic.Value
 	sessionRuntime *UDPFlowRuntime
+	// Keep the established field layout unchanged on the ordinary packet path.
+	pinnedTarget *udpPinnedTargetIdentity
 }
 
 // UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
@@ -237,6 +239,7 @@ type udpEndpointDialerNetworkKey struct {
 type UdpEndpointPool struct {
 	rebuildOverrides    sync.Map // target-specific key -> process-owned peer claim
 	hasRebuildOverrides atomic.Bool
+	hasPinnedDNSRebuild atomic.Bool
 	shards              [udpEndpointCreateShardCount]udpEndpointPoolShard
 	janitorOnce         sync.Once
 	janitorStop         chan struct{}
@@ -599,17 +602,34 @@ func (p *UdpEndpointPool) Close() {
 }
 
 func (p *UdpEndpointPool) Remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint) (err error) {
+	return p.remove(key, udpEndpoint, false)
+}
+
+// Ordinary write-error cleanup preserves the retired target for the next
+// packet too, including when this packet's replacement dial fails.
+func (p *UdpEndpointPool) removeForRetry(key UdpEndpointKey, udpEndpoint *UdpEndpoint) error {
+	return p.remove(key, udpEndpoint, true)
+}
+
+func (p *UdpEndpointPool) remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint, retry bool) error {
+	closeEndpoint := func() error {
+		if retry {
+			udpEndpoint.retire()
+			return udpEndpoint.closeErr
+		}
+		return udpEndpoint.Close()
+	}
 	shard := p.shardFor(key)
 	shard.mu.Lock()
 	if ue, ok := shard.pool[key]; !ok || ue != udpEndpoint {
 		shard.mu.Unlock()
-		_ = udpEndpoint.Close()
+		_ = closeEndpoint()
 		return fmt.Errorf("target udp endpoint is not in the pool")
 	}
 	delete(shard.pool, key)
 	shard.mu.Unlock()
 	// Close waits for the reply sender; never hold shard.mu across it.
-	return udpEndpoint.Close()
+	return closeEndpoint()
 }
 
 // udpEndpointPoolGetObserver, when non-nil, is invoked on every Get. Tests
@@ -740,11 +760,13 @@ dialSuccess:
 	}
 	ue := newUDPEndpointFromConn(p, key, createOption, dialOption, packetConn)
 	rebound, hasRebound := p.rebuildOverride(key)
+	if hasRebound && !p.prepareOrdinaryRebuildSuccessor(ue, rebound, dialOption) {
+		hasRebound = false
+	}
 	if hasRebound {
-		ue.prepared.Store(true)
 		ue.rebuildLineage = rebound.lineageID
 		ue.rebuildRevision = rebound.owner.Load().revision + 1
-		if !ue.installRebuildPeer(key.Dst, rebound) {
+		if !ue.installRebuildPeer(rebound.peer, rebound) {
 			_ = ue.Close()
 			return nil, errUdpEndpointAdmissionClosed
 		}
@@ -847,6 +869,12 @@ func newUDPEndpointFromConn(p *UdpEndpointPool, key UdpEndpointKey, createOption
 		ue.replyDrought = createOption.replyDrought.newFlow(key.Src.String(), ue.Outbound.Name, ue.Dialer.Property().Name, isStatelessProxyBackedUdpProtocol(ue.Dialer))
 		if ue.replyDrought != nil {
 			ue.replyDrought.endpoint = ue
+			if dialOption.ResolveDNSPinned && createOption.replyDrought.policy.Enforce {
+				ue.pinnedTarget = newUDPPinnedTarget(ue, dialOption)
+				if ue.pinnedTarget != nil {
+					p.hasPinnedDNSRebuild.Store(true)
+				}
+			}
 		}
 	}
 	return ue

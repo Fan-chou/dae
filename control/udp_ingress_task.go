@@ -23,12 +23,13 @@ import (
 // cachedRoutingLookup is the per-packet routing-cache probe. Endpoint
 // pointers live only for this packet; they are never stored on UdpFlowDecision.
 type cachedRoutingLookup struct {
-	bound       *bpfRoutingResult
-	bindingHit  bool
-	owner       *UdpEndpoint
-	prefetch    *UdpEndpoint
-	prefetchKey UdpEndpointKey
-	prefetchOK  bool
+	identityChanged bool
+	bound           *bpfRoutingResult
+	bindingHit      bool
+	owner           *UdpEndpoint
+	prefetch        *UdpEndpoint
+	prefetchKey     UdpEndpointKey
+	prefetchOK      bool
 }
 
 // lookupCachedRoutingBinding resolves the flow's bound routing result from the
@@ -42,6 +43,10 @@ type cachedRoutingLookup struct {
 // still has to probe the live NAT key independently.
 func lookupCachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) cachedRoutingLookup {
 	out := cachedRoutingLookup{}
+	if flowDecision.IsQuicInitial && DefaultUdpEndpointPool.hasPinnedDNSRebuild.Load() && DefaultUdpEndpointPool.checkPinnedDNSInitialUnscoped(&flowDecision) {
+		out.identityChanged = true
+		return out
+	}
 	if ue, has := DefaultUdpEndpointPool.rebuildLookup(flowDecision.SymmetricNatEndpointKey()); has {
 		if ue == nil {
 			return out
@@ -317,7 +322,12 @@ func (t *udpIngressTask) Run() {
 	var cacheLookup cachedRoutingLookup
 	if !fakeDest && !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
 		cacheLookup = lookupCachedRoutingBinding(flowDecision, realDst)
-		if cacheLookup.bindingHit {
+		if cacheLookup.identityChanged {
+			// Only packet metadata survives a new business identity. A bound
+			// route or kernel conn-state from the old owner must not select it.
+			rr, _ := c.core.RetrieveRoutingResult(convergeSrc, realDst, unix.IPPROTO_UDP)
+			routingResult = currentPolicyUDPRoutingResult(rr)
+		} else if cacheLookup.bindingHit {
 			routingResult = cacheLookup.bound
 		}
 	}

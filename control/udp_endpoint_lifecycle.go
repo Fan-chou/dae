@@ -401,6 +401,38 @@ func (ue *UdpEndpoint) rememberFlowIdentityOnRetire() {
 	if ue == nil {
 		return
 	}
+	if ue.prepared.Load() {
+		return
+	}
+	if p := ue.pinnedTarget; p != nil {
+		p.flow.mu.Lock()
+		defer p.flow.mu.Unlock()
+	}
+	ue.rememberFlowIdentityOnRetireLocked()
+}
+
+// The scoped DNS owner holds flow.mu. Administrative close writes its final
+// memory and closes the pin under that same lock, so delayed retirement cannot
+// overwrite a new flow's memory or extend an idle-expired identity.
+func (ue *UdpEndpoint) rememberFlowIdentityOnRetireLocked() {
+	if p := ue.pinnedTarget; p != nil {
+		if p.flow.owner != ue || p.flow.revoked.Load() || ue.dead.Load() || ue.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+			return
+		}
+		if ue.poolRef != nil {
+			// Reset/expiry can remove a live endpoint before Close runs. Never
+			// write for that removed owner or race publication on this key.
+			// TryRLock avoids inverting publication's pool -> identity order.
+			shard := ue.poolRef.shardFor(ue.poolKey)
+			if !shard.mu.TryRLock() {
+				return
+			}
+			defer shard.mu.RUnlock()
+			if shard.pool[ue.poolKey] != ue {
+				return
+			}
+		}
+	}
 	now := time.Now().UnixNano()
 	identified := ue.identifiedQuic()
 	domain := strings.TrimSuffix(ue.SniffedDomain, ".")
@@ -439,7 +471,7 @@ func (ue *UdpEndpoint) retire() {
 	ue.markDead()
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
-	_ = ue.Close()
+	_ = ue.closePreservingFlowIdentity(true)
 }
 
 // markRetiredFromReceiver is the push-mode equivalent of retire() for a
@@ -459,7 +491,7 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 	// longer find it. Run Close() on a fresh goroutine — never on the sender
 	// or transport-callback stack — so it may wait for this sender to drain
 	// and exit before closing the conn.
-	go func() { _ = ue.Close() }()
+	go func() { _ = ue.closePreservingFlowIdentity(true) }()
 }
 
 // udpEndpointWriteTimeout bounds one write's wait. Reliable ordered carriers
@@ -740,6 +772,9 @@ func (ue *UdpEndpoint) reportLocalWriteFailure(err error) {
 }
 
 func (ue *UdpEndpoint) Close() error {
+	// Administrative close ends a DNS pin even if a concurrent retire already
+	// saved it or won closeOnce. A prepared candidate cannot discard a live pin.
+	ue.closeDNSPin(true)
 	return ue.closePreservingFlowIdentity(true)
 }
 
@@ -747,17 +782,36 @@ func (ue *UdpEndpoint) Close() error {
 // QUIC/domain memory. The 4-tuple is then free for reuse; extending identity
 // another quicRejectRememberTTL would mis-apply block_quic and resolve_dns.
 func (ue *UdpEndpoint) closeIdleExpired() error {
+	ue.closeDNSPin(false)
 	return ue.closePreservingFlowIdentity(false)
+}
+
+func (ue *UdpEndpoint) closeDNSPin(keepIdentity bool) {
+	if ue.resolveDNSState == nil {
+		return
+	}
+	if p := ue.pinnedTarget; p != nil {
+		// Complete final memory and revoke cache authority before dead allows
+		// the next ingress packet to create a replacement on the same key.
+		ue.rebuildLifecycleMu.Lock()
+		defer ue.rebuildLifecycleMu.Unlock()
+		p.flow.mu.Lock()
+		defer p.flow.mu.Unlock()
+		if keepIdentity && !ue.prepared.Load() {
+			ue.rememberFlowIdentityOnRetireLocked()
+		}
+		ue.resolveDNSState.store.discard(ue)
+		ue.dead.Store(true)
+		return
+	}
+	ue.markDead()
+	ue.resolveDNSState.store.discard(ue)
 }
 
 func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 	ue.closeOnce.Do(func() {
-		wasLive := ue.markDead()
+		ue.markDead()
 		ue.replyDrought.Close()
-		if wasLive && ue.resolveDNSState != nil {
-			ue.resolveDNSState.once.Do(func() {})
-			ue.resolveDNSState.store.discard(ue)
-		}
 		// Reset/Abort/Remove/write-failure call Close() without retire().
 		// Save QUIC identity and sniffed domain before lastPair is cleared.
 		// Natural NAT expiry uses closeIdleExpired() so a dead flow is not

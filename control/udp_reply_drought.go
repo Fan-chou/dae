@@ -67,27 +67,31 @@ type UDPReplyDroughtStats struct {
 }
 
 type UDPReplyDroughtPeer struct {
-	LineageID        uint64                  `json:"lineage_id"`
-	Revision         uint64                  `json:"ownership_revision"`
-	RuntimeID        uint64                  `json:"runtime_id"`
-	PolicyEpoch      uint64                  `json:"policy_epoch"`
-	Association      uint64                  `json:"association"`
-	Client           string                  `json:"client"`
-	Group            string                  `json:"group"`
-	Node             string                  `json:"node"`
-	Peer             string                  `json:"peer"`
-	WriteCompletion  string                  `json:"write_completion"`
-	SuccessfulWrites uint64                  `json:"successful_writes"`
-	Replies          uint64                  `json:"replies"`
-	LastWriteMS      int64                   `json:"last_write_ms"`
-	LastReplyMS      int64                   `json:"last_reply_ms"`
-	AtMS             int64                   `json:"at_ms"`
-	Eligibility      string                  `json:"eligibility"`
-	InvalidatedAtMS  int64                   `json:"invalidated_at_ms,omitempty"`
-	CandidateEpisode uint64                  `json:"candidate_episode"`
-	FirstObservedMS  int64                   `json:"first_observed_ms"`
-	ReplyContract    string                  `json:"reply_contract"`
-	Windows          []UDPReplyDroughtWindow `json:"windows"`
+	OriginalTarget       string                  `json:"original_target,omitempty"`
+	TargetKind           string                  `json:"target_kind,omitempty"`
+	DNSPinOwnerID        uint64                  `json:"dns_pin_owner_id,omitempty"`
+	FlowIdentityRevision uint64                  `json:"flow_identity_revision,omitempty"`
+	LineageID            uint64                  `json:"lineage_id"`
+	Revision             uint64                  `json:"ownership_revision"`
+	RuntimeID            uint64                  `json:"runtime_id"`
+	PolicyEpoch          uint64                  `json:"policy_epoch"`
+	Association          uint64                  `json:"association"`
+	Client               string                  `json:"client"`
+	Group                string                  `json:"group"`
+	Node                 string                  `json:"node"`
+	Peer                 string                  `json:"peer"`
+	WriteCompletion      string                  `json:"write_completion"`
+	SuccessfulWrites     uint64                  `json:"successful_writes"`
+	Replies              uint64                  `json:"replies"`
+	LastWriteMS          int64                   `json:"last_write_ms"`
+	LastReplyMS          int64                   `json:"last_reply_ms"`
+	AtMS                 int64                   `json:"at_ms"`
+	Eligibility          string                  `json:"eligibility"`
+	InvalidatedAtMS      int64                   `json:"invalidated_at_ms,omitempty"`
+	CandidateEpisode     uint64                  `json:"candidate_episode"`
+	FirstObservedMS      int64                   `json:"first_observed_ms"`
+	ReplyContract        string                  `json:"reply_contract"`
+	Windows              []UDPReplyDroughtWindow `json:"windows"`
 }
 
 // Complete describes the time interval, Present describes recorded evidence.
@@ -279,7 +283,7 @@ func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *u
 				o.peerCount--
 				return nil
 			}
-			s := &udpRebuildPeer{peer: peer, original: peer, lineageID: ue.rebuildLineage, manager: ue.sessionRuntime.manager, changed: make(chan struct{})}
+			s := &udpRebuildPeer{peer: peer, original: ue.rebuildOriginal(peer), lineageID: ue.rebuildLineage, manager: ue.sessionRuntime.manager, changed: make(chan struct{})}
 			s.owner.Store(&udpRebuildOwnership{endpoint: ue, revision: ue.rebuildRevision})
 			if !ue.installRebuildPeer(peer, s) {
 				o.peerCount--

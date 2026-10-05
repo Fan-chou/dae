@@ -978,4 +978,52 @@ Astra 独立读取第三轮逐包应用／服务端记录、57 份阶段归档�
 
 Astra 独立设计审查要求明确三项边界：store 锁内不能调用或等待 Once.Do；旧 Close／retire 的 domain／QUIC memory 晚写需要身份同步保护；off／reload 不能释放仍收发或排空的 FakeIP owner 引用。修订后再次静态复核通过，未发现阻碍实施的残留歧义。业务 DNS 与代理 hop 解析分开计数，未知 Initial 不直接销毁活跃关联，新身份沿用有界墓碑预算。审查没有运行执行测试，不代表扩展已经实现或验收。
 
-本轮只有方案与状态记录修改，扩展执行代码尚未实现，也未改变 223 配置或二进制。SS2022 能力声明、CS2 回复义务、跨族 alias 和既有 QUIC strict 超时各自仍有独立门槛。
+`113b045a` 记录上述设计。后续本地实施如下，223 配置及二进制仍保持原版本。SS2022 能力声明、CS2 回复义务、跨族 alias 和既有 QUIC strict 超时各自仍有独立门槛。
+
+#### 本地实现与回归
+
+U2-R1 至 R3 已实现，R4 的诊断及本地性能检查已加入：
+
+- 原始目标 O 用于 pool、override、retained、BPF tuple 和客户端回包；实际固定目标 P 用于发送、证据、精确作用域及 peer claim。自动准备沿用 O→P、原节点及 egress 绑定，不重新解析业务域名；普通错误重试可以重选节点，仅在已有身份及路由条件满足时继承固定目标与 lineage。
+- scoped enforce 的 DNS 流持有不可变目标快照和共享业务身份；DNS state 分别有 prepared、current、superseded、closed 状态。准备取消不删除旧记录，预算、token 和所有权按原发布临界区交接。store 锁内不调用或等待 Once。
+- 新 QUIC Initial 的身份检查位于 routing cache、override、prefetch 和 retained 使用前。同 Initial 维持固定目标，未知 Initial 冻结自动执行，明确不同身份撤销旧目标及记忆，再进入当前策略。身份变化继续消耗有界墓碑预算。
+- 普通 write-error 清理保留有界退休 pin，覆盖后续拨号失败及负缓存到期后的重试；行政 Close 和 NAT 到期结束 pin。scoped Close 在生命周期及身份锁内完成最后合法记忆、关闭 token，然后公布 dead；旧晚回调不能覆盖新流的 domain／QUIC memory。提前移出 pool 的 owner 通过非阻塞所有权检查拒绝写记忆。
+- 诊断增加可选 `original_target`、`target_kind`、`dns_pin_owner_id`、`flow_identity_revision` 和 `pin_inherited`。归档分析器仅在 DNS 继承字段完整且一致时确认新恢复链；旧归档缺字段会明确记录缺失，不推断继承。
+
+真实本地 SS AEAD、SOCKS5 fixture 验证 O≠P、固定目标与 DNS 变化、原地址回复、健康 peer 隔离、无 payload 重放、预算提交和三个新关联回复。IPv6 客户端／应用目标经 IPv4 代理的交接也通过；“同地址族”限制针对原始目标与固定应用目标，外层代理可使用另一地址族。QUIC 身份用例使用明确的 Initial 元数据，应用包为真实 UDP echo，不构成 CS2 或实际 H3 回复义务的证明。
+
+保护回归覆盖 IPv4／IPv6／mapped IPv4、FakeIP／跨族／端口及 mapping store 排除，准备期新回复／reload／身份变化取消，store／Once 竞争、prepared Close 与发布交错、退休身份变更、行政关闭和移出 pool 后的晚记忆。正式环境为持久 Go 缓存、`GOWORK=off`、`GOEXPERIMENT=heapminimum512kib`、`GOMAXPROCS=2`、`GOFLAGS=-mod=readonly`、`-tags trace`。定向 control race 集通过（8.104 秒），control／cmd vet 通过，归档分析器 15 项 Python 测试通过；没有据此宣称 control 全量或既有 QUIC strict 测试通过。
+
+#### 性能对照与审查
+
+正式依赖不变，与 `113b045a` 比较。初测发现首次建连增加约 2–3 微秒，CPU 采样定位为 create frame 扩大导致深层选路多一次栈扩容。已将普通后代身份处理移到仅传指针的函数，create frame 恢复到基线 `0x4a0`；入口栈和已有 endpoint 热字段布局也保留。
+
+固定 CPU 0、1，同工具链及配置进行 5 轮交替首包、3 轮稳态对照：
+
+| 路径 | 基线中位 ns/op | 当前中位 ns/op | 变化 |
+| --- | ---: | ---: | ---: |
+| 完整 QUIC Initial，1 个生产者 | 16699 | 16251 | -2.68% |
+| 完整 QUIC Initial，8 个生产者 | 14199 | 13928 | -1.91% |
+| 稳态 off | 116.8 | 114.4 | -2.05% |
+| 稳态 observe | 271.8 | 271.0 | -0.29% |
+| 稳态 scoped enforce | 327.7 | 329.9 | +0.67% |
+| 新增 pinned enforce | 无对应基线 | 340.3 | 0 B/op、0 allocs/op |
+
+原有三条稳态路径均为 0 B/op、0 allocs/op；首包分配次数基线与当前相同。这批本地样本未再现首包平均回退，稳态均值未达到 5% 回退门槛。早期基线与当前 relay fixture 不同，相关真实代理 p99 对照存在混杂，已排除出放行依据。
+
+随后使用相同 relay fixture 和相同临时测量代码，基线生产源码仍取 `113b045a`，固定 CPU、7 轮交替，每协议／模式／轮预热 2000 包、测量 20000 包。以下为各轮写入 p99 的中位数，回复等待在测量区间外：
+
+| 真实代理路径 | 基线 p99，ns | 当前 p99，ns | 变化 |
+| --- | ---: | ---: | ---: |
+| SS AEAD off | 18646 | 18245 | -2.15% |
+| SS AEAD observe | 19387 | 17864 | -7.86% |
+| SS AEAD enforce | 17955 | 18565 | +3.40% |
+| SOCKS5 off | 14919 | 14068 | -5.70% |
+| SOCKS5 observe | 15339 | 15119 | -1.43% |
+| SOCKS5 enforce | 14999 | 12004 | -19.97% |
+
+这组统一 fixture 的 p50／p95／p99 中位数没有达到 5% 回退门槛，各轮仍有 syscall 尾延迟波动。只用于本地处理开销检查，不代表生产尾延迟或公网 RTT 保证。共同 fixture／测量源、基线 commit、候选生产文件、二进制校验值及交替顺序均记录在 `performance-summary.json`。
+
+Astra 独立审查及复核了早于 routing cache 的身份边界、退休身份撤销、普通错误清理、prepared Close 发布交错，以及旧记忆的关闭同步。发现均已修复；独立定向 race 通过（3.269 秒），最后两项关闭记忆回归由主代理追加执行通过，Astra 静态复核通过。Astra 还独立重算首包、稳态及统一 fixture 的 7 轮真实代理日志，验证生产源码、fixture、测量源和二进制校验值及轮次顺序；与表中数值一致。审查和本地性能检查不替代现场 DNS 验收。
+
+本地安全证据在忽略目录 `build/udp-resolve-rebuild-20261005/`，包括构建 overlay、基线／候选测试二进制、CPU profile、交替原始日志、`performance-summary.json` 及最终 race／vet／Python 结果。R4 的 220→223 有界 DNS 验收仍待完成，结束须恢复 off；R5 的 DNS FakeIP 映射引用保护尚未实施。当前仍不放行 SS2022、SS stream、Hysteria2、TUIC 或 CS2 unknown。
