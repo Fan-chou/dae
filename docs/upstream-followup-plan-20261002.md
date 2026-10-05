@@ -254,6 +254,125 @@ observe 增加 `retained_owner_not_observed` 覆盖统计，使用 runtime ID �
 
 历史复核结论：保留 `6d167837` 的静默保护、`672418c5` 的 FIFO 修复、进程级保留关联与 egress 所有权、真实 peer 归属和早到回复修复。采用 S12 的独立目标拆分与预算发布顺序，继续使用本项目更严格的连续窗口证据。新增的先准备后提交、活跃账本保留和冷启动 off 是本项目执行边界；不恢复按端口／空闲时长判定游戏或预先销毁活跃关联的旧策略。
 
+#### resolve_dns 自动重建扩展设计（10 月 5 日）
+
+**状态：设计待实施。** 基线为 `efb6d662`，223 继续使用 `f6b1e63d` 的默认关闭版本。本节扩展已经验证的 U2 执行器；同族 native IP 的受控验收不等于本节已实现。生产开关、传输能力和实际业务回复资格分别验收。
+
+##### 目标与首批范围
+
+对已使用 `resolve_dns` 固定目标的 UDP 关联，自动重建沿用当前实际 IP、节点及 egress binding，保留客户端原始地址与连接身份。成功后仍经原始地址查找及返回数据，新关联的实际回复才解除再次重建限制。
+
+首批支持同地址族、目标专用、身份明确的数字目标：客户端原始目的 IP 可以与固定 IP 不同。QUIC 身份保护须在放行带 QUIC 身份的 DNS 流之前完成；没有明确回复义务的 H3／CS2 保持 unknown。DNS FakeIP 另设一批，完成映射引用保护后放行。实际跨地址族 alias、只有域名但没有数字固定目标、共享关联上的 DNS 目标歧义及 batch 继续排除。
+
+继续使用现有 off／observe／enforce 与精确 client、group、数字 peer、request_reply 作用域，不增加第二套模式。`udp_reply_drought_peers` 匹配实际固定 IP:port；域名解析到另一个 IP 时，必须重新符合作用域并积累证据。配置中的域名或 resolve_dns 参数本身不建立请求／回复义务。SS2022／SS stream／Hysteria2／TUIC 的能力缺项保持，各自支持不能由本节间接放行。
+
+##### 现状与历史约束
+
+| 依据 | 已有语义 | 本设计的要求 |
+| --- | --- | --- |
+| `80e1f858` | resolve_dns 固定发送目标，回复保持客户端原始目的地址，节点切换后仍遵守 block_quic | 保留原始地址和固定目标，复用当前 NAT 回复上下文与 QUIC 拒绝路径 |
+| `9fabeeaf` | 活跃 endpoint 持有不可变目标；DNS 缓存刷新不改它；普通重试有界继承，路由／域名／Initial 不匹配则失效 | U2 从活跃 owner 取得固定目标，不重新查询 DNS；保留普通退休恢复的边界 |
+| `3ff7022b`、`e8ab1d1c`、`6d167837` | 曾因静默或暂停换源端口导致业务中断；后续保留活跃身份，排除单凭空闲重建 | 原来的暂停、keepalive、unknown 及真实回复保护继续生效 |
+| `5a150027` | 实际应用 peer 与客户端 NAT 回包地址分开；发送意图早于可能快速到达的回复 | 证据只使用真实 peer，原始地址不能冒充实际回复来源 |
+| `90fe9b59`、`f6b1e63d` | 准备后提交、peer claim、revision、进程预算、三次新回复、真实 alias 排除 | 复用现有执行器及界限，native mapping store 存在仍可通过真实身份检查 |
+
+当前代码有五个必须一起调整的点：`admitLocked` 将 `slot.original` 设为实际 peer；prepare 将 `poolKey.Dst` 设为实际 peer；`detachedRebuildPeer` 按原始地址直接查询以实际 peer 索引的表；普通后代也按 `key.Dst` 安装 peer；新 prepare 未继承 DNS 状态。仅删除 exclusion 会使查找、回复、普通退休和晚回调失去一致身份。
+
+还需处理准备取消：新 DNS state 的 owner ID 大于旧 state 时，现有 `discard` 的 `<=` 判断可能让未发布候选的 Close 删除旧恢复记录。旧关联的晚 retire／save 也可能在成功交接后重新写入旧 pin。它们必须由明确的发布状态和 owner 交接保护。
+
+##### 地址与身份
+
+例：客户端向 `O=198.51.100.10:46672` 发送，resolve_dns 固定为 `P=203.0.113.20:46672`。旧关联和新关联均向 P 发包，客户端均收到源地址 O 的回包；更换的是代理关联，不改变业务服务器。
+
+| 字段 | 用途 | 重建规则 |
+| --- | --- | --- |
+| original O、client、RouteScope | pool／override／retained 查找、BPF tuple、客户端回包 | 保留原始 key；固定目标重建的 `next.poolKey = old.poolKey` |
+| actual peer P | 本地完成发送、回复证据、精确 peer 作用域、peer claim 索引 | 必须等于当前数字 DialTarget，port 和 family 符合首批范围 |
+| 规范化 domain、初始身份、flow identity revision | DNS pin 与业务连接边界 | 创建时固定；准备及提交核对，身份变更取消候选 |
+| runtime、lineage、ownership revision | 当前 transport 与已确认的恢复后代 | runtime 更新，lineage 保留，ownership revision 增加 |
+| DNS state owner ID、一次性 save／关闭状态 | 防止旧回调覆盖或删除新恢复记录 | 新 state 分配新 ID 和新 sync.Once，保留 initial 内容，独立管理生命周期 |
+| route／egress binding、mark、must、network、sticky site | 原节点、外层地址族与既有回包路由 | 原样继承；数字实际目标保持，内层 family 不改外层 MagicNetwork |
+
+拟增加不可变的 `udpPinnedTargetIdentity`，保存 O、P、规范化域名、初始身份、是否已识别为 QUIC、DNS state owner 与身份 revision。原始地址种类在建流时确认，区分 native、DNS FakeIP 和跨族 alias；不能仅凭“地址能解析”认定 native。已有绑定可直接引用，避免复制整套可变状态；仅在 resolve_dns 流上需要这份快照。
+
+`rebuildPeers` 继续按 P 索引，发送和真实回复复用现有查找。`slot.original` 从固定目标快照取 O。按 O 查 detached、普通后代及 retained 时，目标专用 DNS 流通过不可变 O→P 关系取得同一 slot；native 共享流沿用现有查找。避免建立两套独立可变 peer 表。非一对一或关系不一致时拒绝执行。
+
+DNS 记录 TTL 与退休 recovery 的 30 秒 TTL 不作为活跃 pin 的期限。旧 owner 活着且身份相同，U2 可以继续沿用 P；自然 NAT 到期、行政删除或真实新连接结束这项继承。无法到达 P 时只报告未恢复，后续目标切换由普通建流策略决定。
+
+##### 准备与提交
+
+1. 扫描仍按现有六个完整窗口及回复历史生成候选。执行器取得 O→P 和身份快照，确认目标专用、当前代、精确作用域与实际传输能力。预留预算前后均核对 owner；缺项有独立排除原因。
+2. 使用当前节点、network、mark 和 P 拨号。调用现有 `ContextWithUDPReplyAddr(ctx, P.String(), O)`，明确实际发送目标和客户端回包地址；同时验证实际 PacketConn 仍能提供本地发送完成、独立关联与真实 peer 元数据。prepare 不重新解析业务域名、不运行质量重选。代理节点自身是域名时，底层新关联可能正常解析外层 hop，单独记录，不能与业务目标重新解析混为一谈。
+3. prepared endpoint 保留旧 key O 和域名、sticky site、QUIC 身份，创建独立 DNS state、绑定进程 recovery store。准备取消仅回收自己的 conn／observer／lease／tuple，不调用旧 pin 的 discard，不更新 QUIC／domain memory，也不产生可供正常新建命中的 recovery 记录。
+4. P 的现有 claim 屏障排空实际写入。原节点、固定目标、DNS owner、身份 revision、Initial 边界、证据、当前配置及目标槽逐项复核。DNS owner 交接锁忙则取消；不能在 100 ms 屏障内等待 DNS、日志、全表遍历或 Close。
+5. 在原槽 O 替换 owner：预算与三次新回复限制先登记，再发布 pool／override／slot revision；DNS pin 状态与发布同步交接。fixed endpoint 新旧 key 相同，复用现有同 shard 锁，不按 P 增设第二个客户端槽。
+6. 提交后移除旧 tuple 引用，旧 target-bound endpoint 在锁外关闭；旧入队回复按原规则排空。它们只记旧 owner，不能给新账本增加回复，不能改写新 DNS pin。三个新 owner、P 的有效回复后才记录 recovered。
+
+固定目标旧 endpoint 不必为发布写入新的退休 cache 条目；prepared 也不提前发布 pin。业务序号、payload 和尚不明确是否完成的包均不复制或重放。既有健康 native A 的共享关联不参与这次 target-bound B 替换。
+
+##### DNS 状态与关闭竞态
+
+DNS state 增加明确的 prepared／current／superseded 状态或等价 owner token；sync.Once 和 owner ID 不与旧 endpoint 共用。新 token 在 pool 发布的同一短临界区成为 current，旧 token 成为 superseded。Close／save／discard 按 token 和对应 key 复核；准备中的 token 无权修改进程恢复缓存。
+
+提交与 `resolveDNSRecoveryStore.save` 的复核必须使用同一同步边界：提交以 TryLock 获取 store 锁，晚 save 获取该锁后再次检查 token。不能只在 save 入口读取一次 atomic 标记。禁用旧 state 使用 token／标志，绝不在 store 锁下调用或等待 sync.Once.Do：已有 save 可能正占用 Once 等待该锁，会形成死锁。提交不创建 recovery 记录、不改变上限 4096、不在锁内遍历缓存；锁忙取消并保留原关联。
+
+提交锁序明确为配置发布租约 → endpoint 生命周期 → peer → 观察证据 → pool create／pool → 流身份保护 → DNS store → ledger，各新增锁均 TryLock。store 和 ledger 均取得后，最终复查 token、完整身份、fence 时限及 ledger 票据；必须先完成所有能失败的校验，才执行 commitLocked 的预算／新回复登记、DNS token 交接、旧 cache 的对应 owner 清理及新所有权发布。committed 计数先于新 owner 对发送端可见，后半段不再做可能失败的获取／安装。开始拨号已消耗的尝试不退款；发布失败不能改变旧 token、cache 或 committed 计数。
+
+普通 save／discard 在释放 store 锁之后才进入其他生命周期操作，retire memory 写入完成后也要释放身份保护锁再 markDead；不能在 store 锁内等待生命周期锁或在 ledger 锁内再取 store／pool 锁。实施时核对完整调用图、现有注册方法及资源准备，防止 helper 内部重新加锁。同步回归须暂停 save 于 Once 内等待 store 的位置，再并发提交／取消，证明没有自等待且旧恢复记录保持。
+
+| 生命周期 | DNS pin 与预算处理 |
+| --- | --- |
+| prepare 失败／取消 | 旧 owner、P 和 cache 不变；未开始 dial 退预留，已开始 dial 保留尝试 |
+| U2 成功提交 | 新 state current，旧 state superseded；三次新回复限制保留 |
+| 新 owner 普通 hard error／transport retire | 在既有身份和路由条件下保存 P；下一普通后代沿用同一 original／actual 关系、lineage 和回复限制 |
+| 行政 Remove／Abort | 释放当前 pin，阻止晚 save；下一正常流按既有策略选择目标，执行预算仍保留 |
+| 自然 NAT expiry | 结束活跃 pin，不续期 QUIC／domain memory；墓碑预算沿用既有 60 秒规则 |
+| reload／关闭重建 | 未提交准备取消；已提交新 owner 继续收发，预算和 pin 随进程保留；无跨代观察交接时不再执行 |
+
+普通后代恢复不是重新开始 U2：它必须验证实际 P 和 DNS 身份，按 P 安装原 slot，而不是按 key.Dst=O。未通过继承条件时先退出旧恢复所有权，再走明确的新流处理；不能让新目标 P2 占用旧 P 的 claim 或收到旧回复门槛。行政删除及新业务身份都不能仅靠相同五元组继承活跃 lineage。
+
+##### QUIC 与 FakeIP 边界
+
+QUIC Initial 检查必须位于 override／prefetch／retained 优先查找之前，复用 ingress 已有的 `UdpFlowDecision`，不再解密或解析每包 payload。只对已参与 DNS 恢复所有权的流检查可比较的客户端 Initial；同一初始身份保留 P，身份冲突或无法确认时冻结旧 U2 资格、取消未提交任务，并按既有规则重新判定连接。普通短头包不能被当成新连接证明。
+
+身份变化需要递增独立 flow identity revision，不能只看 endpoint runtime。改变时在同一生命周期同步边界取消 ticket／阻止旧提交，退出旧 override 并阻止旧 pin 晚 save；不能仅删除 map 项后继续使用旧 sniffer／domain memory。重新建流应清理对应旧身份并重新完成既有 block_quic、domain、route 和目标选择。预算保留；新流不继承旧观察桶或三次新回复证据。
+
+`rememberFlowIdentityOnRetire` 的 QUIC／domain memory 同样需要 owner 保护。对参与 DNS 恢复的流，token 检查与写入、旧身份撤销与 memory 清理置于同一流身份锁临界区，结合 memory shard 的既有同步；不能在函数入口检查一次后放锁再写。prepared 和 superseded transport 无权补写旧记忆。同身份的 U2 后代交接保留有效记忆；已确认新身份则先撤销旧 token 并完成清理，再让新流发布自己的记忆。旧 Close／retire 晚到不能恢复旧域名、误触 block_quic 或续期旧身份。冷启动 off 的普通流沿用原路径，不为未参与恢复的流增加这把锁。用例需把旧 memory 写入暂停在 token 复核前后，与新 Initial／新 memory 发布交错。
+
+首批采用保守的账本处理：已确认身份冲突后，退出旧 owner 及其 override，新连接按新 flow 建立 slot；旧记录等全部 owner 结束后保留 60 秒墓碑。相同预算键在墓碑有效期间的 `lineage_conflict` 作为执行 defer，正常数据可以收发；过期后才以新 slot 预留执行。不因 DCID 变化清空记录或退款，不为赶快再次重建继承旧 slot。未知 Initial 只取消自动执行并交回既有判定，不能把解析失败直接当作已确认新连接并删除活跃 owner。
+
+首批不放行 FakeIP。DNS FakeIP 目前有退休、墓碑及再分配流程，不能用一次 LookBack 成功或 24 小时 grace 证明整个活跃关联地址不会被重用。后续增加进程内映射引用 token，引用精确 store／映射记录／分配身份；当前、prepared 和待排空的旧 owner 分别持有引用，切换先取得新引用，再释放旧引用。持引用的地址不得被复用；状态只存在内存中，现有容量上限保留，容量满或无法安全清理时拒绝新增。
+
+引用绑定 endpoint 的实际生命周期。off／reload 只取消未提交 prepared 并释放它的引用；仍收发的 current、仍排空的 superseded 各自保留引用，直到各自 I/O／回复排空并关闭后才释放一次。提交先取得新引用，不能提前释放旧 owner 排空所需引用。普通后代、行政 Close 和 NAT expiry 均按实际 owner 结束释放；不是观察器结束就释放。映射 store 重置／损坏时取消未提交工作并报告覆盖缺失，不重新绑定到同地址的其他域名。已提交者只能在旧映射仍有效时维持身份。跨族 UDP alias 的命名空间和稳定映射策略继续独立，此批不混合修改。
+
+##### 信息渠道与延迟门槛
+
+扩展现有 `/v1/udp-recovery`，候选、committed、recovered 和关闭记录携带 original、actual peer、target kind、DNS owner ID、flow identity revision 及 `pin_inherited`；domain／Initial 的完整内容不额外写入日志，身份核对使用进程内编号。旧档案字段缺失视为未知，不补造 native 或 pin 继承成功。
+
+细分 `resolve_dns_target_unresolved`、`resolve_dns_peer_mismatch`、`resolve_dns_identity_uncertain`、`resolve_dns_pin_owner_changed`、`resolve_dns_pin_busy`、`resolve_dns_fakeip_unleased` 与 `resolve_dns_mapping_changed`。同时保留模式、范围、传输能力、预算和 coverage，避免混进泛化的 alias 排除。Python 分析器核对同一 original／actual／身份的 commit→新回复链，第三个回复后才允许 recovered。
+
+重建期间不重新发起 resolve_dns 的业务域名查询；外层代理 hop 的正常解析单列。正常 off／observe 不增加进程 DNS 查表、字符串归一化或全局锁。元数据在建流及候选快照时固定，发包沿用已有 numeric target 和 claim，身份冲突检查只在现有 Initial 分支执行。新增 state／映射 token 的分配仅发生于建流和准备，无稳态每包堆分配。
+
+以实施前正式依赖构建为基线，同工具链、固定 CPU、交错多轮比较 off／observe／scoped enforce 及 native／pinned DNS 的每包均值与 p99、完整 ingress 首包、堆分配和 GC；保留 raw 日志。多轮稳定出现至少 5% 的稳态处理延迟回退时先解释并修正，再进入现场。正常稳态零新增每包堆分配、健康 A 不等待 B 屏障是必须满足的门槛；100 ms fence、2 秒 prepare 及预算上限保持。现场 RTT 与故障等待单列，不用于证明处理开销。
+
+##### 实施与验收
+
+| 批次 | 主要修改 | 必须取得的证据 |
+| --- | --- | --- |
+| U2-R1 地址与身份 | `udp_reply_drought.go`、`udp_rebuild_peer.go`、`udp_endpoint_pool.go`、`udp.go`、`session_manager.go` | O≠P 的 slot／pool／override／cache／prefetch／retained 一致；native 行为保持；新目标不能共用旧证据 |
+| U2-R2 DNS 所有权及生命周期 | `resolve_dns_recovery.go`、`udp_endpoint_lifecycle.go`、prepare／commit | 私有候选取消不删旧 cache；旧晚 save／discard 不覆盖新 pin；Once／store 竞争不死锁，发布失败不改 token 或 committed；行政／NAT／普通 hard error／reload race 无泄漏，预算及新回复限制保持 |
+| U2-R3 QUIC 边界与受控开关 | `UdpFlowDecision` 使用点、已有 QUIC 身份路径、exclusion | 同 Initial 保持 pin，冲突／未知 Initial 取消旧执行；旧 Close 不能重新写已清理的 domain／QUIC memory，新连接遵守 block_quic；所有资格及作用域约束通过后放行 native pinned DNS |
+| U2-R4 信息、性能、独立审查与现场 | 诊断、归档、真实 SS AEAD／SOCKS5 fixture 及有界 WAN 工具 | commit／recovered 链可复核，零稳态分配、延迟门槛、Astra 独立审查；220→223 先 observe 后精确 enforce，结束恢复 off |
+| U2-R5 DNS FakeIP | `fakeip_store.go` 的映射引用及 DNS target 快照 | TTL／退休／再分配／store 切换／reload／长流引用保护，回包源仍为 FakeIP；通过独立验收后才扩展首批范围 |
+
+真实本地 fixture 用 O≠P 的两个端点与可控 DNS：先取得 P1 固定目标，之后 DNS 改为 P2，再使 P1 旧代理映射不回复。新关联必须继续到 P1，P2 收到业务包为零，客户端回包源始终为 O；业务域名 DNS 查询数在 prepare／commit 前后不增加。数字代理 hop fixture 核对总查询增量零；域名代理 hop 用例把业务解析与外层解析分开核对。A 550/550 的现场数字是此前基线，不替代本节新验收。SS AEAD、SOCKS5 分别覆盖，本地时钟控制候选窗口，真实网络内容和映射不合成。
+
+保护矩阵还包括 original=P、IPv4／IPv6／mapped IPv4、global mapping store 存在、真实跨族 alias、固定目标／端口不一致、域名未解析、未知 actual peer、并发新回复与准备、临时目标槽竞争、prepared 早到回复、普通后代再次干旱、queue acceptance／batch／SS2022 排除。故意破坏原地址、复制业务序号、旧 cache 删除、新回复归属或 DNS 重查时，验收必须失败。
+
+WAN 继续使用 220→223→自管服务，仅一个 client／group、精确实际 peer；至少记录 off、observe、enforce、恢复 off 四段。应用序号／服务端映射、DNS 请求计数、配置／二进制来源、预算及恢复后采样共同验收。正常 A 全部回复且映射保持，B 新映射至少三次有效回复；没有无法解释的丢包、重复或重放。临时配置有独立回滚，服务、私有凭据和映射引用都确认回收。
+
+本节目前不改依赖 pin；如实际 NAT 包装层不能同时提供 P 的元数据和所需能力，则先保守排除，再为该包装层单独修正及发布 outbound。quic-go 不因本设计更新。每批带对应回归及历史保护，完成代码后由 Astra 独立审查；223 默认 off、主要质量组 observe、CS2 unknown 保持到各自实际验收完成。
+
 ### 性能和构建能力
 
 来源 S13。所有优化在正确性单元完成后评估。

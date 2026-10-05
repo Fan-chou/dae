@@ -967,3 +967,15 @@ Astra 独立读取第三轮逐包应用／服务端记录、57 份阶段归档�
 222 当前磁盘约余 2.1 GiB。旧 benchmark／诊断二进制压缩后校验；四份旧缓存归档复制至 220 的 `/root/kdae-222-cache-archives-20261005/`，校验 SHA256 后删除本地重复副本。当前正式 Go／模块缓存、现场证据和回退副本保留；转存及压缩 manifest 分别在 `build/cache-archives/offloaded-20261005.json`、`build/udp-rebuild-20261005/compressed-artifacts.json`。
 
 后续仍需按实际 SS2022 的独立关联和发送完成语义补齐能力声明、互操作及隔离验收；CS2 先补完整游戏阶段与暂停／keepalive 的回复义务证据，再决定是否可建立精确执行范围。保持生产 UDP 重建 off、主要质量组 observe；本轮受控通过不自动放行其他传输或业务。
+
+### resolve_dns 自动重建扩展设计（10 月 5 日）
+
+[扩展方案](upstream-followup-plan-20261002.md#resolve_dns-自动重建扩展设计10-月-5-日)已按现有实现与历史提交复核。核心是保留客户端 original key／回复地址，发送与证据使用已固定的实际 peer；重建不重新解析业务域名，外层代理 hop 的解析另计。首批限同族目标专用 numeric pin，QUIC 身份保护作为放行前置条件，DNS FakeIP 等映射引用保护完成后再加入。
+
+当前需要同时修正 slot.original、prepared 的 pool key、detached／retained 查找、普通后代的 peer 安装及 DNS state 交接。准备取消必须不删旧恢复记录；成功提交后，旧 retire／save／discard 不能覆盖新 pin，旧 Close 也不能重新写入已撤销身份的 QUIC／domain memory。方案明确了身份快照、prepared／current／superseded 状态、store／Once 同步边界、最终预算校验及发布顺序、Initial 变化、普通错误／NAT／行政关闭／reload 规则、诊断、性能及真实 DNS 变化验收。
+
+历史 `80e1f858` 的原地址回包、`9fabeeaf` 的固定目标及恢复边界、暂停保护、真实 peer 归属、进程预算及三次新回复规则继续保留。实施分 U2-R1 至 U2-R5，代码与对应回归一起交付；先取得 SS AEAD／SOCKS5 本地证据与 Astra 独立审查，再做 220→223 的有界现场验收。
+
+Astra 独立设计审查要求明确三项边界：store 锁内不能调用或等待 Once.Do；旧 Close／retire 的 domain／QUIC memory 晚写需要身份同步保护；off／reload 不能释放仍收发或排空的 FakeIP owner 引用。修订后再次静态复核通过，未发现阻碍实施的残留歧义。业务 DNS 与代理 hop 解析分开计数，未知 Initial 不直接销毁活跃关联，新身份沿用有界墓碑预算。审查没有运行执行测试，不代表扩展已经实现或验收。
+
+本轮只有方案与状态记录修改，扩展执行代码尚未实现，也未改变 223 配置或二进制。SS2022 能力声明、CS2 回复义务、跨族 alias 和既有 QUIC strict 超时各自仍有独立门槛。
