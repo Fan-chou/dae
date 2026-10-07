@@ -298,7 +298,7 @@ type loadBpfOptions struct {
 }
 
 const (
-	defaultConnStateMapMaxEntries = 65536 * 4
+	defaultConnStateMapMaxEntries = 65536
 )
 
 // bpfDataplanePrograms mirrors the always-on datapath programs declared in the

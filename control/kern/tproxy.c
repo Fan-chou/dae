@@ -79,11 +79,22 @@ struct {
 #define ROUTING_EPOCH_SLOT_RESULT_MASK 0x3
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (ROUTING_EPOCH_SLOT_NUM * MAX_MATCH_SET_LEN + 8)
-#define MAX_CONN_STATE_NUM (65536 * 4)
-#define MAX_REDIRECT_TRACK_NUM 65536
-#define MAX_ROUTING_HANDOFF_NUM 65536
-#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
-#define MAX_DOMAIN_ROUTING_NUM 65536
+// Sizing of the BPF_F_NO_PREALLOC hash maps below follows the measured cost
+// model: the kernel charges max_entries * 16 B for the bucket array at load
+// time regardless of use, while live entries cost ~145 B each on top. A
+// 2026-10-10 read of a live gateway (223) showed 834 conn_state, 95
+// redirect_track, 62 routing_handoff and 0 cookie_pid entries against
+// capacities of 262144 / 65536 / 65536 / 65536, i.e. about 9.6 MB of bucket
+// arrays for under 1000 entries. Every map keeps >=60x headroom over that
+// load, and every map-full path degrades to the slow path with a
+// bpf_stats_map overflow counter, so an undersized deployment is observable
+// and recoverable instead of fatal. conn_state is also tunable through
+// global.bpf_conn_state_map_size.
+#define MAX_CONN_STATE_NUM 65536
+#define MAX_REDIRECT_TRACK_NUM 16384
+#define MAX_ROUTING_HANDOFF_NUM 16384
+#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 16384
+#define MAX_DOMAIN_ROUTING_NUM 8192
 // MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
 // session occupies two fast_sock entries (one per direction).
 #define MAX_TCP_OFFLOAD_NUM 16384

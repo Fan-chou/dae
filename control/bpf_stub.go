@@ -451,7 +451,7 @@ type loadBpfOptions struct {
 }
 
 const (
-	defaultConnStateMapMaxEntries = 65536 * 4
+	defaultConnStateMapMaxEntries = 65536
 )
 
 func fullLoadBpfObjects(

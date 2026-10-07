@@ -1866,8 +1866,7 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 	}
 
 	// Alert if map usage is high
-	const redirectTrackCapacity = 65536
-	if totalEntries > 0 {
+	if redirectTrackCapacity := bpf.RedirectTrack.MaxEntries(); totalEntries > 0 && redirectTrackCapacity > 0 {
 		usagePercent := float64(totalEntries) / float64(redirectTrackCapacity) * 100
 		if usagePercent > 90 {
 			c.log.Warnf("cleanupRedirectTrackMap: map at %.1f%% capacity (%d entries)",
