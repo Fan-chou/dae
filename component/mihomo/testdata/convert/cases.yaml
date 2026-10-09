@@ -1,0 +1,341 @@
+# Whole-document fixtures. config is a complete Mihomo YAML; rule-provider
+# files come from ../providers/files. resolve_dns and isolate are the two
+# settings that are not part of the document.
+cases:
+  basic_all_types:
+    config: |
+      proxies:
+        - {name: ss1, type: ss, server: a.example.com, port: 8388, cipher: aes-128-gcm, password: p1}
+        - {name: ss-obfs, type: ss, server: b.example.com, port: 443, cipher: chacha20-ietf-poly1305, password: p2, udp: false, plugin: obfs, plugin-opts: {mode: tls, host: bing.com}}
+        - {name: sock, type: socks5, server: 1.2.3.4, port: 1080, username: u, password: p}
+        - {name: any, type: anytls, server: c.example.com, port: 443, password: pw, sni: c.example.com}
+        - {name: hy, type: hysteria2, server: d.example.com, port: 443, password: pw, up: 50 Mbps, down: 200 Mbps}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [AUTO, FB, ss1, sock, DIRECT]}
+        - {name: AUTO, type: url-test, proxies: [ss1, ss-obfs, any], url: "http://www.gstatic.com/generate_204", interval: 300, tolerance: 50}
+        - {name: FB, type: fallback, proxies: [hy, any], lazy: true}
+      rules:
+        - DOMAIN-SUFFIX,example.com,PROXY
+        - DOMAIN-KEYWORD,ads,REJECT
+        - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+        - DST-PORT,22,FB
+        - MATCH,PROXY
+  node_target_rules:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: "🇭🇰 HK-01 | IEPL", type: ss, server: hk.example.com, port: 2, cipher: aes-128-gcm, password: p}
+        - {name: n3, type: socks5, server: 1.2.3.4, port: 1080}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, "🇭🇰 HK-01 | IEPL", n3]}
+      rules:
+        - DOMAIN,a.com,n1
+        - DOMAIN,b.com,🇭🇰 HK-01 | IEPL
+        - DOMAIN,c.com,n1
+        - DOMAIN,d.com,PROXY
+        - MATCH,n3
+  node_target_in_sub_rule:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: n2, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, n2]}
+      sub-rules:
+        child:
+          - DST-PORT,443,n2
+          - DST-PORT,80,PROXY
+      rules:
+        - SUB-RULE,(NETWORK,tcp),child
+        - MATCH,n1
+  wrapper_name_collides_with_group:
+    config: |
+      proxies:
+        - {name: x, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: y, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: node_x, type: select, proxies: [x, y]}
+        - {name: node_x_g, type: select, proxies: [y]}
+      rules:
+        - DOMAIN,a.com,x
+        - MATCH,node_x
+  wrapper_name_collides_with_node:
+    config: |
+      proxies:
+        - {name: x, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: node_x, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [x, node_x]}
+      rules:
+        - DOMAIN,a.com,x
+        - DOMAIN,b.com,node_x
+        - MATCH,PROXY
+  target_is_builtin_or_unknown:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - DOMAIN,a.com,DIRECT
+        - DOMAIN,b.com,REJECT
+        - DOMAIN,c.com,ghost
+        - MATCH,PROXY
+  providers_full:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, DIRECT]}
+        - {name: OTHER, type: select, proxies: [n1]}
+      rule-providers:
+        ads: {type: file, path: dom_basic.yaml, behavior: domain, interval: 3600}
+        lan: {type: file, path: cidr_basic.yaml, behavior: ipcidr}
+        mix: {type: file, path: cls_mixed.yaml, behavior: classical, format: yaml}
+        spare: {type: file, path: dom_second.yaml, behavior: domain}
+      sub-rules:
+        guarded:
+          - RULE-SET,mix,OTHER
+          - DST-PORT,443,PROXY
+      rules:
+        - RULE-SET,ads,REJECT
+        - RULE-SET,lan,DIRECT,no-resolve
+        - SUB-RULE,(RULE-SET,lan),guarded
+        - AND,((RULE-SET,mix),(NETWORK,tcp)),PROXY
+        - NOT,((RULE-SET,ads)),OTHER
+        - MATCH,PROXY
+  big_provider:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, DIRECT]}
+      rule-providers:
+        big: {type: file, path: big_cls.yaml, behavior: classical}
+      rules:
+        - RULE-SET,big,PROXY
+        - MATCH,DIRECT
+  nested_groups:
+    config: |
+      proxies:
+        - {name: a, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: b, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+        - {name: c, type: socks5, server: 1.2.3.4, port: 1080}
+      proxy-groups:
+        - {name: Top, type: select, proxies: [Region1, Region2, DIRECT, REJECT]}
+        - {name: Region1, type: url-test, proxies: [a, b]}
+        - {name: Region2, type: fallback, proxies: [c, Region1]}
+      rules:
+        - MATCH,Top
+  real_world_names:
+    config: |
+      proxies:
+        - {name: "🇭🇰 香港 01", type: ss, server: hk1.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: "🇭🇰 香港 02", type: ss, server: hk2.example.com, port: 2, cipher: aes-128-gcm, password: p}
+        - {name: "🇯🇵 日本 01 | IEPL", type: ss, server: jp.example.com, port: 3, cipher: aes-128-gcm, password: p}
+        - {name: "🇺🇸 US-LAX ⚡", type: hysteria2, server: us.example.com, port: 4, password: p}
+      proxy-groups:
+        - {name: "🚀 节点选择", type: select, proxies: ["♻️ 自动选择", "🎯 全球直连", "🇭🇰 香港 01", "🇯🇵 日本 01 | IEPL"]}
+        - {name: "♻️ 自动选择", type: url-test, proxies: ["🇭🇰 香港 01", "🇭🇰 香港 02", "🇯🇵 日本 01 | IEPL", "🇺🇸 US-LAX ⚡"]}
+        - {name: "🎯 全球直连", type: select, proxies: [DIRECT]}
+        - {name: "🛑 广告拦截", type: select, proxies: [REJECT, DIRECT]}
+      rules:
+        - DOMAIN-SUFFIX,ad.example.com,🛑 广告拦截
+        - DOMAIN-SUFFIX,example.cn,🎯 全球直连
+        - DOMAIN,hk.example.com,🇭🇰 香港 02
+        - MATCH,🚀 节点选择
+  match_only:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  no_match_rule:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - DOMAIN,a.com,PROXY
+  resolve_dns_overlay:
+    resolve_dns: {n1: "8.8.8.8", n2: "udp://1.1.1.1:5353", n3: "2001:4860:4860::8888", ghost: "9.9.9.9"}
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: n2, type: hysteria2, server: b.example.com, port: 2, password: p, sni: b.example.com}
+        - {name: n3, type: socks5, server: 1.2.3.4, port: 1080}
+        - {name: n4, type: anytls, server: c.example.com, port: 443, password: pw}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, n2, n3, n4]}
+      rules:
+        - MATCH,PROXY
+  resolve_dns_replaces_nothing_when_empty:
+    resolve_dns: {n1: "  "}
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  fatal_resolve_dns_hostname:
+    resolve_dns: {n1: "dns.example.com"}
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  fatal_resolve_dns_unspecified:
+    resolve_dns: {n1: "0.0.0.0"}
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  isolate_transport:
+    isolate: "PROXY,Region"
+    config: |
+      proxies:
+        - {name: a, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: b, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [Region, a]}
+        - {name: Region, type: url-test, proxies: [a, b]}
+        - {name: Other, type: select, proxies: [b]}
+      rules:
+        - MATCH,PROXY
+  fatal_isolate_unknown_group:
+    isolate: "Nope"
+    config: |
+      proxies:
+        - {name: a, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [a]}
+      rules:
+        - MATCH,PROXY
+  ignored_top_level_and_unused_script:
+    config: |
+      mixed-port: 7890
+      dns: {enable: true}
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      script:
+        shortcuts:
+          q: 'network == "udp"'
+      rules:
+        - MATCH,PROXY
+  fatal_active_script:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      script:
+        shortcuts:
+          q: 'network == "udp"'
+      rules:
+        - SCRIPT,q,PROXY
+        - MATCH,PROXY
+  fatal_no_proxies:
+    config: |
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [DIRECT]}
+      rules:
+        - MATCH,PROXY
+  fatal_no_groups:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      rules:
+        - MATCH,n1
+  fatal_all_rules_skipped:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - GEOIP,CN,PROXY
+        - GEOSITE,cn,PROXY
+  rules_skipped_but_match_kept:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - GEOIP,CN,PROXY
+        - IN-PORT,7890,PROXY
+        - MATCH,PROXY
+  fatal_duplicate_proxy:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+        - {name: n1, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  fatal_unknown_group_member:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1, ghost]}
+      rules:
+        - MATCH,PROXY
+  fatal_proxy_provider_members:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1], use: [subs]}
+      rules:
+        - MATCH,PROXY
+  fatal_unsupported_proxy_type:
+    config: |
+      proxies:
+        - {name: n1, type: vmess, server: a.example.com, port: 1, uuid: x}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - MATCH,PROXY
+  fatal_undeclared_rule_set:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rules:
+        - RULE-SET,ghost,PROXY
+        - MATCH,PROXY
+  fatal_provider_file_missing:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rule-providers:
+        gone: {type: file, path: no_such_file.yaml, behavior: domain}
+      rules:
+        - RULE-SET,gone,PROXY
+        - MATCH,PROXY
+  unused_provider_file_missing_is_fine:
+    config: |
+      proxies:
+        - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+      proxy-groups:
+        - {name: PROXY, type: select, proxies: [n1]}
+      rule-providers:
+        gone: {type: file, path: no_such_file.yaml, behavior: domain}
+      rules:
+        - MATCH,PROXY

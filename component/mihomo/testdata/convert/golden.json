@@ -1,0 +1,520 @@
+{
+ "basic_all_types": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "AUTO": "AUTO",
+   "FB": "FB",
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'AUTO,FB,ss1,sock,direct'\n        filter: group('AUTO')\n        filter: group('FB')\n        filter: name('ss1')\n        filter: name('sock')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n    AUTO {\n        tcp_check_url: 'http://www.gstatic.com/generate_204'\n        check_interval: 300s\n        check_tolerance: 50ms\n        filter: name('ss1')\n        filter: name('ss-obfs')\n        filter: name('any')\n        policy: url_test\n    }\n    FB {\n        lazy: true\n        filter: name('hy')\n        filter: name('any')\n        policy: fallback\n    }\n}\n",
+  "node_name_map": {
+   "any": "any",
+   "hy": "hy",
+   "sock": "sock",
+   "ss-obfs": "ss-obfs",
+   "ss1": "ss1"
+  },
+  "nodes": [
+   [
+    "ss1",
+    "ss://aes-128-gcm:p1@a.example.com:8388"
+   ],
+   [
+    "ss-obfs",
+    "ss://chacha20-ietf-poly1305:p2@b.example.com:443?plugin=simple-obfs%3Bobfs%3Dtls%3Bobfs-host%3Dbing.com"
+   ],
+   [
+    "sock",
+    "socks5://u:p@1.2.3.4:1080"
+   ],
+   [
+    "any",
+    "anytls://pw@c.example.com:443?sni=c.example.com"
+   ],
+   [
+    "hy",
+    "hysteria2://pw@d.example.com:443?downmbps=200&upmbps=50"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(suffix: \"example.com\") -> PROXY\n    domain(keyword: \"ads\") -> block\n    ip_no_resolve(\"10.0.0.0/8\") -> direct\n    dport(\"22\") -> FB\n    fallback: PROXY\n"
+ },
+ "big_provider": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,direct'\n        filter: name('n1')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(suffix: \"site0.example.com\", suffix: \"site1.example.com\", suffix: \"site2.example.com\", suffix: \"site3.example.com\", suffix: \"site4.example.com\", suffix: \"site5.example.com\", suffix: \"site6.example.com\", suffix: \"site7.example.com\", suffix: \"site8.example.com\", suffix: \"site9.example.com\", suffix: \"site10.example.com\", suffix: \"site11.example.com\", suffix: \"site12.example.com\", suffix: \"site13.example.com\", suffix: \"site14.example.com\", suffix: \"site15.example.com\", suffix: \"site16.example.com\", suffix: \"site17.example.com\", suffix: \"site18.example.com\", suffix: \"site19.example.com\", suffix: \"site20.example.com\", suffix: \"site21.example.com\", suffix: \"site22.example.com\", suffix: \"site23.example.com\", suffix: \"site24.example.com\", suffix: \"site25.example.com\", suffix: \"site26.example.com\", suffix: \"site27.example.com\", suffix: \"site28.example.com\", suffix: \"site29.example.com\", suffix: \"site30.example.com\", suffix: \"site31.example.com\", suffix: \"site32.example.com\", suffix: \"site33.example.com\", suffix: \"site34.example.com\", suffix: \"site35.example.com\", suffix: \"site36.example.com\", suffix: \"site37.example.com\", suffix: \"site38.example.com\", suffix: \"site39.example.com\", suffix: \"site40.example.com\", suffix: \"site41.example.com\", suffix: \"site42.example.com\", suffix: \"site43.example.com\", suffix: \"site44.example.com\", suffix: \"site45.example.com\", suffix: \"site46.example.com\", suffix: \"site47.example.com\", suffix: \"site48.example.com\", suffix: \"site49.example.com\", suffix: \"site50.example.com\", suffix: \"site51.example.com\", suffix: \"site52.example.com\", suffix: \"site53.example.com\", suffix: \"site54.example.com\", suffix: \"site55.example.com\", suffix: \"site56.example.com\", suffix: \"site57.example.com\", suffix: \"site58.example.com\", suffix: \"site59.example.com\", suffix: \"site60.example.com\", suffix: \"site61.example.com\", suffix: \"site62.example.com\", suffix: \"site63.example.com\", suffix: \"site64.example.com\", suffix: \"site65.example.com\", suffix: \"site66.example.com\", suffix: \"site67.example.com\", suffix: \"site68.example.com\", suffix: \"site69.example.com\", suffix: \"site70.example.com\", suffix: \"site71.example.com\", suffix: \"site72.example.com\", suffix: \"site73.example.com\", suffix: \"site74.example.com\", suffix: \"site75.example.com\", suffix: \"site76.example.com\", suffix: \"site77.example.com\", suffix: \"site78.example.com\", suffix: \"site79.example.com\", suffix: \"site80.example.com\", suffix: \"site81.example.com\", suffix: \"site82.example.com\", suffix: \"site83.example.com\", suffix: \"site84.example.com\", suffix: \"site85.example.com\", suffix: \"site86.example.com\", suffix: \"site87.example.com\", suffix: \"site88.example.com\", suffix: \"site89.example.com\", suffix: \"site90.example.com\", suffix: \"site91.example.com\", suffix: \"site92.example.com\", suffix: \"site93.example.com\", suffix: \"site94.example.com\", suffix: \"site95.example.com\", suffix: \"site96.example.com\", suffix: \"site97.example.com\", suffix: \"site98.example.com\", suffix: \"site99.example.com\", suffix: \"site100.example.com\", suffix: \"site101.example.com\", suffix: \"site102.example.com\", suffix: \"site103.example.com\", suffix: \"site104.example.com\", suffix: \"site105.example.com\", suffix: \"site106.example.com\", suffix: \"site107.example.com\", suffix: \"site108.example.com\", suffix: \"site109.example.com\", suffix: \"site110.example.com\", suffix: \"site111.example.com\", suffix: \"site112.example.com\", suffix: \"site113.example.com\", suffix: \"site114.example.com\", suffix: \"site115.example.com\", suffix: \"site116.example.com\", suffix: \"site117.example.com\", suffix: \"site118.example.com\", suffix: \"site119.example.com\", suffix: \"site120.example.com\", suffix: \"site121.example.com\", suffix: \"site122.example.com\", suffix: \"site123.example.com\", suffix: \"site124.example.com\", suffix: \"site125.example.com\", suffix: \"site126.example.com\", suffix: \"site127.example.com\", suffix: \"site128.example.com\", suffix: \"site129.example.com\", suffix: \"site130.example.com\", suffix: \"site131.example.com\", suffix: \"site132.example.com\", suffix: \"site133.example.com\", suffix: \"site134.example.com\", suffix: \"site135.example.com\", suffix: \"site136.example.com\", suffix: \"site137.example.com\", suffix: \"site138.example.com\", suffix: \"site139.example.com\", suffix: \"site140.example.com\", suffix: \"site141.example.com\", suffix: \"site142.example.com\", suffix: \"site143.example.com\", suffix: \"site144.example.com\", suffix: \"site145.example.com\", suffix: \"site146.example.com\", suffix: \"site147.example.com\", suffix: \"site148.example.com\", suffix: \"site149.example.com\") -> PROXY\n    ip(\"10.0.0.0/24\", \"10.0.1.0/24\", \"10.0.2.0/24\", \"10.0.3.0/24\", \"10.0.4.0/24\", \"10.0.5.0/24\", \"10.0.6.0/24\", \"10.0.7.0/24\", \"10.0.8.0/24\", \"10.0.9.0/24\", \"10.0.10.0/24\", \"10.0.11.0/24\", \"10.0.12.0/24\", \"10.0.13.0/24\", \"10.0.14.0/24\", \"10.0.15.0/24\", \"10.0.16.0/24\", \"10.0.17.0/24\", \"10.0.18.0/24\", \"10.0.19.0/24\", \"10.0.20.0/24\", \"10.0.21.0/24\", \"10.0.22.0/24\", \"10.0.23.0/24\", \"10.0.24.0/24\", \"10.0.25.0/24\", \"10.0.26.0/24\", \"10.0.27.0/24\", \"10.0.28.0/24\", \"10.0.29.0/24\", \"10.0.30.0/24\", \"10.0.31.0/24\", \"10.0.32.0/24\", \"10.0.33.0/24\", \"10.0.34.0/24\", \"10.0.35.0/24\", \"10.0.36.0/24\", \"10.0.37.0/24\", \"10.0.38.0/24\", \"10.0.39.0/24\", \"10.0.40.0/24\", \"10.0.41.0/24\", \"10.0.42.0/24\", \"10.0.43.0/24\", \"10.0.44.0/24\", \"10.0.45.0/24\", \"10.0.46.0/24\", \"10.0.47.0/24\", \"10.0.48.0/24\", \"10.0.49.0/24\", \"10.0.50.0/24\", \"10.0.51.0/24\", \"10.0.52.0/24\", \"10.0.53.0/24\", \"10.0.54.0/24\", \"10.0.55.0/24\", \"10.0.56.0/24\", \"10.0.57.0/24\", \"10.0.58.0/24\", \"10.0.59.0/24\", \"10.0.60.0/24\", \"10.0.61.0/24\", \"10.0.62.0/24\", \"10.0.63.0/24\", \"10.0.64.0/24\", \"10.0.65.0/24\", \"10.0.66.0/24\", \"10.0.67.0/24\", \"10.0.68.0/24\", \"10.0.69.0/24\", \"10.0.70.0/24\", \"10.0.71.0/24\", \"10.0.72.0/24\", \"10.0.73.0/24\", \"10.0.74.0/24\", \"10.0.75.0/24\", \"10.0.76.0/24\", \"10.0.77.0/24\", \"10.0.78.0/24\", \"10.0.79.0/24\", \"10.0.80.0/24\", \"10.0.81.0/24\", \"10.0.82.0/24\", \"10.0.83.0/24\", \"10.0.84.0/24\", \"10.0.85.0/24\", \"10.0.86.0/24\", \"10.0.87.0/24\", \"10.0.88.0/24\", \"10.0.89.0/24\", \"10.0.90.0/24\", \"10.0.91.0/24\", \"10.0.92.0/24\", \"10.0.93.0/24\", \"10.0.94.0/24\", \"10.0.95.0/24\", \"10.0.96.0/24\", \"10.0.97.0/24\", \"10.0.98.0/24\", \"10.0.99.0/24\", \"10.0.100.0/24\", \"10.0.101.0/24\", \"10.0.102.0/24\", \"10.0.103.0/24\", \"10.0.104.0/24\", \"10.0.105.0/24\", \"10.0.106.0/24\", \"10.0.107.0/24\", \"10.0.108.0/24\", \"10.0.109.0/24\", \"10.0.110.0/24\", \"10.0.111.0/24\", \"10.0.112.0/24\", \"10.0.113.0/24\", \"10.0.114.0/24\", \"10.0.115.0/24\", \"10.0.116.0/24\", \"10.0.117.0/24\", \"10.0.118.0/24\", \"10.0.119.0/24\", \"10.0.120.0/24\", \"10.0.121.0/24\", \"10.0.122.0/24\", \"10.0.123.0/24\", \"10.0.124.0/24\", \"10.0.125.0/24\", \"10.0.126.0/24\", \"10.0.127.0/24\", \"10.0.128.0/24\", \"10.0.129.0/24\", \"10.0.130.0/24\", \"10.0.131.0/24\", \"10.0.132.0/24\", \"10.0.133.0/24\", \"10.0.134.0/24\", \"10.0.135.0/24\", \"10.0.136.0/24\", \"10.0.137.0/24\", \"10.0.138.0/24\", \"10.0.139.0/24\", \"10.0.140.0/24\", \"10.0.141.0/24\", \"10.0.142.0/24\", \"10.0.143.0/24\", \"10.0.144.0/24\", \"10.0.145.0/24\", \"10.0.146.0/24\", \"10.0.147.0/24\", \"10.0.148.0/24\", \"10.0.149.0/24\") -> PROXY\n    fallback: direct\n"
+ },
+ "fatal_active_script": {
+  "error": "Mihomo script at index 0 line 9 is active and unsupported",
+  "ok": false
+ },
+ "fatal_all_rules_skipped": {
+  "error": "Mihomo routing produced no routes",
+  "ok": false
+ },
+ "fatal_duplicate_proxy": {
+  "error": "duplicate proxy \"n1\"",
+  "ok": false
+ },
+ "fatal_isolate_unknown_group": {
+  "error": "isolated transport group \"Nope\" does not exist",
+  "ok": false
+ },
+ "fatal_no_groups": {
+  "error": "Mihomo routing generation requires a non-empty group output",
+  "ok": false
+ },
+ "fatal_no_proxies": {
+  "error": "Mihomo routing generation requires a non-empty node output",
+  "ok": false
+ },
+ "fatal_provider_file_missing": {
+  "error": "provider \"gone\": resolve provider file: lstat /tmp/tmph2nmqmy8/no_such_file.yaml: no such file or directory",
+  "ok": false
+ },
+ "fatal_proxy_provider_members": {
+  "error": "group \"PROXY\" cannot be converted: proxy provider members are unsupported",
+  "ok": false
+ },
+ "fatal_resolve_dns_hostname": {
+  "error": "mihomo proxy \"n1\": resolve_dns must be an IP address: dns.example.com",
+  "ok": false
+ },
+ "fatal_resolve_dns_unspecified": {
+  "error": "mihomo proxy \"n1\": invalid resolve_dns address: 0.0.0.0",
+  "ok": false
+ },
+ "fatal_undeclared_rule_set": {
+  "error": "RULE-SET provider \"ghost\" at index 0 line 6 is undeclared",
+  "ok": false
+ },
+ "fatal_unknown_group_member": {
+  "error": "group \"PROXY\" has unknown member \"ghost\"",
+  "ok": false
+ },
+ "fatal_unsupported_proxy_type": {
+  "error": "mihomo proxy \"n1\" uses unsupported type \"vmess\"",
+  "ok": false
+ },
+ "ignored_top_level_and_unused_script": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "isolate_transport": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "Other": "Other",
+   "PROXY": "PROXY",
+   "Region": "Region"
+  },
+  "groups_dae": "group {\n    PROXY {\n        isolate_transport: true\n        selection_members: 'Region,a'\n        filter: group('Region')\n        filter: name('a')\n        policy: fixed(0)\n    }\n    Region {\n        isolate_transport: true\n        filter: name('a')\n        filter: name('b')\n        policy: url_test\n    }\n    Other {\n        selection_members: 'b'\n        filter: name('b')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "a": "a",
+   "b": "b"
+  },
+  "nodes": [
+   [
+    "a",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "b",
+    "ss://aes-128-gcm:p@b.example.com:2"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "match_only": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "nested_groups": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "Region1": "Region1",
+   "Region2": "Region2",
+   "Top": "Top"
+  },
+  "groups_dae": "group {\n    Top {\n        selection_members: 'Region1,Region2,direct,block'\n        filter: group('Region1')\n        filter: group('Region2')\n        filter: group('direct')\n        filter: group('block')\n        policy: fixed(0)\n    }\n    Region1 {\n        filter: name('a')\n        filter: name('b')\n        policy: url_test\n    }\n    Region2 {\n        filter: name('c')\n        filter: group('Region1')\n        policy: fallback\n    }\n}\n",
+  "node_name_map": {
+   "a": "a",
+   "b": "b",
+   "c": "c"
+  },
+  "nodes": [
+   [
+    "a",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "b",
+    "ss://aes-128-gcm:p@b.example.com:2"
+   ],
+   [
+    "c",
+    "socks5://1.2.3.4:1080"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: Top\n"
+ },
+ "no_match_rule": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(full: \"a.com\") -> PROXY\n"
+ },
+ "node_target_in_sub_rule": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY",
+   "node_n1": "node_n1",
+   "node_n2": "node_n2"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,n2'\n        filter: name('n1')\n        filter: name('n2')\n        policy: fixed(0)\n    }\n    node_n1 {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n    node_n2 {\n        selection_members: 'n2'\n        filter: name('n2')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1",
+   "n2": "n2"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "n2",
+    "ss://aes-128-gcm:p@b.example.com:2"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJtZW1vX2lkIjoxLCJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJsNHByb3RvIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiJ0Y3AiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZHBvcnQiLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6IiIsIlZhbCI6IjQ0MyIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX1dfQ\") -> node_n2\n    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJtZW1vX2lkIjoxLCJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJsNHByb3RvIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiJ0Y3AiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZHBvcnQiLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6IiIsIlZhbCI6IjgwIiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fV19\") -> PROXY\n    fallback: node_n1\n"
+ },
+ "node_target_rules": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY",
+   "node_HK_HK_01_IEPL": "node_HK_HK_01_IEPL",
+   "node_n1": "node_n1",
+   "node_n3": "node_n3"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,HK_HK-01_IEPL,n3'\n        filter: name('n1')\n        filter: name('HK_HK-01_IEPL')\n        filter: name('n3')\n        policy: fixed(0)\n    }\n    node_n1 {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n    node_n3 {\n        selection_members: 'n3'\n        filter: name('n3')\n        policy: fixed(0)\n    }\n    node_HK_HK_01_IEPL {\n        selection_members: 'HK_HK-01_IEPL'\n        filter: name('HK_HK-01_IEPL')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1",
+   "n3": "n3",
+   "🇭🇰 HK-01 | IEPL": "HK_HK-01_IEPL"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "HK_HK-01_IEPL",
+    "ss://aes-128-gcm:p@hk.example.com:2"
+   ],
+   [
+    "n3",
+    "socks5://1.2.3.4:1080"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(full: \"a.com\") -> node_n1\n    domain(full: \"b.com\") -> node_HK_HK_01_IEPL\n    domain(full: \"c.com\") -> node_n1\n    domain(full: \"d.com\") -> PROXY\n    fallback: node_n3\n"
+ },
+ "providers_full": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "OTHER": "OTHER",
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,direct'\n        filter: name('n1')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n    OTHER {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(suffix: \"google.com\", suffix: \"example.org\", suffix: \".cdn.example.net\", suffix: \"*.wild.example.com\", suffix: \"upper.example.com\") -> block\n    ip_no_resolve(\"192.168.0.0/16\", \"2001:db8::/32\", \"10.0.0.0/8\") -> direct\n    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJtZW1vX2lkIjoxLCJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJpcCIsIk5vdCI6ZmFsc2UsIlBhcmFtcyI6W3siS2V5IjoiIiwiVmFsIjoiMTkyLjE2OC4wLjAvMTYiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9LHsiS2V5IjoiIiwiVmFsIjoiMjAwMTpkYjg6Oi8zMiIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH0seyJLZXkiOiIiLCJWYWwiOiIxMC4wLjAuMC84IiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoib3IiLCJjaGlsZHJlbiI6W3sib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJmdWxsIiwiVmFsIjoiZnVsbC5leGFtcGxlLmNvbSIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6InN1ZmZpeCIsIlZhbCI6InN1ZmZpeC5leGFtcGxlLmNvbSIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6ImtleXdvcmQiLCJWYWwiOiJrdyIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6InJlZ2V4IiwiVmFsIjoiXnJbMC05XStcXC5leGFtcGxlXFwuY29tJCIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6InJlZ2V4IiwiVmFsIjoiXncuKlxcLmV4YW1wbGVcXC5jb20kIiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImlwX25vX3Jlc29sdmUiLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6IiIsIlZhbCI6IjEwLjAuMC4wLzgiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZGlwIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiIyMDAxOmRiODo6LzMyIiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImRpcCIsIk5vdCI6ZmFsc2UsIlBhcmFtcyI6W3siS2V5IjoiIiwiVmFsIjoiMS4yLjMuNC8zMiIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6InN1ZmZpeCIsIlZhbCI6ImV4YW1wbGUuZHVwLmNvbSIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX1dfV19\") -> OTHER\n    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJtZW1vX2lkIjoxLCJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJpcCIsIk5vdCI6ZmFsc2UsIlBhcmFtcyI6W3siS2V5IjoiIiwiVmFsIjoiMTkyLjE2OC4wLjAvMTYiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9LHsiS2V5IjoiIiwiVmFsIjoiMjAwMTpkYjg6Oi8zMiIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH0seyJLZXkiOiIiLCJWYWwiOiIxMC4wLjAuMC84IiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImRwb3J0IiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiI0NDMiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19XX0\") -> PROXY\n    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJvcCI6Im9yIiwiY2hpbGRyZW4iOlt7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImRvbWFpbiIsIk5vdCI6ZmFsc2UsIlBhcmFtcyI6W3siS2V5IjoiZnVsbCIsIlZhbCI6ImZ1bGwuZXhhbXBsZS5jb20iLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJzdWZmaXgiLCJWYWwiOiJzdWZmaXguZXhhbXBsZS5jb20iLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJrZXl3b3JkIiwiVmFsIjoia3ciLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJyZWdleCIsIlZhbCI6Il5yWzAtOV0rXFwuZXhhbXBsZVxcLmNvbSQiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJyZWdleCIsIlZhbCI6Il53LipcXC5leGFtcGxlXFwuY29tJCIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJpcF9ub19yZXNvbHZlIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiIxMC4wLjAuMC84IiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImRpcCIsIk5vdCI6ZmFsc2UsIlBhcmFtcyI6W3siS2V5IjoiIiwiVmFsIjoiMjAwMTpkYjg6Oi8zMiIsIkFuZEZ1bmN0aW9ucyI6bnVsbCwiQW5ub3RhdGlvbiI6bnVsbH1dfX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkaXAiLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6IiIsIlZhbCI6IjEuMi4zLjQvMzIiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19LHsib3AiOiJhdG9tIiwiYXRvbSI6eyJOYW1lIjoiZG9tYWluIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiJzdWZmaXgiLCJWYWwiOiJleGFtcGxlLmR1cC5jb20iLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19XX0seyJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJsNHByb3RvIiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiJ0Y3AiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19XX0\") -> PROXY\n    !domain(suffix: \"google.com\", suffix: \"example.org\", suffix: \".cdn.example.net\", suffix: \"*.wild.example.com\", suffix: \"upper.example.com\") -> OTHER\n    fallback: PROXY\n"
+ },
+ "real_world_names": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "node_HK_02": "node_HK_02",
+   "♻️ 自动选择": "mihomo_8ecea892da34",
+   "🎯 全球直连": "Target",
+   "🚀 节点选择": "Rocket",
+   "🛑 广告拦截": "mihomo_620dabe78dd4"
+  },
+  "groups_dae": "group {\n    Rocket {\n        selection_members: 'mihomo_8ecea892da34,Target,HK_01,JP_01_IEPL'\n        filter: group('mihomo_8ecea892da34')\n        filter: group('Target')\n        filter: name('HK_01')\n        filter: name('JP_01_IEPL')\n        policy: fixed(0)\n    }\n    mihomo_8ecea892da34 {\n        filter: name('HK_01')\n        filter: name('HK_02')\n        filter: name('JP_01_IEPL')\n        filter: name('US_US-LAX_Bolt')\n        policy: url_test\n    }\n    Target {\n        selection_members: 'direct'\n        filter: group('direct')\n        policy: fixed(0)\n    }\n    mihomo_620dabe78dd4 {\n        selection_members: 'block,direct'\n        filter: group('block')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n    node_HK_02 {\n        selection_members: 'HK_02'\n        filter: name('HK_02')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "🇭🇰 香港 01": "HK_01",
+   "🇭🇰 香港 02": "HK_02",
+   "🇯🇵 日本 01 | IEPL": "JP_01_IEPL",
+   "🇺🇸 US-LAX ⚡": "US_US-LAX_Bolt"
+  },
+  "nodes": [
+   [
+    "HK_01",
+    "ss://aes-128-gcm:p@hk1.example.com:1"
+   ],
+   [
+    "HK_02",
+    "ss://aes-128-gcm:p@hk2.example.com:2"
+   ],
+   [
+    "JP_01_IEPL",
+    "ss://aes-128-gcm:p@jp.example.com:3"
+   ],
+   [
+    "US_US-LAX_Bolt",
+    "hysteria2://p@us.example.com:4"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(suffix: \"ad.example.com\") -> mihomo_620dabe78dd4\n    domain(suffix: \"example.cn\") -> Target\n    domain(full: \"hk.example.com\") -> node_HK_02\n    fallback: Rocket\n"
+ },
+ "resolve_dns_overlay": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,n2,n3,n4'\n        filter: name('n1')\n        filter: name('n2')\n        filter: name('n3')\n        filter: name('n4')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1",
+   "n2": "n2",
+   "n3": "n3",
+   "n4": "n4"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1?resolve_dns=8.8.8.8%3A53"
+   ],
+   [
+    "n2",
+    "hysteria2://p@b.example.com:2?sni=b.example.com&resolve_dns=1.1.1.1%3A5353"
+   ],
+   [
+    "n3",
+    "socks5://1.2.3.4:1080?resolve_dns=%5B2001%3A4860%3A4860%3A%3A8888%5D%3A53"
+   ],
+   [
+    "n4",
+    "anytls://pw@c.example.com:443"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "resolve_dns_replaces_nothing_when_empty": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "rules_skipped_but_match_kept": {
+  "dat": {},
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   },
+   {
+    "index": 1,
+    "kind": "ignore"
+   }
+  ],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "target_is_builtin_or_unknown": {
+  "dat": {},
+  "events": [
+   {
+    "index": 2,
+    "kind": "skip"
+   }
+  ],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(full: \"a.com\") -> direct\n    domain(full: \"b.com\") -> block\n    fallback: PROXY\n"
+ },
+ "unused_provider_file_missing_is_fine": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "n1": "n1"
+  },
+  "nodes": [
+   [
+    "n1",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "wrapper_name_collides_with_group": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "node_2d7116": "node_2d7116",
+   "node_x": "node_x",
+   "node_x_g": "node_x_g"
+  },
+  "groups_dae": "group {\n    node_x {\n        selection_members: 'x,y'\n        filter: name('x')\n        filter: name('y')\n        policy: fixed(0)\n    }\n    node_x_g {\n        selection_members: 'y'\n        filter: name('y')\n        policy: fixed(0)\n    }\n    node_2d7116 {\n        selection_members: 'x'\n        filter: name('x')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "x": "x",
+   "y": "y"
+  },
+  "nodes": [
+   [
+    "x",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "y",
+    "ss://aes-128-gcm:p@b.example.com:2"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(full: \"a.com\") -> node_2d7116\n    fallback: node_x\n"
+ },
+ "wrapper_name_collides_with_node": {
+  "dat": {},
+  "events": [],
+  "group_name_map": {
+   "PROXY": "PROXY",
+   "node_node_x": "node_node_x",
+   "node_x_g": "node_x_g"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'x,node_x'\n        filter: name('x')\n        filter: name('node_x')\n        policy: fixed(0)\n    }\n    node_node_x {\n        selection_members: 'node_x'\n        filter: name('node_x')\n        policy: fixed(0)\n    }\n    node_x_g {\n        selection_members: 'x'\n        filter: name('x')\n        policy: fixed(0)\n    }\n}\n",
+  "node_name_map": {
+   "node_x": "node_x",
+   "x": "x"
+  },
+  "nodes": [
+   [
+    "x",
+    "ss://aes-128-gcm:p@a.example.com:1"
+   ],
+   [
+    "node_x",
+    "ss://aes-128-gcm:p@b.example.com:2"
+   ]
+  ],
+  "ok": true,
+  "routes_dae": "    domain(full: \"a.com\") -> node_x_g\n    domain(full: \"b.com\") -> node_node_x\n    fallback: PROXY\n"
+ }
+}

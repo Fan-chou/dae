@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -130,6 +131,26 @@ func LowerRules(rules []Rule, subRules []SubRule, env RuleEnv) (*LoweredRules, e
 }
 
 func lowerRules(rules []Rule, subRules []SubRule, env RuleEnv, noCompact bool) (*LoweredRules, error) {
+	p, err := prepareRules(rules, subRules, env)
+	if err != nil {
+		return nil, err
+	}
+	return p.lower(env, noCompact)
+}
+
+// preparedRules is the result of everything that does not depend on how
+// outbounds are named: syntax, sub-rule expansion, and the facts the caller
+// needs before it can name them (which providers and which targets are used).
+type preparedRules struct {
+	rules  []*parsedRule
+	events []Event
+	// Providers and Targets are original names, in first-use order and sorted
+	// order respectively.
+	Providers []string
+	Targets   []string
+}
+
+func prepareRules(rules []Rule, subRules []SubRule, env RuleEnv) (*preparedRules, error) {
 	top, err := parseRuleList(rules)
 	if err != nil {
 		return nil, err
@@ -152,14 +173,27 @@ func lowerRules(rules []Rule, subRules []SubRule, env RuleEnv, noCompact bool) (
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
+	var targets []string
+	for _, r := range expanded {
+		if t := strings.TrimSpace(r.action.target); t != "" && !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	sort.Strings(targets)
+	return &preparedRules{rules: expanded, events: events, Providers: used, Targets: targets}, nil
+}
+
+func (p *preparedRules) lower(env RuleEnv, noCompact bool) (*LoweredRules, error) {
 	l := newLowerer(env)
 	l.noCompact = noCompact
-	l.events = append(l.events, events...)
-	out, err := l.lowerTop(expanded)
+	l.events = append(l.events, p.events...)
+	out, err := l.lowerTop(p.rules)
 	if err != nil {
 		return nil, err
 	}
-	out.UsedProviders = used
+	out.UsedProviders = p.Providers
 	return out, nil
 }
 

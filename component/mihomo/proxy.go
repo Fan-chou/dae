@@ -87,6 +87,21 @@ func (f proxyFields) sni() string {
 // internal dae tag. Safe names are stable: they only change when two proxies
 // would otherwise share one (see assignSafeNames).
 func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
+	return ConvertProxiesWith(entries, ProxyOptions{Validate: validate})
+}
+
+// ProxyOptions carries settings that are not part of the Mihomo document.
+type ProxyOptions struct {
+	Validate LinkValidator
+	// ResolveDNS maps an original proxy name to a DNS server (IP, optional
+	// port) that dae should use to resolve destinations through that node.
+	// Names that match no proxy are ignored.
+	ResolveDNS map[string]string
+}
+
+// ConvertProxiesWith is ConvertProxies with options.
+func ConvertProxiesWith(entries []Entry, opts ProxyOptions) ([]Node, error) {
+	validate := opts.Validate
 	names := make([]string, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for i, entry := range entries {
@@ -115,6 +130,11 @@ func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
 		link, protocol, err := proxyLink(entry)
 		if err != nil {
 			return nil, err
+		}
+		if dns := opts.ResolveDNS[entry.Name]; strings.TrimSpace(dns) != "" {
+			if link, err = withResolveDNS(link, dns); err != nil {
+				return nil, fmt.Errorf("proxy %q: %w", entry.Name, err)
+			}
 		}
 		if strings.ContainsAny(link, "\x00\r\n") || (strings.Contains(link, "'") && strings.Contains(link, `"`)) {
 			return nil, fmt.Errorf("proxy %q generated an invalid dae link", entry.Name)

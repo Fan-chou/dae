@@ -28,6 +28,9 @@ type Group struct {
 	Name   string
 	Safe   string
 	Config config.Group
+	// Wrapper marks a one-member group made around a proxy that rules name
+	// directly; Name is then the proxy's name.
+	Wrapper bool
 }
 
 // GroupOptions carries settings that are not part of the Mihomo document.
