@@ -5,6 +5,7 @@ import {
   disconnectClashByIdAPI,
 } from '@/api/clash'
 import { proxyMap } from '@/assembly/proxies'
+import { policyLabel } from '@/fdae/proxies'
 import { PROXY_TYPE } from '@/constant'
 import type { ClashConnectionRawMessage, Connection } from '@/types'
 import { head } from 'lodash'
@@ -104,6 +105,7 @@ export const connectionAccessor: ConnectionAccessor = {
   start: (connection) => asClash(connection).start,
   rule: (connection) => {
     const clash = asClash(connection)
+    if (connection.fdae) return policyLabel(clash.rule)
 
     return clash.rulePayload
       ? `${clash.rule}: ${clash.rulePayload}`
@@ -126,7 +128,7 @@ export const connectionAccessor: ConnectionAccessor = {
     const clash = asClash(connection)
     const host = getHostname(clash)
     if (connection.fdae)
-      return connection.fdae.domain || clash.metadata.destinationIP
+      return connection.fdae.domain || '—'
 
     if (host.includes(':')) {
       return `[${host}]:${clash.metadata.destinationPort}`
