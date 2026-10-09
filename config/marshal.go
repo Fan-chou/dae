@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 
 	"github.com/daeuniverse/dae/common"
@@ -63,11 +62,11 @@ func (m *Marshaller) marshalStringList(from reflect.Value, depth int, keyable bo
 		if keyable {
 			tag, afterTag := common.GetTagFromLinkLikePlaintext(str.String())
 			if len(tag) > 0 {
-				m.writeLine(depth, tag+":"+strconv.Quote(afterTag))
+				m.writeLine(depth, tag+":"+config_parser.QuoteLiteral(afterTag))
 				continue
 			}
 		}
-		m.writeLine(depth, strconv.Quote(str.String()))
+		m.writeLine(depth, config_parser.QuoteLiteral(str.String()))
 	}
 	return nil
 }
@@ -175,7 +174,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			for i := 0; i < from.Len(); i++ {
 				vals = append(vals, fmt.Sprintf("%v", from.Index(i).Interface()))
 			}
-			m.writeLine(depth, key+":"+strconv.Quote(strings.Join(vals, ",")))
+			m.writeLine(depth, key+":"+config_parser.QuoteLiteral(strings.Join(vals, ",")))
 		case *config_parser.Function:
 			var vals []string
 			for i := 0; i < from.Len(); i++ {
@@ -201,7 +200,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			int8, int16, int32, int64,
 			float32, float64,
 			bool:
-			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
+			m.writeLine(depth, key+":"+config_parser.QuoteLiteral(fmt.Sprintf("%v", val)))
 		case *config_parser.Function:
 			m.writeLine(depth, key+":"+val.String(true, true, false))
 		case []*config_parser.Function:

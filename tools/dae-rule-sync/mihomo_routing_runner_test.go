@@ -194,3 +194,26 @@ func testMihomoHTTPProviderSpec(name, rawURL string) ProviderSpec {
 		MaxSize:  1024,
 	}
 }
+
+// dae's parser reads quoted values verbatim, so a regex written to routes.dae
+// must come back unchanged. strconv.Quote used to double every backslash,
+// which turned "\." into a literal backslash plus any character.
+func TestRenderedRegexRoutesSurviveTheDaeParser(t *testing.T) {
+	regex := `^.*\.example\.com$`
+	rules := []MihomoLoweredRoutingRule{{Rule: &config_parser.RoutingRule{
+		AndFunctions: []*config_parser.Function{{Name: "domain", Params: []*config_parser.Param{{Key: "regex", Val: regex}}}},
+		Outbound:     config_parser.Function{Name: "PROXY"},
+	}}}
+	text, _, err := renderMihomoLoweredRoutes(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections, err := config_parser.Parse("routing {\n" + text + "}\n")
+	if err != nil {
+		t.Fatalf("parse rendered routes: %v\n%s", err, text)
+	}
+	parsed := sections[0].Items[0].Value.(*config_parser.RoutingRule)
+	if got := parsed.AndFunctions[0].Params[0].Val; got != regex {
+		t.Fatalf("regex after parse = %q, want %q", got, regex)
+	}
+}

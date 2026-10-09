@@ -116,7 +116,7 @@ func (p *Param) String(compact bool, quoteVal bool) string {
 	// FIXME: annotation
 	var quote func(string) string
 	if quoteVal {
-		quote = strconv.Quote
+		quote = QuoteLiteral
 	} else {
 		quote = func(s string) string { return s }
 	}
