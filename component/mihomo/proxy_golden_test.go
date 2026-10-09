@@ -3,7 +3,6 @@ package mihomo
 import (
 	"encoding/json"
 	"os"
-	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,6 +16,19 @@ type nodeGolden struct {
 	Protocol string `json:"type"`
 	Link     string `json:"link"`
 	Error    string `json:"error"`
+}
+
+// intentionalDeviations lists the only cases where the new conversion is
+// allowed to differ from the archived sidecar, with the reason. A deviation
+// that no longer differs from the golden is stale and fails the test.
+var intentionalDeviations = map[string]struct {
+	accept bool // new behavior
+	reason string
+}{
+	"unknown_field_dialer_proxy": {false, "unsupported proxy fields are rejected; the sidecar silently dropped dialer-proxy, which changes the egress path"},
+	"unknown_field_tfo":          {false, "unsupported proxy fields are rejected rather than silently dropped"},
+	"bad_name_maps_to_direct":    {true, "a name that sanitizes to a reserved outbound gets a derived internal name instead of failing"},
+	"bad_name_maps_to_block":     {true, "a name that sanitizes to a reserved outbound gets a derived internal name instead of failing"},
 }
 
 // TestProxyConversionMatchesArchivedSidecar replays every fixture proxy
@@ -48,6 +60,18 @@ func TestProxyConversionMatchesArchivedSidecar(t *testing.T) {
 			}
 			require.NoError(t, node.Decode(&head))
 			nodes, err := ConvertProxies([]Entry{{Name: head.Name, Type: head.Type, Node: node}}, daeLinkValidator)
+			if dev, ok := intentionalDeviations[caseName]; ok {
+				require.NotEqual(t, want.OK, dev.accept, "stale deviation (%s): new behavior equals the golden", dev.reason)
+				if !dev.accept {
+					require.Error(t, err, dev.reason)
+					return
+				}
+				require.NoError(t, err, dev.reason)
+				require.Len(t, nodes, 1)
+				require.Regexp(t, `^mihomo_[0-9a-f]{6}$`, nodes[0].Safe)
+				require.Equal(t, head.Name, nodes[0].Name, "display name must stay the original")
+				return
+			}
 			if !want.OK {
 				require.Error(t, err, "oracle rejected: %s", want.Error)
 				return
@@ -62,23 +86,96 @@ func TestProxyConversionMatchesArchivedSidecar(t *testing.T) {
 	require.Equal(t, len(golden), seen, "golden has cases missing from cases.yaml")
 }
 
-func TestConvertProxiesRejectsNameCollisions(t *testing.T) {
-	mk := func(name string) Entry {
-		var n yaml.Node
-		require.NoError(t, yaml.Unmarshal([]byte("{server: x.com, port: 1, cipher: aes-128-gcm, password: p}"), &n))
-		return Entry{Name: name, Type: "ss", Node: n.Content[0]}
-	}
-	// Both CJK names sanitize to n_01.
-	_, err := ConvertProxies([]Entry{mk("香港 01"), mk("日本 01")}, nil)
-	require.ErrorContains(t, err, "same dae node name")
-	_, err = ConvertProxies([]Entry{mk("dup"), mk("dup")}, nil)
-	require.ErrorContains(t, err, "duplicate proxy")
+func ssEntry(t *testing.T, name string, extra string) Entry {
+	t.Helper()
+	var n yaml.Node
+	body := "{server: x.com, port: 1, cipher: aes-128-gcm, password: p" + extra + "}"
+	require.NoError(t, yaml.Unmarshal([]byte(body), &n))
+	return Entry{Name: name, Type: "ss", Node: n.Content[0]}
+}
 
-	nodes, err := ConvertProxies([]Entry{mk("a"), mk("b")}, nil)
+func safeNames(nodes []Node) map[string]string {
+	out := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		out[n.Name] = n.Safe
+	}
+	return out
+}
+
+func TestConvertProxiesDisambiguatesCollidingNamesAndKeepsDisplayNames(t *testing.T) {
+	a, b := "香港 01", "日本 01" // both sanitize to n_01
+	nodes, err := ConvertProxies([]Entry{ssEntry(t, a, ""), ssEntry(t, b, ""), ssEntry(t, "Tokyo-1", "")}, nil)
 	require.NoError(t, err)
-	names := []string{nodes[0].Safe, nodes[1].Safe}
-	sort.Strings(names)
-	require.Equal(t, []string{"a", "b"}, names)
+	got := safeNames(nodes)
+	require.NotEqual(t, got[a], got[b])
+	require.Regexp(t, `^n_01_[0-9a-f]{6}$`, got[a])
+	require.Regexp(t, `^n_01_[0-9a-f]{6}$`, got[b])
+	require.Equal(t, "Tokyo-1", got["Tokyo-1"], "non-colliding names stay as they were")
+	for _, n := range nodes {
+		require.Contains(t, []string{a, b, "Tokyo-1"}, n.Name, "Name must stay the original text")
+	}
+
+	// Order must not matter.
+	reversed, err := ConvertProxies([]Entry{ssEntry(t, "Tokyo-1", ""), ssEntry(t, b, ""), ssEntry(t, a, "")}, nil)
+	require.NoError(t, err)
+	require.Equal(t, got, safeNames(reversed))
+
+	// A lone name is not suffixed; its sibling appearing renames it once.
+	alone, err := ConvertProxies([]Entry{ssEntry(t, a, "")}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "n_01", safeNames(alone)[a])
+}
+
+func TestConvertProxiesDerivedNamesAvoidExistingNames(t *testing.T) {
+	a, b := "香港 01", "日本 01"
+	probe, err := ConvertProxies([]Entry{ssEntry(t, a, ""), ssEntry(t, b, "")}, nil)
+	require.NoError(t, err)
+	// A proxy literally named like a derived name must not be clobbered.
+	squatter := safeNames(probe)[a]
+	nodes, err := ConvertProxies([]Entry{ssEntry(t, a, ""), ssEntry(t, b, ""), ssEntry(t, squatter, "")}, nil)
+	require.NoError(t, err)
+	seen := map[string]bool{}
+	for _, n := range nodes {
+		require.False(t, seen[n.Safe], "duplicate safe name %s", n.Safe)
+		seen[n.Safe] = true
+	}
+	require.Equal(t, squatter, safeNames(nodes)[squatter])
+}
+
+func TestConvertProxiesRejectsDuplicateAndReservedOriginals(t *testing.T) {
+	_, err := ConvertProxies([]Entry{ssEntry(t, "dup", ""), ssEntry(t, "dup", "")}, nil)
+	require.ErrorContains(t, err, "duplicate proxy")
+	_, err = ConvertProxies([]Entry{ssEntry(t, "DIRECT", "")}, nil)
+	require.ErrorContains(t, err, "reserved")
+}
+
+func TestConvertProxiesRejectsUnsupportedFieldsIncludingViaMerge(t *testing.T) {
+	_, err := ConvertProxies([]Entry{ssEntry(t, "a", ", dialer-proxy: other")}, nil)
+	require.ErrorContains(t, err, `unsupported field "dialer-proxy"`)
+	require.NotContains(t, err.Error(), "other", "field values must not be echoed")
+
+	// A field smuggled in through a YAML merge key is still caught.
+	doc, err := Parse([]byte(`
+proxies:
+  - &base {name: base, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p, smux: {enabled: true}}
+  - <<: *base
+    name: derived
+proxy-groups: []
+`))
+	require.NoError(t, err)
+	_, err = ConvertProxies(doc.Proxies, nil)
+	require.ErrorContains(t, err, `unsupported field "smux"`)
+
+	doc, err = Parse([]byte(`
+proxies:
+  - &base {name: base, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+  - <<: *base
+    name: derived
+`))
+	require.NoError(t, err)
+	nodes, err := ConvertProxies(doc.Proxies, nil)
+	require.NoError(t, err)
+	require.Len(t, nodes, 2)
 }
 
 func TestConvertProxiesErrorsNeverContainCredentials(t *testing.T) {

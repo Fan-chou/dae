@@ -125,6 +125,10 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
 - [x] 切片 3:`component/mihomo/document.go`——`Parse` 把 Mihomo YAML 解成按源顺序的文档模型(proxies/groups 保留节点,rule-providers/rules/sub-rules 类型化);新增旧实现没有的防护:别名展开节点数上限(200 万)、嵌套深度上限(64);错误信息不回显字段值。
 - [x] 切片 4:节点转换(`proxy.go`、`names.go`):anytls/ss(含 obfs/shadow-tls/v2ray-plugin)/socks5/hysteria2,名称清洗、重名与保留名检查,链接最终由 dae 自己的 dialer 解析器校验(注入式 `LinkValidator`)。
   - **对照基准已建立**:`hack/mihomo-oracle/gen_node_goldens.py` 用归档的旧 sidecar 对 `testdata/nodes/cases.yaml` 的 137 个单代理用例生成 `golden.json`(67 转换 / 70 拒绝);`TestProxyConversionMatchesArchivedSidecar` 要求接受/拒绝、安全名、协议、链接逐项一致。当前 137/137 一致,并用人为改坏验证过测试有效。
-  - **与旧行为保持一致、但应单独评估的点**(记入有意变更候选):① 中文等非 ASCII 节点名会清洗成 `n_01` 这类名字,不同地区的同号节点会撞名并使整份转换失败;② `dialer-proxy`、`tfo` 等未知字段被静默忽略(`dialer-proxy` 会改变真实出站路径);③ `node_resolve_dns` 覆盖尚未实现(待配置形态确定)。
+  - **有意偏离旧行为(2026-10-09 已决定,测试里以 `intentionalDeviations` 显式登记,过期会失败)**:
+    1. 代理里出现不认识的字段(`dialer-proxy`、`tfo`、`smux` 等,含经 YAML merge key 带入的)一律拒绝,报错只含代理名与字段名。旧 sidecar 的设计注释本意即拒绝(`ParseMihomoConfigStrict`),但整份路由订阅实际走的路径漏了严格模式。顶层未知键(`mixed-port`、`dns` 等)不影响路由,只记录不拒绝。放行清单待 220 真实订阅数据再定。
+    2. 撞名不再失败:内部名(`Node.Safe`)沿用原清洗结果——因为 `persist.d/group-selections/state.json` 按内部名保存 select 选择且只接受安全标识符,升级后必须仍然有效;只有撞名或清洗成保留名 `direct`/`block` 的才追加由**自身原名**哈希出的后缀,与顺序无关;展示名(`Node.Name`)始终是原名,保留 emoji/空格。单个不撞名的节点名与旧输出完全一致(金样本照常通过)。
+  - 仍待办:`node_resolve_dns` 覆盖(待配置形态确定)。
+- [ ] 展示名透出(新增切片):`config.Group`/节点需携带展示名,admin API(`control/admin_api.go`)与 web-next 展示 `display_name || name`,日志同理;内部标识仍用安全名。依赖切片 5(分组同样处理)。
 - [ ] 切片 5 起(分组转换:select/fallback/url-test)。
 - [ ] kdae 中旧入口(`tools/dae-rule-sync`、`Makefile` 目标、`openwrt/kdae-rule-sync`、`build-ipk.sh`)暂不删除,切换 223 时同一提交移除。

@@ -82,11 +82,14 @@ func (f proxyFields) sni() string {
 // declaration must not be hidden just because no group references it today.
 // Any proxy that cannot be lowered with identical semantics fails the whole
 // conversion. Errors never contain credentials.
+//
+// Node.Name keeps the original Mihomo name for display; Node.Safe is the
+// internal dae tag. Safe names are stable: they only change when two proxies
+// would otherwise share one (see assignSafeNames).
 func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
-	nodes := make([]Node, 0, len(entries))
+	names := make([]string, len(entries))
 	seen := make(map[string]struct{}, len(entries))
-	safeOwner := make(map[string]string, len(entries))
-	for _, entry := range entries {
+	for i, entry := range entries {
 		name := entry.Name
 		switch {
 		case strings.TrimSpace(name) == "":
@@ -100,16 +103,15 @@ func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
 			return nil, fmt.Errorf("duplicate proxy %q", name)
 		}
 		seen[name] = struct{}{}
-		safe := SafeNodeName(name)
-		if safe == "direct" || safe == "block" {
-			return nil, fmt.Errorf("proxy %q maps to reserved dae outbound %q", name, safe)
-		}
-		if other, taken := safeOwner[safe]; taken {
-			return nil, fmt.Errorf("proxies %q and %q map to the same dae node name %q", other, name, safe)
-		}
-		safeOwner[safe] = name
+		names[i] = name
 	}
-	for _, entry := range entries {
+	safe, err := assignSafeNames(names, SafeNodeName, nodeIdentifier, maxNodeNameLength)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := make([]Node, 0, len(entries))
+	for i, entry := range entries {
 		link, protocol, err := proxyLink(entry)
 		if err != nil {
 			return nil, err
@@ -123,7 +125,7 @@ func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
 				return nil, fmt.Errorf("proxy %q generated %s link cannot be parsed by dae", entry.Name, protocol)
 			}
 		}
-		nodes = append(nodes, Node{Name: entry.Name, Safe: SafeNodeName(entry.Name), Protocol: protocol, Link: link})
+		nodes = append(nodes, Node{Name: entry.Name, Safe: safe[i], Protocol: protocol, Link: link})
 	}
 	return nodes, nil
 }
@@ -132,6 +134,9 @@ func proxyLink(entry Entry) (link, protocol string, err error) {
 	protocol = strings.ToLower(strings.TrimSpace(entry.Type))
 	if protocol == "" {
 		return "", "", fmt.Errorf("proxy %q has empty type", entry.Name)
+	}
+	if field, bad := firstUnsupportedField(entry.Node, proxyFieldSet); bad {
+		return "", protocol, fmt.Errorf("proxy %q has unsupported field %q", entry.Name, field)
 	}
 	var f proxyFields
 	if err := entry.Node.Decode(&f); err != nil {
