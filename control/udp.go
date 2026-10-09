@@ -219,6 +219,15 @@ type DialOption struct {
 	FakeIPStore *FakeIPStore
 }
 
+// dnsFastPathPermitted reports whether port-53 traffic may be absorbed into
+// the DNS controller. A must_rules verdict (Must > 0) reserves the flow for
+// the routing result's outbound: the kernel already decided, and userspace
+// must forward the flow as plain traffic, matching the pre-fast-path
+// semantics where Must forces isDns=false.
+func dnsFastPathPermitted(routingResult *bpfRoutingResult) bool {
+	return routingResult == nil || routingResult.Must == 0
+}
+
 func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout time.Duration) {
 	if sniffDns {
 		var dnsmsg dnsmessage.Msg
@@ -707,10 +716,11 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		prefetchOK = false
 	}
 
-	// DNS to port 53 never reaches this point in production: the ingress
-	// task intercepts valid DNS messages and answers them before calling
-	// into the handlePkt chain (see udp_ingress_task.go). Port-53 packets
-	// that are not valid DNS simply take the normal UDP path below.
+	// Valid DNS to port 53 is answered by the ingress fast path before it
+	// reaches here, unless the routing verdict carries must (see
+	// dnsFastPathPermitted). Those flows are ordinary UDP: the kernel already
+	// chose the outbound, and userspace must not absorb them into the DNS
+	// controller. Port-53 packets that are not valid DNS also take this path.
 
 	var ue *UdpEndpoint
 	var ueExists bool
