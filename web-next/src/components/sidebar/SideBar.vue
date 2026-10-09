@@ -32,7 +32,11 @@
                 isSidebarCollapsed && 'justify-center',
                 'relative z-10 py-2',
               ]"
-              @click.passive="() => router.push({ name: r })"
+              :href="router.resolve({ name: r }).href"
+              :title="isSidebarCollapsed ? $t(r) : undefined"
+              :aria-label="$t(r)"
+              :aria-current="r === route.name ? 'page' : undefined"
+              @click.prevent="() => router.push({ name: r })"
             >
               <component
                 :is="ROUTE_ICON_MAP[r]"

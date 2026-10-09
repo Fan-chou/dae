@@ -22,12 +22,20 @@
     </div>
     <div class="w-full leading-snug break-words">
       <HighlightText :text="entry.message" :filter="logFilter" ansi />
+      <span
+        v-for="field in entry.fields.slice(0, inlineFields)"
+        :key="field.key"
+        class="ml-2 whitespace-nowrap text-xs text-base-content/50"
+        :title="field.key + '=' + field.value"
+        ><span class="text-base-content/35">{{ field.key }}</span
+        >={{ shorten(displayName(field.value)) }}</span
+      >
     </div>
     <details class="mt-1 text-xs">
       <summary class="cursor-pointer text-base-content/45">
         {{
-          entry.fields.length
-            ? entry.fields.length + ' 个字段 · 原始日志'
+          entry.fields.length > inlineFields
+            ? '全部 ' + entry.fields.length + ' 个字段 · 原始日志'
             : '原始日志'
         }}
       </summary>
@@ -53,6 +61,7 @@
 </template>
 
 <script setup lang="ts">
+import { displayName } from '@/fdae/client'
 import { parseLogEntry } from '@/fdae/log-entry'
 import { showNotification } from '@/helper/notification'
 import HighlightText from '@/components/common/HighlightText.vue'
@@ -66,6 +75,10 @@ const props = defineProps<{
   log: LogWithSeq
 }>()
 
+// Fields shown next to the message; the rest wait behind the summary.
+const inlineFields = 4
+const shorten = (value: string) =>
+  value.length > 48 ? value.slice(0, 47) + '…' : value
 const entry = computed(() => parseLogEntry(props.log.payload))
 async function copyRaw() {
   try {

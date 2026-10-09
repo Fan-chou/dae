@@ -10,6 +10,8 @@
     />
     <button
       class="btn btn-circle btn-sm"
+      :title="isSidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+      :aria-label="isSidebarCollapsed ? '展开侧栏' : '收起侧栏'"
       @click="isSidebarCollapsed = !isSidebarCollapsed"
     >
       <component
