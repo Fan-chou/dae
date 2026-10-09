@@ -1201,7 +1201,7 @@ R4 的 220→223 现场验收，与 `92a44aff`（跨族固定目标、替身重�
 #### 局限
 
 - 顺序运行的公网 RTT 样本不能隔离 dae 处理开销；QUIC 跨族场景的 enforce 阶段 A 与 B 的 p99 同时升到约 77～80 毫秒，其余阶段约 54 毫秒。
-- 只验证了 ssserver 的 SS AEAD；SS2022、Hysteria2、TUIC 与 CS2 仍不在执行范围。
+- 这四个场景只验证了 ssserver 的 SS AEAD；SS2022 随后单独补做（见下一节）。Hysteria2、TUIC、AnyTLS 与 CS2 仍不在执行范围。
 - QUIC 场景只用真实 Initial 提供 SNI，之后不是完整 QUIC 会话。
 - FakeIP 跨族固定目标在本环境无法自然产生：对只有 AAAA 的域名，dae 不返回 A 类型的 FakeIP。该路径只有本地测试覆盖。
 
@@ -1214,4 +1214,43 @@ R4 的 220→223 现场验收，与 `92a44aff`（跨族固定目标、替身重�
 `udp_reply_drought_mode: observe` 写在手工维护的 `/etc/dae/config.dae` 的 `global` 块（`local.dae` 由 luci-app-kdae 生成，不改）。不设客户端、分组和 peer，即观察所有客户端在所有代理分组上的 UDP；只记录证据，不重建。修改前备份为 `/etc/dae/config.dae.bak.202610091903`，校验通过后重载，dae 进程未重启。
 
 开启后从 220 发起一条经代理的 QUIC 测试流（www.google.com:443），快照记到 2 次写入、7 次回复，分组为 `Google`，覆盖状态为 `observed`。开启前已存在的流记为 `retained_owner_not_observed`。回滚：恢复上述备份并 `dae reload`，或把该行改为 `off`。
+
+### SS2022 自动重建（10 月 9 日）
+
+223 的生产节点是 SS2022、AnyTLS 和 Hysteria2，都不在执行范围内，所以先开了 observe。随后核实 SS2022 能否执行。
+
+#### 原因与修改
+
+`ss://` 链接即使使用 2022 密码，节点协议仍是 `shadowsocks`，已经算无状态代理；SS2022 不执行只因为 outbound 的 SS2022 UDP 连接没有实现 `PacketRecoveryCapabilities`。另外拨号器返回的 `FakeNetPacketConn` 以嵌入接口包住 `UdpConn`，接口外的方法传不出来，也会挡住声明。
+
+SS2022 UDP 的结构与 SS AEAD 一致：每个连接有自己的底层 UDP socket 和随机客户端会话 ID，新连接在服务端就是新会话；`WriteTo` 同步写底层 socket，每个数据报带目标地址；回包解出真实来源。
+
+- **outbound `0db0543`**（基于 kdae 锁定的 `8647a14`，分支 `codex/ss2022-udp-recovery`，已推送到 `Fan-chou/outbound`）：`UdpConn` 从底层 socket 继承“本地写完成”和“独立关联”，声明按地址写入与应用 peer；`FakeNetPacketConn` 原样转发。底层不是包传输时不作任何承诺。单测覆盖四种底层组合、两层包装、非包底层，以及经真实直连拨号器的三种 2022 密码；去掉包装层声明时测试失败。
+- **kdae `6e7fb8b4`**：依赖改为 `v0.0.0-sticky-ip.0.20261009111629-0db0543ddc65`。重建夹具新增 SIP022 AES-256-GCM 服务端（AES 块加密分离头、按会话 ID 派生子密钥、服务端会话与客户端会话分开），节点协议名与生产一致设为 `shadowsocks`。真实代理隔离、映射池开启的 native peer、固定目标、IPv6、跨族、FakeIP 六组用例都加入 SS2022 并通过；临时去掉 outbound 的 `UdpConn` 声明后 SS2022 用例失败。整个 `./control/` 的 `-race` 通过。每包路径没有变化（能力只在资格判断时读取），不做延迟对照。
+
+#### 部署
+
+223 由 `4ec20f5d` 升级为 `6e7fb8b4`（`unstable-20261009.r1287.6e7fb8b4`，SHA-256 `48ce21fa…c5ebf1b`），旧版备份 `/usr/bin/dae.bak.202610091920`；安装前新二进制校验现有配置通过。生产 observe 保持。
+
+#### 现场验收
+
+方法同上一节，中继改为临时 shadowsocks-rust ssserver，`2022-blake3-aes-256-gcm`，链接密码按百分号编码。生产 `config.dae` 的 observe 行在试验副本里临时去掉，避免与试验写入 `local.dae` 的模式冲突，还原时恢复。一次准备跑两场：
+
+| 场景 | 原始地址 | 实际目标 | enforce 阶段 B（发／收） | 回复中断 |
+| --- | --- | --- | ---: | ---: |
+| native（FullCone） | `185.248.186.73:46672` | 同左 | 550／379 | 34.4 秒 |
+| FakeIP 固定目标 | FakeIP `28.0.22.240:46672` | `185.248.186.73:46672` | 550／379 | 34.4 秒 |
+
+两场的共同结果与 SS AEAD 场景一致：A 在所有阶段 100% 回复；observe 不重建；enforce 恰好一次开始、提交、恢复（三次新回复）；归档无缺口和错误，候选证据校验通过；服务端无丢失、重放、重复或乱序。FakeIP 场景提交类型为 `resolve_dns_fakeip`，后继持有 1 个引用。
+
+native 场景中，服务端按客户端会话分配出站 socket，A 和 B 起初共用一个映射（源端口 16557）；重建后只有 B 换到新会话（9391），A 留在原会话。
+
+还原后三个配置文件与试验前副本逐字节一致，生产 observe 行恢复，模式为 observe，dae 进程（pid 3740）未重启；看门狗已停，临时凭据已删，服务器无残留。
+
+#### 局限与开启 enforce 的前提
+
+- 只验证了 shadowsocks-rust 服务端。223 的生产 SS2022 节点由第三方服务端提供，其会话与映射行为没有现场证据。
+- enforce 仍要求单个客户端 IP、精确分组、明确的服务器 `IP:端口` 列表与 `request_reply` 契约；只有确实对每个请求作出回复的服务才适合，CS2 SDR 等不透明游戏流量不适合。
+
+产物在 `build/udp-field-20261009/ss2022/`，`manifest.json` 已补充。
 
