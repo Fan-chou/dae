@@ -8,7 +8,8 @@ config dae 'config'
 	option admin_listen '192.168.124.223:2025'
 	option admin_secret ''
 	option mihomo_config ''
-	option generation_dir '/etc/dae'
+	# option mihomo_interval '1h'
+	# option isolate_transport_groups 'YouTube,Netflix'
 
 # config subscription
 #	option tag 'main'
@@ -16,7 +17,7 @@ config dae 'config'
 #	option role 'routing'
 #	option persist '1'
 
-# 混入配置：每个节点单独一条。同步时写进节点链接 ?resolve_dns=
+# 混入配置：每个节点单独一条。同步时写进 mihomo { node_resolve_dns } ,名字是 Mihomo 源里的节点名
 # config mixin
 #	option name '🇺🇸 US | Hysteria2'
 #	option resolve_dns '8.8.8.8'

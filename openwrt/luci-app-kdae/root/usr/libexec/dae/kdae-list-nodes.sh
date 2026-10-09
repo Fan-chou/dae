@@ -1,24 +1,16 @@
 #!/bin/sh
-# Print mihomo.node_name_map as JSON. No node URIs or credentials.
-# Used by LuCI so rpcd does not have to read a symlinked metadata.json.
+# Print the nodes that came from the Mihomo routing source as a JSON object
+# {"name in the source": "name in dae"}. Asks the running dae; prints {} when it
+# is not running. No node links or credentials are involved.
 
 set -eu
-META=""
-if [ -f /etc/dae/current/metadata.json ]; then
-	META=/etc/dae/current/metadata.json
-elif [ -f /etc/dae/metadata.json ]; then
-	META=/etc/dae/metadata.json
-else
-	printf '%s\n' '{}'
-	exit 0
-fi
-
-if command -v jsonfilter >/dev/null 2>&1; then
-	out=$(jsonfilter -i "$META" -e '@.mihomo.node_name_map' 2>/dev/null || true)
-	if [ -n "$out" ]; then
-		printf '%s\n' "$out"
+CONFIG=$(uci -q get dae.config.config_file || echo /etc/dae/config.dae)
+out=$(/usr/bin/dae mihomo status -c "$CONFIG" 2>/dev/null || true)
+if [ -n "$out" ] && command -v jsonfilter >/dev/null 2>&1; then
+	names=$(printf '%s' "$out" | jsonfilter -e '@.node_names' 2>/dev/null || true)
+	if [ -n "$names" ]; then
+		printf '%s\n' "$names"
 		exit 0
 	fi
 fi
-
 printf '%s\n' '{}'

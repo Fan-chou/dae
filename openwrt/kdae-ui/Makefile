@@ -36,6 +36,8 @@ define Package/kdae-ui/install
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/www/kdae-ui/ca
 	$(INSTALL_BIN) ./files/kdae-ui-cert $(1)/usr/sbin/kdae-ui-cert
 	$(INSTALL_DATA) ./files/ca-index.html $(1)/www/kdae-ui/ca/index.html
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	echo /etc/kdae-ui > $(1)/lib/upgrade/keep.d/kdae-ui
 endef
 
 # Issue the local CA and a Safari-compliant leaf certificate for uhttpd, and

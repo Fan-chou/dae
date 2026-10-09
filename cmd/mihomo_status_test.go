@@ -34,8 +34,20 @@ func TestMihomoWarning(t *testing.T) {
 
 func TestMihomoStatusCommandReadsRunningDaemon(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/status" || r.Header.Get("Authorization") != "Bearer s3cret" {
+		if r.Header.Get("Authorization") != "Bearer s3cret" {
 			http.Error(w, "no", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/v1/config/effective" {
+			_ = json.NewEncoder(w).Encode(EffectiveConfig{Nodes: []EffectiveNode{
+				{Tag: "HK_01", DisplayName: "🇭🇰 HK 01", Origin: originMihomo},
+				{Tag: "plain", Origin: originMihomo},
+				{Tag: "mine", Origin: originConfig},
+			}})
+			return
+		}
+		if r.URL.Path != "/v1/status" {
+			http.NotFound(w, r)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -55,7 +67,10 @@ func TestMihomoStatusCommandReadsRunningDaemon(t *testing.T) {
 	if err := mihomoStatus(context.Background(), cfg, &out); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"generation": "g1"`, `"sync_warning": "careful"`, `"nodes": 3`} {
+	if strings.Contains(out.String(), `"mine"`) {
+		t.Errorf("a node from the configuration is listed as a Mihomo node:\n%s", out.String())
+	}
+	for _, want := range []string{`"generation": "g1"`, `"sync_warning": "careful"`, `"nodes": 3`, `"🇭🇰 HK 01": "HK_01"`, `"plain": "plain"`} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output lacks %s:\n%s", want, out.String())
 		}

@@ -11,7 +11,6 @@ STRIP ?= llvm-strip
 CFLAGS := -O2 -Wall -Werror $(CFLAGS)
 TARGET ?= bpfel,bpfeb
 OUTPUT ?= dae
-RULE_SYNC_OUTPUT ?= build/dae-rule-sync
 MAX_MATCH_SET_LEN ?= 1024
 CFLAGS := -DMAX_MATCH_SET_LEN=$(MAX_MATCH_SET_LEN) $(CFLAGS)
 DEFAULT_GOEXPERIMENT := heapminimum512kib,randomizedheapbase64
@@ -56,7 +55,7 @@ endif
 
 BUILD_ARGS := -trimpath -ldflags "-s -w -X github.com/daeuniverse/dae/cmd.Version=$(VERSION) -X github.com/daeuniverse/dae/common/consts.MaxMatchSetLen_=$(MAX_MATCH_SET_LEN)" $(BUILD_ARGS)
 
-.PHONY: clean-ebpf ebpf ebpf-config ebpf-sync ebpf-sync-check ebpf-test ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae dae-rule-sync submodule submodules test test-race print-go-env
+.PHONY: clean-ebpf ebpf ebpf-config ebpf-sync ebpf-sync-check ebpf-test ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae submodule submodules test test-race print-go-env
 
 ## Begin Dae Build
 dae: export GOOS=linux
@@ -67,12 +66,6 @@ dae: ebpf
 	@echo $(CFLAGS)
 	go build -tags=$(shell cat $(BUILD_TAGS_FILE)) -o $(OUTPUT) $(BUILD_ARGS) .
 ## End Dae Build
-
-## Begin Rule Sync Build
-dae-rule-sync:
-	@mkdir -p $(dir $(RULE_SYNC_OUTPUT))
-	go build -trimpath -o $(RULE_SYNC_OUTPUT) ./tools/dae-rule-sync
-## End Rule Sync Build
 
 ## Begin Git Submodules
 .gitmodules.d.mk: .gitmodules

@@ -28,7 +28,7 @@ endef
 
 define Package/luci-app-kdae/description
   Start/stop/restart, crash recover (purge leftover eBPF), validate, reload,
-  rule-sync warnings, and a link to /kdae-ui/. Node URI editing is omitted.
+  Mihomo source status, and a link to /kdae-ui/. Node URI editing is omitted.
 endef
 
 define Package/luci-app-kdae/conffiles
@@ -50,6 +50,8 @@ define Package/luci-app-kdae/install
 	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-write-local.sh $(1)/usr/libexec/dae/kdae-write-local.sh
 	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-log-tail.sh $(1)/usr/libexec/dae/kdae-log-tail.sh
 	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-list-nodes.sh $(1)/usr/libexec/dae/kdae-list-nodes.sh
+	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-status.sh $(1)/usr/libexec/dae/kdae-status.sh
+	$(INSTALL_BIN) ./root/usr/libexec/dae/kdae-migrate-mihomo.sh $(1)/usr/libexec/dae/kdae-migrate-mihomo.sh
 endef
 
 $(eval $(call BuildPackage,luci-app-kdae))

@@ -164,28 +164,48 @@ func mihomoStatus(ctx context.Context, cfgPath string, w io.Writer) error {
 	if listen == "" {
 		return fmt.Errorf("admin_listen is not set; the status is served by the admin API")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+"/v1/status", nil)
-	if err != nil {
-		return err
-	}
-	if conf.Global.AdminSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+conf.Global.AdminSecret)
-	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		return fmt.Errorf("dae is not reachable at %s: %w", listen, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("admin API answered %s", resp.Status)
+	get := func(path string, into any) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+path, nil)
+		if err != nil {
+			return err
+		}
+		if conf.Global.AdminSecret != "" {
+			req.Header.Set("Authorization", "Bearer "+conf.Global.AdminSecret)
+		}
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("dae is not reachable at %s: %w", listen, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("admin API answered %s for %s", resp.Status, path)
+		}
+		return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(into)
 	}
 	var body struct {
 		Generation  string       `json:"generation"`
 		SyncWarning string       `json:"sync_warning"`
 		Mihomo      MihomoStatus `json:"mihomo"`
+		// NodeNames maps the name a node has in the Mihomo source to its
+		// name in dae, for the nodes that came from that source.
+		NodeNames map[string]string `json:"node_names"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+	if err := get("/v1/status", &body); err != nil {
 		return err
+	}
+	var view EffectiveConfig
+	if err := get("/v1/config/effective", &view); err == nil {
+		body.NodeNames = map[string]string{}
+		for _, n := range view.Nodes {
+			if n.Origin != originMihomo {
+				continue
+			}
+			name := n.DisplayName
+			if name == "" {
+				name = n.Tag
+			}
+			body.NodeNames[name] = n.Tag
+		}
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

@@ -34,10 +34,9 @@ export TMPDIR="$ROOT/build/tmp"
 mkdir -p "$TMPDIR"
 cd "$ROOT"
 
-echo ">> building dae and dae-rule-sync ($VERSION)"
+echo ">> building dae ($VERSION)"
 : > /tmp/kdae-empty-build-tags
 make dae OUTPUT="$ROOT/build/dae" BUILD_TAGS_FILE=/tmp/kdae-empty-build-tags
-make dae-rule-sync RULE_SYNC_OUTPUT="$ROOT/build/dae-rule-sync"
 
 pack_ipk() {
 	pkg=$1
@@ -102,20 +101,6 @@ Conffiles:
 " "$kdae_data"
 rm -rf "$kdae_data"
 
-# --- kdae-rule-sync ---
-sync_data=$(mktemp -d)
-mkdir -p "$sync_data/usr/libexec/dae"
-install -m 0755 "$ROOT/build/dae-rule-sync" "$sync_data/usr/libexec/dae/dae-rule-sync"
-pack_ipk kdae-rule-sync "$ARCH" "Package: kdae-rule-sync
-Version: $PKGVER
-Depends: libc, kdae
-Section: net
-Architecture: $ARCH
-Maintainer: kdae local feed
-Description: Mihomo-to-kdae generation publisher.
-" "$sync_data"
-rm -rf "$sync_data"
-
 # --- luci-app-kdae ---
 luci_data=$(mktemp -d)
 mkdir -p "$luci_data/usr/share/luci/menu.d" \
@@ -134,6 +119,10 @@ install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-write-loc
 	"$luci_data/usr/libexec/dae/kdae-write-local.sh"
 install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-list-nodes.sh" \
 	"$luci_data/usr/libexec/dae/kdae-list-nodes.sh"
+install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-status.sh" \
+	"$luci_data/usr/libexec/dae/kdae-status.sh"
+install -m 0755 "$ROOT/openwrt/luci-app-kdae/root/usr/libexec/dae/kdae-migrate-mihomo.sh" \
+	"$luci_data/usr/libexec/dae/kdae-migrate-mihomo.sh"
 pack_ipk luci-app-kdae all "Package: luci-app-kdae
 Version: $PKGVER
 Depends: libc, kdae
@@ -141,7 +130,7 @@ Conflicts: luci-app-dae
 Section: luci
 Architecture: all
 Maintainer: kdae local feed
-Description: LuCI for kdae start/stop/restart, crash recover, validate, reload, and rule-sync.
+Description: LuCI for kdae start/stop/restart, crash recover, validate, reload, and the Mihomo source status.
 " "$luci_data"
 rm -rf "$luci_data"
 
@@ -161,9 +150,14 @@ fi
 	FONT=${FONT:-none} "$PNPM" build
 )
 ui_data=$(mktemp -d)
-mkdir -p "$ui_data/www/kdae-ui/assets" "$ui_data/www/cgi-bin"
+mkdir -p "$ui_data/www/kdae-ui/assets" "$ui_data/www/kdae-ui/ca" "$ui_data/www/cgi-bin" \
+	"$ui_data/usr/sbin" "$ui_data/lib/upgrade/keep.d"
 cp -a "$KDAE_UI_DIR/dist/." "$ui_data/www/kdae-ui/"
 install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-proxy.cgi" "$ui_data/www/cgi-bin/kdae-proxy"
+install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-ui-cert" "$ui_data/usr/sbin/kdae-ui-cert"
+install -m 0644 "$ROOT/openwrt/kdae-ui/files/ca-index.html" "$ui_data/www/kdae-ui/ca/index.html"
+# The local CA must survive sysupgrade, or every device has to trust it again.
+printf '/etc/kdae-ui\n' > "$ui_data/lib/upgrade/keep.d/kdae-ui"
 if [ -e "$ui_data/www/kdae-ui/vue.global.prod.js" ] || [ -e "$ui_data/www/kdae-ui/app.js" ]; then
 	echo "kdae-ui ipk must not ship vue.global.prod.js or app.js" >&2
 	rm -rf "$ui_data"
@@ -176,12 +170,22 @@ if ! grep -Eq '(\./|/kdae-ui/)assets/[^" ]+\.js' "$ui_data/www/kdae-ui/index.htm
 fi
 pack_ipk kdae-ui all "Package: kdae-ui
 Version: $PKGVER
-Depends: libc
+Depends: libc, curl, openssl-util
 Section: net
 Architecture: all
 Maintainer: kdae local feed
-Description: Vue panel for kdae /v1 (not Clash-compatible).
-" "$ui_data"
+Description: Vue panel for kdae /v1 (not Clash-compatible), with a local CA for HTTPS.
+" "$ui_data" '#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/usr/sbin/kdae-ui-cert || echo "kdae-ui: certificate setup failed; run kdae-ui-cert" >&2
+if ! grep -q kdae-ui-cert /etc/crontabs/root 2>/dev/null; then
+	echo "17 4 * * * /usr/sbin/kdae-ui-cert >/dev/null 2>&1" >> /etc/crontabs/root
+	/etc/init.d/cron restart >/dev/null 2>&1 || true
+fi
+exit 0' '#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+sed -i "/kdae-ui-cert/d" /etc/crontabs/root 2>/dev/null
+exit 0'
 rm -rf "$ui_data"
 
 # Packages index (unsigned until publish-feed.sh signs on the router)

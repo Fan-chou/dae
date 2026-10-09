@@ -1,6 +1,6 @@
 # 配置与规则获取重构设计(草案)
 
-> 状态:设计草案,尚未实现。目标是去掉对外部二进制 `dae-rule-sync` 和 OpenWrt shell 脚本的依赖。
+> 状态:已实现(转换层、`mihomo {}`、状态 API、OpenWrt 脚本、旧入口移除),待 220 实机验证后切换 223。目标是去掉对外部二进制 `dae-rule-sync` 和 OpenWrt shell 脚本的依赖。
 
 ## 1. 现状
 
@@ -132,7 +132,7 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
 - [x] 切片 7:接入 `readConfig` 与刷新(`cmd/mihomo_source.go`)。`mihomo {}` 段启用时:经 `ruleprovider.FetchDocument` 读取源(校验函数 = 解析 + 完整转换 + 用 dae 自己的 dialer 解析每个节点链接,所以只有"能转换"的文本才可能成为 last-good),转换后合并进 `conf`:节点以 `安全名:链接` 追加,分组追加,规则集声明追加,规则**接在手写 `routing` 规则之后**(手写规则优先,与原 OpenWrt 布局一致),Mihomo 的 `MATCH` 成为 fallback。与手写的组名/节点标签/规则集名冲突一律报错,不静默覆盖;`mihomo-routing` 为规则集保留名。源读取失败、内容无效或不可转换时沿用 last-good,状态里 `used_last_good`;完全没有可用副本则 `readConfig` 失败。`mihomo {}` 新增 `isolate_transport_groups` 与 `node_resolve_dns`(条目写作 `'名字=服务器'`,因为配置语法不允许带空格/emoji 的键)。刷新:`ruleProviderRefreshInterval` 纳入 `mihomo.interval`,`holder.refresh` 同时刷新源,源变化即触发 reload(重载时 `readConfig` 再合并一次)。`CurrentMihomoStatus()` 记录最近一次的来源(去掉查询串)、时间、是否 last-good、错误、各类数量、被跳过的规则、未使用的规则集、被忽略的顶层键,订阅 URL 的 token 不会出现在错误或状态里。`cmd` 包测试现在可运行(此前受缺失的 eBPF 生成文件阻塞,现已不再阻塞):7 个新测试覆盖合并顺序、last-good(无效更新/源消失/有效更新)、名称冲突、保留名、token 脱敏、未启用、刷新间隔,`go test ./cmd ./config ./component/... ./pkg/config_parser ./tools/...` 全部通过。
   - **首次启动无网络**:没有缓存副本时 `readConfig` 失败(与规则集首次加载一致)。迁移时升级发生在联网状态,首次启动会拉取;若要容忍离线首启,需要用旧 generation 之外的途径预置缓存,尚未做。
 - [x] 切片 8:转换结果可查看。① `dae mihomo preview -c <config>`:只读,打印 Mihomo 源转换出的节点(只含协议与 host:port,不含链接和凭据)、分组(含展示名与包装分组)、规则集、规则(`route_expr` 解码成可读的与/或/非,长值列表截断)、fallback、被跳过/忽略的规则及原因、未使用的规则集,并说明与配置里已有内容的合并顺序;不应用任何东西,若会重名冲突会明确指出。② admin API `GET /v1/config/effective`(需 admin 认证,仅 GET):返回**当前正在运行**的最终配置的只读视图——每个节点/分组/规则集/规则都标 `origin`(`config` 手写或 `mihomo`),分组与节点带展示名,规则集以 `ruleset(name)` 形式显示而不展开成每条目一条规则,fallback 标明来自哪里,附带 Mihomo 源状态与被跳过的规则;`?format=text` 返回同内容的纯文本。视图在规则集展开之前生成,只在配置真正生效时(启动完成、分代切换成功)发布,读取过但未运行的配置(校验、失败的重载)不会冒充生效配置。订阅里的节点在启动时才拉取,不在视图里,只显示订阅数量。凭据保证:有测试断言 JSON 和文本里不含密码、`ss://`、`socks5://`、加密方式。
-- [ ] 展示名透出(新增切片):`config.Group`/节点需携带展示名,admin API(`control/admin_api.go`)与 web-next 展示 `display_name || name`,日志同理;内部标识仍用安全名。依赖切片 5(分组同样处理)。
+- [x] 展示名透出:`/v1/groups` 附带 `display_names`(内部名→原名,仅列出不同的),web-next 在代理组/节点/连接链/范围筛选处显示原名(含 emoji),内部名仍是标识。日志里仍是内部名。
 - [x] 切片 5:分组转换(`groups.go`、`names_assign.go`、`config.DecodeGroups`):select/fallback/url-test,成员顺序、`DIRECT`/`REJECT`、嵌套(环与深度 32 上限)、健康检查选项、`x-kdae-quality`、`isolate_transport`。输出直接是 `config.Group`(经 `DecodeGroups` 应用与文本解析相同的默认值和 presence 位),不经过 `.dae` 文本。`hack/mihomo-oracle/gen_group_goldens.py` 对 68 个用例生成金样本(30 转换 / 38 拒绝),测试把金样本的 `groups.dae` 交给 dae 自己的解析器后与内存结果逐字段比较;68/68 一致,3 处人为改坏均被发现。
   - 有意偏离(`groupDeviations` 显式登记):① 分组里不认识的字段一律拒绝(`include-all`、`filter`、`interface-name`、`disable-udp` 等会改变成员或传输;仅 `hidden`、`icon` 这类纯展示字段放行);② 分组内部名撞名,或与节点内部名撞名,改为追加哈希后缀(节点优先保留原名,分组让位),展示名 `Group.Name` 仍是原名。
   - 与 Mihomo 语义一致仍保持拒绝:同名的代理与分组、`direct`/`reject`/`block` 作分组名、`load-balance`/`relay`、`use:`(proxy-providers)、空成员、重复成员、未知成员、环。
@@ -164,4 +164,9 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
   - **发现的旧 sidecar 缺陷(已作为有意偏离登记)**:dae 的解析器不会反转义双引号字符串里的 `\\`,而旧 sidecar 写 `routes.dae` 时把每个反斜杠写成两个,于是 dae 读回的正则带双反斜杠(`\\.` 匹配"字面反斜杠+任意字符"而非"字面点号")。**现网 220/223 上凡含 `\.` 的 `DOMAIN-REGEX` 和全部 `DOMAIN-WILDCARD` 规则实际都匹配不到任何域名。** 进程内转换不经过文本,保持原意。**根因与修复(2026-10-09)**:`config_parser.Param.String` 用 `strconv.Quote` 输出,而解析器按引号内原文读取、不做任何反转义,输出与解析不对称;`config/marshal.go` 同样。已新增 `config_parser.QuoteLiteral`(优先双引号,含 `"` 时用单引号,无法忠实表示的值——同时含两种引号、控制字符、非法 UTF-8、以反斜杠结尾——回退原 `strconv.Quote`),`Param.String` 与 `Marshal` 改用它;普通值输出与此前逐字相同,只有含反斜杠/双引号的值变化。用当前代码重建的 sidecar 实测:dae 读回的正则从 `^.*\\.example\\.org$`(双反斜杠)变为 `^.*\.example\.org$`,并有回归测试。**只需重新打包 `kdae-rule-sync`(以及 dae)即可在 220/223 上修复现网规则,不必等切换**;修复后这类规则从"不生效"变为"生效",可能改变现有流量走向,发布说明需列出。
   - 已知旧行为(保持一致,已被金样本固化):合并后的规则数仍达上限时,后续规则(包括 `MATCH`)被丢弃并记一次 skip,导致没有 fallback、回落为 `direct`(触顶条件已放宽,见上);指向不存在 outbound 的规则只记日志并跳过;规则全部被跳过且无 `MATCH` 时,旧实现整份失败("produced no routes"),此判断归 6e 装配阶段。
   - **旧 sidecar 的跳过/忽略语义**(必须原样保留,属用户指定的兼容策略,不与"未知字段拒绝"混淆):被忽略的条件等价于恒假——`AND` 里含 `IN-PORT`/`IP-ASN` 则整条丢弃,`OR` 里只去掉该分支;`GEO*` 等无法降级的单条规则跳过;指向不存在 outbound 的规则被跳过(只记日志);`match-mac` 忽略,`REJECT-DROP`→`block`;活动 `SCRIPT`、未声明的 RULE-SET、缺少条件的规则整份失败。旧实现只在 stderr 日志里记录跳过/忽略,stdout 报告里 `Skipped` 恒为 0,所以金样本要抓取 stderr 事件,新实现用结构化 `Report` 承载。
-- [ ] kdae 中旧入口(`tools/dae-rule-sync`、`Makefile` 目标、`openwrt/kdae-rule-sync`、`build-ipk.sh`)暂不删除,切换 223 时同一提交移除。
+- [x] 状态 API 与 OpenWrt 收尾:`/v1/status` 带 `mihomo` 状态并据此给出 `sync_warning`,不再读 `/var/run/kdae-last-sync.json`;`dae mihomo status -c` 向运行中的 dae 查询(含 Mihomo 源节点名映射,供 LuCI 的 resolve_dns 表);`kdae-write-local.sh` 直接把 UCI 写成 `local.dae`(`subscription {}` + `mihomo {}`,含 `node_resolve_dns`、`isolate_transport_groups`);`kdae-sync.sh` 缩成"写入→validate→失败回滚→hot_reload",有 `kdae-sync_test.sh`;`kdae-migrate-mihomo.sh` 一次性改写已部署的 `config.dae` 的 include。
+- [x] 离线首启(§3):冷启动时远程订阅读不到且没有旧副本,不再因此起不来,而是不带路由源运行、状态标 `degraded`、每 2 分钟重试(`RefreshLifecycle.NextInterval`);重载与"编辑后校验"仍严格失败,拼错 URL 不会替换正在工作的路由。本地文件源损坏仍直接失败。
+- [x] 订阅 URL 脱敏加强:token 常在路径里,状态与错误里只显示 scheme+host,错误文本里的路径与查询被抹去(`Mihomo.ScrubSecrets`)。
+- [x] 旧入口已移除:`tools/dae-rule-sync`、`openwrt/kdae-rule-sync`、`Makefile` 的 `dae-rule-sync` 目标、`build-ipk.sh` 相关段。归档仓库 `/root/dev/dae-rule-sync` 保留。
+- [ ] geo `.dat` 进程内获取(可选,见 §2.4):原生规则集已覆盖订阅用到的场景,手写 `geoip()/geosite()` 才需要。
+- [ ] 220 实机验证(真实订阅)→ 切 223。

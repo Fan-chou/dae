@@ -1,8 +1,8 @@
 # kdae 主配置：尽量对齐 223 上的 Nikki（Mihomo TUN + LAN 透明代理）。
 #
 # 网卡 / admin_listen / 仅节点订阅由 LuCI 写入 local.dae，不要在这里重复。
-# 节点、组和分流来自 dae-rule-sync 的当前 generation。
-# DAT 通过 /etc/dae/generated -> current/generated。
+# 完整 Mihomo 配置（节点、组、分流）由 dae 自己拉取、转换并并入：订阅或本地文件
+# 写在 local.dae 的 mihomo {} 段里。下面手写的 routing 规则排在它前面，优先匹配。
 #
 # 切流前：先停 Nikki，再启用 kdae。不要两套同时做透明代理。
 # 192.168.124.222 上的 Clash 要留着（部分节点是指向它的 socks5）。
@@ -10,9 +10,6 @@
 
 include {
     local.dae
-    current/nodes.dae
-    current/groups.dae
-    routing.dae
 }
 
 global {
@@ -78,7 +75,7 @@ dns {
     }
 }
 
-# 下面这些规则排在 generation 分流之前（include 会把 routing.dae 接到后面）。
+# 下面这些规则排在 Mihomo 源的分流之前；Mihomo 的 MATCH 成为兜底。
 routing {
     # 组播 / 链路本地，避免被代理。
     dip(224.0.0.0/3, 'ff00::/8') -> must_direct
