@@ -75,6 +75,9 @@ type lowerer struct {
 	events []Event
 	logged map[string]struct{}
 	cur    *parsedRule
+	// noCompact disables merging of adjacent compatible rules. Only tests set
+	// it, to prove that merging does not change what a program matches.
+	noCompact bool
 }
 
 func newLowerer(env RuleEnv) *lowerer {
@@ -83,6 +86,14 @@ func newLowerer(env RuleEnv) *lowerer {
 		limit = DefaultMaxExpandedRules
 	}
 	return &lowerer{env: env, limit: limit, logged: map[string]struct{}{}}
+}
+
+// outRule is one dae rule on its way out. ordered is set for rules that keep
+// their evaluation order; they are encoded to route_expr only once merging is
+// done, because merging works on the expression tree.
+type outRule struct {
+	rule    *config_parser.RoutingRule
+	ordered *routing.OrderedExpr
 }
 
 func (l *lowerer) record(kind EventKind, key, reason string) {
@@ -100,6 +111,10 @@ func (l *lowerer) record(kind EventKind, key, reason string) {
 // rule that parses but has no exact dae equivalent is skipped and reported in
 // Events, which is the compatibility policy for individual rules.
 func LowerRules(rules []Rule, subRules []SubRule, env RuleEnv) (*LoweredRules, error) {
+	return lowerRules(rules, subRules, env, false)
+}
+
+func lowerRules(rules []Rule, subRules []SubRule, env RuleEnv, noCompact bool) (*LoweredRules, error) {
 	top, err := parseRuleList(rules)
 	if err != nil {
 		return nil, err
@@ -118,7 +133,9 @@ func LowerRules(rules []Rule, subRules []SubRule, env RuleEnv) (*LoweredRules, e
 	if err != nil {
 		return nil, err
 	}
-	return newLowerer(env).lowerTop(expanded)
+	l := newLowerer(env)
+	l.noCompact = noCompact
+	return l.lowerTop(expanded)
 }
 
 func parseRuleList(rules []Rule) ([]*parsedRule, error) {
@@ -135,7 +152,7 @@ func parseRuleList(rules []Rule) ([]*parsedRule, error) {
 
 func (l *lowerer) lowerTop(rules []*parsedRule) (*LoweredRules, error) {
 	out := &LoweredRules{}
-	var all []*config_parser.RoutingRule
+	var all []*outRule
 	for _, rule := range rules {
 		l.cur = rule
 		remaining := l.limit - len(all)
@@ -152,11 +169,21 @@ func (l *lowerer) lowerTop(rules []*parsedRule) (*LoweredRules, error) {
 		case err != nil:
 			return nil, err
 		}
-		all = append(all, lowered...)
+		for _, r := range lowered {
+			all = l.appendCompact(all, r)
+		}
 	}
 	// A MATCH is a first-match catch-all: it becomes the fallback and any
 	// later rule is unreachable.
-	for _, rule := range all {
+	for _, item := range all {
+		rule := item.rule
+		if item.ordered != nil {
+			f, err := encodeOrdered(item.ordered)
+			if err != nil {
+				return nil, err
+			}
+			rule.AndFunctions = []*config_parser.Function{f}
+		}
 		if len(rule.AndFunctions) == 0 {
 			if out.Fallback == "" {
 				out.Fallback = rule.Outbound.Name
@@ -172,7 +199,7 @@ func (l *lowerer) lowerTop(rules []*parsedRule) (*LoweredRules, error) {
 	return out, nil
 }
 
-func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*config_parser.RoutingRule, error) {
+func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*outRule, error) {
 	if err := validateRuleOptions(rule.expr, rule.action); err != nil {
 		return nil, err
 	}
@@ -192,17 +219,11 @@ func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*config_parser.Routi
 		if err != nil {
 			return nil, err
 		}
-		f := oe.Atom
-		if oe.Op != "atom" || oe.MemoID != 0 {
-			if f, err = routing.EncodeOrderedExpr(oe); err != nil {
-				return nil, err
-			}
-		}
 		out, err := l.action(rule.action)
 		if err != nil {
 			return nil, err
 		}
-		return []*config_parser.RoutingRule{{AndFunctions: []*config_parser.Function{f}, Outbound: *out}}, nil
+		return []*outRule{{rule: &config_parser.RoutingRule{Outbound: *out}, ordered: oe}}, nil
 	}
 
 	terms, err := l.terms(e, false, limit)
@@ -216,11 +237,20 @@ func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*config_parser.Routi
 	if len(terms) > limit {
 		return nil, unsupported("expanded routing rules exceed %d", limit)
 	}
-	rules := make([]*config_parser.RoutingRule, 0, len(terms))
+	rules := make([]*outRule, 0, len(terms))
 	for _, term := range terms {
-		rules = append(rules, &config_parser.RoutingRule{AndFunctions: term, Outbound: *out})
+		rules = append(rules, &outRule{rule: &config_parser.RoutingRule{AndFunctions: term, Outbound: *out}})
 	}
 	return rules, nil
+}
+
+// encodeOrdered turns an ordered tree into the function placed in a rule: a
+// bare atom stays a plain function, anything else becomes route_expr.
+func encodeOrdered(oe *routing.OrderedExpr) (*config_parser.Function, error) {
+	if oe.Op == "atom" && oe.MemoID == 0 {
+		return oe.Atom, nil
+	}
+	return routing.EncodeOrderedExpr(oe)
 }
 
 // needsOrdered reports whether the expression must keep its evaluation order
@@ -311,10 +341,12 @@ func (l *lowerer) terms(e *expr, negated bool, limit int) ([]term, error) {
 			if err != nil {
 				return nil, err
 			}
-			if len(t) > limit-len(result) {
-				return nil, unsupported("expanded routing rules exceed %d", limit)
+			for _, item := range t {
+				result = l.appendTerm(result, item)
+				if len(result) > limit {
+					return nil, unsupported("expanded routing rules exceed %d", limit)
+				}
 			}
-			result = append(result, t...)
 		}
 		return result, nil
 	}

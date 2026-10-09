@@ -15,8 +15,10 @@ const (
 	// MaxSubRuleDepth bounds nested SUB-RULE calls from a top-level rule.
 	MaxSubRuleDepth = 32
 	// MaxCompiledRules bounds the rules after expansion, ordinary top-level
-	// rules included.
-	MaxCompiledRules = 1024
+	// rules included. It only protects the converter from a hostile document;
+	// the budget that matters for dae is DefaultMaxExpandedRules, applied to
+	// the rules that remain after adjacent ones are merged.
+	MaxCompiledRules = 50000
 )
 
 // Sentinels for SubRuleError.Kind. A document that trips one of these cannot

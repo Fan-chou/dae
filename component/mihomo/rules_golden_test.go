@@ -2,11 +2,13 @@ package mihomo
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/stretchr/testify/require"
@@ -34,11 +36,25 @@ type ruleCases struct {
 // ruleDeviations lists the only cases where the new lowering may differ from
 // the archived sidecar; a stale entry fails the test.
 var ruleDeviations = map[string]string{
-	"domain_regex_keeps_case":       devRegexEscape,
-	"domain_wildcard_star":          devRegexEscape,
-	"domain_wildcard_q":             devRegexEscape,
-	"domain_wildcard_upper_special": devRegexEscape,
+	"expand_1025_skipped":            devMergeCap,
+	"expand_1024_exact":              devMergeCap,
+	"expand_1331_skipped":            devMergeCap,
+	"expand_accumulate_exact":        devMergeCap,
+	"expand_accumulate_break":        devMergeCap,
+	"fatal_sub_expansion_limit":      devMergeCap,
+	"fatal_sub_expansion_with_match": devMergeCap,
+	"domain_regex_keeps_case":        devRegexEscape,
+	"domain_wildcard_star":           devRegexEscape,
+	"domain_wildcard_q":              devRegexEscape,
+	"domain_wildcard_upper_special":  devRegexEscape,
 }
+
+// devMergeCap: the sidecar counts rules before adjacent ones are merged, so a
+// long run of same-outbound rules overflows its 1024 cap (a sub-rule makes
+// the whole conversion fail, top-level rules silently drop everything after
+// the cap, MATCH included). Counting after merging keeps them. The result is
+// checked against the same rules lowered without merging and without a cap.
+const devMergeCap = "rule cap applied after adjacent rules are merged"
 
 // devRegexEscape: the sidecar writes routes.dae with every backslash doubled,
 // but dae's parser does not unescape double-quoted values, so the regex dae
@@ -106,6 +122,22 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 			got, err := LowerRules(rules, subs, RuleEnv{Outbounds: env.Outbounds})
 
 			deviation := ruleDeviations[name]
+			if deviation == devMergeCap {
+				// The sidecar must really have hit its cap, or this entry is stale.
+				hitCap := !want.OK
+				for _, e := range want.Events {
+					hitCap = hitCap || e.Kind == "skip"
+				}
+				require.True(t, hitCap, "stale deviation: the sidecar no longer hits its cap")
+				require.NoError(t, err)
+				for _, e := range got.Events {
+					require.NotEqual(t, EventSkip, e.Kind, "merged rules must fit the cap: %+v", e)
+				}
+				if !c.NoMatch {
+					require.Equal(t, "PROXY", got.Fallback, "MATCH must survive")
+				}
+				return
+			}
 			if !want.OK {
 				if strings.Contains(want.Error, "produced no routes") {
 					// An empty result is rejected when the whole configuration
@@ -183,4 +215,111 @@ func sortedKeys(m map[string][]string) []string {
 func itoa(i int) string {
 	b, _ := json.Marshal(i)
 	return string(b)
+}
+
+// TestMergingDoesNotChangeWhatRulesMatch lowers every fixture twice, once as
+// shipped and once with merging off and no rule cap, and requires the same
+// routing program. A merge that reordered or widened anything would show up
+// here for any fixture, not just the ones with long runs.
+func TestMergingDoesNotChangeWhatRulesMatch(t *testing.T) {
+	cases, _ := loadRuleFixtures(t)
+	env := RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY", "OTHER": "OTHER"}}
+	unlimited := RuleEnv{Outbounds: env.Outbounds, MaxExpandedRules: 5_000_000}
+	for name, c := range cases.Cases {
+		t.Run(name, func(t *testing.T) {
+			raw := append([]string(nil), c.Rules...)
+			if !c.NoMatch {
+				raw = append(raw, "MATCH,PROXY")
+			}
+			rules := make([]Rule, len(raw))
+			for i, r := range raw {
+				rules[i] = Rule{Raw: r, Index: i, Line: i + 1}
+			}
+			var subs []SubRule
+			for _, sub := range sortedKeys(c.SubRules) {
+				sr := SubRule{Name: sub, Line: 1}
+				for i, r := range c.SubRules[sub] {
+					sr.Rules = append(sr.Rules, Rule{Raw: r, Index: i, Line: i + 1})
+				}
+				subs = append(subs, sr)
+			}
+			merged, err := lowerRules(rules, subs, env, false)
+			plain, plainErr := lowerRules(rules, subs, unlimited, true)
+			if err != nil || plainErr != nil {
+				require.Equal(t, err != nil, plainErr != nil)
+				return
+			}
+			for _, e := range merged.Events {
+				if e.Kind == EventSkip && strings.Contains(e.Reason, "exceed") {
+					return // merged output itself hit the cap; nothing to compare
+				}
+			}
+			a, err := canonProgram(merged.Rules, merged.Fallback)
+			require.NoError(t, err)
+			b, err := canonProgram(plain.Rules, plain.Fallback)
+			require.NoError(t, err)
+			require.Equal(t, b, a)
+			require.LessOrEqual(t, len(merged.Rules), len(plain.Rules), "merging must never add rules")
+		})
+	}
+}
+
+// TestSubRuleLeavesCollapseIntoOneDomainSet measures the point of merging: a
+// sub-rule that lists many domains for one outbound becomes one rule, and
+// dae's own normalization turns it into a single term holding one domain set,
+// instead of one rule (and kernel match set) per line.
+func TestSubRuleLeavesCollapseIntoOneDomainSet(t *testing.T) {
+	const n = 800
+	var leaves []Rule
+	for i := 0; i < n; i++ {
+		leaves = append(leaves, Rule{Raw: fmt.Sprintf("DOMAIN-SUFFIX,site%d.example.com,PROXY", i), Index: i, Line: i + 1})
+	}
+	got, err := LowerRules(
+		[]Rule{{Raw: "SUB-RULE,(NETWORK,tcp),big", Index: 0, Line: 1}, {Raw: "MATCH,DIRECT", Index: 1, Line: 2}},
+		[]SubRule{{Name: "big", Rules: leaves}},
+		RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY"}},
+	)
+	require.NoError(t, err)
+	require.Len(t, got.Rules, 1, "%d leaves must become one rule", n)
+	require.Empty(t, got.Events)
+
+	program, err := routing.NewNormalizedProgram(got.Rules, got.Fallback)
+	require.NoError(t, err)
+	require.Len(t, program.Rules, 1, "normalized program must hold one term, not %d", n)
+	var sets int
+	for _, f := range program.Rules[0].AndFunctions {
+		if f.Name == "domain" {
+			sets++
+			require.Len(t, f.Params, n)
+		}
+	}
+	require.Equal(t, 1, sets)
+}
+
+// Runs of same-outbound top-level rules are merged before the cap is applied,
+// so a long plain list does not silently push MATCH out of the budget.
+func TestLongPlainRuleRunKeepsMatch(t *testing.T) {
+	var rules []Rule
+	for i := 0; i < 3000; i++ {
+		rules = append(rules, Rule{Raw: fmt.Sprintf("DOMAIN-SUFFIX,site%d.example.com,PROXY", i), Index: i, Line: i + 1})
+	}
+	rules = append(rules, Rule{Raw: "MATCH,DIRECT", Index: 3000, Line: 3001})
+	got, err := LowerRules(rules, nil, RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY"}})
+	require.NoError(t, err)
+	require.Len(t, got.Rules, 1)
+	require.Len(t, got.Rules[0].AndFunctions[0].Params, 3000)
+	require.Equal(t, "direct", got.Fallback, "MATCH must not be dropped")
+	require.Empty(t, got.Events)
+}
+
+// A different outbound in between must split the runs: order decides who wins.
+func TestMergingNeverCrossesADifferentOutbound(t *testing.T) {
+	rules := []Rule{
+		{Raw: "DOMAIN-SUFFIX,a.com,PROXY", Index: 0}, {Raw: "DOMAIN-SUFFIX,b.com,OTHER", Index: 1},
+		{Raw: "DOMAIN-SUFFIX,c.com,PROXY", Index: 2}, {Raw: "DOMAIN-SUFFIX,d.com,PROXY", Index: 3},
+	}
+	got, err := LowerRules(rules, nil, RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY", "OTHER": "OTHER"}})
+	require.NoError(t, err)
+	require.Len(t, got.Rules, 3)
+	require.Len(t, got.Rules[2].AndFunctions[0].Params, 2)
 }

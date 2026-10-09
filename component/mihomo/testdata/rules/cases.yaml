@@ -4352,3 +4352,79 @@ cases:
       - SUB-RULE,(NETWORK,tcp),c32
       c32:
       - DST-PORT,443,PROXY
+  not_and_same_function:
+    rules:
+    - NOT,((AND,((DOMAIN-SUFFIX,a.com),(DOMAIN-SUFFIX,b.com)))),PROXY
+  or_of_nots_same_function:
+    rules:
+    - OR,((NOT,((DOMAIN-SUFFIX,a.com))),(NOT,((DOMAIN-SUFFIX,b.com)))),PROXY
+  not_and_same_function_ports:
+    rules:
+    - NOT,((AND,((DST-PORT,80),(DST-PORT,443)))),PROXY
+  adjacent_same_outbound_domains:
+    rules:
+    - DOMAIN-SUFFIX,a.com,PROXY
+    - DOMAIN-SUFFIX,b.com,PROXY
+    - DOMAIN-KEYWORD,k,PROXY
+    - DOMAIN-SUFFIX,c.com,PROXY
+  adjacent_negated_rules:
+    rules:
+    - NOT,((DOMAIN-SUFFIX,a.com)),PROXY
+    - NOT,((DOMAIN-SUFFIX,b.com)),PROXY
+  adjacent_ip_rules:
+    rules:
+    - IP-CIDR,1.0.0.0/8,PROXY
+    - IP-CIDR,2.0.0.0/8,PROXY
+    - IP-CIDR6,2001:db8::/32,PROXY
+    - IP-CIDR,3.0.0.0/8,PROXY
+  adjacent_with_skipped_between:
+    rules:
+    - DOMAIN-SUFFIX,a.com,PROXY
+    - GEOIP,CN,PROXY
+    - DOMAIN-SUFFIX,b.com,PROXY
+  adjacent_with_other_outbound_between:
+    rules:
+    - DOMAIN-SUFFIX,a.com,PROXY
+    - DOMAIN-SUFFIX,b.com,OTHER
+    - DOMAIN-SUFFIX,c.com,PROXY
+  sub_adjacent_leaves_same_outbound:
+    rules:
+    - SUB-RULE,(NETWORK,tcp),child
+    sub_rules:
+      child:
+      - DOMAIN-SUFFIX,a.com,PROXY
+      - DOMAIN-SUFFIX,b.com,PROXY
+      - DST-PORT,22,OTHER
+      - DOMAIN-SUFFIX,c.com,PROXY
+  sub_adjacent_leaves_no_resolve:
+    rules:
+    - SUB-RULE,(NETWORK,tcp),child
+    sub_rules:
+      child:
+      - IP-CIDR,1.0.0.0/8,PROXY,no-resolve
+      - DOMAIN-SUFFIX,a.com,PROXY
+      - IP-CIDR,2.0.0.0/8,PROXY,no-resolve
+  sub_two_calls_adjacent_same_outbound:
+    rules:
+    - SUB-RULE,(DOMAIN-SUFFIX,a.com),c
+    - SUB-RULE,(DOMAIN-SUFFIX,b.com),c
+    sub_rules:
+      c:
+      - DST-PORT,443,PROXY
+  sub_negated_leaves_same_function:
+    rules:
+    - SUB-RULE,(NETWORK,tcp),child
+    sub_rules:
+      child:
+      - NOT,((DOMAIN-SUFFIX,a.com)),PROXY
+      - NOT,((DOMAIN-SUFFIX,b.com)),PROXY
+  sub_nested_adjacent_leaves:
+    rules:
+    - SUB-RULE,(NETWORK,tcp),outer
+    sub_rules:
+      outer:
+      - SUB-RULE,(DST-PORT,443),inner
+      - SUB-RULE,(DST-PORT,80),inner
+      inner:
+      - DOMAIN-SUFFIX,a.com,PROXY
+      - DOMAIN-SUFFIX,b.com,PROXY
