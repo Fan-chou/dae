@@ -7,6 +7,7 @@ import type {
   AdminGroup,
   AdminConnectionsSnapshot,
   AdminConfig,
+  EffectiveConfig,
 } from './types'
 
 export const capabilities = Object.freeze({
@@ -179,6 +180,8 @@ export async function fetchGroups() {
 export const fetchConnections = (query: URLSearchParams, backend?: Backend) =>
   request<AdminConnectionsSnapshot>('/connections?' + query, {}, backend)
 export const fetchConfig = () => request<AdminConfig>('/config')
+export const fetchEffective = () =>
+  request<EffectiveConfig>('/config/effective')
 export const saveConfig = (body: AdminConfig) =>
   request<{ queued: boolean }>('/config', {
     method: 'PUT',

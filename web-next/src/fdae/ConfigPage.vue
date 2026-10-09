@@ -35,7 +35,7 @@
       aria-label="配置文件"
     >
       <button
-        v-for="file in ['config', 'routing'] as const"
+        v-for="file in ['config', 'routing', 'effective'] as const"
         :id="'tab-' + file"
         :key="file"
         type="button"
@@ -50,22 +50,21 @@
             : 'border-transparent text-base-content/55 hover:text-base-content'
         "
         @click="activeFile = file"
-        @keydown.right.prevent="
-          activeFile = activeFile === 'config' ? 'routing' : 'config'
-        "
-        @keydown.left.prevent="
-          activeFile = activeFile === 'config' ? 'routing' : 'config'
-        "
+        @keydown.right.prevent="cycle(1)"
+        @keydown.left.prevent="cycle(-1)"
       >
-        {{ file }}.dae
+        {{ file === 'effective' ? '生效配置（只读）' : file + '.dae' }}
         <span
-          v-if="dirtyFile(file)"
+          v-if="file !== 'effective' && dirtyFile(file)"
           class="h-1.5 w-1.5 rounded-full bg-warning"
           aria-label="有未保存修改"
         />
       </button>
     </div>
-    <div class="shrink-0 px-3 py-2 text-xs text-base-content/55">
+    <div
+      v-if="activeFile !== 'effective'"
+      class="shrink-0 px-3 py-2 text-xs text-base-content/55"
+    >
       {{
         activeFile === 'config'
           ? '仅编辑 global / routing 配置段，其他配置段由后端保留。'
@@ -82,7 +81,9 @@
       :aria-labelledby="'tab-' + activeFile"
       class="flex min-h-0 flex-1 border-y border-base-content/10"
     >
+      <EffectivePanel v-if="activeFile === 'effective'" :key="revisionKey" />
       <ConfigEditor
+        v-else
         :key="revisionKey"
         :files="draft"
         :file="activeFile"
@@ -103,7 +104,9 @@
             ? '有未保存修改'
             : '与读取内容一致'
       }}</span>
-      <span>{{ draft[activeFile].split('\n').length }} 行</span>
+      <span v-if="activeFile !== 'effective'"
+        >{{ draft[activeFile].split('\n').length }} 行</span
+      >
       <span>Ctrl/Cmd+S 保存 · Ctrl/Cmd+F 查找</span>
       <span v-if="state.status?.generation"
         >运行代次：{{ state.status.generation }}</span
@@ -117,6 +120,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import ConfigEditor from './ConfigEditor.vue'
+import EffectivePanel from './EffectivePanel.vue'
 import { isMiddleScreen } from '@/helper/utils'
 import { dockTop } from '@/composables/paddingViews'
 import { onBeforeRouteLeave } from 'vue-router'
@@ -131,7 +135,11 @@ const draft = reactive({ config: '', routing: '' }),
 const dirty = computed(
   () => loaded.value && JSON.stringify(draft) !== baseline.value,
 )
-const activeFile = ref<'config' | 'routing'>('config')
+const tabs = ['config', 'routing', 'effective'] as const
+const activeFile = ref<(typeof tabs)[number]>('config')
+const cycle = (step: number) =>
+  (activeFile.value =
+    tabs[(tabs.indexOf(activeFile.value) + step + tabs.length) % tabs.length])
 const revisionKey = ref(0)
 const dirtyFile = (key: 'config' | 'routing') =>
   loaded.value && draft[key] !== JSON.parse(baseline.value || '{}')[key]

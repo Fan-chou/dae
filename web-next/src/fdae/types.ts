@@ -79,3 +79,54 @@ export type AdminConfig = {
 export type AdminError = {
   error?: string
 }
+
+export type EffectiveOrigin = 'config' | 'mihomo'
+export type EffectiveConfig = {
+  loaded_at: string
+  mihomo: {
+    enabled: boolean
+    source?: string
+    checked_at?: string
+    used_last_good: boolean
+    error?: string
+    nodes: number
+    groups: number
+    rules: number
+    providers: number
+    skipped_rules?: {
+      kind: string
+      index: number
+      line: number
+      rule: string
+      reason: string
+    }[]
+    unused_providers?: string[]
+    ignored_fields?: string[]
+  }
+  subscriptions: number
+  nodes: {
+    tag: string
+    display_name?: string
+    endpoint: string
+    origin: EffectiveOrigin
+  }[]
+  groups: {
+    name: string
+    display_name?: string
+    policy: string
+    members: string[]
+    options?: string[]
+    wrapper?: boolean
+    origin: EffectiveOrigin
+  }[]
+  rule_providers: {
+    name: string
+    type: string
+    behavior: string
+    source: string
+    interval?: string
+    origin: EffectiveOrigin
+  }[]
+  rules: { index: number; text: string; origin: EffectiveOrigin }[]
+  fallback: { outbound: string; origin: EffectiveOrigin }
+}
