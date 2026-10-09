@@ -159,17 +159,17 @@ func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *h
 // ones written in the configuration, so rules written by hand keep priority,
 // and its MATCH becomes the fallback. Nothing is merged unless the whole
 // source converts.
-func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) error {
+func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) (*mihomoMerge, error) {
 	m := conf.Mihomo
 	if !m.Enabled() {
 		setMihomoStatus(MihomoStatus{})
-		return nil
+		return nil, nil
 	}
 	status := MihomoStatus{Enabled: true, Source: m.RedactedSource(), CheckedAt: time.Now()}
-	fail := func(err error) error {
+	fail := func(err error) (*mihomoMerge, error) {
 		status.Error = err.Error()
 		setMihomoStatus(status)
-		return fmt.Errorf("load mihomo routing source %s: %w", status.Source, err)
+		return nil, fmt.Errorf("load mihomo routing source %s: %w", status.Source, err)
 	}
 	for _, p := range conf.RuleProvider {
 		if p.Name == mihomoDocumentName {
@@ -182,12 +182,29 @@ func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string,
 		return fail(err)
 	}
 	status.UsedLastGood = fetched.UsedLastGood
+	merge := &mihomoMerge{
+		Result:        result,
+		nodeStart:     len(conf.Node),
+		groupStart:    len(conf.Group),
+		providerStart: len(conf.RuleProvider),
+		ruleStart:     len(conf.Routing.Rules),
+	}
 	if err := mergeMihomoResult(conf, result); err != nil {
 		return fail(err)
 	}
 	fillMihomoStatus(&status, result)
 	setMihomoStatus(status)
-	return nil
+	return merge, nil
+}
+
+// mihomoMerge records where the converted source starts in each list of the
+// merged configuration, so a view can say what came from where.
+type mihomoMerge struct {
+	Result        *mihomo.Result
+	nodeStart     int
+	groupStart    int
+	providerStart int
+	ruleStart     int
 }
 
 func fillMihomoStatus(status *MihomoStatus, result *mihomo.Result) {

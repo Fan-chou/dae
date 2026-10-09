@@ -102,47 +102,79 @@ func describeAtom(f *config_parser.Function) string {
 
 // DescribeGroup renders a group's name, policy and members on one line.
 func DescribeGroup(g Group) string {
-	name := g.Safe
-	if g.Name != "" && g.Name != g.Safe {
-		name = fmt.Sprintf("%s (%q)", g.Safe, g.Name)
+	return DescribeConfigGroup(g.Name, g.Config, g.Wrapper)
+}
+
+// DescribeConfigGroup renders any dae group on one line. display is the name
+// the group had in its source when that differs from cfg.Name.
+func DescribeConfigGroup(display string, cfg config.Group, wrapper bool) string {
+	name := cfg.Name
+	if display != "" && display != cfg.Name {
+		name = fmt.Sprintf("%s (%q)", cfg.Name, display)
 	}
 	policy := "?"
-	if fns, err := config.ParseFunctionListOrString(g.Config.Policy); err == nil && len(fns) > 0 {
+	if fns, err := config.ParseFunctionListOrString(cfg.Policy); err == nil && len(fns) > 0 {
 		policy = fns[0].String(true, false, true)
 	}
 	var members []string
-	for _, filter := range g.Config.Filter {
+	for _, filter := range cfg.Filter {
 		for _, f := range filter {
 			members = append(members, describeAtom(f))
 		}
 	}
 	line := fmt.Sprintf("%s  %s  <- %s", name, policy, strings.Join(members, ", "))
-	var opts []string
-	if len(g.Config.TcpCheckUrl) > 0 {
-		opts = append(opts, "url="+strings.Join(g.Config.TcpCheckUrl, ","))
-	}
-	if g.Config.CheckIntervalSet {
-		opts = append(opts, "interval="+g.Config.CheckInterval.String())
-	}
-	if g.Config.CheckToleranceSet {
-		opts = append(opts, "tolerance="+g.Config.CheckTolerance.String())
-	}
-	if g.Config.LazySet {
-		opts = append(opts, fmt.Sprintf("lazy=%t", g.Config.Lazy))
-	}
-	if g.Config.IsolateTransport {
-		opts = append(opts, "isolate_transport")
-	}
-	if g.Config.QualityMode != "" && g.Config.QualityMode != "off" {
-		opts = append(opts, "quality="+g.Config.QualityMode)
-	}
-	if g.Wrapper {
-		opts = append(opts, "wraps a single node for rules that name it")
-	}
-	if len(opts) > 0 {
+	if opts := groupOptions(cfg, wrapper); len(opts) > 0 {
 		line += "  [" + strings.Join(opts, "; ") + "]"
 	}
 	return line
+}
+
+// GroupSettings lists the notable settings of a group, for display.
+func GroupSettings(cfg config.Group) []string { return groupOptions(cfg, false) }
+
+func groupOptions(cfg config.Group, wrapper bool) []string {
+	var opts []string
+	if len(cfg.TcpCheckUrl) > 0 {
+		opts = append(opts, "url="+strings.Join(cfg.TcpCheckUrl, ","))
+	}
+	if cfg.CheckIntervalSet {
+		opts = append(opts, "interval="+cfg.CheckInterval.String())
+	}
+	if cfg.CheckToleranceSet {
+		opts = append(opts, "tolerance="+cfg.CheckTolerance.String())
+	}
+	if cfg.LazySet {
+		opts = append(opts, fmt.Sprintf("lazy=%t", cfg.Lazy))
+	}
+	if cfg.IsolateTransport {
+		opts = append(opts, "isolate_transport")
+	}
+	if cfg.QualityMode != "" && cfg.QualityMode != "off" {
+		opts = append(opts, "quality="+cfg.QualityMode)
+	}
+	if wrapper {
+		opts = append(opts, "wraps a single node for rules that name it")
+	}
+	return opts
+}
+
+// GroupMembers lists a group's member filters as text, for display.
+func GroupMembers(cfg config.Group) []string {
+	var members []string
+	for _, filter := range cfg.Filter {
+		for _, f := range filter {
+			members = append(members, describeAtom(f))
+		}
+	}
+	return members
+}
+
+// GroupPolicy renders a group's selection policy as text.
+func GroupPolicy(cfg config.Group) string {
+	if fns, err := config.ParseFunctionListOrString(cfg.Policy); err == nil && len(fns) > 0 {
+		return fns[0].String(true, false, true)
+	}
+	return "?"
 }
 
 // Describe renders what the conversion produced, for a person to read.

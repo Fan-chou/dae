@@ -143,6 +143,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/groups/", s.withAdminAuth(s.handleGroup))
 	mux.HandleFunc("/v1/connections", s.withAdminAuth(s.handleConnections))
 	mux.HandleFunc("/v1/config", s.withAdminAuth(s.handleConfig))
+	mux.HandleFunc("/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
 	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
 	server := &http.Server{
@@ -341,6 +342,29 @@ func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleEffectiveConfig serves the read-only view of the running configuration
+// after the Mihomo source was converted and merged. ?format=text returns the
+// same content as plain text.
+func (s *adminServer) handleEffectiveConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	view := CurrentEffectiveConfig()
+	if view == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "no configuration is running yet")
+		return
+	}
+	if r.URL.Query().Get("format") == "text" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, view.Text())
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, view)
 }
 
 func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {

@@ -447,6 +447,7 @@ func (r *Runner) Run() (err error) {
 			requestedAtMono: monotonicNowNano(),
 		})
 	}
+	publishEffectiveConfig(conf)
 	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
 	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
 	var ruleProviderLifecycleCancel context.CancelFunc
@@ -814,6 +815,7 @@ loop:
 					w.c = handoff.preparedGeneration.controlPlane
 					w.currCancel = handoff.preparedGeneration.cancel
 					w.conf = handoff.preparedGeneration.conf
+					publishEffectiveConfig(w.conf)
 					if ruleProviderLifecycleHolder != nil {
 						ruleProviderLifecycleHolder.setConfig(w.conf)
 					}
