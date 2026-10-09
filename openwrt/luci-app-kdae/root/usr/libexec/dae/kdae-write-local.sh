@@ -96,6 +96,18 @@ if [ "$routing_count" -gt 1 ]; then
 	echo "exactly one complete Mihomo routing subscription is allowed" >&2
 	exit 1
 fi
+# dae reads the local file from inside the config directory only, and wants a
+# path relative to it.
+if [ -n "$mihomo_file" ]; then
+	cfgdir=$(dirname "$CFG")
+	case $mihomo_file in
+	"$cfgdir"/*) mihomo_file=${mihomo_file#"$cfgdir"/} ;;
+	/*)
+		echo "dae.config.mihomo_config must be inside $cfgdir" >&2
+		exit 1
+		;;
+	esac
+fi
 if [ -n "$mihomo_file" ] && [ "$routing_count" -eq 1 ]; then
 	echo "note: dae.config.mihomo_config overrides the routing subscription" >&2
 	routing_url=""
