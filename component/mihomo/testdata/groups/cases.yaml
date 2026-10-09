@@ -1,0 +1,172 @@
+# Group fixtures. Every case runs against the same proxies (proxies below)
+# unless it overrides them. gen_group_goldens.py replays each through the
+# archived dae-rule-sync and records groups.dae or the rejection.
+proxies:
+  - {name: n1, type: ss, server: a.example.com, port: 1, cipher: aes-128-gcm, password: p}
+  - {name: n2, type: ss, server: b.example.com, port: 2, cipher: aes-128-gcm, password: p}
+  - {name: n3, type: socks5, server: 1.2.3.4, port: 1080}
+  - {name: "🇭🇰 HK 01", type: ss, server: hk.example.com, port: 3, cipher: aes-128-gcm, password: p}
+  - {name: "香港 02", type: ss, server: hk2.example.com, port: 4, cipher: aes-128-gcm, password: p}
+cases:
+  select_basic:
+    groups: [{name: PROXY, type: select, proxies: [n1, n2, DIRECT]}]
+  select_with_reject:
+    groups: [{name: PROXY, type: select, proxies: [REJECT, DIRECT, n1]}]
+  select_direct_only:
+    groups: [{name: PROXY, type: select, proxies: [DIRECT]}]
+  select_display_names:
+    groups:
+      - {name: "🚀 节点选择", type: select, proxies: ["🇭🇰 HK 01", "香港 02", n1]}
+  select_type_uppercase:
+    groups: [{name: PROXY, type: Select, proxies: [n1]}]
+  fallback_basic:
+    groups: [{name: FB, type: fallback, proxies: [n1, n2, n3]}]
+  fallback_health:
+    groups: [{name: FB, type: fallback, proxies: [n1, n2], url: "http://cp.cloudflare.com/generate_204", interval: 300, tolerance: 50, lazy: true}]
+  fallback_lazy_false:
+    groups: [{name: FB, type: fallback, proxies: [n1, n2], lazy: false}]
+  fallback_https_url:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: "https://www.gstatic.com/generate_204?x=1"}]
+  urltest_basic:
+    groups: [{name: AUTO, type: url-test, proxies: [n1, n2, n3], url: "http://www.gstatic.com/generate_204", interval: 600}]
+  urltest_zero_tolerance:
+    groups: [{name: AUTO, type: url-test, proxies: [n1, n2], tolerance: 0}]
+  urltest_single_direct:
+    groups: [{name: AUTO, type: url-test, proxies: [DIRECT]}]
+  urltest_single_node:
+    groups: [{name: AUTO, type: url-test, proxies: [n1]}]
+  urltest_with_direct:
+    groups: [{name: AUTO, type: url-test, proxies: [n1, DIRECT]}]
+  nested_basic:
+    groups:
+      - {name: A, type: select, proxies: [B, n1]}
+      - {name: B, type: fallback, proxies: [n2, n3]}
+  nested_forward_ref_order:
+    groups:
+      - {name: B, type: fallback, proxies: [n2, n3]}
+      - {name: A, type: select, proxies: [B, DIRECT]}
+  nested_chain:
+    groups:
+      - {name: A, type: select, proxies: [B]}
+      - {name: B, type: select, proxies: [C]}
+      - {name: C, type: url-test, proxies: [n1, n2]}
+  nested_diamond:
+    groups:
+      - {name: A, type: select, proxies: [B, C]}
+      - {name: B, type: select, proxies: [D]}
+      - {name: C, type: select, proxies: [D]}
+      - {name: D, type: fallback, proxies: [n1]}
+  nested_mixed_members:
+    groups:
+      - {name: A, type: select, proxies: [n1, B, DIRECT, REJECT, n2]}
+      - {name: B, type: url-test, proxies: [n3]}
+  group_display_nested:
+    groups:
+      - {name: "🎯 全球直连", type: select, proxies: [DIRECT]}
+      - {name: "🚀 节点选择", type: select, proxies: ["🎯 全球直连", "🇭🇰 HK 01"]}
+  group_emoji_only:
+    groups: [{name: "🎯", type: select, proxies: [n1]}]
+  group_hidden_icon_ok:
+    groups: [{name: PROXY, type: select, proxies: [n1], hidden: true, icon: "https://example.com/i.png"}]
+  quality_observe:
+    groups: [{name: FB, type: fallback, proxies: [n1, n2], x-kdae-quality: {mode: observe}}]
+  quality_enforce_full:
+    groups: [{name: AUTO, type: url-test, proxies: [n1, n2], x-kdae-quality: {mode: enforce, min-download-bytes: 1048576, severe-speed-ratio: 0.25, recovery-speed-ratio: 0.5}}]
+  quality_off_on_select:
+    groups: [{name: PROXY, type: select, proxies: [n1], x-kdae-quality: {mode: "off"}}]
+  isolate_group:
+    groups: [{name: PROXY, type: select, proxies: [n1, n2]}, {name: OTHER, type: select, proxies: [n3]}]
+    isolate: PROXY
+  bad_isolate_unknown:
+    groups: [{name: PROXY, type: select, proxies: [n1]}]
+    isolate: NOPE
+  bad_quality_on_select:
+    groups: [{name: PROXY, type: select, proxies: [n1], x-kdae-quality: {mode: enforce}}]
+  bad_quality_mode:
+    groups: [{name: FB, type: fallback, proxies: [n1], x-kdae-quality: {mode: loud}}]
+  bad_quality_ratios:
+    groups: [{name: FB, type: fallback, proxies: [n1], x-kdae-quality: {mode: observe, severe-speed-ratio: 0.9, recovery-speed-ratio: 0.5}}]
+  bad_quality_ratio_over_one:
+    groups: [{name: FB, type: fallback, proxies: [n1], x-kdae-quality: {mode: observe, severe-speed-ratio: 0.5, recovery-speed-ratio: 1.5}}]
+  bad_quality_unknown_key:
+    groups: [{name: FB, type: fallback, proxies: [n1], x-kdae-quality: {mode: observe, typo: 1}}]
+  bad_type_load_balance:
+    groups: [{name: LB, type: load-balance, proxies: [n1, n2]}]
+  bad_type_relay:
+    groups: [{name: R, type: relay, proxies: [n1, n2]}]
+  bad_type_unknown:
+    groups: [{name: X, type: wat, proxies: [n1]}]
+  bad_type_empty:
+    groups: [{name: X, type: "", proxies: [n1]}]
+  bad_use_provider:
+    groups: [{name: PROXY, type: select, proxies: [n1], use: [subs]}]
+  bad_use_only:
+    groups: [{name: PROXY, type: select, use: [subs]}]
+  bad_no_members:
+    groups: [{name: PROXY, type: select, proxies: []}]
+  bad_missing_proxies_key:
+    groups: [{name: PROXY, type: select}]
+  bad_duplicate_member:
+    groups: [{name: PROXY, type: select, proxies: [n1, n1]}]
+  bad_duplicate_direct:
+    groups: [{name: PROXY, type: select, proxies: [DIRECT, DIRECT]}]
+  bad_unknown_member:
+    groups: [{name: PROXY, type: select, proxies: [n1, ghost]}]
+  bad_cycle_two:
+    groups:
+      - {name: A, type: select, proxies: [B]}
+      - {name: B, type: select, proxies: [A]}
+  bad_self_reference:
+    groups: [{name: A, type: select, proxies: [A, n1]}]
+  bad_duplicate_group:
+    groups:
+      - {name: A, type: select, proxies: [n1]}
+      - {name: A, type: select, proxies: [n2]}
+  bad_empty_group_name:
+    groups: [{name: " ", type: select, proxies: [n1]}]
+  bad_reserved_direct_upper:
+    groups: [{name: DIRECT, type: select, proxies: [n1]}]
+  bad_reserved_reject:
+    groups: [{name: REJECT, type: select, proxies: [n1]}]
+  bad_reserved_direct_lower:
+    groups: [{name: direct, type: select, proxies: [n1]}]
+  bad_reserved_block:
+    groups: [{name: block, type: select, proxies: [n1]}]
+  bad_url_ftp:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: "ftp://example.com/x"}]
+  bad_url_no_host:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: "http:///x"}]
+  bad_url_empty:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: ""}]
+  bad_url_space:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: " http://example.com/x"}]
+  bad_url_both_quotes:
+    groups: [{name: FB, type: fallback, proxies: [n1], url: "http://example.com/a'b\"c"}]
+  bad_interval_zero:
+    groups: [{name: FB, type: fallback, proxies: [n1], interval: 0}]
+  bad_interval_negative:
+    groups: [{name: FB, type: fallback, proxies: [n1], interval: -5}]
+  bad_interval_overflow:
+    groups: [{name: FB, type: fallback, proxies: [n1], interval: 9223372036854775807}]
+  bad_tolerance_negative:
+    groups: [{name: AUTO, type: url-test, proxies: [n1], tolerance: -1}]
+  bad_tolerance_overflow:
+    groups: [{name: AUTO, type: url-test, proxies: [n1], tolerance: 9223372036854775807}]
+  group_vs_node_same_name:
+    groups: [{name: n1, type: select, proxies: [n2]}]
+  group_collision_sanitized:
+    groups:
+      - {name: "Auto 1", type: select, proxies: [n1]}
+      - {name: "Auto_1", type: select, proxies: [n2]}
+  group_collision_cjk:
+    groups:
+      - {name: "香港 01", type: select, proxies: [n1]}
+      - {name: "日本 01", type: select, proxies: [n2]}
+  unknown_field_include_all:
+    groups: [{name: PROXY, type: select, proxies: [n1], include-all: true}]
+  unknown_field_filter:
+    groups: [{name: PROXY, type: select, proxies: [n1], filter: "HK"}]
+  unknown_field_interface_name:
+    groups: [{name: PROXY, type: fallback, proxies: [n1], interface-name: eth1}]
+  unknown_field_disable_udp:
+    groups: [{name: PROXY, type: select, proxies: [n1], disable-udp: true}]

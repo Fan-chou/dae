@@ -102,6 +102,17 @@ func decodeGroupSection(conf *Config, section *config_parser.Section) error {
 	return nil
 }
 
+// DecodeGroups decodes a "group" section that was built in memory instead of
+// parsed from text. It applies the same defaults and presence bits as the
+// text path, so both produce identical Group values.
+func DecodeGroups(section *config_parser.Section) ([]Group, error) {
+	var conf Config
+	if err := decodeGroupSection(&conf, section); err != nil {
+		return nil, err
+	}
+	return conf.Group, nil
+}
+
 func decodeRoutingSection(conf *Config, section *config_parser.Section) error {
 	return SectionParser(reflect.ValueOf(&conf.Routing), section)
 }

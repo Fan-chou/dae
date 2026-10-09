@@ -130,5 +130,8 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
     2. 撞名不再失败:内部名(`Node.Safe`)沿用原清洗结果——因为 `persist.d/group-selections/state.json` 按内部名保存 select 选择且只接受安全标识符,升级后必须仍然有效;只有撞名或清洗成保留名 `direct`/`block` 的才追加由**自身原名**哈希出的后缀,与顺序无关;展示名(`Node.Name`)始终是原名,保留 emoji/空格。单个不撞名的节点名与旧输出完全一致(金样本照常通过)。
   - 仍待办:`node_resolve_dns` 覆盖(待配置形态确定)。
 - [ ] 展示名透出(新增切片):`config.Group`/节点需携带展示名,admin API(`control/admin_api.go`)与 web-next 展示 `display_name || name`,日志同理;内部标识仍用安全名。依赖切片 5(分组同样处理)。
-- [ ] 切片 5 起(分组转换:select/fallback/url-test)。
+- [x] 切片 5:分组转换(`groups.go`、`names_assign.go`、`config.DecodeGroups`):select/fallback/url-test,成员顺序、`DIRECT`/`REJECT`、嵌套(环与深度 32 上限)、健康检查选项、`x-kdae-quality`、`isolate_transport`。输出直接是 `config.Group`(经 `DecodeGroups` 应用与文本解析相同的默认值和 presence 位),不经过 `.dae` 文本。`hack/mihomo-oracle/gen_group_goldens.py` 对 68 个用例生成金样本(30 转换 / 38 拒绝),测试把金样本的 `groups.dae` 交给 dae 自己的解析器后与内存结果逐字段比较;68/68 一致,3 处人为改坏均被发现。
+  - 有意偏离(`groupDeviations` 显式登记):① 分组里不认识的字段一律拒绝(`include-all`、`filter`、`interface-name`、`disable-udp` 等会改变成员或传输;仅 `hidden`、`icon` 这类纯展示字段放行);② 分组内部名撞名,或与节点内部名撞名,改为追加哈希后缀(节点优先保留原名,分组让位),展示名 `Group.Name` 仍是原名。
+  - 与 Mihomo 语义一致仍保持拒绝:同名的代理与分组、`direct`/`reject`/`block` 作分组名、`load-balance`/`relay`、`use:`(proxy-providers)、空成员、重复成员、未知成员、环。
+- [ ] 切片 6 起(规则编译:rules、rule-providers、sub-rules)。
 - [ ] kdae 中旧入口(`tools/dae-rule-sync`、`Makefile` 目标、`openwrt/kdae-rule-sync`、`build-ipk.sh`)暂不删除,切换 223 时同一提交移除。

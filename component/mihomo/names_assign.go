@@ -22,7 +22,10 @@ import (
 // suffix derived from their own original text. The suffix does not depend on
 // order, so reordering a subscription never renames anything; adding a
 // colliding sibling renames the previously unique ones once.
-func assignSafeNames(originals []string, safeName func(string) string, pattern *regexp.Regexp, maxLen int) ([]string, error) {
+//
+// used holds names already claimed elsewhere (for example node tags when
+// naming groups); a name equal to one of them is treated as a collision.
+func assignSafeNames(originals []string, safeName func(string) string, pattern *regexp.Regexp, maxLen int, used map[string]struct{}) ([]string, error) {
 	base := make([]string, len(originals))
 	count := make(map[string]int, len(originals))
 	for i, name := range originals {
@@ -30,10 +33,14 @@ func assignSafeNames(originals []string, safeName func(string) string, pattern *
 		count[base[i]]++
 	}
 	out := make([]string, len(originals))
-	taken := make(map[string]struct{}, len(originals))
+	taken := make(map[string]struct{}, len(originals)+len(used))
+	for name := range used {
+		taken[name] = struct{}{}
+	}
 	var pending []int
 	for i := range originals {
-		if count[base[i]] == 1 && !reservedOutbound(base[i]) {
+		_, claimed := used[base[i]]
+		if count[base[i]] == 1 && !claimed && !reservedOutbound(base[i]) {
 			out[i] = base[i]
 			taken[base[i]] = struct{}{}
 			continue

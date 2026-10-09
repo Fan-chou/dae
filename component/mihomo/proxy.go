@@ -105,7 +105,7 @@ func ConvertProxies(entries []Entry, validate LinkValidator) ([]Node, error) {
 		seen[name] = struct{}{}
 		names[i] = name
 	}
-	safe, err := assignSafeNames(names, SafeNodeName, nodeIdentifier, maxNodeNameLength)
+	safe, err := assignSafeNames(names, SafeNodeName, nodeIdentifier, maxNodeNameLength, nil)
 	if err != nil {
 		return nil, err
 	}

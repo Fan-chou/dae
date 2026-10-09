@@ -1,0 +1,374 @@
+{
+ "bad_cycle_two": {
+  "error": "nested group cycle includes \"A\"",
+  "ok": false
+ },
+ "bad_duplicate_direct": {
+  "error": "group \"PROXY\" repeats member \"DIRECT\"",
+  "ok": false
+ },
+ "bad_duplicate_group": {
+  "error": "duplicate group \"A\"",
+  "ok": false
+ },
+ "bad_duplicate_member": {
+  "error": "group \"PROXY\" repeats member \"n1\"",
+  "ok": false
+ },
+ "bad_empty_group_name": {
+  "error": "group has empty name",
+  "ok": false
+ },
+ "bad_interval_negative": {
+  "error": "group \"FB\": interval must be greater than zero",
+  "ok": false
+ },
+ "bad_interval_overflow": {
+  "error": "group \"FB\": interval duration overflows time.Duration",
+  "ok": false
+ },
+ "bad_interval_zero": {
+  "error": "group \"FB\": interval must be greater than zero",
+  "ok": false
+ },
+ "bad_isolate_unknown": {
+  "error": "isolated transport group \"NOPE\" does not exist",
+  "ok": false
+ },
+ "bad_missing_proxies_key": {
+  "error": "group \"PROXY\" has no members",
+  "ok": false
+ },
+ "bad_no_members": {
+  "error": "group \"PROXY\" has no members",
+  "ok": false
+ },
+ "bad_quality_mode": {
+  "error": "group \"FB\": invalid x-kdae-quality mode",
+  "ok": false
+ },
+ "bad_quality_on_select": {
+  "error": "group \"PROXY\": quality requires fallback or url-test",
+  "ok": false
+ },
+ "bad_quality_ratio_over_one": {
+  "error": "group \"FB\": invalid quality ratios",
+  "ok": false
+ },
+ "bad_quality_ratios": {
+  "error": "group \"FB\": invalid quality ratios",
+  "ok": false
+ },
+ "bad_quality_unknown_key": {
+  "error": "parse Mihomo routing document: decode proxy-groups: yaml: unmarshal errors:",
+  "ok": false
+ },
+ "bad_reserved_block": {
+  "error": "group \"block\" conflicts with a reserved Mihomo member or dae outbound",
+  "ok": false
+ },
+ "bad_reserved_direct_lower": {
+  "error": "group \"direct\" conflicts with a reserved Mihomo member or dae outbound",
+  "ok": false
+ },
+ "bad_reserved_direct_upper": {
+  "error": "group \"DIRECT\" conflicts with a reserved Mihomo member or dae outbound",
+  "ok": false
+ },
+ "bad_reserved_reject": {
+  "error": "group \"REJECT\" conflicts with a reserved Mihomo member or dae outbound",
+  "ok": false
+ },
+ "bad_self_reference": {
+  "error": "nested group cycle includes \"A\"",
+  "ok": false
+ },
+ "bad_tolerance_negative": {
+  "error": "group \"AUTO\": tolerance must be non-negative",
+  "ok": false
+ },
+ "bad_tolerance_overflow": {
+  "error": "group \"AUTO\": tolerance duration overflows time.Duration",
+  "ok": false
+ },
+ "bad_type_empty": {
+  "error": "group \"X\" cannot be converted: group type \"\" is unsupported for flat conversion",
+  "ok": false
+ },
+ "bad_type_load_balance": {
+  "error": "group \"LB\" cannot be converted: group type \"load-balance\" is unsupported for flat conversion",
+  "ok": false
+ },
+ "bad_type_relay": {
+  "error": "group \"R\" cannot be converted: group type \"relay\" is unsupported for flat conversion",
+  "ok": false
+ },
+ "bad_type_unknown": {
+  "error": "group \"X\" cannot be converted: group type \"wat\" is unsupported for flat conversion",
+  "ok": false
+ },
+ "bad_unknown_member": {
+  "error": "group \"PROXY\" has unknown member \"ghost\"",
+  "ok": false
+ },
+ "bad_url_both_quotes": {
+  "error": "group \"FB\": url cannot be represented in dae config: rule value contains both quote characters",
+  "ok": false
+ },
+ "bad_url_empty": {
+  "error": "group \"FB\": url must be a non-empty absolute URL",
+  "ok": false
+ },
+ "bad_url_ftp": {
+  "error": "group \"FB\": url scheme \"ftp\" is unsupported; only http and https are allowed",
+  "ok": false
+ },
+ "bad_url_no_host": {
+  "error": "group \"FB\": url must include a host",
+  "ok": false
+ },
+ "bad_url_space": {
+  "error": "group \"FB\": url must be a non-empty absolute URL",
+  "ok": false
+ },
+ "bad_use_only": {
+  "error": "group \"PROXY\" cannot be converted: proxy provider members are unsupported",
+  "ok": false
+ },
+ "bad_use_provider": {
+  "error": "group \"PROXY\" cannot be converted: proxy provider members are unsupported",
+  "ok": false
+ },
+ "fallback_basic": {
+  "group_name_map": {
+   "FB": "FB"
+  },
+  "groups_dae": "group {\n    FB {\n        filter: name('n1')\n        filter: name('n2')\n        filter: name('n3')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "fallback_health": {
+  "group_name_map": {
+   "FB": "FB"
+  },
+  "groups_dae": "group {\n    FB {\n        tcp_check_url: 'http://cp.cloudflare.com/generate_204'\n        check_interval: 300s\n        check_tolerance: 50ms\n        lazy: true\n        filter: name('n1')\n        filter: name('n2')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "fallback_https_url": {
+  "group_name_map": {
+   "FB": "FB"
+  },
+  "groups_dae": "group {\n    FB {\n        tcp_check_url: 'https://www.gstatic.com/generate_204?x=1'\n        filter: name('n1')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "fallback_lazy_false": {
+  "group_name_map": {
+   "FB": "FB"
+  },
+  "groups_dae": "group {\n    FB {\n        lazy: false\n        filter: name('n1')\n        filter: name('n2')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "group_collision_cjk": {
+  "error": "groups \"香港 01\" and \"日本 01\" map to the same dae name \"n_01\"",
+  "ok": false
+ },
+ "group_collision_sanitized": {
+  "error": "groups \"Auto 1\" and \"Auto_1\" map to the same dae name \"Auto_1\"",
+  "ok": false
+ },
+ "group_display_nested": {
+  "group_name_map": {
+   "🎯 全球直连": "Target",
+   "🚀 节点选择": "Rocket"
+  },
+  "groups_dae": "group {\n    Target {\n        selection_members: 'direct'\n        filter: group('direct')\n        policy: fixed(0)\n    }\n    Rocket {\n        selection_members: 'Target,HK_HK_01'\n        filter: group('Target')\n        filter: name('HK_HK_01')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "group_emoji_only": {
+  "group_name_map": {
+   "🎯": "Target"
+  },
+  "groups_dae": "group {\n    Target {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "group_hidden_icon_ok": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "group_vs_node_same_name": {
+  "error": "Mihomo node/group names \"n1\" and \"n1\" map to the same dae outbound \"n1\"",
+  "ok": false
+ },
+ "isolate_group": {
+  "group_name_map": {
+   "OTHER": "OTHER",
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        isolate_transport: true\n        selection_members: 'n1,n2'\n        filter: name('n1')\n        filter: name('n2')\n        policy: fixed(0)\n    }\n    OTHER {\n        selection_members: 'n3'\n        filter: name('n3')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "nested_basic": {
+  "group_name_map": {
+   "A": "A",
+   "B": "B"
+  },
+  "groups_dae": "group {\n    A {\n        selection_members: 'B,n1'\n        filter: group('B')\n        filter: name('n1')\n        policy: fixed(0)\n    }\n    B {\n        filter: name('n2')\n        filter: name('n3')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "nested_chain": {
+  "group_name_map": {
+   "A": "A",
+   "B": "B",
+   "C": "C"
+  },
+  "groups_dae": "group {\n    A {\n        selection_members: 'B'\n        filter: group('B')\n        policy: fixed(0)\n    }\n    B {\n        selection_members: 'C'\n        filter: group('C')\n        policy: fixed(0)\n    }\n    C {\n        filter: name('n1')\n        filter: name('n2')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "nested_diamond": {
+  "group_name_map": {
+   "A": "A",
+   "B": "B",
+   "C": "C",
+   "D": "D"
+  },
+  "groups_dae": "group {\n    A {\n        selection_members: 'B,C'\n        filter: group('B')\n        filter: group('C')\n        policy: fixed(0)\n    }\n    B {\n        selection_members: 'D'\n        filter: group('D')\n        policy: fixed(0)\n    }\n    C {\n        selection_members: 'D'\n        filter: group('D')\n        policy: fixed(0)\n    }\n    D {\n        filter: name('n1')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "nested_forward_ref_order": {
+  "group_name_map": {
+   "A": "A",
+   "B": "B"
+  },
+  "groups_dae": "group {\n    B {\n        filter: name('n2')\n        filter: name('n3')\n        policy: fallback\n    }\n    A {\n        selection_members: 'B,direct'\n        filter: group('B')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "nested_mixed_members": {
+  "group_name_map": {
+   "A": "A",
+   "B": "B"
+  },
+  "groups_dae": "group {\n    A {\n        selection_members: 'n1,B,direct,block,n2'\n        filter: name('n1')\n        filter: group('B')\n        filter: group('direct')\n        filter: group('block')\n        filter: name('n2')\n        policy: fixed(0)\n    }\n    B {\n        filter: name('n3')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "quality_enforce_full": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        quality_mode: 'enforce'\n        quality_min_download_bytes: 1048576\n        severe_speed_ratio: '0.25'\n        recovery_speed_ratio: '0.5'\n        filter: name('n1')\n        filter: name('n2')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "quality_observe": {
+  "group_name_map": {
+   "FB": "FB"
+  },
+  "groups_dae": "group {\n    FB {\n        quality_mode: 'observe'\n        filter: name('n1')\n        filter: name('n2')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "quality_off_on_select": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        quality_mode: 'off'\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "select_basic": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1,n2,direct'\n        filter: name('n1')\n        filter: name('n2')\n        filter: group('direct')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "select_direct_only": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'direct'\n        filter: group('direct')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "select_display_names": {
+  "group_name_map": {
+   "🚀 节点选择": "Rocket"
+  },
+  "groups_dae": "group {\n    Rocket {\n        selection_members: 'HK_HK_01,n_02,n1'\n        filter: name('HK_HK_01')\n        filter: name('n_02')\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "select_type_uppercase": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "select_with_reject": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'block,direct,n1'\n        filter: group('block')\n        filter: group('direct')\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "unknown_field_disable_udp": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "unknown_field_filter": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "unknown_field_include_all": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        selection_members: 'n1'\n        filter: name('n1')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "unknown_field_interface_name": {
+  "group_name_map": {
+   "PROXY": "PROXY"
+  },
+  "groups_dae": "group {\n    PROXY {\n        filter: name('n1')\n        policy: fallback\n    }\n}\n",
+  "ok": true
+ },
+ "urltest_basic": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        tcp_check_url: 'http://www.gstatic.com/generate_204'\n        check_interval: 600s\n        filter: name('n1')\n        filter: name('n2')\n        filter: name('n3')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "urltest_single_direct": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        selection_members: 'direct'\n        filter: group('direct')\n        policy: fixed(0)\n    }\n}\n",
+  "ok": true
+ },
+ "urltest_single_node": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        filter: name('n1')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "urltest_with_direct": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        filter: name('n1')\n        filter: group('direct')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ },
+ "urltest_zero_tolerance": {
+  "group_name_map": {
+   "AUTO": "AUTO"
+  },
+  "groups_dae": "group {\n    AUTO {\n        check_tolerance: 0ms\n        filter: name('n1')\n        filter: name('n2')\n        policy: url_test\n    }\n}\n",
+  "ok": true
+ }
+}
