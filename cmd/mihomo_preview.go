@@ -7,11 +7,13 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/daeuniverse/dae/component/mihomo"
 	"github.com/daeuniverse/dae/config"
@@ -119,4 +121,72 @@ func previewMihomo(ctx context.Context, cfgPath string, w io.Writer) error {
 		fmt.Fprintf(w, "fallback: %s (%s)\n", fb.Name, origin)
 	}
 	return nil
+}
+
+var mihomoStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show the state of the Mihomo routing source of the running dae.",
+	Long: `Asks the running dae (through its admin API, using admin_listen and
+admin_secret from the config) when the Mihomo routing source was last read,
+whether the last good copy is in use, and why a read failed.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		if cfgFile == "" {
+			fmt.Println("Argument \"--config\" or \"-c\" is required but not provided.")
+			os.Exit(1)
+		}
+		if err := mihomoStatus(cmd.Context(), cfgFile, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	},
+}
+
+func init() {
+	mihomoCmd.AddCommand(mihomoStatusCmd)
+	mihomoStatusCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
+}
+
+// mihomoStatus prints the Mihomo part of GET /v1/status as JSON.
+func mihomoStatus(ctx context.Context, cfgPath string, w io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sections, _, err := config.NewMerger(cfgPath).Merge()
+	if err != nil {
+		return err
+	}
+	conf, err := config.New(sections)
+	if err != nil {
+		return err
+	}
+	listen := conf.Global.AdminListen
+	if listen == "" {
+		return fmt.Errorf("admin_listen is not set; the status is served by the admin API")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+"/v1/status", nil)
+	if err != nil {
+		return err
+	}
+	if conf.Global.AdminSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+conf.Global.AdminSecret)
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("dae is not reachable at %s: %w", listen, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("admin API answered %s", resp.Status)
+	}
+	var body struct {
+		Generation  string       `json:"generation"`
+		SyncWarning string       `json:"sync_warning"`
+		Mihomo      MihomoStatus `json:"mihomo"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(body)
 }

@@ -75,7 +75,10 @@ type adminStatusBody struct {
 	control.AdminStatus
 	Generation         string `json:"generation,omitempty"`
 	PreviousGeneration string `json:"previous_generation,omitempty"`
-	SyncWarning        string `json:"sync_warning,omitempty"`
+	// SyncWarning is set when the Mihomo routing source is not being read
+	// fresh: the last attempt failed or the last good copy is in use.
+	SyncWarning string       `json:"sync_warning,omitempty"`
+	Mihomo      MihomoStatus `json:"mihomo"`
 }
 
 type adminLogsBody struct {
@@ -89,11 +92,6 @@ type adminReloadBody struct {
 type adminGenerationMetadata struct {
 	Generation         string `json:"generation"`
 	PreviousGeneration string `json:"previous_generation"`
-}
-
-type adminSyncState struct {
-	Warning    string `json:"warning"`
-	Generation string `json:"generation"`
 }
 
 func newAdminServer(log *logrus.Logger, logFile, configDir string, plane adminPlaneProvider, reload adminReloadFunc) *adminServer {
@@ -222,10 +220,11 @@ func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		body.Generation = meta.Generation
 		body.PreviousGeneration = meta.PreviousGeneration
 	}
-	if syncState, err := readAdminSyncState(); err == nil {
-		body.SyncWarning = syncState.Warning
-		if body.Generation == "" {
-			body.Generation = syncState.Generation
+	body.Mihomo = CurrentMihomoStatus()
+	body.SyncWarning = mihomoWarning(body.Mihomo)
+	if body.Generation == "" {
+		if view := CurrentEffectiveConfig(); view != nil {
+			body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
 		}
 	}
 	writeAdminJSON(w, http.StatusOK, body)
@@ -589,18 +588,6 @@ func readAdminGenerationMetadata(configDir string) (adminGenerationMetadata, err
 		return adminGenerationMetadata{}, err
 	}
 	return meta, nil
-}
-
-func readAdminSyncState() (adminSyncState, error) {
-	body, err := os.ReadFile("/var/run/kdae-last-sync.json")
-	if err != nil {
-		return adminSyncState{}, err
-	}
-	var state adminSyncState
-	if err := json.Unmarshal(body, &state); err != nil {
-		return adminSyncState{}, err
-	}
-	return state, nil
 }
 
 func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {

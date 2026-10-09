@@ -290,3 +290,19 @@ func mergeMihomoResult(conf *config.Config, result *mihomo.Result) error {
 	}
 	return nil
 }
+
+// mihomoWarning says why the Mihomo routing source is not current, or "" when
+// it is, or is not in use.
+func mihomoWarning(status MihomoStatus) string {
+	switch {
+	case !status.Enabled:
+		return ""
+	case status.Error != "" && status.UsedLastGood:
+		return "Mihomo routing source failed, using the last good copy: " + status.Error
+	case status.Error != "":
+		return "Mihomo routing source failed: " + status.Error
+	case status.UsedLastGood:
+		return "Mihomo routing source unchanged: using the last good copy"
+	}
+	return ""
+}
