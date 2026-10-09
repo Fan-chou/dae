@@ -73,3 +73,31 @@ func TestMihomoSectionMarshalRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, conf.Mihomo, again.Mihomo)
 }
+
+func TestMihomoSectionNodeSettings(t *testing.T) {
+	conf, err := newWithMihomo(t, `mihomo {
+  routing_file: 'mihomo.yaml'
+  isolate_transport_groups: 'PROXY,Region'
+  node_resolve_dns {
+    'HK 01=8.8.8.8'
+    '🇯🇵 日本 01=udp://1.1.1.1:5353'
+    jp2: '1.1.1.1:5353'
+  }
+}`)
+	require.NoError(t, err)
+	require.Equal(t, []string{"PROXY", "Region"}, conf.Mihomo.IsolateTransportGroups)
+	require.Equal(t, map[string]string{"HK 01": "8.8.8.8", "🇯🇵 日本 01": "udp://1.1.1.1:5353", "jp2": "1.1.1.1:5353"}, conf.Mihomo.ResolveDNSMap())
+
+	b, err := conf.Marshal(2)
+	require.NoError(t, err)
+	sections, err := config_parser.Parse(string(b))
+	require.NoError(t, err)
+	again, err := New(sections)
+	require.NoError(t, err)
+	require.Equal(t, conf.Mihomo, again.Mihomo)
+}
+
+func TestMihomoNodeSettingsNeedASource(t *testing.T) {
+	_, err := newWithMihomo(t, `mihomo { node_resolve_dns { 'n1=8.8.8.8' } }`)
+	require.Error(t, err)
+}

@@ -209,6 +209,9 @@ func readConfig(cfgFile string) (conf *config.Config, includes []string, err err
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err
 	}
+	if err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient); err != nil {
+		return nil, nil, err
+	}
 	if err := ruleprovider.LoadAndExpand(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient); err != nil {
 		return nil, nil, fmt.Errorf("load native rule providers: %w", err)
 	}

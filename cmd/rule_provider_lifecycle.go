@@ -58,7 +58,13 @@ func (h *ruleProviderLifecycleHolder) refresh(ctx context.Context) (ruleprovider
 	baseDir := h.baseDir
 	h.mu.RUnlock()
 
-	return ruleprovider.Refresh(ctx, conf, baseDir, http.DefaultClient)
+	report, err := ruleprovider.Refresh(ctx, conf, baseDir, http.DefaultClient)
+	// The Mihomo source is refreshed on the same schedule; either changing
+	// is a reason to reload.
+	mihomoReport, mihomoErr := refreshMihomoSource(ctx, conf, baseDir, http.DefaultClient)
+	report.Changed = report.Changed || mihomoReport.Changed
+	report.UsedLastGood = report.UsedLastGood || mihomoReport.UsedLastGood
+	return report, errors.Join(err, mihomoErr)
 }
 
 func (h *ruleProviderLifecycleHolder) setConfig(conf *config.Config) {
@@ -95,6 +101,9 @@ func ruleProviderRefreshInterval(conf *config.Config) time.Duration {
 	}
 
 	var interval time.Duration
+	if conf.Mihomo.Enabled() && conf.Mihomo.Interval > 0 {
+		interval = conf.Mihomo.Interval
+	}
 	for _, provider := range conf.RuleProvider {
 		if provider.Interval > 0 && (interval == 0 || provider.Interval < interval) {
 			interval = provider.Interval

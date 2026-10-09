@@ -29,6 +29,37 @@ type Mihomo struct {
 	RoutingFile         string        `mapstructure:"routing_file"`
 	Interval            time.Duration `mapstructure:"interval" default:"1h"`
 	MaxSize             int64         `mapstructure:"max_size" default:"16777216"`
+
+	// IsolateTransportGroups lists converted group names (the internal names
+	// shown in dae) that get a private proxy transport per node.
+	IsolateTransportGroups []string `mapstructure:"isolate_transport_groups"`
+	// NodeResolveDNS maps an original Mihomo proxy name to a DNS server (IP,
+	// optional port) used to resolve destinations through that node. Proxy
+	// names are free text, so an entry is "name=server" (split at the last
+	// "="); a plain identifier may also be written as a keyed entry:
+	//
+	//	node_resolve_dns {
+	//	    'HK 01=8.8.8.8'
+	//	    jp2: '1.1.1.1:5353'
+	//	}
+	NodeResolveDNS []KeyableString `mapstructure:"node_resolve_dns"`
+}
+
+// ResolveDNSMap returns NodeResolveDNS as a map from proxy name to server.
+func (m Mihomo) ResolveDNSMap() map[string]string {
+	if len(m.NodeResolveDNS) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m.NodeResolveDNS))
+	for _, entry := range m.NodeResolveDNS {
+		raw := string(entry)
+		if i := strings.LastIndex(raw, "="); i >= 0 {
+			out[raw[:i]] = raw[i+1:]
+		} else if name, server, ok := strings.Cut(raw, ":"); ok {
+			out[name] = server
+		}
+	}
+	return out
 }
 
 // Enabled reports whether a routing source is configured.
@@ -68,6 +99,14 @@ func (m Mihomo) Validate() error {
 			clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("mihomo: routing_file must be a relative path inside the config directory")
 		}
+	}
+	for _, name := range m.IsolateTransportGroups {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("mihomo: isolate_transport_groups has an empty name")
+		}
+	}
+	if len(m.NodeResolveDNS) > 0 && !m.Enabled() {
+		return fmt.Errorf("mihomo: node_resolve_dns needs routing_subscription or routing_file")
 	}
 	if m.Interval < 0 {
 		return fmt.Errorf("mihomo: interval cannot be negative")
