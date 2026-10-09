@@ -121,5 +121,6 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
 
 - [x] 旧 sidecar 迁出为独立仓库(62 个提交历史),独立 `go test ./...` 通过。
 - [x] 切片 1:`component/ruleprovider/document.go`——`FetchDocument`。内部 `document` 行为不对用户配置开放;非法/超限/不可达的源回退到 last-good,无缓存则报错,从不返回未校验内容。`go test -race ./component/ruleprovider ./config` 通过。
-- [ ] 切片 2 起。
+- [x] 切片 2:`mihomo {}` 配置段(`config/mihomo.go`):`routing_subscription`/`routing_file`(互斥)/`interval`/`max_size`;订阅 URL 视为机密,错误与诊断仅使用脱敏形式。admin 配置接口只暴露 `global`/`routing` 两段,不会泄露该段。`node_resolve_dns`/`isolate_transport_groups` 待节点/分组转换切片按实际形态再加。
+- [ ] 切片 3 起。
 - [ ] kdae 中旧入口(`tools/dae-rule-sync`、`Makefile` 目标、`openwrt/kdae-rule-sync`、`build-ipk.sh`)暂不删除,切换 223 时同一提交移除。
