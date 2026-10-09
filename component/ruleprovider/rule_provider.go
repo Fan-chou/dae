@@ -80,6 +80,19 @@ var ErrProductionRuntimeDisabled = errors.New("native rule provider runtime is d
 // same-package test hook; production callers can only use the safe Load path.
 type loadOptions struct {
 	allowPrivate bool
+	// document marks an internal opaque-document fetch (see FetchDocument).
+	// parse then validates the body instead of the rule-provider parsers.
+	document bool
+	parse    func(body []byte, provider config.RuleProvider) (ProviderRules, error)
+}
+
+const documentBehavior = "document"
+
+func (o loadOptions) parseBody(body []byte, provider config.RuleProvider) (ProviderRules, error) {
+	if o.parse != nil {
+		return o.parse(body, provider)
+	}
+	return parseProviderBody(body, provider)
 }
 
 type preparedProvider struct {
@@ -471,12 +484,22 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 	normalized := make([]config.RuleProvider, len(providers))
 	for i, provider := range providers {
 		normalized[i] = normalizeProvider(provider)
-		if err := validateProviderDefinition(normalized[i], baseDir, options.allowPrivate); err != nil {
+		if err := validateProviderDefinition(normalized[i], baseDir, options.allowPrivate, options.document); err != nil {
 			return nil, nil, err
 		}
 	}
 	if !options.allowPrivate {
-		if err := config.ValidateRuleProviders(normalized, baseDir); err != nil {
+		// The public validator only knows user-facing behaviors; validate
+		// the URL/path shape of internal documents as an ordinary provider.
+		forValidation := normalized
+		if options.document {
+			forValidation = make([]config.RuleProvider, len(normalized))
+			copy(forValidation, normalized)
+			for i := range forValidation {
+				forValidation[i].Behavior = "classical"
+			}
+		}
+		if err := config.ValidateRuleProviders(forValidation, baseDir); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -612,7 +635,7 @@ func normalizeProvider(provider config.RuleProvider) config.RuleProvider {
 	return provider
 }
 
-func validateProviderDefinition(provider config.RuleProvider, baseDir string, allowPrivate bool) error {
+func validateProviderDefinition(provider config.RuleProvider, baseDir string, allowPrivate bool, document ...bool) error {
 	if provider.Name == "" || !providerNamePattern.MatchString(provider.Name) {
 		return fmt.Errorf("rule provider has invalid name %q", provider.Name)
 	}
@@ -642,6 +665,10 @@ func validateProviderDefinition(provider config.RuleProvider, baseDir string, al
 	}
 	switch provider.Behavior {
 	case "domain", "ipcidr", "classical":
+	case documentBehavior:
+		if len(document) == 0 || !document[0] {
+			return fmt.Errorf("rule provider %q has unsupported behavior %q", provider.Name, provider.Behavior)
+		}
 	default:
 		return fmt.Errorf("rule provider %q has unsupported behavior %q", provider.Name, provider.Behavior)
 	}
@@ -691,7 +718,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	switch provider.Type {
 	case "file":
 		cached, cacheErr := readCacheSnapshot(descriptor)
-		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider)
+		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider, options)
 		body, readErr := readProviderFile(baseDir, provider.Path, provider.MaxSize)
 		if readErr != nil {
 			if cachedRulesErr == nil {
@@ -699,7 +726,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			}
 			return preparedProvider{}, fmt.Errorf("read provider file: %v; cache failed: %w", readErr, cachedRulesErr)
 		}
-		rules, parseErr := parseProviderBody(body, provider)
+		rules, parseErr := options.parseBody(body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
 				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
@@ -726,7 +753,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 		return makePrepared(rules, "", batchIdentity, candidate, false), nil
 	case "http":
 		cached, cacheErr := readCacheSnapshot(descriptor)
-		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider)
+		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider, options)
 		fetched, fetchErr := fetchHTTP(ctx, provider.URL, provider.MaxSize, client, options.allowPrivate, cached)
 		if fetchErr != nil {
 			if cachedRulesErr == nil {
@@ -756,7 +783,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			}
 			return makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false), nil
 		}
-		rules, parseErr := parseProviderBody(fetched.body, provider)
+		rules, parseErr := options.parseBody(fetched.body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
 				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
@@ -791,11 +818,11 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	}
 }
 
-func parseCachedRules(cached cacheSnapshot, cacheErr error, provider config.RuleProvider) (ProviderRules, error) {
+func parseCachedRules(cached cacheSnapshot, cacheErr error, provider config.RuleProvider, options loadOptions) (ProviderRules, error) {
 	if cacheErr != nil {
 		return ProviderRules{}, cacheErr
 	}
-	rules, err := parseProviderBody(cached.body, provider)
+	rules, err := options.parseBody(cached.body, provider)
 	if err != nil {
 		return ProviderRules{}, fmt.Errorf("cached provider body is invalid: %w", err)
 	}
