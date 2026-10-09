@@ -1,0 +1,77 @@
+# Provider fixtures. providers: name -> declaration (file refers to files/);
+# every case also gets MATCH,PROXY unless it sets no_match. Fixed proxies and
+# groups are PROXY and OTHER, as for the rule fixtures.
+cases:
+  rs_domain: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_domain_text: {providers: {p: {file: dom_text.txt, behavior: domain, format: text}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_cidr: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_cidr_text: {providers: {p: {file: cidr_text.txt, behavior: ipcidr, format: text}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_classical_mixed: {providers: {p: {file: cls_mixed.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_classical_domains_only: {providers: {p: {file: cls_domains.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_classical_ips_only: {providers: {p: {file: cls_ips.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_classical_wildcard_unquoted: {providers: {p: {file: cls_wildcard_unquoted.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_nested_path: {providers: {p: {file: sub/nested.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_cidr_no_resolve_action: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY,no-resolve"]}
+  rs_domain_no_resolve_action: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY,no-resolve"]}
+  rs_classical_no_resolve_action: {providers: {p: {file: cls_ips.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY,no-resolve"]}
+  rs_classical_all_no_resolve: {providers: {p: {file: cls_ips_no_resolve.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_classical_mixed_no_resolve_action: {providers: {p: {file: cls_mixed.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY,no-resolve"]}
+  rs_in_and: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["AND,((RULE-SET,p),(DST-PORT,443)),PROXY"]}
+  rs_in_and_cidr: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["AND,((RULE-SET,p),(DST-PORT,443)),PROXY"]}
+  rs_in_and_cidr_no_resolve: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["AND,((RULE-SET,p,no-resolve),(DST-PORT,443)),PROXY"]}
+  rs_in_or_two_providers: {providers: {a: {file: dom_basic.yaml, behavior: domain}, b: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["OR,((RULE-SET,a),(RULE-SET,b)),PROXY"]}
+  rs_negated_domain: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["NOT,((RULE-SET,p)),PROXY"]}
+  rs_negated_cidr: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["NOT,((RULE-SET,p)),PROXY"]}
+  rs_negated_classical_mixed: {providers: {p: {file: cls_mixed.yaml, behavior: classical}}, rules: ["NOT,((RULE-SET,p)),PROXY"]}
+  rs_double_negated: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["NOT,((NOT,((RULE-SET,p)))),PROXY"]}
+  rs_negated_in_and: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["AND,((NOT,((RULE-SET,p))),(DST-PORT,443)),PROXY"]}
+  rs_same_provider_two_outbounds: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY", "RULE-SET,p,OTHER"]}
+  rs_adjacent_providers_same_outbound: {providers: {a: {file: dom_basic.yaml, behavior: domain}, b: {file: dom_second.yaml, behavior: domain}}, rules: ["RULE-SET,a,PROXY", "RULE-SET,b,PROXY"]}
+  rs_adjacent_cidr_same_outbound: {providers: {a: {file: cidr_basic.yaml, behavior: ipcidr}, b: {file: cidr_second.yaml, behavior: ipcidr}}, rules: ["RULE-SET,a,PROXY", "RULE-SET,b,PROXY"]}
+  rs_reject: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,REJECT"]}
+  rs_reject_drop: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,REJECT-DROP"]}
+  rs_ghost_outbound: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,ghost"]}
+  rs_in_sub_rule_leaf: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["SUB-RULE,(NETWORK,tcp),child"], sub_rules: {child: ["RULE-SET,p,PROXY", "DST-PORT,22,OTHER"]}}
+  rs_as_sub_rule_guard: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["SUB-RULE,(RULE-SET,p),child"], sub_rules: {child: ["DST-PORT,443,PROXY"]}}
+  rs_cidr_as_sub_rule_guard: {providers: {p: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["SUB-RULE,(RULE-SET,p),child"], sub_rules: {child: ["DST-PORT,443,PROXY"]}}
+  rs_negated_guard: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["SUB-RULE,(NOT,((RULE-SET,p))),child"], sub_rules: {child: ["DST-PORT,443,PROXY"]}}
+  rs_unused_provider: {providers: {p: {file: dom_basic.yaml, behavior: domain}, unused: {file: cidr_basic.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_only_in_unused_sub_rule: {providers: {p: {file: dom_basic.yaml, behavior: domain}}, rules: ["DOMAIN,a.com,PROXY"], sub_rules: {unused: ["RULE-SET,p,PROXY"]}}
+  rs_fatal_undeclared: {rules: ["RULE-SET,ghost,PROXY"]}
+  rs_fatal_undeclared_in_sub_rule: {rules: ["SUB-RULE,(NETWORK,tcp),child"], sub_rules: {child: ["RULE-SET,ghost,PROXY"]}}
+  rs_undeclared_in_unused_sub_rule: {rules: ["DOMAIN,a.com,PROXY"], sub_rules: {unused: ["RULE-SET,ghost,PROXY"]}}
+  rs_fatal_behavior_mismatch_domain_in_cidr: {providers: {p: {file: dom_basic.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_behavior_mismatch_cidr_in_domain: {providers: {p: {file: cidr_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_classical_src_ip: {providers: {p: {file: cls_src_ip.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_classical_process: {providers: {p: {file: cls_process.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_classical_geoip: {providers: {p: {file: cls_geoip.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_bad_domain_entry: {providers: {p: {file: dom_bad_entry.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_empty_provider: {providers: {p: {file: empty.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_bad_cidr: {providers: {p: {file: cidr_bad.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_missing_file: {providers: {p: {file: no_such_file.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unused_bad_behavior: {providers: {p: {file: dom_basic.yaml, behavior: domain}, bad: {file: dom_basic.yaml, behavior: wat}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unused_bad_format: {providers: {p: {file: dom_basic.yaml, behavior: domain}, bad: {file: dom_basic.yaml, behavior: domain, format: mrs}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_missing_behavior: {providers: {p: {file: dom_basic.yaml}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_file_without_path: {providers: {p: {type: file, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_file_with_url: {providers: {p: {type: file, file: dom_basic.yaml, url: "https://example.com/p.yaml", behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_http_without_url: {providers: {p: {type: http, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unknown_type: {providers: {p: {type: inline, file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unused_http_loopback: {providers: {p: {file: dom_basic.yaml, behavior: domain}, bad: {type: http, url: "http://127.0.0.1/p.yaml", behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unused_http_userinfo: {providers: {p: {file: dom_basic.yaml, behavior: domain}, bad: {type: http, url: "https://u:pw@example.com/p.yaml", behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_unused_http_scheme: {providers: {p: {file: dom_basic.yaml, behavior: domain}, bad: {type: http, url: "ftp://example.com/p.yaml", behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_absolute_path: {providers: {p: {file: dom_basic.yaml, path: /etc/passwd, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_escaping_path: {providers: {p: {file: dom_basic.yaml, path: ../dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_negative_interval: {providers: {p: {file: dom_basic.yaml, behavior: domain, interval: -1}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_fatal_huge_interval: {providers: {p: {file: dom_basic.yaml, behavior: domain, interval: 99999999}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_interval_ok: {providers: {p: {file: dom_basic.yaml, behavior: domain, interval: 3600}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_unused_http_ok: {providers: {p: {file: dom_basic.yaml, behavior: domain}, remote: {type: http, url: "https://example.com/p.yaml", behavior: domain, interval: 600}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_name_with_space: {providers: {"my provider": {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,my provider,PROXY"]}
+  rs_name_cjk: {providers: {"广告": {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,广告,PROXY"]}
+  rs_name_hyphen_underscore: {providers: {my-list_1: {file: dom_basic.yaml, behavior: domain}}, rules: ["RULE-SET,my-list_1,PROXY"]}
+  rs_name_collision: {providers: {"a b": {file: dom_basic.yaml, behavior: domain}, "a  b": {file: dom_second.yaml, behavior: domain}}, rules: ["RULE-SET,a b,PROXY", "RULE-SET,a  b,OTHER"]}
+  rs_big_domain: {providers: {p: {file: big_dom.yaml, behavior: domain}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_big_cidr: {providers: {p: {file: big_cidr.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_big_classical: {providers: {p: {file: big_cls.yaml, behavior: classical}}, rules: ["RULE-SET,p,PROXY"]}
+  rs_big_domain_negated: {providers: {p: {file: big_dom.yaml, behavior: domain}}, rules: ["NOT,((RULE-SET,p)),PROXY"]}
+  rs_big_cidr_no_resolve: {providers: {p: {file: big_cidr.yaml, behavior: ipcidr}}, rules: ["RULE-SET,p,PROXY,no-resolve"]}
+  rs_big_domain_in_and: {providers: {p: {file: big_dom.yaml, behavior: domain}}, rules: ["AND,((RULE-SET,p),(DST-PORT,443)),PROXY"]}

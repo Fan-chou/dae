@@ -110,8 +110,8 @@ var mihomoAligned = map[string]func(t *testing.T, got *LoweredRules){
 		require.Equal(t, "PROXY", got.Fallback)
 	},
 	// Mihomo sets no depth limit besides rejecting cycles.
-	"fatal_sub_depth_exceeded": programHas("[dport(443) & l4proto(tcp)] -> PROXY"),
-	"fatal_sub_depth_33":       programHas("[dport(443) & l4proto(tcp)] -> PROXY"),
+	"fatal_sub_depth_exceeded": programHas("[l4proto(tcp) & port(443)] -> PROXY"),
+	"fatal_sub_depth_33":       programHas("[l4proto(tcp) & port(443)] -> PROXY"),
 	// A stray extra field makes the last field the sub-rule name. It is a
 	// proxy, not a sub-rule, so Mihomo loads the rule and it never matches.
 	"fatal_sub_call_with_action": func(t *testing.T, got *LoweredRules) {
@@ -121,7 +121,7 @@ var mihomoAligned = map[string]func(t *testing.T, got *LoweredRules){
 		require.Contains(t, got.Events[0].Reason, "never matches")
 	},
 	// ... unless a sub-rule really has that name, which is then the one called.
-	"sub_call_name_is_defined_sub_rule": programHas("[dport(22) & l4proto(tcp)] -> OTHER"),
+	"sub_call_name_is_defined_sub_rule": programHas("[l4proto(tcp) & port(22)] -> OTHER"),
 }
 
 func lowerStrings(t *testing.T, raw ...string) *LoweredRules {

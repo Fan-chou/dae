@@ -1,0 +1,3 @@
+payload:
+  - DOMAIN-WILDCARD,*.example.com
+  - DOMAIN-WILDCARD,a?.example.org

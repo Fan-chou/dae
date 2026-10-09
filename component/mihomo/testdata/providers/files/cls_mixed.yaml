@@ -1,0 +1,10 @@
+payload:
+  - DOMAIN,full.example.com
+  - DOMAIN-SUFFIX,suffix.example.com
+  - DOMAIN-KEYWORD,kw
+  - DOMAIN-REGEX,^r[0-9]+\.example\.com$
+  - DOMAIN-WILDCARD,w*.example.com
+  - IP-CIDR,10.0.0.0/8,no-resolve
+  - IP-CIDR6,2001:db8::/32
+  - 1.2.3.4/32
+  - example.dup.com

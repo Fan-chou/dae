@@ -80,6 +80,21 @@ func splitValues(e *routing.OrderedExpr) *routing.OrderedExpr {
 	return c
 }
 
+// canonName unifies the aliases dae treats as the same function. dae's
+// AliasOptimizer does this for plain rules only, so atoms decoded from a
+// route_expr are normalized here.
+func canonName(name string) string {
+	switch name {
+	case "dip":
+		return "ip"
+	case "dport":
+		return "port"
+	case "dip_no_resolve":
+		return "ip_no_resolve"
+	}
+	return name
+}
+
 func canonTerm(term []*config_parser.Function) string {
 	parts := make([]string, 0, len(term))
 	ordered := false
@@ -87,15 +102,20 @@ func canonTerm(term []*config_parser.Function) string {
 		if strings.HasSuffix(f.Name, "_no_resolve") {
 			ordered = true
 		}
-		s := f.Name + "("
+		s := canonName(f.Name) + "("
 		for i, p := range f.Params {
 			if i > 0 {
 				s += ","
 			}
+			val := p.Val
+			if f.Name == "domain" && (p.Key == "full" || p.Key == "suffix" || p.Key == "keyword" || p.Key == "") {
+				// dae lower-cases domain patterns when it builds the matcher.
+				val = strings.ToLower(val)
+			}
 			if p.Key != "" {
 				s += p.Key + "="
 			}
-			s += p.Val
+			s += val
 		}
 		s += ")"
 		if f.Not {

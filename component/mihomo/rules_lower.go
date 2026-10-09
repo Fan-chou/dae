@@ -69,6 +69,9 @@ type LoweredRules struct {
 	// Fallback is the outbound of the first MATCH rule, or "" if none.
 	Fallback string
 	Events   []Event
+	// UsedProviders are the original names of the rule sets the rules refer
+	// to, in first-use order. Only these need to be fetched.
+	UsedProviders []string
 }
 
 // unsupportedError marks a rule that parses but cannot be lowered exactly.
@@ -145,10 +148,64 @@ func lowerRules(rules []Rule, subRules []SubRule, env RuleEnv, noCompact bool) (
 	if err != nil {
 		return nil, err
 	}
+	used, err := usedProviders(expanded, env.Providers)
+	if err != nil {
+		return nil, err
+	}
 	l := newLowerer(env)
 	l.noCompact = noCompact
 	l.events = append(l.events, events...)
-	return l.lowerTop(expanded)
+	out, err := l.lowerTop(expanded)
+	if err != nil {
+		return nil, err
+	}
+	out.UsedProviders = used
+	return out, nil
+}
+
+// UndeclaredProviderError is a RULE-SET that names no rule-provider. Mihomo
+// refuses to load such a configuration, so it is not a rule to skip.
+type UndeclaredProviderError struct {
+	Index, Line int
+	Name        string
+}
+
+func (e *UndeclaredProviderError) Error() string {
+	return fmt.Sprintf("RULE-SET provider %q at index %d line %d is undeclared", e.Name, e.Index, e.Line)
+}
+
+// usedProviders lists, in first-use order, the providers the expanded rules
+// refer to, and fails on a reference to one that was never declared.
+func usedProviders(rules []*parsedRule, declared map[string]string) ([]string, error) {
+	var used []string
+	seen := map[string]bool{}
+	var walk func(r *parsedRule, e *expr) error
+	walk = func(r *parsedRule, e *expr) error {
+		if e == nil {
+			return nil
+		}
+		if e.kind == kindRuleSet {
+			if _, ok := declared[e.provider]; !ok {
+				return &UndeclaredProviderError{Index: r.index, Line: r.line, Name: e.provider}
+			}
+			if !seen[e.provider] {
+				seen[e.provider] = true
+				used = append(used, e.provider)
+			}
+		}
+		for _, c := range e.children {
+			if err := walk(r, c); err != nil {
+				return err
+			}
+		}
+		return walk(r, e.guard)
+	}
+	for _, r := range rules {
+		if err := walk(r, r.expr); err != nil {
+			return nil, err
+		}
+	}
+	return used, nil
 }
 
 func parseRuleList(rules []Rule) ([]*parsedRule, error) {
@@ -257,7 +314,11 @@ func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*outRule, error) {
 // encodeOrdered turns an ordered tree into the function placed in a rule: a
 // bare atom stays a plain function, anything else becomes route_expr.
 func encodeOrdered(oe *routing.OrderedExpr) (*config_parser.Function, error) {
-	if oe.Op == "atom" && oe.MemoID == 0 {
+	// A negated rule set cannot stay a bare function: the provider loader
+	// expands a plain ruleset() into alternatives, which a negation cannot
+	// distribute over, but it does handle the negation inside route_expr.
+	negatedSet := oe.Op == "atom" && oe.Atom.Not && (oe.Atom.Name == "ruleset" || oe.Atom.Name == "ruleset_no_resolve")
+	if oe.Op == "atom" && oe.MemoID == 0 && !negatedSet {
 		return oe.Atom, nil
 	}
 	return routing.EncodeOrderedExpr(oe)

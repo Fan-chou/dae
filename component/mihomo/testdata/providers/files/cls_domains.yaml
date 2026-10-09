@@ -1,0 +1,5 @@
+payload:
+  - DOMAIN-SUFFIX,a.example.com
+  - DOMAIN-SUFFIX,b.example.com
+  - DOMAIN-SUFFIX,a.example.com
+  - DOMAIN-KEYWORD,kw

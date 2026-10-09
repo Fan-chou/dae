@@ -1,0 +1,5 @@
+google.com
++.text.example.com
+# comment
+
+example.net

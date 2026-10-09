@@ -1,0 +1,7 @@
+payload:
+  - "+.google.com"
+  - "example.org"
+  - ".cdn.example.net"
+  - "*.wild.example.com"
+  - "UPPER.Example.COM"
+  - "example.org"
