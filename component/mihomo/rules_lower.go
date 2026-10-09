@@ -94,11 +94,34 @@ func (l *lowerer) record(kind EventKind, key, reason string) {
 	l.events = append(l.events, Event{Kind: kind, Index: l.cur.index, Line: l.cur.line, Raw: l.cur.raw, Reason: reason})
 }
 
-// LowerRules parses and lowers rules. A syntax error or an active SCRIPT
-// fails the whole call; a rule that parses but has no exact dae equivalent is
-// skipped and reported in Events, which is the compatibility policy for
-// individual rules.
-func LowerRules(rules []Rule, env RuleEnv) (*LoweredRules, error) {
+// LowerRules parses and lowers rules, expanding the SUB-RULE calls reachable
+// from them. A syntax error (in any rule or sub-rule, used or not), an active
+// SCRIPT, or a sub-rule graph that cannot be expanded fails the whole call; a
+// rule that parses but has no exact dae equivalent is skipped and reported in
+// Events, which is the compatibility policy for individual rules.
+func LowerRules(rules []Rule, subRules []SubRule, env RuleEnv) (*LoweredRules, error) {
+	top, err := parseRuleList(rules)
+	if err != nil {
+		return nil, err
+	}
+	defs := make(map[string]*parsedSubRule, len(subRules))
+	for _, sr := range subRules {
+		// Every definition is parsed even when unreferenced: a malformed
+		// rule is a mistake in the document, not something to hide.
+		body, err := parseRuleList(sr.Rules)
+		if err != nil {
+			return nil, err
+		}
+		defs[sr.Name] = &parsedSubRule{name: sr.Name, line: sr.Line, rules: body}
+	}
+	expanded, err := expandSubRules(top, defs)
+	if err != nil {
+		return nil, err
+	}
+	return newLowerer(env).lowerTop(expanded)
+}
+
+func parseRuleList(rules []Rule) ([]*parsedRule, error) {
 	parsed := make([]*parsedRule, 0, len(rules))
 	for _, r := range rules {
 		p, err := parseRule(r)
@@ -107,7 +130,7 @@ func LowerRules(rules []Rule, env RuleEnv) (*LoweredRules, error) {
 		}
 		parsed = append(parsed, p)
 	}
-	return newLowerer(env).lowerTop(parsed)
+	return parsed, nil
 }
 
 func (l *lowerer) lowerTop(rules []*parsedRule) (*LoweredRules, error) {
@@ -205,7 +228,7 @@ func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*config_parser.Routi
 // destination observable, and a negated rule set cannot be spelled as a flat
 // rule.
 func needsOrdered(e *expr, negated bool) bool {
-	if e.noResolve {
+	if e.noResolve || e.memoID != 0 {
 		return true
 	}
 	switch e.kind {
@@ -318,6 +341,22 @@ func combine(left, right []term, limit int) ([]term, error) {
 
 // ordered builds the evaluation-order-preserving form used for route_expr.
 func (l *lowerer) ordered(e *expr, inhibit, negated bool) (*routing.OrderedExpr, error) {
+	if e.memoID != 0 {
+		// A SUB-RULE guard: build it once, tag it with the call's memo id,
+		// and apply any negation around the tagged node.
+		id := e.memoID
+		c := *e
+		c.memoID = 0
+		result, err := l.ordered(&c, inhibit, false)
+		if err != nil {
+			return nil, err
+		}
+		result.MemoID = id
+		if negated {
+			result = &routing.OrderedExpr{Op: "not", Children: []*routing.OrderedExpr{result}}
+		}
+		return result, nil
+	}
 	inhibit = inhibit || e.noResolve
 	switch e.kind {
 	case kindNot:

@@ -25,8 +25,9 @@ type ruleGolden struct {
 
 type ruleCases struct {
 	Cases map[string]struct {
-		Rules   []string `yaml:"rules"`
-		NoMatch bool     `yaml:"no_match"`
+		Rules    []string            `yaml:"rules"`
+		SubRules map[string][]string `yaml:"sub_rules"`
+		NoMatch  bool                `yaml:"no_match"`
 	} `yaml:"cases"`
 }
 
@@ -94,7 +95,15 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 			for i, r := range raw {
 				rules[i] = Rule{Raw: r, Index: i, Line: i + 1}
 			}
-			got, err := LowerRules(rules, RuleEnv{Outbounds: env.Outbounds})
+			var subs []SubRule
+			for _, name := range sortedKeys(c.SubRules) {
+				sr := SubRule{Name: name, Line: 1}
+				for i, r := range c.SubRules[name] {
+					sr.Rules = append(sr.Rules, Rule{Raw: r, Index: i, Line: i + 1})
+				}
+				subs = append(subs, sr)
+			}
+			got, err := LowerRules(rules, subs, RuleEnv{Outbounds: env.Outbounds})
 
 			deviation := ruleDeviations[name]
 			if !want.OK {
@@ -109,6 +118,21 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 				require.Error(t, err, "oracle rejected: %s", want.Error)
 				if strings.Contains(want.Error, "SCRIPT") || strings.Contains(want.Error, "script") {
 					require.ErrorIs(t, err, ErrScriptUnsupported)
+				}
+				// Sub-rule failures must be rejected for the same reason, not
+				// merely rejected.
+				for text, kind := range map[string]error{
+					"cycle detected":        ErrSubRuleCycle,
+					"maximum depth":         ErrSubRuleDepth,
+					"is not defined":        ErrSubRuleUndefined,
+					"has no rules":          ErrSubRuleEmpty,
+					"nested inside":         ErrSubRuleEmbedded,
+					"cannot carry":          ErrSubRuleCall,
+					"expanded rules exceed": ErrSubRuleLimit,
+				} {
+					if strings.Contains(want.Error, text) && strings.Contains(want.Error, "compile Mihomo sub-rule") {
+						require.ErrorIs(t, err, kind, "oracle: %s", want.Error)
+					}
 				}
 				return
 			}
@@ -145,6 +169,15 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 			require.Equal(t, eventKeys(wantEvents), eventKeys(gotEvents))
 		})
 	}
+}
+
+func sortedKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func itoa(i int) string {

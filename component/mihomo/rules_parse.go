@@ -42,6 +42,29 @@ type expr struct {
 	// noResolve is an explicit "do not resolve the destination" request on an
 	// atom or rule set. Mihomo applies it to the condition, not the outbound.
 	noResolve bool
+
+	// memoID is non-zero on the guard of one SUB-RULE call: every rule
+	// expanded from that call shares the guard's evaluation, so a guard with
+	// side effects (resolving a name) is decided once per call.
+	memoID int
+}
+
+func (e *expr) clone() *expr {
+	if e == nil {
+		return nil
+	}
+	c := *e
+	if e.atom != nil {
+		a := *e.atom
+		a.args = append([]string(nil), e.atom.args...)
+		c.atom = &a
+	}
+	c.children = make([]*expr, len(e.children))
+	for i, child := range e.children {
+		c.children[i] = child.clone()
+	}
+	c.guard = e.guard.clone()
+	return &c
 }
 
 // atom is one leaf condition: typ is upper-case and args[0] is the match

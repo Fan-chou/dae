@@ -4,7 +4,7 @@ dae-rule-sync.
 
     ORACLE_BIN=/path/to/dae-rule-sync ./gen_rule_goldens.py
 
-Each case is a list of Mihomo rules run against fixed proxies and groups
+Each case is a list of Mihomo rules (and optional sub_rules) run against fixed proxies and groups
 (PROXY, OTHER). Unless the case sets no_match, MATCH,PROXY is appended so the
 generation is never empty. The oracle's routes.dae, its skip/ignore log events
 (it only reports them on stderr) and any rejection are recorded.
@@ -41,6 +41,8 @@ for name, case in spec["cases"].items():
         ],
         "rules": rules,
     }
+    if case.get("sub_rules"):
+        doc["sub-rules"] = case["sub_rules"]
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "in.yaml")
         with open(src, "w") as f:
