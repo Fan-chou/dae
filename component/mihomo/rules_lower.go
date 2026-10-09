@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/daeuniverse/dae/component/routing"
@@ -28,6 +29,17 @@ type RuleEnv struct {
 	Outbounds map[string]string
 	// MaxExpandedRules overrides DefaultMaxExpandedRules when positive.
 	MaxExpandedRules int
+}
+
+// knownTarget reports whether name is something Mihomo would accept as a rule
+// target: a built-in, a proxy, or a group.
+func (e RuleEnv) knownTarget(name string) bool {
+	switch strings.ToUpper(name) {
+	case "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE":
+		return strings.ToUpper(name) == name
+	}
+	_, ok := e.Outbounds[name]
+	return ok
 }
 
 // EventKind classifies a rule that was not lowered exactly.
@@ -129,12 +141,13 @@ func lowerRules(rules []Rule, subRules []SubRule, env RuleEnv, noCompact bool) (
 		}
 		defs[sr.Name] = &parsedSubRule{name: sr.Name, line: sr.Line, rules: body}
 	}
-	expanded, err := expandSubRules(top, defs)
+	expanded, events, err := expandSubRules(top, defs, env.knownTarget)
 	if err != nil {
 		return nil, err
 	}
 	l := newLowerer(env)
 	l.noCompact = noCompact
+	l.events = append(l.events, events...)
 	return l.lowerTop(expanded)
 }
 
@@ -200,10 +213,7 @@ func (l *lowerer) lowerTop(rules []*parsedRule) (*LoweredRules, error) {
 }
 
 func (l *lowerer) lowerRule(rule *parsedRule, limit int) ([]*outRule, error) {
-	if err := validateRuleOptions(rule.expr, rule.action); err != nil {
-		return nil, err
-	}
-	e, err := applyRuleOptions(rule.expr, rule.action.options)
+	e, err := l.ruleOptions(rule.expr, rule.action)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +273,7 @@ func needsOrdered(e *expr, negated bool) bool {
 	}
 	switch e.kind {
 	case kindAtom:
-		return e.atom != nil && e.atom.hasOption("no-resolve")
+		return e.atom != nil && isSourceIPAtom(e.atom.typ) && e.atom.hasOption("no-resolve")
 	case kindRuleSet:
 		return negated
 	case kindNot:
@@ -297,7 +307,7 @@ func (l *lowerer) terms(e *expr, negated bool, limit int) ([]term, error) {
 			}
 			return []term{{}}, nil
 		}
-		f, err := lowerAtom(*e.atom, negated)
+		f, err := l.lowerAtom(*e.atom, negated)
 		if err != nil {
 			return nil, err
 		}
@@ -456,15 +466,16 @@ func (l *lowerer) action(a action) (*config_parser.Function, error) {
 
 // ---- atoms ----
 
-func lowerAtom(a atom, negated bool) (*config_parser.Function, error) {
+func (l *lowerer) lowerAtom(a atom, negated bool) (*config_parser.Function, error) {
 	if len(a.args) == 0 {
 		return nil, unsupported("Mihomo atom %q has no value", a.typ)
 	}
-	value, options := a.args[0], a.options()
-	if err := validateAtomOptions(a.typ, options); err != nil {
+	value := a.args[0]
+	typ := strings.ToUpper(a.typ)
+	options, err := l.atomOptions(typ, a.options())
+	if err != nil {
 		return nil, err
 	}
-	typ := strings.ToUpper(a.typ)
 	if typ == "DOMAIN-WILDCARD" {
 		re, err := wildcardRegex(value)
 		if err != nil {
@@ -475,7 +486,8 @@ func lowerAtom(a atom, negated bool) (*config_parser.Function, error) {
 	if strings.TrimSpace(value) == "" {
 		return nil, unsupported("Mihomo atom %q has an empty value", a.typ)
 	}
-	param := &config_parser.Param{Val: value}
+	params := []*config_parser.Param{{Val: value}}
+	param := params[0]
 
 	var name, key string
 	switch typ {
@@ -506,6 +518,18 @@ func lowerAtom(a atom, negated bool) (*config_parser.Function, error) {
 		param.Val = v
 	case "PROCESS-NAME":
 		name = "pname"
+	case "DSCP":
+		// The 6-bit DSCP of the IP header, which is what dae's dscp reads.
+		// Mihomo's payload is a list of numbers and ranges (46, 0-10/46).
+		values, err := parseDSCP(value)
+		if err != nil {
+			return nil, err
+		}
+		name = "dscp"
+		params = params[:0]
+		for _, v := range values {
+			params = append(params, &config_parser.Param{Val: strconv.Itoa(v)})
+		}
 	default:
 		return nil, unsupported("unsupported Mihomo atom %q", a.typ)
 	}
@@ -529,27 +553,70 @@ func lowerAtom(a atom, negated bool) (*config_parser.Function, error) {
 			param.Key = "match_mac"
 		}
 	}
-	return &config_parser.Function{Name: name, Not: negated, Params: []*config_parser.Param{param}}, nil
+	return &config_parser.Function{Name: name, Not: negated, Params: params}, nil
 }
 
-func validateAtomOptions(typ string, options []string) error {
-	typ = strings.ToUpper(typ)
-	isIP := typ == "IP-CIDR" || typ == "IP-CIDR6" || typ == "SRC-IP-CIDR"
+// atomOptions returns the options that mean something for this atom type and
+// records the others as ignored: upstream Mihomo reads no-resolve and src for
+// IP rules only. match-mac belongs to the deployed fork and is only defined
+// as a source-IP modifier, so on any other atom the rule is skipped.
+func (l *lowerer) atomOptions(typ string, options []string) ([]string, error) {
+	var applicable []string
 	for _, option := range options {
-		switch option = strings.TrimSpace(option); {
-		case strings.EqualFold(option, "no-resolve"), strings.EqualFold(option, "match-mac"):
-			if !isIP {
-				return unsupported("Mihomo atom %q option %q has no exact kdae equivalent", typ, option)
+		option = strings.TrimSpace(option)
+		switch {
+		case strings.EqualFold(option, "match-mac"):
+			if !isSourceIPAtom(typ) {
+				return nil, unsupported("Mihomo atom %q option %q has no exact kdae equivalent", typ, option)
 			}
-		case strings.EqualFold(option, "src"):
-			if typ != "IP-CIDR" && typ != "IP-CIDR6" && typ != "SRC-IP-CIDR" {
-				return unsupported("Mihomo atom %q option %q has no exact kdae equivalent", typ, option)
+			applicable = append(applicable, option)
+		case strings.EqualFold(option, "no-resolve"), strings.EqualFold(option, "src"):
+			if isSourceIPAtom(typ) {
+				applicable = append(applicable, option)
+			} else {
+				l.ignoredOption(option, "applies to IP rules only")
 			}
 		default:
-			return unsupported("unsupported Mihomo atom %q option %q", typ, option)
+			l.ignoredOption(option, "unknown to Mihomo")
 		}
 	}
-	return nil
+	return applicable, nil
+}
+
+// parseDSCP expands a Mihomo DSCP payload ("46", "0-10/46", "10,20") to values.
+func parseDSCP(payload string) ([]int, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "*" {
+		return nil, unsupported("DSCP matching every value has no exact kdae equivalent")
+	}
+	seen := map[int]bool{}
+	var values []int
+	for _, part := range strings.FieldsFunc(payload, func(r rune) bool { return r == '/' || r == ',' }) {
+		lo, hi, isRange := strings.Cut(strings.Trim(part, "[ ]"), "-")
+		start, err := strconv.Atoi(strings.Trim(lo, "[ ]"))
+		if err != nil || start < 0 {
+			return nil, unsupported("invalid DSCP value")
+		}
+		end := start
+		if isRange {
+			if end, err = strconv.Atoi(strings.Trim(hi, "[ ]")); err != nil || end < start {
+				return nil, unsupported("invalid DSCP range")
+			}
+		}
+		if end > 63 {
+			return nil, unsupported("DSCP cannot exceed 63")
+		}
+		for v := start; v <= end; v++ {
+			if !seen[v] {
+				seen[v] = true
+				values = append(values, v)
+			}
+		}
+	}
+	if len(values) == 0 {
+		return nil, unsupported("invalid DSCP value")
+	}
+	return values, nil
 }
 
 // wildcardRegex converts Mihomo's DOMAIN-WILDCARD (* and ?) to the anchored
@@ -610,40 +677,49 @@ func exprSearch(e *expr, match func(atom) bool) bool {
 	return false
 }
 
-func validateRuleOptions(e *expr, a action) error {
+// ruleOptions applies the options that follow a rule's outbound. Upstream
+// Mihomo reads only no-resolve and src, and only for IP rules; every other
+// option is ignored and the rule stays active. The same is done here, with an
+// ignore event so the report shows what was dropped.
+//
+// Two options are not guessed at. src on a rule set is honored by Mihomo (the
+// provider's addresses are matched against the source) and dae has no
+// source-address form of a rule set. match-mac is not in upstream Mihomo at
+// all; the deployed fork defines it, so where it cannot be applied as a
+// source-IP modifier the rule is skipped rather than given a meaning here.
+func (l *lowerer) ruleOptions(e *expr, a action) (*expr, error) {
 	srcFromAction := a.hasOption("src")
+	hasSourceIP := exprSearch(e, func(x atom) bool { return isSourceIPAtom(x.typ) })
 	for _, option := range a.options {
 		switch option = strings.TrimSpace(option); {
 		case strings.EqualFold(option, "no-resolve"):
 		case strings.EqualFold(option, "src"):
-			if !exprSearch(e, func(x atom) bool { return isSourceIPAtom(x.typ) }) {
-				return unsupported("Mihomo rule option %q has no source IP matcher", option)
+			switch {
+			case hasSourceIP:
+			case e.kind == kindRuleSet:
+				return nil, unsupported("Mihomo rule option %q on a rule set has no exact kdae equivalent", option)
+			default:
+				l.ignoredOption(option, "applies to IP rules only")
 			}
 		case strings.EqualFold(option, "match-mac"):
 			if !exprSearch(e, func(x atom) bool { return acceptsMatchMac(x, srcFromAction) }) {
-				return unsupported("Mihomo rule option %q has no source IP matcher", option)
+				return nil, unsupported("Mihomo rule option %q has no source IP matcher", option)
 			}
 		default:
-			return unsupported("unsupported Mihomo rule option %q", option)
+			l.ignoredOption(option, "unknown to Mihomo")
 		}
 	}
-	return nil
-}
-
-func applyRuleOptions(e *expr, options []string) (*expr, error) {
-	if hasOption(options, "src") {
-		if !exprSearch(e, func(x atom) bool { return isSourceIPAtom(x.typ) }) {
-			return nil, unsupported("Mihomo rule option %q has no source IP matcher", "src")
-		}
+	if hasOption(a.options, "src") && hasSourceIP {
 		e = withOption(e, "src")
 	}
-	if hasOption(options, "match-mac") {
-		if !exprSearch(e, func(x atom) bool { return acceptsMatchMac(x, false) }) {
-			return nil, unsupported("Mihomo rule option %q has no source IP matcher", "match-mac")
-		}
+	if hasOption(a.options, "match-mac") && exprSearch(e, func(x atom) bool { return acceptsMatchMac(x, false) }) {
 		e = withOption(e, "match-mac")
 	}
 	return e, nil
+}
+
+func (l *lowerer) ignoredOption(option, why string) {
+	l.record(EventIgnore, "option:"+strings.ToLower(option), fmt.Sprintf("option %q ignored (%s)", option, why))
 }
 
 // withOption returns e with option appended to every atom it applies to.

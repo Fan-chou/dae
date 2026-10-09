@@ -49,6 +49,118 @@ var ruleDeviations = map[string]string{
 	"domain_wildcard_upper_special":  devRegexEscape,
 }
 
+// mihomoAligned lists cases where Mihomo itself loads the rules and the
+// sidecar did not (it failed the whole conversion, or mis-split the line). The
+// converter follows Mihomo here; each check states the expected result.
+// A case is stale when the sidecar now agrees (it converted the rule and
+// skipped nothing), so the list cannot outlive the gap it documents.
+var mihomoAligned = map[string]func(t *testing.T, got *LoweredRules){
+	// Empty option fields (a trailing comma, ",,") are ignored.
+	"fatal_trailing_comma":    programIs("DOMAIN,a.com,PROXY"),
+	"fatal_empty_option":      programIs("DOMAIN,a.com,PROXY,no-resolve"),
+	"trailing_comma_on_logic": programIs("AND,((DOMAIN-SUFFIX,a.com),(DST-PORT,443)),PROXY"),
+	// An empty value loads in Mihomo but cannot be lowered: the rule is
+	// skipped with a reason instead of failing the whole conversion.
+	"fatal_empty_field": func(t *testing.T, got *LoweredRules) {
+		require.Empty(t, got.Rules)
+		require.Len(t, got.Events, 1)
+		require.Equal(t, EventSkip, got.Events[0].Kind)
+	},
+	// Quotes are not special to Mihomo: an unclosed one is an ordinary character.
+	"fatal_unclosed_quote":    programHas("[domain(full='a.com)] -> PROXY"),
+	"process_name_apostrophe": programHas("[pname(Foo's App)] -> PROXY"),
+	// Regex rules take the last field as the outbound and keep every comma,
+	// parenthesis and quote before it in the pattern.
+	"domain_regex_with_comma":           programHas(`[domain(regex=^a{1,3}\.example\.com$)] -> PROXY`),
+	"domain_regex_with_paren_and_quote": programHas(`[domain(regex=^[(]x[^"']+\.com$)] -> PROXY`),
+	// Upstream Mihomo reads only no-resolve and src, only for IP rules, and
+	// ignores every other option; the rule stays active and the ignored option
+	// is reported. (match-mac is deliberately absent: it belongs to the
+	// deployed fork, so it keeps its conservative skip.)
+	"domain_src_option":                        programHasIgnoring(`[domain(full=a.com)] -> PROXY`, 1),
+	"opt_unknown":                              programHasIgnoring(`[domain(full=a.com)] -> PROXY`, 1),
+	"no_resolve_on_domain_atom":                programHasIgnoring(`[domain(full=a.com) & port(443)] -> PROXY`, 1),
+	"opt_src_on_rule_set_like_domain_in_logic": programHasIgnoring(`[domain(full=a.com) & port(443)] -> PROXY`, 1),
+	"ip_unknown_option":                        programHasIgnoring(`[ip(1.2.3.0/24)] -> PROXY`, 1),
+	"ip_unknown_option_with_no_resolve":        programHasIgnoring(`[ip_no_resolve(1.2.3.0/24)] -> PROXY`, 1),
+	// DSCP is the 6-bit DSCP of the IP header on both sides.
+	"dscp":            programHas(`[dscp(46)] -> PROXY`),
+	"dscp_slash_list": programHas(`[dscp(10)] -> PROXY`, `[dscp(20)] -> PROXY`),
+	"dscp_range":      programHas(`[dscp(0)] -> PROXY`, `[dscp(1)] -> PROXY`, `[dscp(2)] -> PROXY`, `[dscp(46)] -> PROXY`),
+	"dscp_in_and":     programHas(`[dscp(46) & l4proto(udp)] -> PROXY`),
+	"dscp_negated":    programHas(`[!dscp(46)] -> PROXY`),
+	// Sub-rule definitions nobody calls are not examined beyond syntax.
+	"fatal_sub_unused_syntax_error": func(t *testing.T, got *LoweredRules) { require.Empty(t, got.Events) },
+	// An empty sub-rule matches nothing and matching goes on.
+	"fatal_sub_empty_referenced": func(t *testing.T, got *LoweredRules) {
+		require.Empty(t, got.Rules)
+		require.Empty(t, got.Events)
+		require.Equal(t, "PROXY", got.Fallback)
+	},
+	// Mihomo sets no depth limit besides rejecting cycles.
+	"fatal_sub_depth_exceeded": programHas("[dport(443) & l4proto(tcp)] -> PROXY"),
+	"fatal_sub_depth_33":       programHas("[dport(443) & l4proto(tcp)] -> PROXY"),
+	// A stray extra field makes the last field the sub-rule name. It is a
+	// proxy, not a sub-rule, so Mihomo loads the rule and it never matches.
+	"fatal_sub_call_with_action": func(t *testing.T, got *LoweredRules) {
+		require.Empty(t, got.Rules)
+		require.Len(t, got.Events, 1)
+		require.Equal(t, EventSkip, got.Events[0].Kind)
+		require.Contains(t, got.Events[0].Reason, "never matches")
+	},
+	// ... unless a sub-rule really has that name, which is then the one called.
+	"sub_call_name_is_defined_sub_rule": programHas("[dport(22) & l4proto(tcp)] -> OTHER"),
+}
+
+func lowerStrings(t *testing.T, raw ...string) *LoweredRules {
+	t.Helper()
+	rules := make([]Rule, len(raw))
+	for i, r := range raw {
+		rules[i] = Rule{Raw: r, Index: i, Line: i + 1}
+	}
+	got, err := LowerRules(rules, nil, RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY", "OTHER": "OTHER"}})
+	require.NoError(t, err)
+	return got
+}
+
+// programIs: the result equals that of the given, well-formed rule plus MATCH.
+func programIs(rule string) func(*testing.T, *LoweredRules) {
+	return func(t *testing.T, got *LoweredRules) {
+		want := lowerStrings(t, rule, "MATCH,PROXY")
+		a, err := canonProgram(got.Rules, got.Fallback)
+		require.NoError(t, err)
+		b, err := canonProgram(want.Rules, want.Fallback)
+		require.NoError(t, err)
+		require.Equal(t, b, a)
+		require.Empty(t, got.Events)
+	}
+}
+
+// programHas: the canonical program contains the given term.
+func programHas(terms ...string) func(*testing.T, *LoweredRules) {
+	return func(t *testing.T, got *LoweredRules) {
+		prog, err := canonProgram(got.Rules, got.Fallback)
+		require.NoError(t, err)
+		for _, term := range terms {
+			require.Contains(t, prog, term)
+		}
+		require.Empty(t, got.Events)
+	}
+}
+
+// programHasIgnoring: like programHas, and exactly n options were ignored.
+func programHasIgnoring(term string, n int) func(*testing.T, *LoweredRules) {
+	return func(t *testing.T, got *LoweredRules) {
+		prog, err := canonProgram(got.Rules, got.Fallback)
+		require.NoError(t, err)
+		require.Contains(t, prog, term)
+		require.Len(t, got.Events, n)
+		for _, e := range got.Events {
+			require.Equal(t, EventIgnore, e.Kind)
+		}
+	}
+}
+
 // devMergeCap: the sidecar counts rules before adjacent ones are merged, so a
 // long run of same-outbound rules overflows its 1024 cap (a sub-rule makes
 // the whole conversion fail, top-level rules silently drop everything after
@@ -122,6 +234,16 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 			got, err := LowerRules(rules, subs, RuleEnv{Outbounds: env.Outbounds})
 
 			deviation := ruleDeviations[name]
+			if check, ok := mihomoAligned[name]; ok {
+				differs := !want.OK
+				for _, e := range want.Events {
+					differs = differs || e.Kind == "skip"
+				}
+				require.True(t, differs, "stale entry: the sidecar already handles this the Mihomo way")
+				require.NoError(t, err)
+				check(t, got)
+				return
+			}
 			if deviation == devMergeCap {
 				// The sidecar must really have hit its cap, or this entry is stale.
 				hitCap := !want.OK
@@ -157,9 +279,7 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 					"cycle detected":        ErrSubRuleCycle,
 					"maximum depth":         ErrSubRuleDepth,
 					"is not defined":        ErrSubRuleUndefined,
-					"has no rules":          ErrSubRuleEmpty,
 					"nested inside":         ErrSubRuleEmbedded,
-					"cannot carry":          ErrSubRuleCall,
 					"expanded rules exceed": ErrSubRuleLimit,
 				} {
 					if strings.Contains(want.Error, text) && strings.Contains(want.Error, "compile Mihomo sub-rule") {
@@ -322,4 +442,52 @@ func TestMergingNeverCrossesADifferentOutbound(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got.Rules, 3)
 	require.Len(t, got.Rules[2].AndFunctions[0].Params, 2)
+}
+
+// TestDumpAcceptance writes, for every rule fixture, whether this converter
+// accepts it (and how many rules it skipped), for hack/mihomo-oracle's
+// crosscheck_mihomo.py. It does nothing unless DUMP_ACCEPTANCE names a file.
+func TestDumpAcceptance(t *testing.T) {
+	path := os.Getenv("DUMP_ACCEPTANCE")
+	if path == "" {
+		t.Skip("DUMP_ACCEPTANCE not set")
+	}
+	cases, _ := loadRuleFixtures(t)
+	out := map[string]map[string]any{}
+	for name, c := range cases.Cases {
+		raw := append([]string(nil), c.Rules...)
+		if !c.NoMatch {
+			raw = append(raw, "MATCH,PROXY")
+		}
+		rules := make([]Rule, len(raw))
+		for i, r := range raw {
+			rules[i] = Rule{Raw: r, Index: i, Line: i + 1}
+		}
+		var subs []SubRule
+		for _, sub := range sortedKeys(c.SubRules) {
+			sr := SubRule{Name: sub, Line: 1}
+			for i, r := range c.SubRules[sub] {
+				sr.Rules = append(sr.Rules, Rule{Raw: r, Index: i, Line: i + 1})
+			}
+			subs = append(subs, sr)
+		}
+		got, err := LowerRules(rules, subs, RuleEnv{Outbounds: map[string]string{"PROXY": "PROXY", "OTHER": "OTHER"}})
+		entry := map[string]any{"ok": err == nil}
+		if err != nil {
+			entry["error"] = err.Error()
+		} else {
+			skips := 0
+			for _, e := range got.Events {
+				if e.Kind == EventSkip {
+					skips++
+				}
+			}
+			entry["skipped"] = skips
+			entry["rules"] = len(got.Rules)
+		}
+		out[name] = entry
+	}
+	body, err := json.MarshalIndent(out, "", " ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, body, 0o600))
 }

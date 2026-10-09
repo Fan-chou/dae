@@ -13,7 +13,9 @@ import (
 
 const (
 	// MaxSubRuleDepth bounds nested SUB-RULE calls from a top-level rule.
-	MaxSubRuleDepth = 32
+	// Mihomo has no limit apart from rejecting cycles; this only keeps a
+	// hostile document from recursing without bound.
+	MaxSubRuleDepth = 256
 	// MaxCompiledRules bounds the rules after expansion, ordinary top-level
 	// rules included. It only protects the converter from a hostile document;
 	// the budget that matters for dae is DefaultMaxExpandedRules, applied to
@@ -26,11 +28,9 @@ const (
 var (
 	ErrSubRuleUndefined = errors.New("undefined Mihomo sub-rule")
 	ErrSubRuleCycle     = errors.New("Mihomo sub-rule cycle")
-	ErrSubRuleEmpty     = errors.New("empty Mihomo sub-rule")
 	ErrSubRuleDepth     = errors.New("Mihomo sub-rule expansion depth exceeded")
 	ErrSubRuleLimit     = errors.New("Mihomo sub-rule expansion limit exceeded")
 	ErrSubRuleEmbedded  = errors.New("embedded Mihomo SUB-RULE is not representable")
-	ErrSubRuleCall      = errors.New("invalid Mihomo SUB-RULE call")
 )
 
 // SubRuleError locates the call or rule that made expansion fail.
@@ -59,8 +59,10 @@ type parsedSubRule struct {
 
 type expander struct {
 	defs    map[string]*parsedSubRule
+	known   func(name string) bool
 	emitted int
 	memo    int
+	events  []Event
 }
 
 // expandSubRules inlines every SUB-RULE call reachable from the top-level
@@ -74,27 +76,27 @@ type expander struct {
 // meaning as a yes/no condition. There is no reference behavior to preserve,
 // so such a rule is rejected rather than given an invented meaning. (A
 // SUB-RULE's own guard may of course be an AND/OR/NOT expression.)
-func expandSubRules(top []*parsedRule, defs map[string]*parsedSubRule) ([]*parsedRule, error) {
-	x := &expander{defs: defs}
+func expandSubRules(top []*parsedRule, defs map[string]*parsedSubRule, known func(string) bool) ([]*parsedRule, []Event, error) {
+	x := &expander{defs: defs, known: known}
 	out := make([]*parsedRule, 0, len(top))
 	for _, rule := range top {
 		if rule.expr.kind == kindSubRule {
 			expanded, err := x.call(rule, nil, 1, nil)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			out = append(out, expanded...)
 			continue
 		}
 		if err := rejectEmbedded(rule); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := x.emit(rule); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, rule)
 	}
-	return out, nil
+	return out, x.events, nil
 }
 
 func (x *expander) call(call *parsedRule, inherited *expr, depth int, path []string) ([]*parsedRule, error) {
@@ -104,9 +106,6 @@ func (x *expander) call(call *parsedRule, inherited *expr, depth int, path []str
 	name := call.expr.subRule
 	if strings.TrimSpace(name) == "" {
 		return nil, fail(ErrSubRuleUndefined, "", "SUB-RULE expression has no referenced name")
-	}
-	if call.action.target != "" || len(call.action.options) != 0 {
-		return nil, fail(ErrSubRuleCall, name, "SUB-RULE call cannot carry an action or options")
 	}
 	if containsSubRule(call.expr.guard) {
 		return nil, fail(ErrSubRuleEmbedded, "", "SUB-RULE inside AND/OR/NOT is not valid Mihomo (it refuses to load such a rule: a sub-rule yields an outbound, not a yes/no condition)")
@@ -132,11 +131,20 @@ func (x *expander) named(name string, guard *expr, depth int, path []string, cal
 	}
 	def, ok := x.defs[name]
 	if !ok {
+		if x.known != nil && x.known(name) {
+			// Mihomo only checks that the name is a proxy or a sub-rule, and a
+			// proxy passes. At match time it looks the name up as a sub-rule,
+			// finds none, and the rule never matches. That happens when the
+			// call carries a stray extra field: the last field is the name.
+			x.events = append(x.events, Event{
+				Kind: EventSkip, Index: call.index, Line: call.line, Raw: call.raw,
+				Reason: fmt.Sprintf("SUB-RULE target %q is an outbound, not a sub-rule; Mihomo never matches it", name),
+			})
+			return nil, nil
+		}
 		return nil, fail(ErrSubRuleUndefined, call.index, call.line, "referenced sub-rule is not defined")
 	}
-	if len(def.rules) == 0 {
-		return nil, fail(ErrSubRuleEmpty, 0, def.line, "referenced sub-rule has no rules")
-	}
+	// An empty sub-rule is valid in Mihomo and matches nothing.
 
 	next := append(append([]string(nil), path...), name)
 	var out []*parsedRule

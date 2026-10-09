@@ -2,6 +2,9 @@
 """Cross-check the rule fixtures against a real Mihomo binary.
 
     MIHOMO_BIN=/path/to/mihomo ./crosscheck_mihomo.py
+    # Compare with this converter as well as the archived sidecar:
+    DUMP_ACCEPTANCE=/tmp/ours.json go test ./component/mihomo -run TestDumpAcceptance
+    MIHOMO_BIN=... OURS=/tmp/ours.json ./crosscheck_mihomo.py
 
 Mihomo is the reference for what a configuration means; the archived sidecar
 is only the reference for what the converter used to do. For every fixture in
@@ -27,6 +30,7 @@ data = os.path.join(here, "..", "..", "component", "mihomo", "testdata", "rules"
 cases = yaml.safe_load(open(os.path.join(data, "cases.yaml")))["cases"]
 golden = json.load(open(os.path.join(data, "golden.json")))
 
+ours = json.load(open(os.environ["OURS"])) if os.environ.get("OURS") else None
 rows = []
 for name, case in cases.items():
     rules = list(case["rules"]) + ([] if case.get("no_match") else ["MATCH,PROXY"])
@@ -62,3 +66,18 @@ print("Mihomo accepts, sidecar rejects:")
 for name, m, o, e in rows:
     if m and not o:
         print(f"  {name:42s} sidecar: {golden[name]['error'][:100]}")
+
+if ours:
+    print("\nThis converter vs Mihomo:")
+    print("Mihomo accepts, this converter rejects:")
+    for name, m, _, _ in rows:
+        if m and not ours[name]["ok"]:
+            print(f"  {name:42s} {ours[name]['error'][:110]}")
+    print("Mihomo accepts, this converter accepts but skips rules:")
+    for name, m, _, _ in rows:
+        if m and ours[name]["ok"] and ours[name].get("skipped"):
+            print(f"  {name:42s} skipped={ours[name]['skipped']}")
+    print("Mihomo rejects, this converter converts:")
+    for name, m, _, e in rows:
+        if not m and ours[name]["ok"]:
+            print(f"  {name:42s} {e}")

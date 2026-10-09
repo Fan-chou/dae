@@ -134,19 +134,53 @@ func (e *ScriptError) Error() string {
 
 func (e *ScriptError) Unwrap() error { return ErrScriptUnsupported }
 
+// regexRuleTypes are the rule types whose payload may itself contain commas.
+// Mihomo takes the last comma-separated field as the outbound and joins
+// everything between the type and that field back into the payload, with no
+// quoting or parenthesis handling, so a quantifier like {1,3} is legal.
+var regexRuleTypes = map[string]struct{}{
+	"DOMAIN-REGEX": {}, "PROCESS-NAME-REGEX": {}, "PROCESS-PATH-REGEX": {},
+}
+
+func isRegexRule(typ string) bool {
+	_, ok := regexRuleTypes[typ]
+	return ok
+}
+
 func parseRule(r Rule) (*parsedRule, error) {
 	fail := func(reason string) error { return &ParseError{Index: r.Index, Line: r.Line, Reason: reason} }
+	if strings.TrimSpace(r.Raw) == "" {
+		return nil, fail("empty rule field")
+	}
+	rule := &parsedRule{index: r.Index, line: r.Line, raw: r.Raw}
+
+	// Regex rules first: they must not be split on commas inside the regex.
+	head, _, _ := strings.Cut(r.Raw, ",")
+	if typ := strings.ToUpper(strings.TrimSpace(head)); isRegexRule(typ) {
+		parts := strings.Split(r.Raw, ",")
+		if len(parts) < 3 {
+			return nil, fail(typ + " rule requires condition and action")
+		}
+		act, err := parseAction(strings.TrimSpace(parts[len(parts)-1]), nil)
+		if err != nil {
+			return nil, fail(err.Error())
+		}
+		payload := strings.TrimSpace(strings.Join(parts[1:len(parts)-1], ","))
+		rule.expr = &expr{kind: kindAtom, atom: &atom{typ: typ, args: []string{payload}}}
+		rule.action = act
+		return rule, nil
+	}
+
 	fields, err := splitFields(r.Raw)
 	if err != nil {
 		return nil, fail(err.Error())
 	}
 	for i := range fields {
 		fields[i] = unquote(fields[i])
-		if fields[i] == "" {
-			return nil, fail("empty rule field")
-		}
 	}
-	rule := &parsedRule{index: r.Index, line: r.Line, raw: r.Raw}
+	if fields[0] == "" {
+		return nil, fail("empty rule type")
+	}
 	switch typ := strings.ToUpper(fields[0]); typ {
 	case "SCRIPT":
 		return nil, scriptError(r, fields[1:])
@@ -170,6 +204,9 @@ func parseRule(r Rule) (*parsedRule, error) {
 		if len(fields) < 3 {
 			return nil, fail("RULE-SET rule requires provider and action")
 		}
+		if fields[1] == "" {
+			return nil, fail("empty RULE-SET provider")
+		}
 		act, err := parseAction(fields[2], fields[3:])
 		if err != nil {
 			return nil, fail(err.Error())
@@ -178,17 +215,25 @@ func parseRule(r Rule) (*parsedRule, error) {
 		rule.action = act
 
 	case "SUB-RULE":
+		// Mihomo: the sub-rule name is the last field, the guard is the
+		// parenthesized group before it, and anything in between is ignored.
 		if len(fields) < 3 {
 			return nil, fail("SUB-RULE requires guard and sub-rule name")
+		}
+		name := fields[len(fields)-1]
+		if name == "" {
+			return nil, fail("empty sub-rule name")
 		}
 		guard, err := parseExpression(fields[1], r)
 		if err != nil {
 			return nil, asParseError(r, err)
 		}
-		// The third field is the referenced sub-rule, not an outbound; any
-		// extension fields are kept as options instead of being dropped.
-		rule.expr = &expr{kind: kindSubRule, subRule: fields[2], guard: guard}
-		rule.action = action{options: append([]string(nil), fields[3:]...)}
+		for _, middle := range fields[2 : len(fields)-1] {
+			if strings.ContainsAny(middle, "()") {
+				return nil, fail("SUB-RULE has more than one guard")
+			}
+		}
+		rule.expr = &expr{kind: kindSubRule, subRule: name, guard: guard}
 		rule.isSubRule = true
 
 	case "MATCH":
@@ -210,6 +255,8 @@ func parseRule(r Rule) (*parsedRule, error) {
 		if err != nil {
 			return nil, fail(err.Error())
 		}
+		// An empty value is not a syntax error: Mihomo loads it. It cannot be
+		// lowered, so the rule is skipped later with a reason.
 		rule.expr = &expr{kind: kindAtom, atom: &atom{typ: typ, args: unquoteAll(fields[1:2])}}
 		rule.action = act
 	}
@@ -309,11 +356,11 @@ func parseAction(target string, options []string) (action, error) {
 	if target == "" {
 		return action{}, errors.New("empty action target")
 	}
-	clean := make([]string, len(options))
-	for i, option := range options {
-		clean[i] = unquote(option)
-		if clean[i] == "" {
-			return action{}, errors.New("empty action option")
+	// Empty option fields (a trailing comma, ",,") are ignored, as Mihomo does.
+	clean := make([]string, 0, len(options))
+	for _, option := range options {
+		if option = unquote(option); option != "" {
+			clean = append(clean, option)
 		}
 	}
 	return action{target: target, options: clean}, nil
@@ -356,31 +403,25 @@ func hasOption(options []string, name string) bool {
 	return false
 }
 
-// splitFields splits on top-level commas, honoring quotes and parentheses.
+// splitFields splits on top-level commas. Parentheses group. A quote groups
+// only when it opens a field and has a closing partner; anywhere else it is an
+// ordinary character, because Mihomo has no quoting and an apostrophe in a
+// process name must survive. Empty fields are returned; callers decide
+// whether an empty field is an error.
 func splitFields(raw string) ([]string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errors.New("empty rule field")
 	}
 	var fields []string
 	start, depth := 0, 0
-	var quote byte
-	escaped := false
 	for i := 0; i < len(raw); i++ {
-		c := raw[i]
-		if quote != 0 {
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == quote:
-				quote = 0
-			}
-			continue
-		}
-		switch c {
+		switch c := raw[i]; c {
 		case '\'', '"':
-			quote = c
+			if strings.TrimSpace(raw[start:i]) == "" {
+				if end := closingQuote(raw, i); end >= 0 {
+					i = end
+				}
+			}
 		case '(':
 			depth++
 		case ')':
@@ -390,26 +431,30 @@ func splitFields(raw string) ([]string, error) {
 			}
 		case ',':
 			if depth == 0 {
-				field := strings.TrimSpace(raw[start:i])
-				if field == "" {
-					return nil, errors.New("empty rule field")
-				}
-				fields = append(fields, field)
+				fields = append(fields, strings.TrimSpace(raw[start:i]))
 				start = i + 1
 			}
 		}
 	}
-	if quote != 0 {
-		return nil, errors.New("unclosed quote")
-	}
 	if depth != 0 {
 		return nil, errors.New("unclosed parentheses")
 	}
-	last := strings.TrimSpace(raw[start:])
-	if last == "" {
-		return nil, errors.New("empty rule field")
+	return append(fields, strings.TrimSpace(raw[start:])), nil
+}
+
+// closingQuote returns the index of the quote matching the one at open, or -1.
+// A backslash keeps the next character from closing the quote.
+func closingQuote(raw string, open int) int {
+	quote := raw[open]
+	for i := open + 1; i < len(raw); i++ {
+		switch raw[i] {
+		case '\\':
+			i++
+		case quote:
+			return i
+		}
 	}
-	return append(fields, last), nil
+	return -1
 }
 
 // unquote trims a field and strips one pair of matching quotes, resolving

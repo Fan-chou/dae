@@ -173,6 +173,20 @@
   "ok": true,
   "routes_dae": "    domain(regex: \"^Ad[0-9]+\\\\.example\\\\.com$\") -> block\n    fallback: PROXY\n"
  },
+ "domain_regex_with_comma": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "domain_regex_with_paren_and_quote": {
+  "error": "parse Mihomo rule at index 0 line 19: unclosed quote",
+  "ok": false
+ },
  "domain_src_option": {
   "events": [
    {
@@ -209,6 +223,66 @@
   "routes_dae": "    domain(full: \"a.com\") -> PROXY\n    fallback: PROXY\n"
  },
  "dscp": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_in_and": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_negated": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_range": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_slash_list": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_star": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "dscp_too_big": {
   "events": [
    {
     "index": 0,
@@ -346,6 +420,14 @@
  },
  "fatal_sub_bad_guard": {
   "error": "parse Mihomo rule at index 0 line 19: NETWORK condition requires a value",
+  "ok": false
+ },
+ "fatal_sub_call_extra_field_unknown": {
+  "error": "compile Mihomo sub-rule \"child\" at index 0 line 19: SUB-RULE call cannot carry an action or options",
+  "ok": false
+ },
+ "fatal_sub_call_two_guards": {
+  "error": "compile Mihomo sub-rule \"(DST-PORT,1)\" at index 0 line 19: SUB-RULE call cannot carry an action or options",
   "ok": false
  },
  "fatal_sub_call_with_action": {
@@ -514,6 +596,26 @@
   "ok": true,
   "routes_dae": "    sip(\"10.0.0.0/8\") -> PROXY\n    fallback: PROXY\n"
  },
+ "ip_unknown_option": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "ip_unknown_option_with_no_resolve": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
  "match_direct": {
   "events": [],
   "ok": true,
@@ -679,6 +781,16 @@
   "ok": true,
   "routes_dae": "    ip_no_resolve(\"1.2.3.0/24\") -> PROXY\n    fallback: PROXY\n"
  },
+ "opt_src_on_rule_set_like_domain_in_logic": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
  "opt_unknown": {
   "events": [
    {
@@ -783,6 +895,10 @@
   "ok": true,
   "routes_dae": "    pname(\"curl\") -> PROXY\n    fallback: PROXY\n"
  },
+ "process_name_apostrophe": {
+  "error": "parse Mihomo rule at index 0 line 19: unclosed quote",
+  "ok": false
+ },
  "process_path": {
   "events": [
    {
@@ -852,6 +968,10 @@
   "events": [],
   "ok": true,
   "routes_dae": "    domain(full: \"first.com\") -> OTHER\n    route_expr(\"eyJvcCI6ImFuZCIsImNoaWxkcmVuIjpbeyJtZW1vX2lkIjoxLCJvcCI6ImF0b20iLCJhdG9tIjp7Ik5hbWUiOiJkb21haW4iLCJOb3QiOmZhbHNlLCJQYXJhbXMiOlt7IktleSI6InN1ZmZpeCIsIlZhbCI6ImEuY29tIiwiQW5kRnVuY3Rpb25zIjpudWxsLCJBbm5vdGF0aW9uIjpudWxsfV19fSx7Im9wIjoiYXRvbSIsImF0b20iOnsiTmFtZSI6ImRwb3J0IiwiTm90IjpmYWxzZSwiUGFyYW1zIjpbeyJLZXkiOiIiLCJWYWwiOiI0NDMiLCJBbmRGdW5jdGlvbnMiOm51bGwsIkFubm90YXRpb24iOm51bGx9XX19XX0\") -> PROXY\n    domain(full: \"last.com\") -> OTHER\n    fallback: PROXY\n"
+ },
+ "sub_call_name_is_defined_sub_rule": {
+  "error": "compile Mihomo sub-rule \"child\" at index 0 line 19: SUB-RULE call cannot carry an action or options",
+  "ok": false
  },
  "sub_called_twice": {
   "events": [],
@@ -1037,6 +1157,10 @@
   "events": [],
   "ok": true,
   "routes_dae": "    domain(full: \"a.com\") -> PROXY\n    fallback: PROXY\n"
+ },
+ "trailing_comma_on_logic": {
+  "error": "parse Mihomo rule at index 0 line 19: empty rule field",
+  "ok": false
  },
  "two_matches": {
   "events": [],
