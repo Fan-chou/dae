@@ -44,6 +44,7 @@ type rebuildRelay struct {
 	badPeer     netip.AddrPort
 	ss2022      *ss2022RelayCodec
 	drop        atomic.Bool
+	closing     atomic.Bool
 	wg          sync.WaitGroup
 	err         chan error
 }
@@ -121,6 +122,8 @@ func newRebuildRelay(t *testing.T, kind string, badPeer netip.AddrPort) (*rebuil
 	r.wg.Add(1)
 	go r.serve()
 	t.Cleanup(func() {
+		// Errors after this point come from the fixture's own shutdown.
+		r.closing.Store(true)
 		_ = r.udp.Close()
 		if r.tcp != nil {
 			_ = r.tcp.Close()
@@ -174,7 +177,7 @@ func (r *rebuildRelay) accept() {
 				return
 			}
 			if q[0] != 5 || q[1] != 3 || (q[3] != 1 && q[3] != 4) {
-				r.err <- fmt.Errorf("unexpected UDP associate: %x", q)
+				r.fail(fmt.Errorf("unexpected UDP associate: %x", q))
 				return
 			}
 			addressBytes := 6
@@ -257,6 +260,15 @@ func (r *rebuildRelay) reply(client, peer netip.AddrPort, b []byte) error {
 	_, e = r.udp.WriteToUDPAddrPort(append([]byte{0, 0, 0}, plain...), client)
 	return e
 }
+
+// fail reports a relay error unless the fixture is shutting down.
+func (r *rebuildRelay) fail(e error) {
+	if r.closing.Load() {
+		return
+	}
+	r.err <- e
+}
+
 func (r *rebuildRelay) serve() {
 	defer r.wg.Done()
 	b := make([]byte, 4096)
@@ -267,7 +279,7 @@ func (r *rebuildRelay) serve() {
 		}
 		peer, payload, e := r.decode(client, b[:n])
 		if e != nil {
-			r.err <- e
+			r.fail(e)
 			return
 		}
 		r.mu.Lock()
@@ -277,6 +289,10 @@ func (r *rebuildRelay) serve() {
 		r.seen[string(payload)]++
 		key := client.String() + "/" + peer.String()
 		c := r.mappings[key]
+		if c == nil && r.closing.Load() {
+			r.mu.Unlock()
+			return
+		}
 		if c == nil {
 			c, e = net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(peer))
 			if e == nil {
@@ -286,17 +302,17 @@ func (r *rebuildRelay) serve() {
 		shouldDrop := r.drop.Load() && client == r.first && peer == r.badPeer
 		r.mu.Unlock()
 		if e != nil {
-			r.err <- e
+			r.fail(e)
 			return
 		}
 		_ = c.SetDeadline(time.Now().Add(time.Second))
 		if _, e = c.Write(payload); e != nil {
-			r.err <- e
+			r.fail(e)
 			return
 		}
 		n, e = c.Read(b)
 		if e != nil {
-			r.err <- e
+			r.fail(e)
 			return
 		}
 		if !shouldDrop {
