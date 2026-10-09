@@ -25,6 +25,7 @@ type pinnedRebuildFixture struct {
 	dnsPlane *ControlPlane
 	dnsIP    atomic.Value
 	queries  atomic.Int32
+	fake     *FakeIPStore
 }
 
 func newPinnedRebuildFixture(t *testing.T, kind string) *pinnedRebuildFixture {
@@ -36,11 +37,28 @@ func newPinnedRebuildFixtureFamily(t *testing.T, kind string, v6 bool) *pinnedRe
 }
 
 func newPinnedRebuildFixtureFamilies(t *testing.T, kind string, clientV6, peerV6 bool, store *UDPCrossFamilyStore) *pinnedRebuildFixture {
+	return newPinnedRebuildFixtureWith(t, kind, clientV6, peerV6, store, nil)
+}
+
+// A non-nil fake store makes the client destination a DNS FakeIP mapped to
+// pinned.example, as handlePktOwned records it in the dial option.
+func newPinnedRebuildFixtureWith(t *testing.T, kind string, clientV6, peerV6 bool, store *UDPCrossFamilyStore, fake *FakeIPStore) *pinnedRebuildFixture {
 	t.Helper()
-	f := &pinnedRebuildFixture{rebuildFixture: newRebuildFixtureFamilies(t, kind, "enforce", false, store, clientV6, peerV6)}
+	f := &pinnedRebuildFixture{rebuildFixture: newRebuildFixtureFamilies(t, kind, "enforce", false, store, clientV6, peerV6), fake: fake}
 	f.original = netip.AddrPortFrom(netip.MustParseAddr("198.51.100.10"), f.b.Port())
 	if clientV6 {
 		f.original = netip.AddrPortFrom(netip.MustParseAddr("2001:db8::10"), f.b.Port())
+	}
+	fakeName := ""
+	if fake != nil {
+		v4, v6, _, err := fake.Assign("pinned.example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if clientV6 {
+			v4 = v6
+		}
+		f.original, fakeName = netip.AddrPortFrom(v4, f.b.Port()), "pinned.example"
 	}
 	key := UdpEndpointKey{Src: f.old.poolKey.Src, Dst: f.original}
 	// The explicit Initial metadata also lets identity tests construct matching
@@ -96,7 +114,7 @@ func newPinnedRebuildFixtureFamilies(t *testing.T, kind string, clientV6, peerV6
 		binding := f.old.sessionRuntime.binding
 		binding.Route = UdpRouteBinding{PolicyEpoch: f.dnsPlane.PolicyEpoch(), Outbound: res.OutboundIndex, Mark: res.Mark, Must: res.Must}
 		binding.Egress.Target, binding.Egress.SniffedDomain, binding.Egress.IsDialIp = res.DialTarget, res.SniffedDomain, true
-		return &DialOption{Dialer: res.Dialer, Outbound: res.Outbound, Network: binding.Egress.Network, NetworkType: &binding.Egress.NetworkType, Target: res.DialTarget, IsDialIp: true, Binding: binding, ResolveDNSPinned: res.ResolveDNSPinned, ResolveDNSOriginalNative: true, ResolveDNSInitial: f.initial, SniffedDomain: res.SniffedDomain}, nil
+		return &DialOption{Dialer: res.Dialer, Outbound: res.Outbound, Network: binding.Egress.Network, NetworkType: &binding.Egress.NetworkType, Target: res.DialTarget, IsDialIp: true, Binding: binding, ResolveDNSPinned: res.ResolveDNSPinned, ResolveDNSOriginalNative: fake == nil, FakeIPName: fakeName, FakeIPStore: fake, ResolveDNSInitial: f.initial, SniffedDomain: res.SniffedDomain}, nil
 	}
 	f.options = &opts
 	var err error

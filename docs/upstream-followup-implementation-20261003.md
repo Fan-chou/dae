@@ -1110,3 +1110,54 @@ FullCone 新通道的 pool key 目的地址是 A，回包由 `canonicalReplyFrom
 跨族 pinned 与目的地址同族的 pinned 基本持平，和 10 月 9 日上一轮结论一致。FullCone 替身比 pinned 慢约 36%～48%，计时区间与前一次相同：已有 dial 字符串上的 `TrackUdpConnStateTuplePair` 加写入，写入里的 `droughtPeer` 会 decode 真实 peer，连接记录查找会读按 A 的索引；拨号字符串的格式化在计时之外。目前没有同族 FullCone 的对照基准，这部分差距不能全部归因于替身，也不构成对已有路径的回退。前一次（合并前）的中位为 525.8 ns/op。
 
 还没有做的是 Astra 独立审查和提交。R4 现场验收完成前，223 不对跨族固定目标流或替身流开 enforce。DNS FakeIP 引用保护没有开始。R4 的 220→223 同族 DNS 现场验收也不因这批本地改动而完成。
+
+### U2-R5 DNS FakeIP 引用保护实现（10 月 9 日）
+
+跨族固定目标与替身重建先提交为 `92a44aff`，随后按[计划](upstream-followup-plan-20261002.md#u2-r5-dns-fakeip-引用保护10-月-9-日)实现 R5。引用上限取 `min(maxLive, 1024)`，只保护进入重建的流，两点均已确认。
+
+#### 实现
+
+- **store 侧**（`fakeip_lease.go`）：`AcquireLease(addr, name)` 在写锁下确认 X 仍属于 D（墓碑也算），计数加一并返回带纪元的句柄；`Release` 用原子交换保证只释放一次，纪元不符时不动新表。`expireTombstonesLocked` 跳过有引用的墓碑，这类墓碑既不到期释放，也不计入超上限的释放候选。`resetMemoryLocked` 递增纪元并清空引用表。引用不写 WAL、不进快照。
+- **身份**：`DialOption` 增加 `FakeIPName`、`FakeIPStore`，在 `handlePktOwned` 由建流时的 `fakeDomain` 和当前 FakeIP store 填入。固定目标身份记录二者；不使用 `SniffedDomain`。
+- **资格**：`pinnedDNSExclusion` 对 FakeIP 固定目标改为只读检查 `LookBack(X)==D`，失败记 `resolve_dns_mapping_changed`；没有名字或 store 未就绪仍记 `resolve_dns_fakeip_unleased`。
+- **准备与提交**：拨号前取引用，失败按原因记 `resolve_dns_mapping_changed`、`resolve_dns_fakeip_lease_full` 或 `resolve_dns_fakeip_unleased`，不拨号。引用在后继创建后交给它的 `udpResolveDNSState`，之后任何失败都由后继关闭释放。fence 之前复核句柄仍有效（同一纪元、store 未关闭），失败记 `resolve_dns_mapping_changed`。
+- **普通后代**：`inheritPinnedRebuildTarget` 允许 FakeIP 后代，前提是 store 与名字一致且自己取得引用；否则按新流处理。
+- **释放**：`closePreservingFlowIdentity` 的一次性关闭里释放，覆盖行政关闭、NAT 到期、写入失败、prepared 取消和提交后旧端点结束。原始流不取引用。
+- **诊断**：`/v1/udp-recovery` 增加 `fakeip_leases`（`active`、`retained_tombstones`、`limit`）。分析器沿用 DNS pin 确认规则，增加 FakeIP 用例；FakeIP 提交不能由 native 回复确认。
+
+`UdpEndpoint` 不增加字段，每包路径不变。
+
+#### 测试
+
+store 单测覆盖：一条活跃记录、宽限期为零时连续分配 32 个名字，被引用的地址不被分出且仍映射回原名；池前缀移走再移回后同样不被改派；名字不符、地址未分配、引用上限、重复释放；内存重置后旧句柄失效且不影响新表计数；关闭后不发新引用。临时去掉墓碑保护后，前两项失败。
+
+端到端（真实 SS AEAD 与 SOCKS5）复用固定目标的完整用例：DNS 变化、旧发送方跟随、三次新回复、关闭观察器、普通后代；另测引用生命周期（提交后计数为 1，连续分配不改派 X，回包源保持 X，关闭后计数归零、墓碑按期释放）、准备前映射已变、引用已满时不拨号、准备期取消三种原因后计数归零、准备后 store 重置时在 fence 前取消。以下四种临时破坏各至少被一项捕获：准备不取引用、关闭不释放、提交不复核、普通后代不持有引用。
+
+整个 `./control/` 的 `-race` 通过，`control`／`cmd` vet 干净，内存布局守卫未改，分析器 18 项通过。
+
+#### 延迟
+
+基线 `92a44aff`，在临时 worktree 中构建；当前是未提交工作区。条件同前：Go 1.27.0、`GOWORK=off`、`GOEXPERIMENT=heapminimum512kib`、`GOMAXPROCS=2`、`-tags dae_stub_ebpf`、`taskset -c 0,1`，7 轮交错，奇数轮先基线。稳态每轮 `benchtime=1s`；首包沿用 R4 的 `BenchmarkQuicInitialEndToEnd`，每轮 `20000x`，覆盖入口分发、`handlePktOwned`、代理拨号、首包写入和端点创建。原始输出、`summary.json` 和测试二进制在忽略目录 `build/udp-fakeip-lease-latency/`；SHA-256：基线 `9732afb6…e52471b2`，当前 `40ed2931…ba225fc`。
+
+**首包对照发现并修正了一处每包分配。** 第一次首包对照中，当前版本每次多 1 次分配（p=1 由 73 到 74，p=8 由 72 到 73）。原因是建流闭包直接引用了 `fakeDomain`，而它在 `handlePktOwned` 里被重新赋值过，Go 只能按引用捕获，逃逸分析显示 `udp.go: moved to heap: fakeDomain`。这个分配发生在每次进入 `handlePktOwned` 时，即每个入口包都会多一次，不只是首包；稳态基准直接调用 `WriteTo`，测不到。修正为在闭包前复制成不再赋值的 `fakeIPName`，按值捕获；之后 `udp.go` 的逃逸条数与基线相同（11 条）。修正前的二进制和输出移到 `superseded/`。下表是修正后的结果。
+
+| 路径 | 基线中位 ns/op | 当前中位 ns/op | 变化 |
+| --- | ---: | ---: | ---: |
+| 首包 p=1 | 16936 | 17140 | +1.20% |
+| 首包 p=8 | 14674 | 14500 | -1.19% |
+| 稳态 off | 115.3 | 115.1 | -0.17% |
+| 稳态 observe | 274.6 | 274.1 | -0.18% |
+| 限定范围 enforce | 332.8 | 330.9 | -0.57% |
+| 同族 pinned enforce | 342.1 | 354.6 | +3.65% |
+| 跨族 pinned v4→v6 | 374.3 | 377.3 | +0.80% |
+| 跨族 pinned v6→v4 | 343.2 | 343.2 | +0.00% |
+| FullCone 替身 | 510.9 | 506.8 | -0.80% |
+
+稳态全部 0 B/op、0 allocs/op。首包 p=8 各轮都是 72 次分配，与基线相同；p=1 个别轮显示 74，字节中位多约 90 B。用 `memprofilerate=1` 跑 100000 次比较分配 profile，两边都是每次 56 次分配，差异只在嗅探池的少量噪声（总量 0.44%，当前更少），入口和建流路径没有新的分配点。
+
+同族 pinned 的 +3.65% 各轮一致（比值 1.02～1.07），但没有达到 5% 门槛，判断为代码布局效应：该基准经过的源码在修正前后完全相同；把基线、修正前、修正后三个二进制交替各跑 5 轮，修正前与基线持平（中位 345.7 对 344.1），修正后为 360.7。`objdump` 显示 `writeTo`、`writeToRebuildPeer`、`udpReplyDroughtFlow.write`、`observeDroughtWrite` 的指令完全一致，只是整体前移 32 字节，从 64 字节对齐变为 32 字节对齐。
+
+#### 待办
+
+Astra 独立审查、提交，以及与 R4 一起的 220→223 现场验收。223 上 FakeIP 固定目标流在现场验收前不开 enforce。
+

@@ -114,6 +114,15 @@ type UDPRecoverySnapshot struct {
 	LostRecords          uint64                   `json:"lost_records"`
 	RingEvicted          uint64                   `json:"ring_evicted"`
 	EventCounts          map[string]uint64        `json:"event_counts"`
+	FakeIPLeases         *UDPRecoveryFakeIPLeases `json:"fakeip_leases,omitempty"`
+}
+
+// Leases held by rebuilt DNS FakeIP associations, and tombstones kept past
+// their normal expiry only because a lease still uses the address.
+type UDPRecoveryFakeIPLeases struct {
+	Active             int `json:"active"`
+	RetainedTombstones int `json:"retained_tombstones"`
+	Limit              int `json:"limit"`
 }
 
 func (m *SessionManager) recoveryJournal() *udpRecoveryJournal {
@@ -329,6 +338,10 @@ func (c *ControlPlane) AdminUDPRecovery(after uint64, process string) UDPRecover
 	}
 	s.Process = m.adminSnapshotID
 	s.Execution = m.udpRebuild.Load().snapshot(now)
+	if store := c.fakeIPStore(); store != nil {
+		active, retained, limit := store.LeaseStats()
+		s.FakeIPLeases = &UDPRecoveryFakeIPLeases{Active: active, RetainedTombstones: retained, Limit: limit}
+	}
 	if o := c.udpReplyDrought; o != nil && !o.closed.Load() {
 		s.Mode = "observe"
 		if o.policy.Enforce {

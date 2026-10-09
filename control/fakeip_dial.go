@@ -223,6 +223,15 @@ func (c *ControlPlane) resolveFakeIPDomain(domain string, dst netip.Addr) (strin
 	return strings.TrimSuffix(name, "."), nil
 }
 
+// fakeIPStoreFor keeps the store with a FakeIP flow's dial option so recovery
+// can lease the original mapping without consulting the live generation.
+func fakeIPStoreFor(fake bool, c *ControlPlane) *FakeIPStore {
+	if !fake {
+		return nil
+	}
+	return c.fakeIPStore()
+}
+
 func (c *ControlPlane) guardFakeIPOutbound(outbound consts.OutboundIndex, dst netip.Addr) error {
 	store := c.fakeIPStore()
 	if store == nil || !store.Contains(dst) {

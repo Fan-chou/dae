@@ -5,6 +5,7 @@ package control
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,10 @@ import (
 
 const udpRebuildQueueLimit = 32
 
-var errUDPRebuildAliasUnavailable = errors.New("udp alias mapping unavailable")
+var (
+	errUDPRebuildAliasUnavailable = errors.New("udp alias mapping unavailable")
+	errUDPRebuildFakeIPLease      = errors.New("udp FakeIP lease unavailable")
+)
 
 type udpRebuildCandidate struct {
 	flow   *udpReplyDroughtFlow
@@ -325,6 +329,9 @@ func (x *udpRebuildExecutor) execute(q udpRebuildCandidate) {
 	next, prepareErr := x.prepare(ctx, ue, peer)
 	if prepareErr != nil {
 		reason := "prepare_failed"
+		if errors.Is(prepareErr, errUDPRebuildFakeIPLease) {
+			reason = fakeIPLeaseReason(prepareErr)
+		}
 		if x.closing.Load() || x.ctx.Err() != nil {
 			reason = "prepare_cancelled"
 		}
@@ -340,7 +347,10 @@ func (x *udpRebuildExecutor) execute(q udpRebuildCandidate) {
 	}()
 	// After prepare and before the handoff fence. Ready takes a short read
 	// lock; publication and rebuild mutexes are not held yet.
-	if reason = aliasMappingReady(slot, next); reason != "" {
+	if reason = aliasMappingReady(slot, next); reason == "" {
+		reason = fakeIPLeaseReady(next)
+	}
+	if reason != "" {
 		x.ledger.count(reason)
 		x.event("cancelled", reason, &q.row)
 		return
@@ -396,6 +406,16 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 			}
 		}
 	}
+	// Lease before dialing: the successor must not be built for an address
+	// that has already been handed to another name.
+	var fakeLease *fakeIPLease
+	if p := old.pinnedTarget; p != nil && !p.native {
+		var err error
+		if fakeLease, err = p.acquireFakeIPLease(); err != nil {
+			return nil, fmt.Errorf("%w: %w", errUDPRebuildFakeIPLease, err)
+		}
+		defer func() { fakeLease.Release() }()
+	}
 	conn, err := group.DialContextWithSelected(netproxy.ContextWithUDPReplyAddr(ctx, target, original), binding.Egress.Dialer, binding.Egress.Network, target)
 	if err != nil {
 		return nil, err
@@ -429,6 +449,11 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 		next.pinnedTarget = &copy
 		next.resolveDNSState.phase.Store(udpDNSPinPrepared)
 		next.resolveDNSState.store = old.resolveDNSState.store
+		if fakeLease != nil {
+			// From here next.Close releases it on every failure path.
+			next.resolveDNSState.fakeLease.Store(fakeLease)
+			fakeLease = nil
+		}
 		if old.identifiedQuic() {
 			next.markIdentifiedQuic()
 		}
@@ -454,6 +479,18 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 
 // The inner table is fixed while this process holds it open. A different
 // table or a closed table cancels the successor before its writes are fenced.
+// A held lease keeps the mapping fixed; only a reset or closed table can
+// invalidate it after prepare.
+func fakeIPLeaseReady(next *UdpEndpoint) string {
+	if p := next.pinnedTarget; p == nil || p.native {
+		return ""
+	}
+	if !next.resolveDNSState.fakeLease.Load().Valid() {
+		return "resolve_dns_mapping_changed"
+	}
+	return ""
+}
+
 func aliasMappingReady(slot *udpRebuildPeer, next *UdpEndpoint) string {
 	store := slot.aliasStore.Load()
 	if store == nil {

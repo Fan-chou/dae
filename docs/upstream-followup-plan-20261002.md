@@ -412,6 +412,86 @@ commit 不比较记录序号，也不以缓存是否存在判断映射。`decode
 
 本地要覆盖两个方向，目标专用和 FullCone 各至少一条。重建后客户端仍看到原来的 A，新通道发往 P，映射条数不增加。映射在进程内无法删改，不构造这种场景；取消改测两种：store 已关闭，以及注入不同 store 使查找结果与准备时的 A、P 不一致，两种都必须取消且旧流仍可收发。另测重载到只读包装（缓存为空）时，目标专用和 FullCone 的重建都不被误取消。旧通道迟到回包仍显示 A。同族 native 恢复，以及已经落地的跨族 `resolve_dns` 固定目标，行为保持。稳态写入保持 0 B/op、0 allocs/op，并沿用 5% 门槛。FakeIP 引用保护、替身回收和现场验收都不在这一批。
 
+#### U2-R5 DNS FakeIP 引用保护（10 月 9 日）
+
+**状态：已实现，尚未提交。** 跨族与替身重建已在 `92a44aff` 提交。实现记录见[实施记录](upstream-followup-implementation-20261003.md#u2-r5-dns-fakeip-引用保护实现10-月-9-日)。本节细化上文 U2-R5 的“进程内映射引用 token”，对照的是 `fakeip_store.go` 当前的退休与再分配流程。
+
+##### 现状与风险
+
+客户端目的地址是 FakeIP X，X 在 DNS 映射里属于名字 D；`resolve_dns` 把实际目标固定为数字 P。目前这类流以 `resolve_dns_fakeip_unleased` 排除，不自动重建。
+
+X 被再分配的路径都在 store 内部：
+
+- 表满时 `evictIfNeededLocked` 把 `updatedUnix` 最旧的活跃记录退休。`updatedUnix` 只由 DNS 的 `Assign`／`Lookup` 刷新，包转发不刷新，所以长期只收发、不再查 DNS 的流最先被退休。
+- 退休记录作为墓碑保留 `fakeIPTombstoneGrace`（24 小时）。`expireTombstonesLocked` 到期释放；墓碑数超过 `maxLive` 时，不等到期就按退休时间释放最旧的。
+- 池前缀变化时，`RetireActive`／`applyRangesLocked` 把整代记录退休，之后同样走墓碑。
+- `releaseTombstoneLocked` 删掉反向索引和 used 位后，`allocateLocked` 就可以把 X 分给别的名字 E。
+- 打开时发现磁盘损坏会隔离文件并 `resetMemoryLocked`，所有映射清空。
+
+只要墓碑还在，`allocateLocked` 的 used 位和 `lookBackLocked` 检查都会跳过 X，地址不会被复用。所以保护点只需要一个：**被引用的记录不释放墓碑**。退休本身不改变 X→D，可以照常进行。
+
+已有流在 X 被改派后仍然按 (Src, X) 发往 D 的 P，这是现有行为，不在本批修改。重建的问题在于它会延长或重新建立这种关联，所以重建必须在准备时确认 X 仍属于 D，并保证新关联存活期间 X 不会被改派。
+
+##### 引用的身份
+
+引用绑定三样东西：内层 `*FakeIPStore` 指针、store 的内存纪元、以及记录身份（X、记录下标、名字 D）。
+
+- 名字 D 取自建流时对 X 的 `LookBack` 结果，即 `handlePktOwned` 里的 `fakeDomain`，经 `DialOption` 存进固定目标身份。不能用 `SniffedDomain`：嗅探到的 SNI 优先于 DNS 名，可能和 X 的映射名不同。
+- 内存纪元在 `resetMemoryLocked` 时递增。损坏重置、重新 `Open` 之后，旧引用一律失效，不重新绑定到同一地址上的其他名字。
+- 只用于 DNS FakeIP store。`stableAliases` 的跨族映射表本来就不回收，不接入引用，两套命名空间不混合。
+
+##### store 侧
+
+新增内存表 `leases map[fakeIPInternID]*fakeIPLeaseEntry`，记录引用计数，不写 WAL，不进快照，进程重启即清空（届时流也都已结束）。
+
+- `AcquireLease(addr, name)`：持写锁，要求 store 就绪、未关闭，`lookBackLocked(addr)` 命中，且该下标的名字等于 `name`。记录可以已退休（墓碑仍代表 X→D）。成功后计数加一，返回带纪元的句柄；不满足时返回具体原因（映射已变、未就绪、已满）。
+- `Release()`：计数减一，句柄内部用原子交换保证只释放一次；纪元不符时不动表。
+- `releaseTombstoneLocked` 的两个调用点（到期、超过上限）都跳过有引用的记录；超上限的释放改为在无引用的墓碑里挑最旧的。
+- 计数归零时不立即释放墓碑，交回正常的到期规则处理。
+- 引用总数设上限，建议取 `maxLive` 与 1024 中较小的值。满了就拒绝新引用，对应的重建以排除结束，不去强行释放别的墓碑。这样被引用而保留下来的墓碑最多多出这个上限，内存有界。
+
+Store 的锁只在准备、继承、提交和关闭时拿，不进每包路径。
+
+##### 端点侧
+
+引用放在每个端点自己的 `udpResolveDNSState` 上，不放在 `udpPinnedTargetIdentity`。后者在准备和继承时会被整体复制，放在那里会让两个端点共用同一个句柄。这样 `UdpEndpoint` 本身也不增加字段。
+
+- **原始流**：建流时不取引用，行为不变；没有参与过恢复的 FakeIP 流不增加任何开销。
+- **准备**：在拨号前取引用，`AcquireLease(X, D)` 成功才继续。失败时，映射已变记 `resolve_dns_mapping_changed`，已满记 `resolve_dns_fakeip_lease_full`，未就绪或已关闭记 `resolve_dns_fakeip_unleased`，旧流不受影响。引用交给准备中的后继持有。
+- **提交**：只复核句柄纪元与 store 未关闭。因为有引用的记录不会被释放，持有期间 X→D 不会改变，不需要再次 `LookBack`。复核放在 fence 之前，和替身的 `aliasMappingReady` 同一位置。
+- **取消**：准备中的后继关闭时释放它的引用。
+- **普通后代**：写入出错后经 `inheritPinnedRebuildTarget` 接手时，自己再取一份引用，成功才继承 claim；失败按新流处理，不占用旧 peer claim。
+- **释放**：跟着端点的实际结束走。在 `closePreservingFlowIdentity` 的一次性关闭里释放，覆盖行政关闭、NAT 到期、写入失败和提交后旧端点结束。观察器关闭、关闭功能或重载都不提前释放还在收发或排空的端点所持的引用。
+
+回包仍由 `canonicalReplyFrom` 恢复成 X，回包源保持 FakeIP。迟到的旧回包同样显示 X。
+
+##### 资格
+
+`pinnedDNSExclusion` 对非 native 的固定目标不再直接排除，改为要求：建流时记录了映射名 D；当前 FakeIP store 就绪；只读检查 `LookBack(X) == D`。准备阶段的 `AcquireLease` 才是最终判定。其余规则（端口一致、实际 peer 等于固定 peer、QUIC 身份、目标歧义、batch 等）保持不变。`inheritPinnedRebuildTarget` 里 `!option.ResolveDNSOriginalNative` 的条件改为允许已取得引用的 FakeIP 后代。
+
+##### 诊断
+
+`target_kind=resolve_dns_fakeip` 已有。另加：当前引用数、因引用而保留的墓碑数、`resolve_dns_fakeip_lease_full` 与 `resolve_dns_mapping_changed` 计数。分析器对 FakeIP 链沿用 DNS pin 的确认规则；归档里没有 FakeIP 池配置，分析器不核对 `original_target` 是否落在池内，FakeIP 提交只能由同为 FakeIP 的新回复确认。
+
+##### 验收
+
+store 单测：
+
+- 有引用的墓碑在宽限期到期和超过上限两种情况下都不释放，`allocateLocked` 不会分出 X；引用释放后按正常规则到期回收。
+- 池前缀变化、表满退休时，引用的记录变成墓碑但保留；名字 D 再次查询时按原规则复活或换新地址，不影响 X→D。
+- 重新 `Open`／损坏重置后旧句柄失效，`Release` 不误删新表的计数。
+- 引用达到上限时拒绝新增，已有引用不受影响。
+
+端到端（真实 SS AEAD 和 SOCKS5）：
+
+- FakeIP 固定目标重建成功，新通道发往原 P，客户端回包源始终是 X，业务域名不重新解析。
+- 准备前把 X 改派给另一个名字时取消，旧流仍可收发。
+- 重建后人为触发退休和墓碑到期，X 不被改派；后继结束后引用计数归零。
+- 普通后代继承时取得引用；引用已满时以排除结束。
+- 重载（包括关闭 FakeIP）不提前释放在用的引用；prepared 取消后计数恢复。
+
+性能：每包路径不增加锁或分配，按此前方法对照 `92a44aff` 做 7 轮交错，沿用 5% 门槛。完成后由 Astra 独立审查，现场验收与 R4 一起排期。
+
 ### 性能和构建能力
 
 来源 S13。所有优化在正确性单元完成后评估。

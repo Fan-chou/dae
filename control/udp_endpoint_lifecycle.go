@@ -824,6 +824,9 @@ func (ue *UdpEndpoint) closePreservingFlowIdentity(keepIdentity bool) error {
 			ue.rememberFlowIdentityOnRetire()
 		}
 		ue.endRebuildOwnership()
+		// Released only when this endpoint's I/O ends, including a cancelled
+		// prepared successor and a superseded ancestor.
+		ue.releaseFakeIPLease()
 		ue.expiresAtNano.Store(0)
 		ue.stopTransportReceiver()
 		ue.releaseCachedResponseConns()

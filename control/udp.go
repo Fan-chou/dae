@@ -213,6 +213,10 @@ type DialOption struct {
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
+	// FakeIPName is the DNS mapping name of a FakeIP destination at flow
+	// creation; it can differ from a sniffed domain.
+	FakeIPName  string
+	FakeIPStore *FakeIPStore
 }
 
 func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout time.Duration) {
@@ -1124,6 +1128,9 @@ getNew:
 			endpointDrainTracker = nil
 		}
 		replyLog := c.log
+		// Capture by value: fakeDomain is reassigned above, so referencing it
+		// from the dial closure would move it to the heap on every packet.
+		fakeIPName := fakeDomain
 		flowDecision.observeStage(2)
 		ue, isNew, err = DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
 			Ctx:         c.ctx,
@@ -1206,6 +1213,8 @@ getNew:
 					ResolveDNSPinned:         res.ResolveDNSPinned,
 					ResolveDNSInitial:        flowDecision.PacketSnifferKey(),
 					ResolveDNSOriginalNative: originalNative,
+					FakeIPName:               fakeIPName,
+					FakeIPStore:              fakeIPStoreFor(fakeDestination, c),
 					// Pass the domain (or resolve_dns-pinned IP) from chooseProxyDialer.
 					// Endpoint key stays on the client destination (including FakeIP).
 					Target:        udpDialTarget(res.DialTarget, realDst.String()),

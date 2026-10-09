@@ -19,6 +19,8 @@ type udpResolveDNSState struct {
 	once    sync.Once
 	id      uint64
 	phase   atomic.Uint32
+	// fakeLease protects a DNS FakeIP original for this endpoint's lifetime.
+	fakeLease atomic.Pointer[fakeIPLease]
 }
 
 type resolveDNSRecovery struct {

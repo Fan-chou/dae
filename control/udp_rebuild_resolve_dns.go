@@ -3,6 +3,7 @@
 package control
 
 import (
+	"errors"
 	"net/netip"
 	"strings"
 	"sync"
@@ -24,6 +25,10 @@ type udpPinnedTargetIdentity struct {
 	native         bool
 	initial        PacketSnifferKey
 	flow           *udpPinnedFlowIdentity
+	// DNS FakeIP flows record the mapping name seen when the flow was created
+	// and the process-owned store. Leases are per endpoint, never copied here.
+	fakeName  string
+	fakeStore *FakeIPStore
 }
 
 // No packet write takes this mutex. It serializes publication, connection
@@ -43,7 +48,44 @@ func newUDPPinnedTarget(ue *UdpEndpoint, option *DialOption) *udpPinnedTargetIde
 	}
 	f := &udpPinnedFlowIdentity{owner: ue}
 	f.revision.Store(1)
-	return &udpPinnedTargetIdentity{original: ue.poolKey.Dst, peer: netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()), domain: strings.ToLower(strings.TrimSuffix(option.SniffedDomain, ".")), native: option.ResolveDNSOriginalNative, initial: option.ResolveDNSInitial, flow: f}
+	t := &udpPinnedTargetIdentity{original: ue.poolKey.Dst, peer: netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()), domain: strings.ToLower(strings.TrimSuffix(option.SniffedDomain, ".")), native: option.ResolveDNSOriginalNative, initial: option.ResolveDNSInitial, flow: f}
+	if !t.native {
+		t.fakeName, t.fakeStore = canonicalizeFakeIPQname(option.FakeIPName), option.FakeIPStore
+	}
+	return t
+}
+
+// A read-only check for candidate selection. prepare's AcquireLease is the
+// authoritative decision.
+func (p *udpPinnedTargetIdentity) fakeIPExclusion() string {
+	if p.fakeName == "" || p.fakeStore == nil || !p.fakeStore.Ready() {
+		return "resolve_dns_fakeip_unleased"
+	}
+	if name, ok := p.fakeStore.LookBack(p.original.Addr()); !ok || canonicalizeFakeIPQname(name) != p.fakeName {
+		return "resolve_dns_mapping_changed"
+	}
+	return ""
+}
+
+func (p *udpPinnedTargetIdentity) acquireFakeIPLease() (*fakeIPLease, error) {
+	return p.fakeStore.AcquireLease(p.original.Addr(), p.fakeName)
+}
+
+func fakeIPLeaseReason(err error) string {
+	switch {
+	case errors.Is(err, errFakeIPLeaseMappingChanged):
+		return "resolve_dns_mapping_changed"
+	case errors.Is(err, errFakeIPLeaseFull):
+		return "resolve_dns_fakeip_lease_full"
+	default:
+		return "resolve_dns_fakeip_unleased"
+	}
+}
+
+func (ue *UdpEndpoint) releaseFakeIPLease() {
+	if ue.resolveDNSState != nil {
+		ue.resolveDNSState.fakeLease.Swap(nil).Release()
+	}
 }
 
 func (ue *UdpEndpoint) pinnedDNSExclusion(peer netip.AddrPort) string {
@@ -52,7 +94,9 @@ func (ue *UdpEndpoint) pinnedDNSExclusion(peer netip.AddrPort) string {
 		return "resolve_dns_identity_uncertain"
 	}
 	if !p.native {
-		return "resolve_dns_fakeip_unleased"
+		if reason := p.fakeIPExclusion(); reason != "" {
+			return reason
+		}
 	}
 	target, err := netip.ParseAddrPort(ue.DialTarget)
 	if err != nil {
@@ -129,8 +173,19 @@ func (ue *UdpEndpoint) inheritPinnedRebuildTarget(old *UdpEndpoint, option *Dial
 	}
 	p, ds := old.pinnedTarget, ue.resolveDNSState
 	peer, err := netip.ParseAddrPort(ue.DialTarget)
-	if ds == nil || err != nil || netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()) != p.peer || ue.poolKey != old.poolKey || strings.ToLower(strings.TrimSuffix(ue.SniffedDomain, ".")) != p.domain || ds.initial != p.initial || old.resolveDNSState.phase.Load() != udpDNSPinCurrent || p.flow.revoked.Load() || option.Binding.Route != old.flowRouteBinding || !option.ResolveDNSOriginalNative {
+	if ds == nil || err != nil || netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()) != p.peer || ue.poolKey != old.poolKey || strings.ToLower(strings.TrimSuffix(ue.SniffedDomain, ".")) != p.domain || ds.initial != p.initial || old.resolveDNSState.phase.Load() != udpDNSPinCurrent || p.flow.revoked.Load() || option.Binding.Route != old.flowRouteBinding || option.ResolveDNSOriginalNative != p.native {
 		return false
+	}
+	if !p.native {
+		// Each owner holds its own lease; the ancestor's ends with it.
+		if p.fakeStore == nil || option.FakeIPStore != p.fakeStore || canonicalizeFakeIPQname(option.FakeIPName) != p.fakeName {
+			return false
+		}
+		lease, err := p.acquireFakeIPLease()
+		if err != nil {
+			return false
+		}
+		ds.fakeLease.Store(lease)
 	}
 	copy := *p
 	ue.pinnedTarget = &copy

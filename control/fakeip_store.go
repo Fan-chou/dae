@@ -112,6 +112,11 @@ type FakeIPStore struct {
 	maxBytes int
 	diskOK   bool
 	loadWarn error
+	// epoch changes whenever memory is reset; leases from an older table
+	// never protect or release records in the new one.
+	epoch      uint64
+	leases     map[fakeIPInternID]int
+	leaseCount int
 }
 
 func NewFakeIPStore(dir string, maxEntries int) *FakeIPStore {
@@ -189,6 +194,9 @@ func (s *FakeIPStore) resetMemoryLocked(inet4, inet6 netip.Prefix) {
 	s.seq = 0
 	s.durable = 0
 	s.syncErr = nil
+	s.epoch++
+	s.leases = nil
+	s.leaseCount = 0
 }
 
 func (s *FakeIPStore) quarantineDiskLocked() {
@@ -856,6 +864,11 @@ func (s *FakeIPStore) expireTombstonesLocked(now time.Time) {
 	var live []int
 	for i, rec := range s.records {
 		if rec.qname == "" || !rec.retired {
+			continue
+		}
+		if s.leasedLocked(i) {
+			// A rebuilt association still uses this address. It neither
+			// expires nor counts toward the tombstone overflow.
 			continue
 		}
 		at := rec.retiredUnix
