@@ -262,7 +262,9 @@ observe 增加 `retained_owner_not_observed` 覆盖统计，使用 runtime ID �
 
 对已使用 `resolve_dns` 固定目标的 UDP 关联，自动重建沿用当前实际 IP、节点及 egress binding，保留客户端原始地址与连接身份。成功后仍经原始地址查找及返回数据，新关联的实际回复才解除再次重建限制。
 
-首批支持同地址族、目标专用、身份明确的数字目标：客户端原始目的 IP 可以与固定 IP 不同。QUIC 身份保护须在放行带 QUIC 身份的 DNS 流之前完成；没有明确回复义务的 H3／CS2 保持 unknown。DNS FakeIP 另设一批，完成映射引用保护后放行。实际跨地址族 alias、只有域名但没有数字固定目标、共享关联上的 DNS 目标歧义及 batch 继续排除。
+首批（同族，`c55bd62c`）支持同地址族、目标专用、身份明确的数字目标：客户端原始目的 IP 可以与固定 IP 不同。QUIC 身份保护须在放行带 QUIC 身份的 DNS 流之前完成；没有明确回复义务的 H3／CS2 保持 unknown。DNS FakeIP 另设一批，完成映射引用保护后放行。实际跨地址族 alias、只有域名但没有数字固定目标、共享关联上的 DNS 目标歧义及 batch 继续排除。
+
+10 月 5 日同族实现完成后，补充决定把固定数字目标的跨族 `resolve_dns` 作为下一步，虚拟地址映射仍后置。交流和验收口径见[实现记录](upstream-followup-implementation-20261003.md#跨族固定目标自动重建10-月-5-日讨论10-月-9-日记录)。最终范围是：客户端原始目标 A 与固定目标 B 可以不同族；重建继续使用 B，回包仍显示 A，恢复证据只取 B；不分配虚拟地址。客户端与 A 同族、端口相同、B 等于已固定 peer。映射池中的地址、FakeIP、无数字目标、目标歧义、batch，以及非 DNS 的 foreign peer 继续排除。跨族虚拟地址流和 FakeIP 引用保护不在这一步。虚拟地址流的后续方案见[跨族替身地址的自动重建](#跨族替身地址的自动重建10-月-9-日)。
 
 继续使用现有 off／observe／enforce 与精确 client、group、数字 peer、request_reply 作用域，不增加第二套模式。`udp_reply_drought_peers` 匹配实际固定 IP:port；域名解析到另一个 IP 时，必须重新符合作用域并积累证据。配置中的域名或 resolve_dns 参数本身不建立请求／回复义务。SS2022／SS stream／Hysteria2／TUIC 的能力缺项保持，各自支持不能由本节间接放行。
 
@@ -372,6 +374,43 @@ QUIC Initial 检查必须位于 override／prefetch／retained 优先查找之�
 WAN 继续使用 220→223→自管服务，仅一个 client／group、精确实际 peer；至少记录 off、observe、enforce、恢复 off 四段。应用序号／服务端映射、DNS 请求计数、配置／二进制来源、预算及恢复后采样共同验收。正常 A 全部回复且映射保持，B 新映射至少三次有效回复；没有无法解释的丢包、重复或重放。临时配置有独立回滚，服务、私有凭据和映射引用都确认回收。
 
 本节目前不改依赖 pin；如实际 NAT 包装层不能同时提供 P 的元数据和所需能力，则先保守排除，再为该包装层单独修正及发布 outbound。quic-go 不因本设计更新。每批带对应回归及历史保护，完成代码后由 Astra 独立审查；223 默认 off、主要质量组 observe、CS2 unknown 保持到各自实际验收完成。
+
+#### 跨族替身地址的自动重建（10 月 9 日）
+
+**状态：已实现，尚未提交。** 10 月 5 日同意的四条规则成立：沿用同一条替身映射、映射对不上就取消、迟到回包仍用原映射、替身不回收也不改派。映射在进程内不可变，“映射对不上”只剩两种可观测情况：store 已关闭，或查找结果与准备时记下的 A、P 不一致，见下文交接。不能把实现收成删掉 `peer_alias_unsupported`。10 月 9 日补上 FullCone 的按 A 索引：slot 仍按真实 peer P 索引，A 与 P 不同时再记一份客户端可见地址。两张表放在同一个指针后面，安装时一次发布。每包判断只读这一次加载，不调用 `decode`。端点不再为此多占一个指针。本地验收和延迟数字见实施记录。
+
+现有排除是对的。`udpRebuildPeerUsesAlias` 把客户端和真实 peer 不同族、目的地址落在映射池、以及 store 未就绪都视为不能重建。直接放行时，`rebuildOriginal` 会把 slot 和后继 pool key 设成真实 peer。目标专用流提交后还会按这个地址拆 tuple，并在目的地址有效时结束旧 endpoint。客户端之后看到的就不是原来的替身。
+
+映射表本身已经满足稳定性。`peerMapping` 只分配客户端能用的那一族。`stableAliases` 下表满时 `evictIfNeededLocked` 直接报错而不驱逐，`expireTombstonesLocked` 不执行，分配也不并入已退休地址，所以一对 A↔P 一旦写入，进程内不会被删除、改写或改派；记录已存在时只查找。`prepare` 已经把旧 endpoint 的 `crossFamily` 交给后继。回包翻译在 `forwardUdpEndpointReplyToClient`，查的是这张表。干旱证据经过 `decode`，记的是真实 peer。因此重建要固定的是已经存在的一对地址，不是新分配一个替身。
+
+##### 范围
+
+只放行已经存在的替身。客户端可见地址记为 A，真实 peer 记为 P。A 与客户端同族，P 是另一族，且只查找、不分配时 `decode(A)` 得到 P。每个 P 只有一条记录，同一族的替身固定，所以 `decode(A)==P` 已经说明 P 在客户端这一族的替身就是 A，不需要再反查 P→A。
+
+同一条身份覆盖两种现有形态，不增加模式：
+
+- 目标专用：客户端的目的地址就是已分配的替身。pool key、BPF tuple 和回包源保持 A，发送和证据使用 P。提交后旧 endpoint 可以结束。
+- FullCone：一个 endpoint 服务多个 peer。只替换这个 P 的关联，不因为一个 peer 结束整个 endpoint。新回包和迟到回包都经同一个 store 的 `reply` 把 P 译回原来的 A。写入方向由 `dialTargetForWrite` 先把 A 解码成 P，按 P 查 slot 必须放在解码之后。
+
+两种形态的回包翻译不在同一处：目标专用流在 `canonicalReplyFrom` 已恢复成 `poolKey.Dst`，即 A，到 `forwardUdpEndpointReplyToClient` 时与客户端同族，不再查 store；FullCone 的 `Dst` 端口为 0，才由 store 翻译。
+
+继续排除：还没有替身的 foreign peer、映射池里尚未分配的地址、store 未就绪、只读视图里查不到记录、FakeIP、带域名的流、batch、无数字目标，以及 `resolve_dns` 已有规则。不为了让重建成功而去分配新替身。store 已关闭，或查找结果与准备时的 A、P 不一致，就取消，旧流和表项保持原样。
+
+##### 交接
+
+prepare 在拨号前调用 `decode(A)` 得到 P：`reverse` 缓存命中直接使用，未命中退回 `LookBack`，只取读锁，不等待 `WaitDurable`。保存 A、P 和内层 `*FakeIPStore` 指针。这一步只查找，不调用 `peerMapping`：即使 `allocate=false`，它也会拿 store 写锁并等待 `WaitDurable`。后继继承同一个 `crossFamily` 对象，只读视图也原样保留。slot 按 P 索引，`slot.original` 保存 A。
+
+commit 不比较记录序号，也不以缓存是否存在判断映射。`decode` 只写 `reverse[A]=P`；`forward[P]=A` 只在 `reply` 收到跨族来源时写入，目标专用流的回包已经是 A，`forward` 可能始终为空；只读包装新建时两个缓存都为空，内层记录仍在。缓存为空不等于映射消失。因为映射在进程内不可变，prepare 之后唯一可能的变化是 store 关闭，所以交接前只复核后继的内层 store 指针与 prepare 时相同且 `Ready()`。这一步放在 prepare 成功之后、fence 之前：`Ready` 只拿短读锁，此时还没有持有发布锁或重建锁，也不等待磁盘。对不上就取消。重建不删除、不改写映射记录。
+
+普通后代只有在同一 store、同一 A 和同一 P 都还成立时才继承这条关联，A→P 用同样的 `decode` 查找确认。“同一 store”比较内层 `*FakeIPStore`，不比较 `UDPCrossFamilyStore` 包装：映射池保持配置时，重载复用进程里原来的包装，缓存仍在；新配置清空 IPv4 映射池时，`initUDPCrossFamily` 才新建只读包装，其缓存为空、指针不同，内层 store 相同。按包装指针比较会把这次重载误判成映射变化。映射对不上时按新流处理，不占用旧 peer claim。
+
+##### 热路径与作用域
+
+每包写入不增加 store 锁、磁盘等待或替身分配。资格和快照只出现在 prepare 与 commit。A 与 P 不同的 slot 在同一次安装里写入按 A 的索引，之后每包只加载这一份发布。`udp_reply_drought_peers` 继续匹配真实 P，不把替身 A 当成应用 peer。
+
+##### 验收
+
+本地要覆盖两个方向，目标专用和 FullCone 各至少一条。重建后客户端仍看到原来的 A，新通道发往 P，映射条数不增加。映射在进程内无法删改，不构造这种场景；取消改测两种：store 已关闭，以及注入不同 store 使查找结果与准备时的 A、P 不一致，两种都必须取消且旧流仍可收发。另测重载到只读包装（缓存为空）时，目标专用和 FullCone 的重建都不被误取消。旧通道迟到回包仍显示 A。同族 native 恢复，以及已经落地的跨族 `resolve_dns` 固定目标，行为保持。稳态写入保持 0 B/op、0 allocs/op，并沿用 5% 门槛。FakeIP 引用保护、替身回收和现场验收都不在这一批。
 
 ### 性能和构建能力
 

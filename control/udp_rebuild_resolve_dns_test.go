@@ -32,10 +32,14 @@ func newPinnedRebuildFixture(t *testing.T, kind string) *pinnedRebuildFixture {
 }
 
 func newPinnedRebuildFixtureFamily(t *testing.T, kind string, v6 bool) *pinnedRebuildFixture {
+	return newPinnedRebuildFixtureFamilies(t, kind, v6, v6, nil)
+}
+
+func newPinnedRebuildFixtureFamilies(t *testing.T, kind string, clientV6, peerV6 bool, store *UDPCrossFamilyStore) *pinnedRebuildFixture {
 	t.Helper()
-	f := &pinnedRebuildFixture{rebuildFixture: newRebuildFixtureFamily(t, kind, "enforce", false, nil, v6)}
+	f := &pinnedRebuildFixture{rebuildFixture: newRebuildFixtureFamilies(t, kind, "enforce", false, store, clientV6, peerV6)}
 	f.original = netip.AddrPortFrom(netip.MustParseAddr("198.51.100.10"), f.b.Port())
-	if v6 {
+	if clientV6 {
 		f.original = netip.AddrPortFrom(netip.MustParseAddr("2001:db8::10"), f.b.Port())
 	}
 	key := UdpEndpointKey{Src: f.old.poolKey.Src, Dst: f.original}
@@ -60,8 +64,11 @@ func newPinnedRebuildFixtureFamily(t *testing.T, kind string, v6 bool) *pinnedRe
 			f.queries.Add(1)
 			r := new(dnsmessage.Msg)
 			r.SetReply(q)
-			if q.Question[0].Qtype == dnsmessage.TypeA {
-				r.Answer = []dnsmessage.RR{&dnsmessage.A{Hdr: dnsmessage.RR_Header{Name: q.Question[0].Name, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60}, A: net.IP(f.dnsIP.Load().(netip.Addr).AsSlice())}}
+			ip := f.dnsIP.Load().(netip.Addr)
+			if q.Question[0].Qtype == dnsmessage.TypeA && ip.Is4() {
+				r.Answer = []dnsmessage.RR{&dnsmessage.A{Hdr: dnsmessage.RR_Header{Name: q.Question[0].Name, Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60}, A: net.IP(ip.AsSlice())}}
+			} else if q.Question[0].Qtype == dnsmessage.TypeAAAA && ip.Is6() {
+				r.Answer = []dnsmessage.RR{&dnsmessage.AAAA{Hdr: dnsmessage.RR_Header{Name: q.Question[0].Name, Rrtype: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, Ttl: 60}, AAAA: net.IP(ip.AsSlice())}}
 			}
 			wire, _ := r.Pack()
 			_, _ = dns.WriteToUDPAddrPort(wire, src)
@@ -71,9 +78,12 @@ func newPinnedRebuildFixtureFamily(t *testing.T, kind string, v6 bool) *pinnedRe
 	f.old.Dialer.SetResolveDNS(dns.LocalAddr().(*net.UDPAddr).AddrPort())
 	f.dnsPlane = testDialControlPlane(f.old.Outbound)
 	f.dnsPlane.policyIdentity = f.c.policyIdentity
-	cacheKey := resolveDNSResultKey(&proxyDialResult{Dialer: f.old.Dialer, Mark: f.dnsPlane.soMarkFromDae}, "pinned.example", v6)
+	cacheKey := resolveDNSResultKey(&proxyDialResult{Dialer: f.old.Dialer, Mark: f.dnsPlane.soMarkFromDae}, "pinned.example", clientV6)
 	f.dnsPlane.resolveDNSPins.store(cacheKey, f.b.Addr(), time.Now(), time.Minute)
 	opts := *f.rebuildFixture.options
+	// A retained endpoint may already own a read-only mapping view. Install
+	// the requested view before publication rather than mutating a live flow.
+	opts.crossFamily = store
 	opts.GetDialOption = func(ctx context.Context) (*DialOption, error) {
 		param := &proxyDialParam{Outbound: consts.OutboundUserDefinedMin, Domain: "pinned.example", Src: key.Src, Dest: key.Dst, Network: "udp"}
 		if r, ok := f.m.resolveDNSRecovery.lookup(key, f.initial, false); ok {
@@ -138,6 +148,7 @@ func (f *pinnedRebuildFixture) qualifyPin(t *testing.T) time.Time {
 	flow.mu.Lock()
 	p := flow.peers[f.b]
 	if p == nil || p.writes != 64 || p.replies != 3 {
+		flow.mu.Unlock()
 		t.Fatalf("actual-peer evidence: %+v", p)
 	}
 	p.first, p.lastReply = (epoch-7)*int64(udpDroughtBucketDuration), (epoch-7)*int64(udpDroughtBucketDuration)
@@ -157,94 +168,131 @@ func (f *pinnedRebuildFixture) qualifyPin(t *testing.T) time.Time {
 func TestUDPRebuildResolveDNSRealProxy(t *testing.T) {
 	for _, kind := range []string{"shadowsocks", "socks5"} {
 		t.Run(kind, func(t *testing.T) {
-			f := newPinnedRebuildFixture(t, kind)
-			// Fetch a changed answer through the real relay. The live pin remains P1.
-			f.dnsIP.Store(netip.MustParseAddr("127.0.0.2"))
-			f.dnsPlane.resolveDNSPins.mu.Lock()
-			clear(f.dnsPlane.resolveDNSPins.entries)
-			f.dnsPlane.resolveDNSPins.mu.Unlock()
-			option, err := f.options.GetDialOption(context.Background())
-			if err != nil || option.Target != netip.AddrPortFrom(netip.MustParseAddr("127.0.0.2"), f.b.Port()).String() || f.queries.Load() == 0 {
-				t.Fatalf("changed DNS answer: %v, %+v", err, option)
-			}
-			queries := f.queries.Load()
-			f.relay.mu.Lock()
-			f.relay.first = netip.AddrPort{}
-			f.relay.mu.Unlock()
-			f.o.scan(f.qualifyPin(t))
-			slot := f.pin.rebuildPeer(f.b)
-			waitRebuild(t, func() bool { return slot.owner.Load().endpoint != f.pin })
-			next := slot.owner.Load().endpoint
-			if next.poolKey != f.pin.poolKey || slot.original != f.original || next.DialTarget != f.b.String() || next.resolveDNSState.id == f.pin.resolveDNSState.id || next.resolveDNSState.initial != f.initial {
-				t.Fatal("original/actual/DNS state handover failed")
-			}
-			if f.pin.resolveDNSState.phase.Load() != udpDNSPinSuperseded || next.resolveDNSState.phase.Load() != udpDNSPinCurrent {
-				t.Fatal("DNS publication phase")
-			}
-			if got, ok := f.pool.rebuildLookup(f.pin.poolKey); !ok || got != next {
-				t.Fatal("original-key override lost")
-			}
-			previousPool := DefaultUdpEndpointPool
-			DefaultUdpEndpointPool = f.pool
-			t.Cleanup(func() { DefaultUdpEndpointPool = previousPool })
-			decision := UdpFlowDecision{Key: NewUdpFlowKey(f.pin.poolKey.Src, f.original)}
-			_, looked, ok := lookupUdpEndpointForFlowWithPrefetch(decision, udpEndpointRouteScope{}, true, f.original, false, f.pin, f.pin.poolKey, true)
-			if !ok || looked != next {
-				t.Fatal("stale pinned prefetch bypassed successor")
-			}
-			if looked, ok := f.m.retainedUDPEndpoint(f.pin.poolKey.Src, f.original, nil, 2); !ok || looked != next {
-				t.Fatal("retained original-key lookup lost pin")
-			}
-			for i := 0; i < 3; i++ {
-				f.send(t, f.old, f.a, fmt.Sprintf("A/healthy/%d", i), true)
-				if r := f.sendPin(t, f.pin, fmt.Sprintf("pin/new/%d", i), true); r.endpoint != next {
-					t.Fatal("stale sender did not follow actual-peer claim")
-				}
-			}
-			snap := f.m.udpRebuild.Load().snapshot(time.Now())
-			if snap.Counts["committed"] != 1 || snap.Counts["recovered"] != 1 || snap.AttemptsInWindow != 1 || f.queries.Load() != queries {
-				t.Fatalf("budget/replies/DNS queries: %+v, %d -> %d", snap, queries, f.queries.Load())
-			}
-			journal := f.m.recoveryJournal()
-			journal.mu.Lock()
-			for _, e := range journal.records {
-				if e.Kind == "committed" || e.Kind == "recovered" {
-					if e.OriginalTarget != f.original.String() || e.ActualPeer != f.b.String() || e.DNSPinOwnerID != next.resolveDNSState.id || e.FlowIdentityRevision != 1 || !e.PinInherited {
-						t.Errorf("incomplete pin evidence: %+v", e)
-					}
-				}
-			}
-			journal.mu.Unlock()
-			f.relay.mu.Lock()
-			for key := range f.relay.mappings {
-				if strings.HasSuffix(key, "/"+option.Target) {
-					t.Error("application payload reached P2")
-				}
-			}
-			for payload, n := range f.relay.seen {
-				if len(payload) >= 4 && payload[:4] == "pin/" && n != 1 {
-					t.Errorf("replayed %s: %d", payload, n)
-				}
-			}
-			f.relay.mu.Unlock()
-			// Turning observation off preserves the established owner and pin.
-			_ = f.o.Close()
-			f.sendPin(t, f.pin, "pin/after-off", true)
-			next.retire()
-			waitRebuild(t, func() bool { return next.dead.Load() })
-			opts := *f.options
-			opts.replyDrought = nil
-			// Ordinary retirement retains the cache under the original route epoch.
-			ordinary, _, err := f.pool.GetOrCreate(next.poolKey, &opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if ordinary.DialTarget != f.b.String() || ordinary.pinnedTarget == nil || ordinary.rebuildPeer(f.b) != slot || ordinary.rebuildRevision != next.rebuildRevision+1 {
-				t.Fatal("ordinary successor lost DNS pin/lineage")
-			}
-			f.sendPin(t, f.pin, "pin/ordinary", true)
+			runUDPRebuildResolveDNSRealProxy(t, newPinnedRebuildFixture(t, kind))
 		})
 	}
+}
+
+func runUDPRebuildResolveDNSRealProxy(t *testing.T, f *pinnedRebuildFixture) {
+	t.Helper()
+	f.send(t, f.old, f.a, "A/before-pin-recovery", true)
+	f.relay.mu.Lock()
+	healthyMappings := make(map[string]netip.AddrPort)
+	for key, conn := range f.relay.mappings {
+		if strings.HasSuffix(key, "/"+f.a.String()) {
+			healthyMappings[key] = conn.LocalAddr().(*net.UDPAddr).AddrPort()
+		}
+	}
+	f.relay.mu.Unlock()
+	// Fetch a changed answer through the real relay. The live pin remains P1.
+	f.dnsIP.Store(netip.MustParseAddr("127.0.0.2"))
+	f.dnsPlane.resolveDNSPins.mu.Lock()
+	clear(f.dnsPlane.resolveDNSPins.entries)
+	f.dnsPlane.resolveDNSPins.mu.Unlock()
+	option, err := f.options.GetDialOption(context.Background())
+	if err != nil || option.Target != netip.AddrPortFrom(netip.MustParseAddr("127.0.0.2"), f.b.Port()).String() || f.queries.Load() == 0 {
+		t.Fatalf("changed DNS answer: %v, %+v", err, option)
+	}
+	queries := f.queries.Load()
+	f.relay.mu.Lock()
+	f.relay.first = netip.AddrPort{}
+	f.relay.mu.Unlock()
+	f.o.scan(f.qualifyPin(t))
+	slot := f.pin.rebuildPeer(f.b)
+	waitRebuild(t, func() bool { return slot.owner.Load().endpoint != f.pin })
+	next := slot.owner.Load().endpoint
+	if next.poolKey != f.pin.poolKey || slot.original != f.original || next.DialTarget != f.b.String() || next.resolveDNSState.id == f.pin.resolveDNSState.id || next.resolveDNSState.initial != f.initial {
+		t.Fatal("original/actual/DNS state handover failed")
+	}
+	if f.pin.resolveDNSState.phase.Load() != udpDNSPinSuperseded || next.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+		t.Fatal("DNS publication phase")
+	}
+	if got, ok := f.pool.rebuildLookup(f.pin.poolKey); !ok || got != next {
+		t.Fatal("original-key override lost")
+	}
+	previousPool := DefaultUdpEndpointPool
+	DefaultUdpEndpointPool = f.pool
+	t.Cleanup(func() { DefaultUdpEndpointPool = previousPool })
+	decision := UdpFlowDecision{Key: NewUdpFlowKey(f.pin.poolKey.Src, f.original)}
+	_, looked, ok := lookupUdpEndpointForFlowWithPrefetch(decision, udpEndpointRouteScope{}, true, f.original, false, f.pin, f.pin.poolKey, true)
+	if !ok || looked != next {
+		t.Fatal("stale pinned prefetch bypassed successor")
+	}
+	if looked, ok := f.m.retainedUDPEndpoint(f.pin.poolKey.Src, f.original, nil, 2); !ok || looked != next {
+		t.Fatal("retained original-key lookup lost pin")
+	}
+	// Old replies and a new socket's unsolicited reply before a fresh write
+	// cannot satisfy the post-commit confirmation requirement.
+	f.pin.recordRebuildReply(f.b)
+	next.recordRebuildReply(f.b)
+	for i := 0; i < 3; i++ {
+		f.send(t, f.old, f.a, fmt.Sprintf("A/healthy/%d", i), true)
+		if r := f.sendPin(t, f.pin, fmt.Sprintf("pin/new/%d", i), true); r.endpoint != next {
+			t.Fatal("stale sender did not follow actual-peer claim")
+		}
+		// A client-visible O is never substituted for actual peer P in evidence.
+		next.recordRebuildReply(f.original)
+		if i < 2 && f.m.udpRebuild.Load().snapshot(time.Now()).Counts["recovered"] != 0 {
+			t.Fatal("recovery confirmed before three fresh actual-peer replies")
+		}
+	}
+	snap := f.m.udpRebuild.Load().snapshot(time.Now())
+	if snap.Counts["committed"] != 1 || snap.Counts["recovered"] != 1 || snap.AttemptsInWindow != 1 || f.queries.Load() != queries {
+		t.Fatalf("budget/replies/DNS queries: %+v, %d -> %d", snap, queries, f.queries.Load())
+	}
+	journal := f.m.recoveryJournal()
+	journal.mu.Lock()
+	for _, e := range journal.records {
+		if e.Kind == "committed" || e.Kind == "recovered" {
+			if e.OriginalTarget != f.original.String() || e.ActualPeer != f.b.String() || e.OriginalFamily != udpPinnedAddrFamily(f.original.Addr()) || e.ActualPeerFamily != udpPinnedAddrFamily(f.b.Addr()) || e.DNSPinOwnerID != next.resolveDNSState.id || e.FlowIdentityRevision != 1 || !e.PinInherited {
+				t.Errorf("incomplete pin evidence: %+v", e)
+			}
+		}
+	}
+	journal.mu.Unlock()
+	f.relay.mu.Lock()
+	for key, addr := range healthyMappings {
+		if conn := f.relay.mappings[key]; conn == nil || conn.LocalAddr().(*net.UDPAddr).AddrPort() != addr {
+			t.Error("healthy peer's mapping changed")
+		}
+	}
+	for key := range f.relay.mappings {
+		if strings.HasSuffix(key, "/"+option.Target) {
+			t.Error("application payload reached P2")
+		}
+	}
+	for payload, n := range f.relay.seen {
+		if len(payload) >= 4 && payload[:4] == "pin/" && n != 1 {
+			t.Errorf("replayed %s: %d", payload, n)
+		}
+	}
+	f.relay.mu.Unlock()
+	if next.crossFamily != f.pin.crossFamily {
+		t.Fatal("successor changed the reply mapping view")
+	}
+	f.m.udpStateMu.Lock()
+	for _, pair := range [][2]netip.AddrPort{{f.pin.poolKey.Src, f.original}, {f.original, f.pin.poolKey.Src}} {
+		if refs := f.m.pinnedUDP[bpfTuplesKeyFromAddrPorts(pair[0], pair[1], 17)]; refs != 1 {
+			t.Errorf("client-visible tuple %v refs=%d", pair, refs)
+		}
+	}
+	f.m.udpStateMu.Unlock()
+	// Turning observation off preserves the established owner and pin.
+	_ = f.o.Close()
+	f.sendPin(t, f.pin, "pin/after-off", true)
+	next.retire()
+	waitRebuild(t, func() bool { return next.dead.Load() })
+	opts := *f.options
+	opts.replyDrought = nil
+	// Ordinary retirement retains the cache under the original route epoch.
+	ordinary, _, err := f.pool.GetOrCreate(next.poolKey, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.DialTarget != f.b.String() || ordinary.pinnedTarget == nil || ordinary.rebuildPeer(f.b) != slot || ordinary.rebuildRevision != next.rebuildRevision+1 {
+		t.Fatal("ordinary successor lost DNS pin/lineage")
+	}
+	f.sendPin(t, f.pin, "pin/ordinary", true)
 }
 
 func TestUDPRebuildResolveDNSPreparedCancel(t *testing.T) {
@@ -345,63 +393,67 @@ func TestUDPRebuildResolveDNSInitialBoundary(t *testing.T) {
 func TestUDPRebuildResolveDNSCancelDuringPrepare(t *testing.T) {
 	for _, reason := range []string{"reply", "reload", "unknown_initial", "new_initial", "store_busy"} {
 		t.Run(reason, func(t *testing.T) {
-			f := newPinnedRebuildFixture(t, "shadowsocks")
-			now := f.qualifyPin(t)
-			f.m.resolveDNSRecovery.save(f.pin)
-			f.dial.entered, f.dial.unblock = make(chan struct{}, 1), make(chan struct{})
-			f.o.scan(now)
-			select {
-			case <-f.dial.entered:
-			case <-time.After(time.Second):
-				t.Fatal("prepare did not start")
-			}
-			// The unrelated healthy peer keeps sending while B's dial is blocked.
-			f.send(t, f.old, f.a, "A/during-prepare", true)
-			storeLocked := false
-			defer func() {
-				if storeLocked {
-					f.m.resolveDNSRecovery.mu.Unlock()
-				}
-			}()
-			switch reason {
-			case "reply":
-				f.relay.drop.Store(false)
-				f.sendPin(t, f.pin, "pin/original-recovers", true)
-			case "reload":
-				recoveryTestPlane(f.m, nil, 2).publishActiveControlPlane()
-			case "unknown_initial", "new_initial":
-				initial := f.initial
-				if reason == "unknown_initial" {
-					initial.DCIDLen = 0
-				} else {
-					initial.DCID[0]++
-				}
-				f.pool.checkPinnedRebuildInitial(f.pin.poolKey, UdpFlowDecision{Key: NewUdpFlowKey(f.pin.poolKey.Src, f.original), SnifferKey: initial, IsQuicInitial: true})
-			case "store_busy":
-				f.m.resolveDNSRecovery.mu.Lock()
-				storeLocked = true
-			}
-			close(f.dial.unblock)
-			waitRebuild(t, func() bool { return f.o.execution.Load().idleForTest() })
-			if storeLocked {
-				f.m.resolveDNSRecovery.mu.Unlock()
-				storeLocked = false
-			}
-			snap := f.m.udpRebuild.Load().snapshot(time.Now())
-			if snap.Counts["committed"] != 0 || snap.AttemptsInWindow != 1 {
-				t.Fatalf("cancel published/refunded attempt: %+v", snap)
-			}
-			if reason != "new_initial" {
-				if f.pin.dead.Load() || f.pin.resolveDNSState.phase.Load() != udpDNSPinCurrent {
-					t.Fatal("cancel changed old owner")
-				}
-				if r, ok := f.m.resolveDNSRecovery.lookup(f.pin.poolKey, f.initial, false); !ok || r.owner != f.pin.resolveDNSState.id {
-					t.Fatal("cancel discarded original cache")
-				}
-				f.relay.drop.Store(false)
-				f.sendPin(t, f.pin, "pin/after-cancel", true)
-			}
+			runUDPRebuildResolveDNSCancelDuringPrepare(t, newPinnedRebuildFixture(t, "shadowsocks"), reason)
 		})
+	}
+}
+
+func runUDPRebuildResolveDNSCancelDuringPrepare(t *testing.T, f *pinnedRebuildFixture, reason string) {
+	t.Helper()
+	now := f.qualifyPin(t)
+	f.m.resolveDNSRecovery.save(f.pin)
+	f.dial.entered, f.dial.unblock = make(chan struct{}, 1), make(chan struct{})
+	f.o.scan(now)
+	select {
+	case <-f.dial.entered:
+	case <-time.After(time.Second):
+		t.Fatal("prepare did not start")
+	}
+	// The unrelated healthy peer keeps sending while B's dial is blocked.
+	f.send(t, f.old, f.a, "A/during-prepare", true)
+	storeLocked := false
+	defer func() {
+		if storeLocked {
+			f.m.resolveDNSRecovery.mu.Unlock()
+		}
+	}()
+	switch reason {
+	case "reply":
+		f.relay.drop.Store(false)
+		f.sendPin(t, f.pin, "pin/original-recovers", true)
+	case "reload":
+		recoveryTestPlane(f.m, nil, 2).publishActiveControlPlane()
+	case "unknown_initial", "new_initial":
+		initial := f.initial
+		if reason == "unknown_initial" {
+			initial.DCIDLen = 0
+		} else {
+			initial.DCID[0]++
+		}
+		f.pool.checkPinnedRebuildInitial(f.pin.poolKey, UdpFlowDecision{Key: NewUdpFlowKey(f.pin.poolKey.Src, f.original), SnifferKey: initial, IsQuicInitial: true})
+	case "store_busy":
+		f.m.resolveDNSRecovery.mu.Lock()
+		storeLocked = true
+	}
+	close(f.dial.unblock)
+	waitRebuild(t, func() bool { return f.o.execution.Load().idleForTest() })
+	if storeLocked {
+		f.m.resolveDNSRecovery.mu.Unlock()
+		storeLocked = false
+	}
+	snap := f.m.udpRebuild.Load().snapshot(time.Now())
+	if snap.Counts["committed"] != 0 || snap.AttemptsInWindow != 1 {
+		t.Fatalf("cancel published/refunded attempt: %+v", snap)
+	}
+	if reason != "new_initial" {
+		if f.pin.dead.Load() || f.pin.resolveDNSState.phase.Load() != udpDNSPinCurrent {
+			t.Fatal("cancel changed old owner")
+		}
+		if r, ok := f.m.resolveDNSRecovery.lookup(f.pin.poolKey, f.initial, false); !ok || r.owner != f.pin.resolveDNSState.id {
+			t.Fatal("cancel discarded original cache")
+		}
+		f.relay.drop.Store(false)
+		f.sendPin(t, f.pin, "pin/after-cancel", true)
 	}
 }
 
@@ -654,15 +706,20 @@ func TestUDPRebuildResolveDNSAddressEligibility(t *testing.T) {
 		{"v4", "192.0.2.201:32000", "198.51.100.10:27015", "203.0.113.20:27015", ""},
 		{"v6", "[2001:db8::201]:32000", "[2001:db8::10]:27015", "[2001:db8::20]:27015", ""},
 		{"mapped v4", "[::ffff:192.0.2.201]:32000", "[::ffff:198.51.100.10]:27015", "203.0.113.20:27015", ""},
-		{"cross family", "192.0.2.201:32000", "198.51.100.10:27015", "[2001:db8::20]:27015", "resolve_dns_peer_mismatch"},
+		{"v4 to v6", "192.0.2.201:32000", "198.51.100.10:27015", "[2001:db8::20]:27015", ""},
+		{"v6 to v4", "[2001:db8::201]:32000", "[2001:db8::10]:27015", "203.0.113.20:27015", ""},
+		{"mapped v4 to v6", "[::ffff:192.0.2.201]:32000", "[::ffff:198.51.100.10]:27015", "[2001:db8::20]:27015", ""},
+		{"v6 to mapped v4", "[2001:db8::201]:32000", "[2001:db8::10]:27015", "[::ffff:203.0.113.20]:27015", ""},
 		{"original family", "[2001:db8::201]:32000", "198.51.100.10:27015", "[2001:db8::20]:27015", "resolve_dns_peer_mismatch"},
+		{"original v6 for v4 client", "192.0.2.201:32000", "[2001:db8::10]:27015", "203.0.113.20:27015", "resolve_dns_peer_mismatch"},
 		{"port", "192.0.2.201:32000", "198.51.100.10:27016", "203.0.113.20:27015", "resolve_dns_peer_mismatch"},
 		{"no client", "", "[2001:db8::10]:27015", "[2001:db8::20]:27015", "resolve_dns_peer_mismatch"},
 		{"dns", "192.0.2.201:32000", "198.51.100.10:53", "203.0.113.20:53", "resolve_dns_peer_mismatch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src, _ := netip.ParseAddrPort(tc.client)
-			peer := netip.MustParseAddrPort(tc.peer)
+			parsed := netip.MustParseAddrPort(tc.peer)
+			peer := netip.AddrPortFrom(parsed.Addr().Unmap(), parsed.Port())
 			ue := &UdpEndpoint{poolKey: UdpEndpointKey{Src: src, Dst: netip.MustParseAddrPort(tc.original)}, DialTarget: tc.peer, SniffedDomain: "PINNED.EXAMPLE.", resolveDNSState: &udpResolveDNSState{}}
 			ue.pinnedTarget = newUDPPinnedTarget(ue, &DialOption{Target: tc.peer, SniffedDomain: ue.SniffedDomain, ResolveDNSOriginalNative: true})
 			if got := ue.pinnedDNSExclusion(peer); got != tc.exclusion {

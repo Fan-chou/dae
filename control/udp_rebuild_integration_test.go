@@ -298,12 +298,13 @@ func (r *rebuildRelay) mapping(client, peer netip.AddrPort) netip.AddrPort {
 }
 
 type rebuildDialer struct {
-	next    netproxy.Dialer
-	dials   atomic.Int32
-	fail    atomic.Bool
-	entered chan struct{}
-	unblock chan struct{}
-	gate    *rebuildWriteGate
+	next        netproxy.Dialer
+	dials       atomic.Int32
+	fail        atomic.Bool
+	entered     chan struct{}
+	unblock     chan struct{}
+	gate        *rebuildWriteGate
+	onExtraDial func()
 }
 
 type rebuildWriteGate struct {
@@ -337,6 +338,9 @@ func (c *rebuildGatedConn) WriteTo(b []byte, addr string) (int, error) {
 func (d *rebuildDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
 	n := d.dials.Add(1)
 	if n > 1 {
+		if d.onExtraDial != nil {
+			d.onExtraDial()
+		}
 		if d.entered != nil {
 			select {
 			case d.entered <- struct{}{}:
@@ -390,10 +394,14 @@ func newRebuildFixtureWithStore(t *testing.T, kind, mode string, gated bool, sto
 }
 
 func newRebuildFixtureFamily(t *testing.T, kind, mode string, gated bool, store *UDPCrossFamilyStore, v6 bool) *rebuildFixture {
+	return newRebuildFixtureFamilies(t, kind, mode, gated, store, v6, v6)
+}
+
+func newRebuildFixtureFamilies(t *testing.T, kind, mode string, gated bool, store *UDPCrossFamilyStore, clientV6, peerV6 bool) *rebuildFixture {
 	t.Helper()
-	f := &rebuildFixture{a: rebuildEchoFamily(t, v6), b: rebuildEchoFamily(t, v6), replies: make(chan rebuildReply, 256)}
+	f := &rebuildFixture{a: rebuildEchoFamily(t, clientV6), b: rebuildEchoFamily(t, peerV6), replies: make(chan rebuildReply, 256)}
 	client := netip.MustParseAddr("192.0.2.201")
-	if v6 {
+	if clientV6 {
 		client = netip.MustParseAddr("2001:db8::201")
 	}
 	r, base := newRebuildRelay(t, kind, f.b)

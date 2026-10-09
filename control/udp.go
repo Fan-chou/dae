@@ -563,7 +563,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
-	_, err := flowDecision.writeTo(ue, data, ue.dialTargetForWrite(realDst))
+	_, err := flowDecision.writeToVisible(ue, data, ue.dialTargetForWrite(realDst), realDst)
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
@@ -808,7 +808,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 
 				ue.TrackUdpConnStateTuplePair(realSrc, realDst)
-				_, err = flowDecision.writeTo(ue, data, dialTarget)
+				_, err = flowDecision.writeToVisible(ue, data, dialTarget, realDst)
 				if err == nil {
 					c.recordUploadTraffic(int64(len(data)))
 					return nil
@@ -1270,7 +1270,7 @@ getNew:
 	dialTarget = ue.dialTargetForWrite(realDst)
 
 	for packetIndex < len(payloads) {
-		_, err = flowDecision.writeTo(ue, payloads[packetIndex], dialTarget)
+		_, err = flowDecision.writeToVisible(ue, payloads[packetIndex], dialTarget, realDst)
 		if err != nil {
 			if isUdpEndpointWriteTolerated(err) {
 				// Transient write failure: drop this datagram, keep the session.

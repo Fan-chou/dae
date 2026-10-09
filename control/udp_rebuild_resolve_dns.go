@@ -66,7 +66,11 @@ func (ue *UdpEndpoint) pinnedDNSExclusion(peer netip.AddrPort) string {
 	}
 	src := ue.poolKey.Src.Addr().Unmap()
 	original := netip.AddrPortFrom(p.original.Addr().Unmap(), p.original.Port())
-	if !src.IsValid() || p.original != ue.poolKey.Dst || peer != p.peer || netip.AddrPortFrom(target.Addr().Unmap(), target.Port()) != p.peer || !validDroughtPeer(original) || !validDroughtPeer(peer) || original.Port() != peer.Port() || src.Is4() != peer.Addr().Is4() || original.Addr().Is4() != peer.Addr().Is4() {
+	// The visible reply address must be usable by the client. The immutable
+	// application peer can use either family: canonicalReplyFrom and the
+	// transport's UDP reply hint preserve original, while recovery evidence
+	// still comes from the independently reported actual peer.
+	if !src.IsValid() || p.original != ue.poolKey.Dst || peer != p.peer || netip.AddrPortFrom(target.Addr().Unmap(), target.Port()) != p.peer || !validDroughtPeer(original) || !validDroughtPeer(peer) || original.Port() != peer.Port() || src.Is4() != original.Addr().Is4() {
 		return "resolve_dns_peer_mismatch"
 	}
 	if ue.crossFamily != nil {
@@ -85,14 +89,36 @@ func (ue *UdpEndpoint) rebuildOriginal(peer netip.AddrPort) netip.AddrPort {
 	if p := ue.pinnedTarget; p != nil && p.peer == peer {
 		return p.original
 	}
+	if A, _, ok := ue.aliasCandidate(peer); ok {
+		return A
+	}
 	return peer
 }
 
 func (ue *UdpEndpoint) rebuildPeerForOriginal(original netip.AddrPort) *udpRebuildPeer {
+	if ue == nil {
+		return nil
+	}
 	if p := ue.pinnedTarget; p != nil && p.original == original {
 		return ue.rebuildPeer(p.peer)
 	}
-	return ue.rebuildPeer(original)
+	tables := ue.rebuildPeers.Load()
+	if tables == nil {
+		return nil
+	}
+	if s := tables.byPeer[original]; s != nil {
+		return s
+	}
+	if tables.byOriginal == nil {
+		return nil
+	}
+	if s := tables.byOriginal[original]; s != nil {
+		return s
+	}
+	if mapped := unmapPort(original); mapped != original {
+		return tables.byOriginal[mapped]
+	}
+	return nil
 }
 
 // Called before normal successor admission. A new target or business identity
@@ -112,12 +138,39 @@ func (ue *UdpEndpoint) inheritPinnedRebuildTarget(old *UdpEndpoint, option *Dial
 	return true
 }
 
+// Ordinary successors of an alias claim must still resolve the same client
+// address to the same real peer in the same inner table. A new read-only
+// wrapper is the same table. A different table, a closed table, or a different
+// peer starts a new flow and must not keep the old claim.
+func (ue *UdpEndpoint) inheritAliasRebuild(slot *udpRebuildPeer) bool {
+	if slot == nil || slot.aliasStore.Load() == nil {
+		return true
+	}
+	snap := slot.aliasStore.Load()
+	if ue == nil || ue.crossFamily == nil || ue.crossFamily.store != snap || !snap.Ready() {
+		return false
+	}
+	A, P := unmapPort(slot.original), unmapPort(slot.peer)
+	if ue.poolKey.Dst.IsValid() && ue.poolKey.Dst.Port() != 0 && unmapPort(ue.poolKey.Dst) != A {
+		return false
+	}
+	target, err := netip.ParseAddrPort(ue.DialTarget)
+	if err != nil || unmapPort(target) != P {
+		return false
+	}
+	decoded, isAlias, err := ue.crossFamily.decode(A)
+	if err != nil || !isAlias || unmapPort(decoded) != P {
+		return false
+	}
+	return true
+}
+
 // Keep the boxed key and identity-validation temporaries out of the ordinary
 // create frame. Most new flows have no recovery override.
 func (p *UdpEndpointPool) prepareOrdinaryRebuildSuccessor(ue *UdpEndpoint, slot *udpRebuildPeer, option *DialOption) bool {
 	ue.prepared.Store(true)
 	old := slot.owner.Load().endpoint
-	if ue.inheritPinnedRebuildTarget(old, option) {
+	if ue.inheritPinnedRebuildTarget(old, option) && ue.inheritAliasRebuild(slot) {
 		return true
 	}
 	// A closed pin/new target starts a new business flow.
@@ -206,6 +259,8 @@ func (ue *UdpEndpoint) revokePinnedDNSIdentityLocked() {
 func (ue *UdpEndpoint) fillPinnedRecoveryRow(row *UDPReplyDroughtPeer) {
 	if p := ue.pinnedTarget; p != nil {
 		row.OriginalTarget = p.original.String()
+		row.OriginalFamily = udpPinnedAddrFamily(p.original.Addr())
+		row.ActualPeerFamily = udpPinnedAddrFamily(p.peer.Addr())
 		row.TargetKind = "resolve_dns_native"
 		if !p.native {
 			row.TargetKind = "resolve_dns_fakeip"
@@ -219,8 +274,49 @@ func (ue *UdpEndpoint) fillPinnedRecoveryEvent(event *UDPRecoveryEvent) {
 	var row UDPReplyDroughtPeer
 	ue.fillPinnedRecoveryRow(&row)
 	event.OriginalTarget, event.TargetKind = row.OriginalTarget, row.TargetKind
+	event.OriginalFamily, event.ActualPeerFamily = row.OriginalFamily, row.ActualPeerFamily
 	event.DNSPinOwnerID, event.FlowIdentityRevision = row.DNSPinOwnerID, row.FlowIdentityRevision
 	event.PinInherited = ue.pinnedTarget != nil && ue.rebuildRevision > 1
+}
+
+// Alias claims keep the client-visible address on the slot. Fill it for the
+// archive without consulting the mapping table.
+func (ue *UdpEndpoint) fillAliasRecoveryRow(row *UDPReplyDroughtPeer, peer netip.AddrPort) {
+	if ue == nil || row == nil || ue.pinnedTarget != nil || row.TargetKind != "" {
+		return
+	}
+	slot := ue.rebuildPeer(unmapPort(peer))
+	if slot == nil {
+		return
+	}
+	original, actual := unmapPort(slot.original), unmapPort(slot.peer)
+	if !original.IsValid() || original == actual || original.Addr().Is4() == actual.Addr().Is4() {
+		return
+	}
+	row.OriginalTarget = original.String()
+	row.OriginalFamily = udpPinnedAddrFamily(original.Addr())
+	row.ActualPeerFamily = udpPinnedAddrFamily(actual.Addr())
+	row.TargetKind = "peer_alias"
+}
+
+func (ue *UdpEndpoint) fillAliasRecoveryEvent(event *UDPRecoveryEvent, peer netip.AddrPort) {
+	if event == nil || event.TargetKind != "" {
+		return
+	}
+	var row UDPReplyDroughtPeer
+	ue.fillAliasRecoveryRow(&row, peer)
+	event.OriginalTarget, event.TargetKind = row.OriginalTarget, row.TargetKind
+	event.OriginalFamily, event.ActualPeerFamily = row.OriginalFamily, row.ActualPeerFamily
+}
+
+func udpPinnedAddrFamily(addr netip.Addr) string {
+	if addr.Unmap().Is4() {
+		return "ipv4"
+	}
+	if addr.Is6() {
+		return "ipv6"
+	}
+	return ""
 }
 
 // Keep the large key/decision copies out of the usual ingress stack frame.

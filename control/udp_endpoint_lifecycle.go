@@ -558,19 +558,23 @@ func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 }
 
 func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
-	return ue.writeTo(b, addr, false)
+	return ue.writeTo(b, addr, false, netip.AddrPort{})
 }
 
-func (ue *UdpEndpoint) writeToRebuildPeer(b []byte, addr string, peers *udpRebuildPeerMap) (int, error, bool) {
+func (ue *UdpEndpoint) writeObserved(b []byte, addr string, visible netip.AddrPort) (int, error) {
+	return ue.writeTo(b, addr, false, visible)
+}
+
+func (ue *UdpEndpoint) writeToRebuildPeer(b []byte, addr string, peers udpRebuildPeerMap, visible netip.AddrPort) (int, error, bool) {
 	peer, err := netip.ParseAddrPort(addr)
 	if err != nil {
 		return 0, nil, false
 	}
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
-	s := (*peers)[peer]
+	s := peers[peer]
 	if s == nil {
 		if f := ue.replyDrought; f != nil && f.observer.policy.Enforce && !f.observer.closed.Load() {
-			ue.prepareDroughtWrite(addr)
+			ue.prepareDroughtWriteVisible(addr, visible)
 			s = ue.rebuildPeer(peer)
 		}
 		if s == nil {
@@ -594,7 +598,7 @@ func (ue *UdpEndpoint) writeToRebuildPeer(b []byte, addr string, peers *udpRebui
 		owner.TrackUdpConnStateTuplePair(owner.poolKey.Src, s.original)
 		target = owner.dialTargetForWrite(peer)
 	}
-	n, err := owner.writeTo(b, target, true)
+	n, err := owner.writeTo(b, target, true, netip.AddrPort{})
 	if owner != ue && err != nil && !isUdpEndpointWriteTolerated(err) {
 		// Actual I/O and retirement belong to the successor. The ingress caller
 		// still holds the shared ancestor pointer and must only drop this packet.
@@ -604,17 +608,17 @@ func (ue *UdpEndpoint) writeToRebuildPeer(b []byte, addr string, peers *udpRebui
 	return n, err, true
 }
 
-func (ue *UdpEndpoint) writeTo(b []byte, addr string, claimed bool) (int, error) {
+func (ue *UdpEndpoint) writeTo(b []byte, addr string, claimed bool, visible netip.AddrPort) (int, error) {
 	if !claimed {
 		peers := ue.rebuildPeers.Load()
 		if peers == nil {
 			if f := ue.replyDrought; f != nil && f.observer.policy.Enforce && !f.observer.closed.Load() {
-				ue.prepareDroughtWrite(addr)
+				ue.prepareDroughtWriteVisible(addr, visible)
 				peers = ue.rebuildPeers.Load()
 			}
 		}
 		if peers != nil {
-			if n, err, ok := ue.writeToRebuildPeer(b, addr, peers); ok {
+			if n, err, ok := ue.writeToRebuildPeer(b, addr, peers.byPeer, visible); ok {
 				return n, err
 			}
 		}
@@ -678,7 +682,7 @@ func (ue *UdpEndpoint) writeTo(b []byte, addr string, claimed bool) (int, error)
 	writeStarted := udpWriteWait.start()
 	carrier := &udpWriteByCarrier[udpCarrierIndex(ue)]
 	carrierStarted := carrier.start()
-	ue.prepareDroughtWrite(addr)
+	ue.prepareDroughtWriteVisible(addr, visible)
 	n, err := ue.conn.WriteTo(b, addr)
 	udpWriteWait.finish(writeStarted)
 	recordUDPSlowWrite(ue, addr, carrier.finish(carrierStarted), err)

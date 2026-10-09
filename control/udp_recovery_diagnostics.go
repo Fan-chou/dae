@@ -43,6 +43,8 @@ type udpDroughtIdentity struct {
 
 type UDPRecoveryEvent struct {
 	OriginalTarget       string                      `json:"original_target,omitempty"`
+	OriginalFamily       string                      `json:"original_family,omitempty"`
+	ActualPeerFamily     string                      `json:"actual_peer_family,omitempty"`
 	TargetKind           string                      `json:"target_kind,omitempty"`
 	DNSPinOwnerID        uint64                      `json:"dns_pin_owner_id,omitempty"`
 	FlowIdentityRevision uint64                      `json:"flow_identity_revision,omitempty"`
@@ -148,6 +150,7 @@ func (o *udpReplyDroughtObserver) bindDiagnostics(m *SessionManager, epoch routi
 func (o *udpReplyDroughtObserver) recordDiagnostic(e UDPRecoveryEvent) {
 	if e.Peer != nil && e.TargetKind == "" {
 		e.OriginalTarget, e.TargetKind = e.Peer.OriginalTarget, e.Peer.TargetKind
+		e.OriginalFamily, e.ActualPeerFamily = e.Peer.OriginalFamily, e.Peer.ActualPeerFamily
 		e.DNSPinOwnerID, e.FlowIdentityRevision = e.Peer.DNSPinOwnerID, e.Peer.FlowIdentityRevision
 		e.PinInherited = e.TargetKind != "" && e.Peer.Revision > 1
 	}
@@ -214,6 +217,7 @@ func (f *udpReplyDroughtFlow) rowLocked(peer netip.AddrPort, p *udpDroughtPeerSt
 	}
 	if f.endpoint != nil {
 		f.endpoint.fillPinnedRecoveryRow(&r)
+		f.endpoint.fillAliasRecoveryRow(&r, peer)
 	}
 	epoch := nano / int64(udpDroughtBucketDuration)
 	r.Windows = make([]UDPReplyDroughtWindow, 0, len(p.buckets))

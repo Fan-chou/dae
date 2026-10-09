@@ -4,6 +4,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,8 @@ import (
 )
 
 const udpRebuildQueueLimit = 32
+
+var errUDPRebuildAliasUnavailable = errors.New("udp alias mapping unavailable")
 
 type udpRebuildCandidate struct {
 	flow   *udpReplyDroughtFlow
@@ -125,11 +128,15 @@ func (x *udpRebuildExecutor) work() {
 func (x *udpRebuildExecutor) event(kind, reason string, row *UDPReplyDroughtPeer, successor ...*UdpEndpoint) {
 	e := UDPRecoveryEvent{Kind: kind, Reason: reason, AtMS: x.now().UnixMilli(), Peer: row, RuntimeID: row.RuntimeID, LineageID: row.LineageID, Revision: row.Revision, ActualPeer: row.Peer}
 	e.OriginalTarget, e.TargetKind = row.OriginalTarget, row.TargetKind
+	e.OriginalFamily, e.ActualPeerFamily = row.OriginalFamily, row.ActualPeerFamily
 	e.DNSPinOwnerID, e.FlowIdentityRevision = row.DNSPinOwnerID, row.FlowIdentityRevision
 	if len(successor) > 0 {
 		e.SuccessorRuntimeID = successor[0].sessionRuntime.id
 		e.Revision = successor[0].rebuildRevision
 		successor[0].fillPinnedRecoveryEvent(&e)
+		if peer, err := netip.ParseAddrPort(row.Peer); err == nil {
+			successor[0].fillAliasRecoveryEvent(&e, peer)
+		}
 	}
 	x.observer.recordDiagnostic(e)
 }
@@ -166,16 +173,23 @@ func (x *udpRebuildExecutor) exclusion(ue *UdpEndpoint, peer netip.AddrPort) str
 	return ""
 }
 
-// A writable mapping store is attached to native flows too. Reject aliases
-// for this peer without disabling recovery of an independent native peer on
-// the same shared association.
+// A writable mapping store is attached to native flows too. Reject an alias
+// that is not already a stable client-visible mapping, without disabling
+// recovery of an independent native peer on the same shared association.
 func udpRebuildPeerUsesAlias(ue *UdpEndpoint, peer netip.AddrPort) bool {
 	client := ue.poolKey.Src.Addr().Unmap()
-	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
-	if !client.IsValid() || !validDroughtPeer(peer) || client.Is4() != peer.Addr().Is4() || (ue.poolKey.Dst.IsValid() && ue.poolKey.Dst != peer) {
+	peer = unmapPort(peer)
+	if !client.IsValid() || !validDroughtPeer(peer) {
 		return true
 	}
-	if slot := ue.rebuildPeer(peer); slot != nil && netip.AddrPortFrom(slot.original.Addr().Unmap(), slot.original.Port()) != peer {
+	if client.Is4() != peer.Addr().Is4() {
+		_, _, ok := ue.confirmAlias(peer)
+		return !ok
+	}
+	if ue.poolKey.Dst.IsValid() && unmapPort(ue.poolKey.Dst) != peer {
+		return true
+	}
+	if slot := ue.rebuildPeer(peer); slot != nil && unmapPort(slot.original) != peer {
 		return true
 	}
 	if ue.crossFamily == nil {
@@ -189,6 +203,66 @@ func udpRebuildPeerUsesAlias(ue *UdpEndpoint, peer netip.AddrPort) bool {
 		return true
 	}
 	return false
+}
+
+func unmapPort(p netip.AddrPort) netip.AddrPort {
+	if !p.IsValid() {
+		return p
+	}
+	return netip.AddrPortFrom(p.Addr().Unmap(), p.Port())
+}
+
+// aliasCandidate is the client-visible address already known for this peer.
+// It does not consult the mapping table. Target-specific flows keep that
+// address in the pool key. FullCone flows store it on the peer slot when the
+// packet is admitted.
+func (ue *UdpEndpoint) aliasCandidate(peer netip.AddrPort) (A, P netip.AddrPort, ok bool) {
+	if ue == nil {
+		return
+	}
+	client := ue.poolKey.Src.Addr().Unmap()
+	P = unmapPort(peer)
+	if !client.IsValid() || !validDroughtPeer(P) || client.Is4() == P.Addr().Is4() {
+		return
+	}
+	if ue.poolKey.Dst.IsValid() && ue.poolKey.Dst.Port() != 0 {
+		A = unmapPort(ue.poolKey.Dst)
+	} else if slot := ue.rebuildPeer(P); slot != nil {
+		A = unmapPort(slot.original)
+	}
+	if !validDroughtPeer(A) || client.Is4() != A.Addr().Is4() || A.Addr().Is4() == P.Addr().Is4() || A == P {
+		return netip.AddrPort{}, netip.AddrPort{}, false
+	}
+	return A, P, true
+}
+
+// confirmAlias checks an existing mapping. decode takes a read lock on a
+// cache miss and does not allocate or wait for disk.
+func (ue *UdpEndpoint) confirmAlias(peer netip.AddrPort) (A netip.AddrPort, store *FakeIPStore, ok bool) {
+	A, P, shaped := ue.aliasCandidate(peer)
+	if !shaped || ue.crossFamily == nil || ue.crossFamily.store == nil || !ue.crossFamily.store.Ready() {
+		return netip.AddrPort{}, nil, false
+	}
+	store = ue.crossFamily.store
+	if store.Contains(P.Addr()) {
+		return netip.AddrPort{}, nil, false
+	}
+	if ue.poolKey.Dst.IsValid() && ue.poolKey.Dst.Port() != 0 {
+		target, err := netip.ParseAddrPort(ue.DialTarget)
+		if err != nil || unmapPort(target) != P || store.Contains(target.Addr().Unmap()) {
+			return netip.AddrPort{}, nil, false
+		}
+	} else if target, err := netip.ParseAddrPort(ue.DialTarget); err == nil && store.Contains(target.Addr().Unmap()) {
+		return netip.AddrPort{}, nil, false
+	}
+	decoded, isAlias, err := ue.crossFamily.decode(A)
+	if err != nil || !isAlias || unmapPort(decoded) != P {
+		return netip.AddrPort{}, nil, false
+	}
+	if slot := ue.rebuildPeer(P); slot != nil && unmapPort(slot.original) != A {
+		return netip.AddrPort{}, nil, false
+	}
+	return A, store, true
 }
 func (x *udpRebuildExecutor) evidenceLocked(q udpRebuildCandidate, peer netip.AddrPort) bool {
 	f := q.flow
@@ -264,6 +338,13 @@ func (x *udpRebuildExecutor) execute(q udpRebuildCandidate) {
 			_ = next.Close()
 		}
 	}()
+	// After prepare and before the handoff fence. Ready takes a short read
+	// lock; publication and rebuild mutexes are not held yet.
+	if reason = aliasMappingReady(slot, next); reason != "" {
+		x.ledger.count(reason)
+		x.event("cancelled", reason, &q.row)
+		return
+	}
 	if !slot.fence(ctx, ue) {
 		x.ledger.count("fence_cancelled")
 		x.event("cancelled", "fence_cancelled", &q.row)
@@ -301,6 +382,20 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 	defer lease.release()
 	target := peer.String()
 	original := old.rebuildOriginal(peer)
+	if old.pinnedTarget == nil {
+		client := old.poolKey.Src.Addr().Unmap()
+		real := unmapPort(peer)
+		if client.IsValid() && validDroughtPeer(real) && client.Is4() != real.Addr().Is4() {
+			alias, store, ok := old.confirmAlias(peer)
+			if !ok {
+				return nil, errUDPRebuildAliasUnavailable
+			}
+			original = alias
+			if slot := old.rebuildPeer(real); slot != nil {
+				slot.aliasStore.Store(store)
+			}
+		}
+	}
 	conn, err := group.DialContextWithSelected(netproxy.ContextWithUDPReplyAddr(ctx, target, original), binding.Egress.Dialer, binding.Egress.Network, target)
 	if err != nil {
 		return nil, err
@@ -355,6 +450,23 @@ func (x *udpRebuildExecutor) prepare(ctx context.Context, old *UdpEndpoint, peer
 		go next.startReadLoop()
 	}
 	return next, nil
+}
+
+// The inner table is fixed while this process holds it open. A different
+// table or a closed table cancels the successor before its writes are fenced.
+func aliasMappingReady(slot *udpRebuildPeer, next *UdpEndpoint) string {
+	store := slot.aliasStore.Load()
+	if store == nil {
+		return ""
+	}
+	var got *FakeIPStore
+	if next != nil && next.crossFamily != nil {
+		got = next.crossFamily.store
+	}
+	if got != store || !store.Ready() {
+		return "alias_mapping_changed"
+	}
+	return ""
 }
 
 func (x *udpRebuildExecutor) commit(ctx context.Context, q udpRebuildCandidate, slot *udpRebuildPeer, ticket *udpRebuildTicket, old, next *UdpEndpoint) string {

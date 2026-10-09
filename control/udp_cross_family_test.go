@@ -18,7 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func openCrossFamilyTestStore(t *testing.T, dir string) *UDPCrossFamilyStore {
+func openCrossFamilyTestStore(t testing.TB, dir string) *UDPCrossFamilyStore {
 	t.Helper()
 	s := NewUDPCrossFamilyStore(dir, "peers")
 	if err := s.store.Open(netip.MustParsePrefix("198.19.0.0/24"), netip.MustParsePrefix("fd00:cafe::/120")); err != nil {

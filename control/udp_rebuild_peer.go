@@ -19,6 +19,13 @@ type udpRebuildOwnership struct {
 	revision uint64
 }
 type udpRebuildPeerMap map[netip.AddrPort]*udpRebuildPeer
+
+// One publication holds the real-peer table and, when the client-visible
+// address differs, the alias table. A packet loads this pointer once.
+type udpRebuildPeers struct {
+	byPeer     udpRebuildPeerMap
+	byOriginal udpRebuildPeerMap
+}
 type udpRebuildPeer struct {
 	peer            netip.AddrPort
 	original        netip.AddrPort
@@ -35,6 +42,10 @@ type udpRebuildPeer struct {
 	changed         chan struct{}
 	freshReplies    uint64
 	successorIntent bool
+	// aliasStore is the inner mapping table captured before the successor is
+	// dialed. It stays nil for native and resolve_dns claims. Commit and
+	// ordinary inheritance compare this pointer; they do not read the cache.
+	aliasStore atomic.Pointer[FakeIPStore]
 }
 
 func (s *udpRebuildPeer) signalLocked() {
@@ -47,34 +58,72 @@ func (ue *UdpEndpoint) rebuildPeer(peer netip.AddrPort) *udpRebuildPeer {
 	if ue == nil {
 		return nil
 	}
-	peers := ue.rebuildPeers.Load()
-	if peers == nil {
+	tables := ue.rebuildPeers.Load()
+	if tables == nil {
 		return nil
 	}
-	return (*peers)[peer]
+	return tables.byPeer[peer]
 }
+
 func (ue *UdpEndpoint) installRebuildPeer(peer netip.AddrPort, s *udpRebuildPeer) bool {
+	original, index := rebuildOriginalKey(s)
 	for {
 		previous := ue.rebuildPeers.Load()
+		var prevPeer, prevOriginal udpRebuildPeerMap
 		if previous != nil {
-			if (*previous)[peer] != nil {
-				return (*previous)[peer] == s
+			prevPeer, prevOriginal = previous.byPeer, previous.byOriginal
+		}
+		if prevPeer != nil {
+			if existing := prevPeer[peer]; existing != nil && existing != s {
+				return false
 			}
-			if len(*previous) >= udpDroughtAssociationPeerLimit {
+			if prevPeer[peer] == nil && len(prevPeer) >= udpDroughtAssociationPeerLimit {
 				return false
 			}
 		}
-		next := make(udpRebuildPeerMap)
-		if previous != nil {
-			for k, v := range *previous {
-				next[k] = v
+		if prevPeer != nil && prevPeer[peer] == s && originalIndexed(prevOriginal, original, index, s) {
+			return true
+		}
+		nextPeer := make(udpRebuildPeerMap, len(prevPeer)+1)
+		for k, v := range prevPeer {
+			nextPeer[k] = v
+		}
+		nextPeer[peer] = s
+		var nextOriginal udpRebuildPeerMap
+		if index || len(prevOriginal) > 0 {
+			nextOriginal = make(udpRebuildPeerMap, len(prevOriginal)+1)
+			for k, v := range prevOriginal {
+				if index && k == original && v != s {
+					return false
+				}
+				nextOriginal[k] = v
+			}
+			if index {
+				nextOriginal[original] = s
 			}
 		}
-		next[peer] = s
-		if ue.rebuildPeers.CompareAndSwap(previous, &next) {
+		if ue.rebuildPeers.CompareAndSwap(previous, &udpRebuildPeers{byPeer: nextPeer, byOriginal: nextOriginal}) {
 			return true
 		}
 	}
+}
+
+func rebuildOriginalKey(s *udpRebuildPeer) (netip.AddrPort, bool) {
+	if s == nil {
+		return netip.AddrPort{}, false
+	}
+	original, peer := unmapPort(s.original), unmapPort(s.peer)
+	if !original.IsValid() || original == peer {
+		return netip.AddrPort{}, false
+	}
+	return original, true
+}
+
+func originalIndexed(tables udpRebuildPeerMap, original netip.AddrPort, index bool, s *udpRebuildPeer) bool {
+	if !index {
+		return true
+	}
+	return tables != nil && tables[original] == s
 }
 
 // A claim spans actual I/O. V1 deliberately excludes aggregators, whose
@@ -193,6 +242,7 @@ func (ue *UdpEndpoint) recordRebuildReply(peer netip.AddrPort) {
 	if recovered && ue.sessionRuntime != nil {
 		e := UDPRecoveryEvent{RuntimeID: ue.sessionRuntime.id, PolicyEpoch: uint64(ue.sessionRuntime.binding.Route.PolicyEpoch), LineageID: s.lineageID, Revision: owner.revision, ActualPeer: peer.String(), Kind: "recovered", Reason: "three_fresh_successor_replies", AtMS: time.Now().UnixMilli()}
 		ue.fillPinnedRecoveryEvent(&e)
+		ue.fillAliasRecoveryEvent(&e, peer)
 		if ue.replyDrought != nil {
 			e.Generation = ue.replyDrought.observer.generation
 		}
@@ -211,7 +261,7 @@ func (ue *UdpEndpoint) endRebuildOwnership() {
 	if peers == nil {
 		return
 	}
-	for _, s := range *peers {
+	for _, s := range peers.byPeer {
 		s.mu.Lock()
 		if owner := s.owner.Load(); owner != nil && owner.endpoint == ue {
 			s.signalLocked()

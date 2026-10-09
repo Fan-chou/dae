@@ -3,6 +3,7 @@
 import argparse
 import collections
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import sys
@@ -64,7 +65,40 @@ def ratio(n, d):
     return n / d if d else None
 
 
+def recovery_addr(value):
+    host, port = value.rsplit(":", 1)
+    if not 0 < int(port) <= 65535:
+        raise ValueError("port")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    addr = ipaddress.ip_address(host)
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped or addr
+
+
+def alias_identity_validation(commit, reply):
+    fields = ("original_target", "target_kind", "original_family", "actual_peer_family", "actual_peer")
+    if commit.get("target_kind") != "peer_alias" or reply.get("target_kind") != "peer_alias":
+        return "mismatch"
+    if not all(e.get(k) for e in (commit, reply) for k in fields):
+        return "incomplete"
+    if any(commit[k] != reply[k] for k in fields):
+        return "mismatch"
+    try:
+        original, actual = recovery_addr(commit["original_target"]), recovery_addr(commit["actual_peer"])
+    except ValueError:
+        return "mismatch"
+    expected = {4: "ipv4", 6: "ipv6"}
+    if commit["original_family"] != expected[original.version] or commit["actual_peer_family"] != expected[actual.version]:
+        return "mismatch"
+    if original.version == actual.version:
+        return "mismatch"
+    return "matched"
+
+
 def pin_identity_validation(commit, reply):
+    if commit.get("target_kind") == "peer_alias" or reply.get("target_kind") == "peer_alias":
+        return alias_identity_validation(commit, reply)
     fields = ("original_target", "target_kind", "dns_pin_owner_id", "flow_identity_revision")
     if not any(k in e for e in (commit, reply) for k in fields):
         return "not_recorded"
@@ -74,6 +108,23 @@ def pin_identity_validation(commit, reply):
         return "mismatch"
     if commit.get("pin_inherited") is not True or reply.get("pin_inherited") is not True:
         return "inheritance_not_confirmed"
+    family_fields = ("original_family", "actual_peer_family")
+    if any(k in e for e in (commit, reply) for k in family_fields):
+        if not all(e.get(k) for e in (commit, reply) for k in family_fields):
+            return "incomplete"
+        for e in (commit, reply):
+            for field, target in (("original_family", "original_target"), ("actual_peer_family", "actual_peer")):
+                try:
+                    host, port = e[target].rsplit(":", 1)
+                    if not 0 < int(port) <= 65535:
+                        return "mismatch"
+                    ip = ipaddress.ip_address(host.strip("[]"))
+                    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                        ip = ip.ipv4_mapped
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    return "mismatch"
+                if e[field] != "ipv" + str(ip.version) or commit[field] != reply[field]:
+                    return "mismatch"
     return "matched"
 
 

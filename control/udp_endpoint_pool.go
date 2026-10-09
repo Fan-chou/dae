@@ -60,7 +60,7 @@ type UdpEndpoint struct {
 	writeBatch                      *udpWriteBatchAggregator
 	replyDrought                    *udpReplyDroughtFlow // belongs to the creating generation
 	prepared                        atomic.Bool
-	rebuildPeers                    atomic.Pointer[udpRebuildPeerMap]
+	rebuildPeers                    atomic.Pointer[udpRebuildPeers]
 	rebuildLifecycleMu              sync.Mutex // retirement versus recovery publication only
 	rebuildLineage, rebuildRevision uint64     // immutable before adoption
 	expiresAtNano                   atomic.Int64

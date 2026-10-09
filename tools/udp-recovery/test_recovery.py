@@ -215,6 +215,33 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result["archived_commit_sequence"], 1)
         self.assertEqual(result["pin_identity_validation"], "matched")
 
+    def test_alias_confirmation_matches_visible_and_real_addresses(self):
+        page = empty_page()
+        identity = {"original_target": "198.19.0.1:27015", "target_kind": "peer_alias",
+                    "original_family": "ipv4", "actual_peer_family": "ipv6",
+                    "actual_peer": "[2001:db8::1]:27015"}
+        commit = dict(identity, sequence=1, generation=1, kind="committed", successor_runtime_id=8,
+                      ownership_revision=2)
+        reply = dict(identity, sequence=2, generation=1, kind="recovered", runtime_id=8,
+                     ownership_revision=2)
+        value = {"kind": "poll", "started_at_ms": 0, "gaps": [], "errors": [],
+                 "fetch_brackets": [], "provenance_stable": True, "provenance_before": {},
+                 "pages": {"udp-recovery": [page]}}
+        page["records"] = [commit, reply]
+        result = analyze.summarize([value])["successor_reply_confirmations_archived"][0]
+        self.assertEqual(result["pin_identity_validation"], "matched")
+        self.assertEqual(result["archived_commit_sequence"], 1)
+        reply["actual_peer_family"] = "ipv4"
+        page["records"] = [commit, reply]
+        result = analyze.summarize([value])["successor_reply_confirmations_archived"][0]
+        self.assertEqual(result["pin_identity_validation"], "mismatch")
+        self.assertIsNone(result["archived_commit_sequence"])
+        for peer in ("[2001:db8::1]:0", "[2001:db8::1]:65536"):
+            page["records"] = [dict(commit, actual_peer=peer), dict(reply, actual_peer_family="ipv6", actual_peer=peer)]
+            result = analyze.summarize([value])["successor_reply_confirmations_archived"][0]
+            self.assertEqual(result["pin_identity_validation"], "mismatch", peer)
+            self.assertIsNone(result["archived_commit_sequence"])
+
     def test_quality_counter_frequency_keeps_generation_separate(self):
         values = []
         for at, epoch, count in ((1000, 1, 5), (61000, 1, 7), (62000, 2, 0)):
@@ -228,6 +255,30 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(history[0]["verification_windows_per_minute"], 2)
         self.assertIsNone(history[1]["verification_windows_per_minute"])
         self.assertTrue(result["quality_budget_channel_available"])
+
+    def test_cross_family_pin_confirmation_checks_both_families(self):
+        for original, peer, original_family, peer_family in (
+                ("198.51.100.10:27015", "[2001:db8::20]:27015", "ipv4", "ipv6"),
+                ("[2001:db8::10]:27015", "192.0.2.20:27015", "ipv6", "ipv4"),
+                ("[::ffff:198.51.100.10]:27015", "[2001:db8::20]:27015", "ipv4", "ipv6")):
+            commit = {"original_target": original, "actual_peer": peer,
+                      "original_family": original_family, "actual_peer_family": peer_family,
+                      "target_kind": "resolve_dns_native", "dns_pin_owner_id": 9,
+                      "flow_identity_revision": 1, "pin_inherited": True}
+            with self.subTest(original=original, peer=peer):
+                self.assertEqual(analyze.pin_identity_validation(commit, dict(commit)), "matched")
+                for field in ("original_family", "actual_peer_family"):
+                    missing = dict(commit)
+                    missing.pop(field)
+                    self.assertEqual(analyze.pin_identity_validation(commit, missing), "incomplete")
+                    wrong = dict(commit)
+                    wrong[field] = "ipv6" if wrong[field] == "ipv4" else "ipv4"
+                    self.assertEqual(analyze.pin_identity_validation(commit, wrong), "mismatch")
+                    # Matching labels alone are insufficient if both events lie
+                    # about their recorded addresses.
+                    self.assertEqual(analyze.pin_identity_validation(wrong, dict(wrong)), "mismatch")
+                malformed = dict(commit, actual_peer="not-a-numeric-peer:27015")
+                self.assertEqual(analyze.pin_identity_validation(malformed, dict(malformed)), "mismatch")
 
 
 if __name__ == "__main__":

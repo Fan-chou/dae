@@ -68,6 +68,8 @@ type UDPReplyDroughtStats struct {
 
 type UDPReplyDroughtPeer struct {
 	OriginalTarget       string                  `json:"original_target,omitempty"`
+	OriginalFamily       string                  `json:"original_family,omitempty"`
+	ActualPeerFamily     string                  `json:"actual_peer_family,omitempty"`
 	TargetKind           string                  `json:"target_kind,omitempty"`
 	DNSPinOwnerID        uint64                  `json:"dns_pin_owner_id,omitempty"`
 	FlowIdentityRevision uint64                  `json:"flow_identity_revision,omitempty"`
@@ -245,6 +247,10 @@ func (p *udpDroughtPeerState) checkClock(nano int64) {
 // Admit intent before transport I/O so a fast reply cannot overtake peer
 // registration. Intent never counts as a successful write or a full bucket.
 func (f *udpReplyDroughtFlow) prepare(peer netip.AddrPort, now time.Time) {
+	f.prepareVisible(peer, netip.AddrPort{}, now)
+}
+
+func (f *udpReplyDroughtFlow) prepareVisible(peer, visible netip.AddrPort, now time.Time) {
 	if f == nil || f.closed.Load() || f.observer.closed.Load() {
 		return
 	}
@@ -255,13 +261,13 @@ func (f *udpReplyDroughtFlow) prepare(peer netip.AddrPort, now time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.closed.Load() && !f.observer.closed.Load() {
-		f.admitLocked(peer, now)
+		f.admitLocked(peer, visible, now)
 	}
 }
 
 // The flow lock protects this peer table; the registry lock only reserves
 // bounded space. Rejected intent is counted once when its write completes.
-func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *udpDroughtPeerState {
+func (f *udpReplyDroughtFlow) admitLocked(peer, visible netip.AddrPort, now time.Time) *udpDroughtPeerState {
 	if p := f.peers[peer]; p != nil {
 		return p
 	}
@@ -283,7 +289,16 @@ func (f *udpReplyDroughtFlow) admitLocked(peer netip.AddrPort, now time.Time) *u
 				o.peerCount--
 				return nil
 			}
-			s := &udpRebuildPeer{peer: peer, original: ue.rebuildOriginal(peer), lineageID: ue.rebuildLineage, manager: ue.sessionRuntime.manager, changed: make(chan struct{})}
+			original := ue.rebuildOriginal(peer)
+			if !ue.poolKey.Dst.IsValid() {
+				if vis := unmapPort(visible); validDroughtPeer(vis) {
+					client := ue.poolKey.Src.Addr().Unmap()
+					if client.IsValid() && client.Is4() == vis.Addr().Is4() && vis.Addr().Is4() != peer.Addr().Is4() {
+						original = vis
+					}
+				}
+			}
+			s := &udpRebuildPeer{peer: peer, original: original, lineageID: ue.rebuildLineage, manager: ue.sessionRuntime.manager, changed: make(chan struct{})}
 			s.owner.Store(&udpRebuildOwnership{endpoint: ue, revision: ue.rebuildRevision})
 			if !ue.installRebuildPeer(peer, s) {
 				o.peerCount--
@@ -346,7 +361,7 @@ func (f *udpReplyDroughtFlow) write(peer netip.AddrPort, size int, now time.Time
 	if f.closed.Load() || o.closed.Load() {
 		return
 	}
-	p := f.admitLocked(peer, now)
+	p := f.admitLocked(peer, netip.AddrPort{}, now)
 	if p == nil {
 		o.admissionDropped.Add(1)
 		return
@@ -694,11 +709,15 @@ func (ue *UdpEndpoint) observeDroughtWrite(addr string, size int, now time.Time)
 }
 
 func (ue *UdpEndpoint) prepareDroughtWrite(addr string) {
+	ue.prepareDroughtWriteVisible(addr, netip.AddrPort{})
+}
+
+func (ue *UdpEndpoint) prepareDroughtWriteVisible(addr string, visible netip.AddrPort) {
 	if ue.replyDrought == nil {
 		return
 	}
 	peer, _ := netip.ParseAddrPort(addr)
-	ue.replyDrought.prepare(ue.droughtPeer(peer), time.Now())
+	ue.replyDrought.prepareVisible(ue.droughtPeer(peer), visible, time.Now())
 }
 
 // Call before releasing the batch mutex: item addresses and payloads still
