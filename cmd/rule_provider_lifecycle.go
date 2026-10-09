@@ -70,7 +70,10 @@ func (h *ruleProviderLifecycleHolder) refresh(ctx context.Context) (ruleprovider
 	mihomoReport, mihomoErr := refreshMihomoSource(ctx, conf, baseDir, http.DefaultClient)
 	report.Changed = report.Changed || mihomoReport.Changed
 	report.UsedLastGood = report.UsedLastGood || mihomoReport.UsedLastGood
-	return report, errors.Join(err, mihomoErr)
+	// The dat files are read when routing is built, so a new one needs a reload.
+	geodataChanged, geodataErr := syncGeodata(ctx, conf.Geodata, baseDir, http.DefaultClient)
+	report.Changed = report.Changed || geodataChanged
+	return report, errors.Join(err, mihomoErr, geodataErr)
 }
 
 func (h *ruleProviderLifecycleHolder) setConfig(conf *config.Config) {
@@ -113,6 +116,9 @@ func ruleProviderRefreshInterval(conf *config.Config) time.Duration {
 	var interval time.Duration
 	if conf.Mihomo.Enabled() && conf.Mihomo.Interval > 0 {
 		interval = conf.Mihomo.Interval
+	}
+	if conf.Geodata.Enabled() && conf.Geodata.Interval > 0 && (interval == 0 || conf.Geodata.Interval < interval) {
+		interval = conf.Geodata.Interval
 	}
 	for _, provider := range conf.RuleProvider {
 		if provider.Interval > 0 && (interval == 0 || provider.Interval < interval) {

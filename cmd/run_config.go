@@ -224,6 +224,7 @@ func readConfigAt(cfgFile string, startup bool) (conf *config.Config, includes [
 	if err != nil {
 		return nil, nil, err
 	}
+	loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), startup)
 	// Taken before rule sets are expanded: after that there is one rule per
 	// entry, which is no longer something to read.
 	rememberEffectiveConfig(conf, buildEffectiveConfig(conf, merge))
@@ -242,4 +243,27 @@ func emptyConfig() (conf *config.Config, err error) {
 		return nil, err
 	}
 	return conf, nil
+}
+
+// loadGeodata makes the dat files named by the geodata section available. A
+// cold start fetches them; a reload only fills in what is missing, since the
+// refresh schedule keeps them current and a reload should not wait on it.
+func loadGeodata(ctx context.Context, conf *config.Config, dir string, startup bool) {
+	if !conf.Geodata.Enabled() {
+		setGeodataStatus(GeodataStatus{})
+		return
+	}
+	if !startup {
+		missing := false
+		for name, url := range map[string]string{"geoip.dat": conf.Geodata.GeoIP, "geosite.dat": conf.Geodata.GeoSite} {
+			if _, err := os.Stat(filepath.Join(dir, name)); url != "" && err != nil {
+				missing = true
+			}
+		}
+		if !missing {
+			return
+		}
+	}
+	// Failures are logged and kept in the status; see syncGeodata.
+	_, _ = syncGeodata(ctx, conf.Geodata, dir, http.DefaultClient)
 }

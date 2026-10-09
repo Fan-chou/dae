@@ -77,8 +77,9 @@ type adminStatusBody struct {
 	PreviousGeneration string `json:"previous_generation,omitempty"`
 	// SyncWarning is set when the Mihomo routing source is not being read
 	// fresh: the last attempt failed or the last good copy is in use.
-	SyncWarning string       `json:"sync_warning,omitempty"`
-	Mihomo      MihomoStatus `json:"mihomo"`
+	SyncWarning string        `json:"sync_warning,omitempty"`
+	Mihomo      MihomoStatus  `json:"mihomo"`
+	Geodata     GeodataStatus `json:"geodata"`
 }
 
 type adminLogsBody struct {
@@ -221,6 +222,7 @@ func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		body.PreviousGeneration = meta.PreviousGeneration
 	}
 	body.Mihomo = CurrentMihomoStatus()
+	body.Geodata = CurrentGeodataStatus()
 	body.SyncWarning = mihomoWarning(body.Mihomo)
 	if body.Generation == "" {
 		if view := CurrentEffectiveConfig(); view != nil {

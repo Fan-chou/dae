@@ -25,6 +25,7 @@ var configSectionSpecs = []configSectionSpec{
 	{name: "subscription", decode: decodeSubscriptionSection},
 	{name: "rule_provider", decode: decodeRuleProviderSection},
 	{name: "mihomo", decode: decodeMihomoSection},
+	{name: "geodata", decode: decodeGeodataSection},
 	{name: "node", decode: decodeNodeSection},
 	{name: "group", decode: decodeGroupSection},
 	{name: "routing", required: true, decode: decodeRoutingSection},
@@ -75,6 +76,13 @@ func decodeMihomoSection(conf *Config, section *config_parser.Section) error {
 		return err
 	}
 	return conf.Mihomo.Validate()
+}
+
+func decodeGeodataSection(conf *Config, section *config_parser.Section) error {
+	if err := SectionParser(reflect.ValueOf(&conf.Geodata), section); err != nil {
+		return err
+	}
+	return conf.Geodata.Validate()
 }
 
 func decodeNodeSection(conf *Config, section *config_parser.Section) error {

@@ -190,6 +190,15 @@ return view.extend({
 
 		o = s.option(form.Value, 'isolate_transport_groups', _('独立传输的分组'), _('逗号分隔的分组名；这些分组的每个节点各用一条独立连接'));
 
+		s = m.section(form.NamedSection, 'config', 'dae', _('地理数据'));
+		s.description = _('geoip() 与 geosite 规则用的 geoip.dat / geosite.dat。填写链接后由 dae 自己下载、校验并定期更新；失败时保留旧文件。');
+		o = s.option(form.Value, 'geoip_url', _('geoip.dat 链接'));
+		o.placeholder = 'https://github.com/v2fly/geoip/releases/latest/download/geoip.dat';
+		o = s.option(form.Value, 'geosite_url', _('geosite.dat 链接'));
+		o.placeholder = 'https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat';
+		o = s.option(form.Value, 'geodata_interval', _('更新间隔'), _('留空为 168h'));
+		o.placeholder = '168h';
+
 		s = m.section(form.TypedSection, 'subscription', _('订阅'));
 		s.anonymous = true;
 		s.addremove = true;

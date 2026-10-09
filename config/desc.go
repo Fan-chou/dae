@@ -10,6 +10,7 @@ type Desc map[string]string
 var SectionSummaryDesc = Desc{
 	"subscription":  "Subscriptions defined here will be resolved as nodes and merged as a part of the global node pool.\nSupport to give the subscription a tag, and filter nodes from a given subscription in the group section.",
 	"rule_provider": "Remote or local rule sources are fetched, validated, and lowered into the existing routing matcher. Provider content is data only and never executed.",
+	"geodata":       "Where geoip.dat and geosite.dat come from (geoip / geosite URLs). Fetched in-process, checked to be readable dat files, kept beside the config and refreshed every interval; a failed download keeps the previous copy.",
 	"mihomo":        "One complete Mihomo YAML (routing_subscription URL or routing_file) fetched in-process and converted into nodes, groups and routing rules. The document is data only and never executed. The last valid copy is kept when refresh fails. routing_subscription is a secret and is redacted from logs.",
 	"node":          "Nodes defined here will be merged as a part of the global node pool.\nOptional link query resolve_dns=8.8.8.8 (IP, optional :port) pins UDP dest IP via DNS through this node. Default is to pass the domain. DNS uses UDP; tcp:// is unsupported. Known-domain UDP sessions keep the chosen target across bounded transport recovery; TCP/DNS may prewarm HTTP/3 candidates.",
 	"dns":           "See more at https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md.",

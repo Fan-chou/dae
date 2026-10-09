@@ -23,6 +23,9 @@ secret=$(uci -q get dae.config.admin_secret || true)
 mihomo_file=$(uci -q get dae.config.mihomo_config || true)
 mihomo_interval=$(uci -q get dae.config.mihomo_interval || true)
 isolate_groups=$(uci -q get dae.config.isolate_transport_groups || true)
+geoip_url=$(uci -q get dae.config.geoip_url || true)
+geosite_url=$(uci -q get dae.config.geosite_url || true)
+geodata_interval=$(uci -q get dae.config.geodata_interval || true)
 
 # dae does not interpret escapes inside a quoted string, so pick the quote
 # that does not occur in the value.
@@ -202,6 +205,17 @@ umask 077
 		if [ "$dns_open" -eq 1 ]; then
 			echo "    }"
 		fi
+		echo "}"
+	fi
+
+	# geoip.dat / geosite.dat for geoip() and domain(geosite:) rules, fetched
+	# and kept current by dae itself.
+	if [ -n "$geoip_url" ] || [ -n "$geosite_url" ]; then
+		echo
+		echo "geodata {"
+		[ -z "$geoip_url" ] || echo "    geoip: $(quote_dae "$geoip_url")"
+		[ -z "$geosite_url" ] || echo "    geosite: $(quote_dae "$geosite_url")"
+		[ -z "$geodata_interval" ] || echo "    interval: ${geodata_interval}"
 		echo "}"
 	fi
 } > "$TMP"

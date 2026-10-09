@@ -168,5 +168,6 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
 - [x] 离线首启(§3):冷启动时远程订阅读不到且没有旧副本,不再因此起不来,而是不带路由源运行、状态标 `degraded`、每 2 分钟重试(`RefreshLifecycle.NextInterval`);重载与"编辑后校验"仍严格失败,拼错 URL 不会替换正在工作的路由。本地文件源损坏仍直接失败。
 - [x] 订阅 URL 脱敏加强:token 常在路径里,状态与错误里只显示 scheme+host,错误文本里的路径与查询被抹去(`Mihomo.ScrubSecrets`)。
 - [x] 旧入口已移除:`tools/dae-rule-sync`、`openwrt/kdae-rule-sync`、`Makefile` 的 `dae-rule-sync` 目标、`build-ipk.sh` 相关段。归档仓库 `/root/dev/dae-rule-sync` 保留。
-- [ ] geo `.dat` 进程内获取(可选,见 §2.4):原生规则集已覆盖订阅用到的场景,手写 `geoip()/geosite()` 才需要。
-- [ ] 220 实机验证(真实订阅)→ 切 223。
+- [x] geo `.dat` 进程内获取:新增 `geodata { geoip: '<url>'  geosite: '<url>'  interval: 168h }` 段。文件经 `ruleprovider.FetchDocument`(SSRF 防护、条件请求、last-good)下载,先按 protobuf 结构走完整个文件并用 dae 自己的读取器校验(截断或 HTML 错误页不会通过),再原子写到配置目录的 `geoip.dat`/`geosite.dat`(dae 默认在那里找)。失败不影响启动、不覆盖旧文件,状态在 `/v1/status` 的 `geodata`;冷启动拉取,重载只补缺失,定时刷新有变化才触发重载。UCI:`geoip_url`/`geosite_url`/`geodata_interval`。用真实的 geoip.dat(23MB)与 dlc.dat 验证过,`dae validate` 能用上 `geosite:cn`/`geoip:cn`。
+- [x] 220 实机验证(2026-10-10,内核 7.2.7):用 220 上真实的 40KB Mihomo 配置(67 个规则集、30 个分组、含 SCRIPT/gRPC 节点)——旧 sidecar 与新实现都拒绝其中的 `script` 与 gRPC 节点,去掉后两边转换结果规范化后完全一致(51489 项,`component/mihomo/realworld_test.go`,需 `REAL_YAML`/`REAL_GENERATION`);`dae run` 在 220 上完整启动(1.1s),`/v1/status`、`/v1/groups`(32 个展示名)、`/v1/config/effective`、`dae mihomo status` 都对;订阅不可达时降级启动、token 不在日志里。此过程发现并修复三个真实问题:复用的 transport 在 ALPN 里带 h2(服务器选 h2 就整份抓取失败);YAML 预检把相邻的带引号列表项长度累加(v2fly 风格 `- "+.x.com"` 的长列表被拒);规则集逐个串行抓取且每批抓两遍(75s,现在最多 8 并发,11s)。
+- [ ] 切 223(用户操作):在 223 上先备份 `/etc/dae`、`/etc/config/dae`,装新的 kdae/luci-app-kdae/kdae-ui ipk,运行 `kdae-migrate-mihomo.sh`,再重启服务。

@@ -254,6 +254,7 @@ type Config struct {
 	Subscription []KeyableString `mapstructure:"subscription"`
 	RuleProvider []RuleProvider  `mapstructure:"rule_provider"`
 	Mihomo       Mihomo          `mapstructure:"mihomo"`
+	Geodata      Geodata         `mapstructure:"geodata"`
 	Node         []KeyableString `mapstructure:"node"`
 	Group        []Group         `mapstructure:"group" desc:"GroupDesc"`
 	Routing      Routing         `mapstructure:"routing" required:""`

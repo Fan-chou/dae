@@ -131,7 +131,15 @@ func redactSubscription(raw string) string {
 // ScrubSecrets removes the parts of the subscription URL that may carry a
 // token from text that quotes it, such as the error of a failed fetch.
 func (m Mihomo) ScrubSecrets(text string) string {
-	raw := m.RoutingSubscription
+	return ScrubURL(text, m.RoutingSubscription)
+}
+
+// RedactURL keeps only the scheme and host of a URL.
+func RedactURL(raw string) string { return redactSubscription(raw) }
+
+// ScrubURL replaces, in text, the URL raw and the path and query of it, which
+// may hold a token.
+func ScrubURL(text, raw string) string {
 	if raw == "" {
 		return text
 	}
