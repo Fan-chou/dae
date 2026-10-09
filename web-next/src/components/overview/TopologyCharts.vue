@@ -101,6 +101,7 @@ import { getConnectionChains, getConnectionRule, getConnectionSourceIP } from '@
 import { backgroundImage } from '@/helper/indexeddb'
 import { getIPLabelFromMap } from '@/helper/sourceip'
 import { isMiddleScreen } from '@/helper/utils'
+import { displayName } from '@/fdae/client'
 import { activeConnections, filteredActiveConnections } from '@/store/connections'
 import { topologyApplyConnectionFilter } from '@/store/settings'
 import {
@@ -160,7 +161,7 @@ const topologyData = computed(() =>
     ).map((connection) => ({
       source: getIPLabelFromMap(getConnectionSourceIP(connection)),
       rule: getConnectionRule(connection),
-      chains: getConnectionChains(connection),
+      chains: getConnectionChains(connection).map(displayName),
     })),
     {
       sourceIPAddress: t('sourceIPAddress'),
