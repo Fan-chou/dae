@@ -73,8 +73,7 @@ type adminErrorBody struct {
 
 type adminStatusBody struct {
 	control.AdminStatus
-	Generation         string `json:"generation,omitempty"`
-	PreviousGeneration string `json:"previous_generation,omitempty"`
+	Generation string `json:"generation,omitempty"`
 	// SyncWarning is set when the Mihomo routing source is not being read
 	// fresh: the last attempt failed or the last good copy is in use.
 	SyncWarning string        `json:"sync_warning,omitempty"`
@@ -88,11 +87,6 @@ type adminLogsBody struct {
 
 type adminReloadBody struct {
 	Queued bool `json:"queued"`
-}
-
-type adminGenerationMetadata struct {
-	Generation         string `json:"generation"`
-	PreviousGeneration string `json:"previous_generation"`
 }
 
 func newAdminServer(log *logrus.Logger, logFile, configDir string, plane adminPlaneProvider, reload adminReloadFunc) *adminServer {
@@ -217,17 +211,11 @@ func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if plane != nil {
 		body.AdminStatus = plane.AdminStatusSnapshot(Version)
 	}
-	if meta, err := readAdminGenerationMetadata(s.configDir); err == nil {
-		body.Generation = meta.Generation
-		body.PreviousGeneration = meta.PreviousGeneration
-	}
 	body.Mihomo = CurrentMihomoStatus()
 	body.Geodata = CurrentGeodataStatus()
 	body.SyncWarning = mihomoWarning(body.Mihomo)
-	if body.Generation == "" {
-		if view := CurrentEffectiveConfig(); view != nil {
-			body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
-		}
+	if view := CurrentEffectiveConfig(); view != nil {
+		body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
 	}
 	writeAdminJSON(w, http.StatusOK, body)
 }
@@ -575,21 +563,6 @@ func tailLogLines(path string, n int) ([]string, error) {
 	}
 
 	return lines, nil
-}
-
-func readAdminGenerationMetadata(configDir string) (adminGenerationMetadata, error) {
-	if configDir == "" {
-		return adminGenerationMetadata{}, os.ErrNotExist
-	}
-	body, err := os.ReadFile(strings.TrimRight(configDir, "/") + "/metadata.json")
-	if err != nil {
-		return adminGenerationMetadata{}, err
-	}
-	var meta adminGenerationMetadata
-	if err := json.Unmarshal(body, &meta); err != nil {
-		return adminGenerationMetadata{}, err
-	}
-	return meta, nil
 }
 
 func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {

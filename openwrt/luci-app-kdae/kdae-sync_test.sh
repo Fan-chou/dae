@@ -31,6 +31,7 @@ cat > "$tmp/write-fail" <<'STUB'
 printf 'half-written\n' > "$KDAE_LOCAL_DAE"
 exit 1
 STUB
+# dae stubs: validate and `mihomo preview` can be told to fail separately.
 cat > "$tmp/dae-ok" <<'STUB'
 #!/bin/sh
 exit 0
@@ -39,6 +40,12 @@ cat > "$tmp/dae-bad" <<'STUB'
 #!/bin/sh
 echo "invalid config" >&2
 exit 1
+STUB
+# validate passes (as it does offline), the source cannot be read
+cat > "$tmp/dae-nosource" <<'STUB'
+#!/bin/sh
+[ "$1" = mihomo ] && { echo "cannot read the source" >&2; exit 1; }
+exit 0
 STUB
 chmod +x "$tmp"/write-* "$tmp"/dae-*
 
@@ -60,6 +67,11 @@ if run "$tmp/write-fail" "$tmp/dae-ok"; then fail "writer failure was reported a
 rm -f "$tmp/local.dae"
 if run "$tmp/write-ok" "$tmp/dae-bad"; then fail "validate failure was reported as success"; fi
 [ ! -e "$tmp/local.dae" ] || fail "rejected first local.dae was kept"
+
+# validate passes but the Mihomo source cannot be read: rejected as well
+printf 'old\n' > "$tmp/local.dae"
+if run "$tmp/write-ok" "$tmp/dae-nosource"; then fail "unreadable source was reported as success"; fi
+[ "$(cat "$tmp/local.dae")" = old ] || fail "local.dae not restored when the source was unreadable"
 
 # success keeps the new file and no backup
 printf 'old\n' > "$tmp/local.dae"

@@ -200,18 +200,39 @@ func preprocessWanInterfaceAuto(params *config.Config) error {
 	return nil
 }
 
+// How much of a configuration's remote parts a read insists on.
+type readMode struct {
+	// tolerateMihomo lets an unreachable Mihomo source with no earlier copy
+	// pass as degraded instead of failing; see applyMihomoSource.
+	tolerateMihomo bool
+	// fetchGeodata downloads the dat files even if they are present; without
+	// it only missing ones are filled in.
+	fetchGeodata bool
+}
+
+var (
+	// A reload, or validation of an edit: a mistyped URL must be an error, so
+	// it cannot replace working routing.
+	readStrict = readMode{}
+	// A cold start: dae comes up without what it cannot reach yet and retries.
+	readColdStart = readMode{tolerateMihomo: true, fetchGeodata: true}
+	// `dae validate`, which the service script runs before every start: it must
+	// not fail only because the uplink is not up yet, but it is not the place to
+	// download the dat files, which `run` does right after.
+	readValidate = readMode{tolerateMihomo: true}
+)
+
 // readConfig reads a configuration for a reload or for validation of an edit.
 func readConfig(cfgFile string) (conf *config.Config, includes []string, err error) {
-	return readConfigAt(cfgFile, false)
+	return readConfigAt(cfgFile, readStrict)
 }
 
-// readConfigAtStartup is readConfig for a cold start, where an unreachable
-// Mihomo source with no earlier copy is tolerated; see applyMihomoSource.
+// readConfigAtStartup is readConfig for a cold start.
 func readConfigAtStartup(cfgFile string) (conf *config.Config, includes []string, err error) {
-	return readConfigAt(cfgFile, true)
+	return readConfigAt(cfgFile, readColdStart)
 }
 
-func readConfigAt(cfgFile string, startup bool) (conf *config.Config, includes []string, err error) {
+func readConfigAt(cfgFile string, mode readMode) (conf *config.Config, includes []string, err error) {
 	merger := config.NewMerger(cfgFile)
 	sections, includes, err := merger.Merge()
 	if err != nil {
@@ -220,11 +241,11 @@ func readConfigAt(cfgFile string, startup bool) (conf *config.Config, includes [
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err
 	}
-	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, startup)
+	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, mode.tolerateMihomo)
 	if err != nil {
 		return nil, nil, err
 	}
-	loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), startup)
+	loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), mode.fetchGeodata)
 	// Taken before rule sets are expanded: after that there is one rule per
 	// entry, which is no longer something to read.
 	rememberEffectiveConfig(conf, buildEffectiveConfig(conf, merge))
@@ -248,12 +269,12 @@ func emptyConfig() (conf *config.Config, err error) {
 // loadGeodata makes the dat files named by the geodata section available. A
 // cold start fetches them; a reload only fills in what is missing, since the
 // refresh schedule keeps them current and a reload should not wait on it.
-func loadGeodata(ctx context.Context, conf *config.Config, dir string, startup bool) {
+func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll bool) {
 	if !conf.Geodata.Enabled() {
 		setGeodataStatus(GeodataStatus{})
 		return
 	}
-	if !startup {
+	if !fetchAll {
 		missing := false
 		for name, url := range map[string]string{"geoip.dat": conf.Geodata.GeoIP, "geosite.dat": conf.Geodata.GeoSite} {
 			if _, err := os.Stat(filepath.Join(dir, name)); url != "" && err != nil {

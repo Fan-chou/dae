@@ -4,7 +4,6 @@ export type AdminStatus = {
   lan_interface?: string[]
   wan_interface?: string[]
   generation?: string
-  previous_generation?: string
   sync_warning?: string
   mihomo?: EffectiveConfig['mihomo']
   upload_rate?: number

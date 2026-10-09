@@ -44,6 +44,15 @@ if ! "$DAE" validate -c "$config"; then
 	exit 1
 fi
 
+# `validate` passes while the Mihomo source cannot be reached, so that a router
+# can boot before its uplink is up. Applying new settings is the moment to
+# insist: read the source now, which also leaves a copy to fall back on.
+if ! "$DAE" mihomo preview -c "$config" >/dev/null; then
+	restore
+	echo "the Mihomo routing source could not be read; local.dae was restored" >&2
+	exit 1
+fi
+
 if /etc/init.d/dae running >/dev/null 2>&1; then
 	/etc/init.d/dae hot_reload
 	echo "reload requested; the new routing source is read now"

@@ -27,6 +27,9 @@ names() {
 	host=$(uci -q get system.@system[0].hostname 2>/dev/null || hostname)
 	domain=$(uci -q get dhcp.@dnsmasq[0].domain 2>/dev/null || echo lan)
 	printf 'DNS:%s\nDNS:%s.%s\nDNS:kdae.%s\nDNS:localhost\n' "$host" "$host" "$domain" "$domain"
+	# The LAN address from UCI, in case `ip` is missing or the interface is down.
+	lanip=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
+	[ -z "$lanip" ] || echo "IP:${lanip%%/*}"
 	ip -o -4 addr show 2>/dev/null | awk '{split($4,a,"/"); print "IP:" a[1]}'
 	ip -o -6 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print "IP:" a[1]}'
 	echo "IP:127.0.0.1"

@@ -139,3 +139,30 @@ func TestGeodataIntervalJoinsTheRefreshSchedule(t *testing.T) {
 	conf := &config.Config{Geodata: config.Geodata{GeoIP: "https://geo.example.com/geoip.dat", Interval: 48 * 3600 * 1e9}}
 	require.Equal(t, conf.Geodata.Interval, ruleProviderRefreshInterval(conf))
 }
+
+func TestValidateModeDoesNotDownloadGeodataThatIsThere(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.dae")
+	require.NoError(t, os.WriteFile(path, []byte(`global {}
+geodata { geosite: 'https://geo.example.com/geosite.dat' }
+mihomo { routing_subscription: 'https://sub.invalid/token' }
+routing { fallback: direct }
+`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "geosite.dat"), sampleSiteDat(t, "CN"), 0o644))
+	calls := 0
+	saved := fetchGeodataDocument
+	t.Cleanup(func() { fetchGeodataDocument = saved })
+	fetchGeodataDocument = func(context.Context, config.RuleProvider, string, *http.Client, func([]byte) error) (ruleprovider.Document, error) {
+		calls++
+		return ruleprovider.Document{}, errors.New("unexpected download")
+	}
+	// The service script validates before every start; offline that must pass,
+	// and the download is left to `run`.
+	_, _, err := readConfigAt(path, readValidate)
+	require.NoError(t, err)
+	require.Zero(t, calls)
+	require.True(t, CurrentMihomoStatus().Degraded)
+	// A reload or the validation of an edit stays strict about the source.
+	_, _, err = readConfig(path)
+	require.Error(t, err)
+}

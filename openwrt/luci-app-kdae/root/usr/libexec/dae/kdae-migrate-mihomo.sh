@@ -55,5 +55,12 @@ if ! "$DAE" validate -c "$CONFIG"; then
 	echo "dae validate failed; config.dae restored from $bak" >&2
 	exit 1
 fi
+# validate also passes offline; read the source for real. This leaves a copy
+# of it for the first start to fall back on.
+if ! "$DAE" mihomo preview -c "$CONFIG" >/dev/null; then
+	cp -p "$bak" "$CONFIG"
+	echo "the Mihomo routing source could not be read; config.dae restored from $bak" >&2
+	exit 1
+fi
 echo "migrated. Apply with: /etc/init.d/dae restart"
 echo "old generation files are untouched under $(dirname "$CONFIG")/current and generations"

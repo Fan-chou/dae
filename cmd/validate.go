@@ -25,7 +25,7 @@ var (
 				os.Exit(1)
 			}
 			// Read config from --config cfgFile.
-			conf, _, err := readConfigAtStartup(cfgFile)
+			conf, _, err := readConfigAt(cfgFile, readValidate)
 			if err == nil {
 				err = validateFixedDomainTtl(conf)
 			}

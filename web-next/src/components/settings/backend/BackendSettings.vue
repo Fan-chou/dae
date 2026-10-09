@@ -42,7 +42,7 @@
         <div class="setting-item">
           <div class="setting-item-label">
             fdae 配置<span class="block mt-1 text-xs text-base-content/50"
-              >global、routing 与独立路由规则</span
+              >global、routing 与独立路由规则；可查看合并 Mihomo 源之后的生效配置</span
             >
           </div>
           <RouterLink to="/rules" class="btn btn-sm">编辑配置</RouterLink>
