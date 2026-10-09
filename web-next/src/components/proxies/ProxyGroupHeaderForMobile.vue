@@ -8,9 +8,10 @@
       :class="proxyGroup.icon && 'pr-12'"
     >
       <span
-        class="shrink-0 tracking-wider whitespace-nowrap uppercase tabular-nums"
+        class="shrink-0 whitespace-nowrap tabular-nums"
+        :title="proxyGroup.fdaePolicy"
       >
-        {{ proxyGroup.fdaePolicy }} · {{ proxiesCount }}
+        {{ policyLabel(proxyGroup.fdaePolicy) }} · {{ proxiesCount }} 可用
       </span>
       <ProxyGroupFilter v-if="displayContent" :group-name="name" />
     </div>
@@ -56,6 +57,7 @@
 
 <script setup lang="ts">
 import { displayName } from '@/fdae/client'
+import { policyLabel } from '@/fdae/proxies'
 import GroupTraffic from '@/fdae/GroupTraffic.vue'
 import {
   KEYBOARD_SHORTCUT_ACTION,

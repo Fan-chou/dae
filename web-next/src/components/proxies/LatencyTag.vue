@@ -1,7 +1,7 @@
 <template>
   <div
     :class="[
-      'latency-tag bg-base-100 h-5 w-10 rounded-xl text-xs select-none md:hover:shadow-sm',
+      'latency-tag bg-base-100 h-5 min-w-10 rounded-xl px-1.5 text-xs select-none md:hover:shadow-sm',
       color,
     ]"
     @mouseenter="handlerHistoryTip"
@@ -18,7 +18,11 @@
         v-else-if="state === 'empty'"
         class="latency-state text-base-content h-3 w-3"
       />
-      <div v-else ref="latencyRef" class="latency-state tabular-nums">
+      <div
+        v-else
+        ref="latencyRef"
+        class="latency-state tabular-nums after:ml-px after:text-[9px] after:opacity-60 after:content-['ms']"
+      >
         {{ latency }}
       </div>
     </Transition>

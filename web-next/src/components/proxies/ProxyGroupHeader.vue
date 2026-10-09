@@ -7,10 +7,11 @@
       class="text-base-content"
     />
     <span
-      class="text-base-content/40 min-w-0 flex-1 truncate text-[11px] tracking-wider uppercase tabular-nums"
+      class="text-base-content/45 min-w-0 flex-1 truncate text-[11px] tabular-nums"
+      :title="proxyGroup.fdaePolicy"
       @mouseenter="checkTruncation"
     >
-      {{ proxyGroup.fdaePolicy }} · {{ proxiesCount }}
+      {{ policyLabel(proxyGroup.fdaePolicy) }} · {{ proxiesCount }} 可用
     </span>
     <ProxyGroupFilter :group-name="name" />
     <VisibilityToggle
@@ -46,6 +47,7 @@
 
 <script setup lang="ts">
 import GroupTraffic from '@/fdae/GroupTraffic.vue'
+import { policyLabel } from '@/fdae/proxies'
 import {
   KEYBOARD_SHORTCUT_ACTION,
   useKeyboardShortcuts,

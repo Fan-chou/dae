@@ -26,3 +26,21 @@ export async function proxySnapshot(): Promise<{
   }
   return { proxies }
 }
+
+// What a group does with its members, in words. The raw policy name stays
+// available as the tooltip for anyone who writes the config.
+export function policyLabel(policy?: string): string {
+  const name = (policy || '').replace(/\(.*\)$/, '')
+  return (
+    {
+      fixed: '手动选择',
+      min: '最近延迟最低',
+      min_avg10: '近 10 次均值最低',
+      min_moving_avg: '滑动均值最低',
+      first_alive: '首个可用',
+      random: '随机',
+      fallback: '故障转移',
+      url_test: '自动测速',
+    }[name] ?? (policy || '')
+  )
+}
