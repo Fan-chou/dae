@@ -1,0 +1,110 @@
+#!/bin/sh
+# Issue a certificate for uhttpd that Safari/iOS/macOS accept once the local
+# CA is trusted. A bare self-signed certificate is rejected by Safari; this
+# makes a private CA (10 years, created once) and a leaf certificate with the
+# router's addresses as SANs, serverAuth EKU and <= 397 days validity (Apple's
+# limit). The CA is published for download; its key never leaves the router.
+#
+#   kdae-ui-cert          create/renew when missing, expiring or SANs changed
+#   kdae-ui-cert --force  always reissue the leaf certificate
+set -eu
+
+DIR=${KDAE_PKI_DIR:-/etc/kdae-ui/pki}
+PUB=${KDAE_CA_PUB:-/www/kdae-ui/ca}
+LEAF_DAYS=397
+RENEW_SECS=$((30 * 86400))
+
+command -v openssl >/dev/null 2>&1 || {
+	echo "kdae-ui-cert: openssl-util is required" >&2
+	exit 1
+}
+
+umask 077
+mkdir -p "$DIR" "$PUB"
+chmod 755 "$PUB"
+
+names() {
+	host=$(uci -q get system.@system[0].hostname 2>/dev/null || hostname)
+	domain=$(uci -q get dhcp.@dnsmasq[0].domain 2>/dev/null || echo lan)
+	printf 'DNS:%s\nDNS:%s.%s\nDNS:kdae.%s\nDNS:localhost\n' "$host" "$host" "$domain" "$domain"
+	ip -o -4 addr show 2>/dev/null | awk '{split($4,a,"/"); print "IP:" a[1]}'
+	ip -o -6 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print "IP:" a[1]}'
+	echo "IP:127.0.0.1"
+}
+sans=$(names | sort -u | paste -sd, -)
+
+if [ ! -s "$DIR/ca.key" ] || [ ! -s "$DIR/ca.crt" ]; then
+	openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
+		-keyout "$DIR/ca.key" -out "$DIR/ca.crt" \
+		-subj "/CN=kdae local CA $(date +%Y%m%d)/O=kdae" \
+		-addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+		-addext "keyUsage=critical,keyCertSign,cRLSign" \
+		-addext "subjectKeyIdentifier=hash" 2>/dev/null
+fi
+
+need=0
+[ "${1:-}" = "--force" ] && need=1
+[ -s "$DIR/leaf.crt" ] || need=1
+[ -f "$DIR/sans" ] && [ "$(cat "$DIR/sans")" = "$sans" ] || need=1
+if [ "$need" = 0 ] && ! openssl x509 -checkend "$RENEW_SECS" -noout -in "$DIR/leaf.crt" >/dev/null 2>&1; then
+	need=1
+fi
+
+if [ "$need" = 1 ]; then
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+	openssl req -new -newkey rsa:2048 -nodes -sha256 -keyout "$tmp/leaf.key" \
+		-out "$tmp/leaf.csr" -subj "/CN=kdae" 2>/dev/null
+	cat > "$tmp/ext" <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=$sans
+EXT
+	openssl x509 -req -sha256 -days "$LEAF_DAYS" -in "$tmp/leaf.csr" \
+		-CA "$DIR/ca.crt" -CAkey "$DIR/ca.key" -CAcreateserial \
+		-CAserial "$DIR/ca.srl" -extfile "$tmp/ext" -out "$tmp/leaf.crt" 2>/dev/null
+	# Serve the chain so clients that only trust the CA can build the path.
+	cat "$tmp/leaf.crt" > "$DIR/leaf.crt"
+	cp "$tmp/leaf.key" "$DIR/leaf.key"
+	printf '%s' "$sans" > "$DIR/sans"
+	changed=1
+else
+	changed=0
+fi
+
+# Public material: the CA certificate (DER for Android/Windows, PEM for the
+# rest) and an iOS/macOS profile that installs it.
+cp "$DIR/ca.crt" "$PUB/kdae-ca.crt"
+openssl x509 -in "$DIR/ca.crt" -outform der -out "$PUB/kdae-ca.der"
+b64=$(openssl base64 -A -in "$PUB/kdae-ca.der")
+uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || echo 00000000-0000-4000-8000-000000000000; }
+cat > "$PUB/kdae-ca.mobileconfig" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>PayloadType</key><string>Configuration</string>
+<key>PayloadVersion</key><integer>1</integer>
+<key>PayloadIdentifier</key><string>kdae.local-ca</string>
+<key>PayloadUUID</key><string>$(uuid)</string>
+<key>PayloadDisplayName</key><string>kdae local CA</string>
+<key>PayloadContent</key><array><dict>
+<key>PayloadType</key><string>com.apple.security.root</string>
+<key>PayloadVersion</key><integer>1</integer>
+<key>PayloadIdentifier</key><string>kdae.local-ca.cert</string>
+<key>PayloadUUID</key><string>$(uuid)</string>
+<key>PayloadDisplayName</key><string>kdae local CA</string>
+<key>PayloadContent</key><data>$b64</data>
+</dict></array>
+</dict></plist>
+PLIST
+chmod 644 "$PUB"/*
+
+# Point uhttpd at the new leaf certificate.
+if [ "$changed" = 1 ] && command -v uci >/dev/null 2>&1 && [ -f /etc/config/uhttpd ]; then
+	uci set uhttpd.main.cert="$DIR/leaf.crt"
+	uci set uhttpd.main.key="$DIR/leaf.key"
+	uci commit uhttpd
+	/etc/init.d/uhttpd reload 2>/dev/null || true
+fi
+echo "kdae-ui-cert: SAN $sans"

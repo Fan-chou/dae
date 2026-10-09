@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kdae 本地证书 / Local CA</title>
+<style>
+body{font:16px/1.6 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem 16px;color:#222;background:#fff}
+@media(prefers-color-scheme:dark){body{color:#ddd;background:#111}a{color:#8ab4ff}}
+a.b{display:block;margin:.5rem 0;padding:.7rem 1rem;border:1px solid #888;border-radius:8px;text-decoration:none}
+code{background:#8883;padding:0 .3em;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>安装 kdae 本地证书</h1>
+<p>面板使用路由器自己签发的证书。安装并信任下面的根证书后，Safari、Chrome 等浏览器即可正常打开 HTTPS 面板，不再出现警告，且可使用离线缓存与“添加到主屏幕”。证书私钥只保存在路由器上。</p>
+<a class="b" href="kdae-ca.mobileconfig">iPhone / iPad / Mac：下载描述文件 (.mobileconfig)</a>
+<a class="b" href="kdae-ca.crt">Linux / Firefox：下载 PEM (.crt)</a>
+<a class="b" href="kdae-ca.der">Android / Windows：下载 DER (.der)</a>
+<h2>iOS / iPadOS</h2>
+<ol><li>用 Safari 打开本页并下载描述文件，选择“允许”。</li>
+<li>设置 → 通用 → VPN 与设备管理 → 安装“kdae local CA”。</li>
+<li>设置 → 通用 → 关于本机 → 证书信任设置 → 打开“kdae local CA”的完全信任。</li></ol>
+<h2>macOS</h2>
+<p>双击描述文件，在“系统设置 → 隐私与安全性 → 描述文件”中安装；或在“钥匙串访问”中将证书设为“始终信任”。</p>
+<h2>说明</h2>
+<p>如果路由器的 IP 或主机名变化，运行 <code>kdae-ui-cert</code> 重新签发叶子证书；根证书不变，无需重新安装。不想安装证书时，可改用 HTTP 访问（局域网内），面板同样可用，仅少了离线缓存。</p>
+</body>
+</html>

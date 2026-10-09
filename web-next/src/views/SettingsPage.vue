@@ -413,7 +413,8 @@ const openSetting = async (category: SETTINGS_MENU_KEY, settingKey: string) => {
 }
 
 const refreshPages = async () => {
-  const registrations = await navigator.serviceWorker.getRegistrations()
+  const registrations =
+    (await navigator.serviceWorker?.getRegistrations()) ?? []
   for (const registration of registrations) registration.unregister()
   window.location.reload()
 }
