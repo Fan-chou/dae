@@ -67,21 +67,17 @@ import { syncSettingsFromCore } from '@/helper/autoImportSettings'
 import { useBackendReachability } from '@/composables/backendReachability'
 import { describeProbeFailure } from '@/helper/connectivity'
 import { showNotification } from '@/helper/notification'
-import { getBackendFromUrl, getBackendProbeUrl } from '@/helper/utils'
+import {
+  defaultBackendForm,
+  getBackendFromUrl,
+  getBackendProbeUrl,
+} from '@/helper/utils'
 import router from '@/router'
 import { addBackend, backendList, openBackendManager } from '@/store/setup'
-import type { Backend, BackendType } from '@/types'
+import type { Backend } from '@/types'
 import { computed, ref, watch } from 'vue'
 
-const form = ref<Omit<Backend, 'uuid'>>({
-  type: 'fdae' as BackendType,
-  protocol: 'http',
-  host: '127.0.0.1',
-  port: '9090',
-  secondaryPath: '',
-  password: '',
-  label: '',
-})
+const form = ref<Omit<Backend, 'uuid'>>(defaultBackendForm())
 
 // 填表期间就持续探测:通不通、为什么不通,在按提交之前就该看得见。
 const reachability = useBackendReachability(form)

@@ -143,7 +143,7 @@ import { useBackendListProbe } from '@/composables/backendListProbe'
 import { useBackendReachability } from '@/composables/backendReachability'
 import { ROUTE_NAME } from '@/constant'
 import { showNotification } from '@/helper/notification'
-import { getLabelFromBackend } from '@/helper/utils'
+import { defaultBackendForm, getLabelFromBackend } from '@/helper/utils'
 import router from '@/router'
 import {
   activeUuid,
@@ -156,7 +156,7 @@ import {
   setActiveBackend,
   updateBackend,
 } from '@/store/setup'
-import type { Backend, BackendType } from '@/types'
+import type { Backend } from '@/types'
 import {
   ChevronUpDownIcon,
   PencilSquareIcon,
@@ -200,13 +200,7 @@ const isListVisible = computed(() => view.value?.mode === 'list')
 const { stateOf } = useBackendListProbe(isListVisible)
 
 const emptyForm = (): Omit<Backend, 'uuid'> => ({
-  type: 'fdae' as BackendType,
-  protocol: 'http',
-  host: '127.0.0.1',
-  port: '9090',
-  secondaryPath: '',
-  password: '',
-  label: '',
+  ...defaultBackendForm(),
   disableUpgradeCore: false,
   disableTunMode: false,
 })

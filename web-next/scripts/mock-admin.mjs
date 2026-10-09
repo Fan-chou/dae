@@ -153,11 +153,6 @@ let configFiles = {
     lan_interface: br-lan
     admin_listen: '0.0.0.0:2025'
 }
-
-mihomo {
-    routing_subscription: 'https://example.invalid/sub'
-    interval: 1h
-}
 `,
   routing: `routing {
     dip(224.0.0.0/3, 'ff00::/8') -> must_direct
@@ -171,6 +166,21 @@ const displayNames = () => {
   const out = {}
   for (const x of [...e.nodes, ...e.groups]) if (x.display_name) out[x.tag || x.name] = x.display_name
   return out
+}
+
+// MOCK_MIHOMO=degraded | lastgood | error | off changes what /v1/status reports.
+const mihomoState = () => {
+  const mode = process.env.MOCK_MIHOMO || 'ok'
+  const e = effective().mihomo
+  if (mode === 'off') return { mihomo: { enabled: false, used_last_good: false, nodes: 0, groups: 0, rules: 0, providers: 0 } }
+  const mihomo = { ...e, source: 'https://sub.example.com/…', checked_at: new Date(Date.now() - 95000).toISOString() }
+  if (mode === 'degraded') Object.assign(mihomo, { degraded: true, error: 'fetch failed: no such host', nodes: 0, groups: 0, rules: 0, providers: 0 })
+  if (mode === 'lastgood') Object.assign(mihomo, { used_last_good: true, error: 'fetch failed: timeout' })
+  const warnings = {
+    degraded: 'Mihomo routing source is unavailable and has no earlier copy; running without it: fetch failed: no such host',
+    lastgood: 'Mihomo routing source failed, using the last good copy: fetch failed: timeout',
+  }
+  return { mihomo, ...(warnings[mode] ? { sync_warning: warnings[mode] } : {}) }
 }
 
 const effective = () => ({
@@ -238,7 +248,7 @@ http
     let body = ''
     req.on('data', (c) => (body += c))
     req.on('end', () => {
-      if (p === '/v1/status') return send(res, 200, { ...status(), generation: 'generation-2106476694' })
+      if (p === '/v1/status') return send(res, 200, { ...status(), generation: '20261009T162549Z', ...mihomoState() })
       if (p === '/v1/groups') return send(res, 200, { groups: groups(), display_names: displayNames() })
       const g = p.match(/^\/v1\/groups\/([^/]+)(\/delay)?$/)
       if (g) {

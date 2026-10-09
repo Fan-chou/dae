@@ -3,7 +3,7 @@
     <p v-if="error" class="text-error" role="alert">{{ error }}</p>
     <p v-else-if="!data" class="text-base-content/55">正在读取生效配置…</p>
     <template v-else>
-      <section class="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1">
+      <section class="mb-4 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1">
         <span class="text-base-content/55"
           >生效于 {{ new Date(data.loaded_at).toLocaleString() }}</span
         >
@@ -27,7 +27,7 @@
       </section>
       <details
         v-if="notices.length"
-        class="mb-4 rounded-box bg-base-200/50 p-3"
+        class="mb-4 shrink-0 rounded-box bg-base-200/50 p-3"
         open
       >
         <summary class="cursor-pointer font-medium">
@@ -38,7 +38,7 @@
         </ul>
       </details>
       <div
-        class="mb-3 flex flex-wrap items-center gap-2"
+        class="mb-3 flex shrink-0 flex-wrap items-center gap-2"
         role="tablist"
         aria-label="生效配置分区"
       >
@@ -62,11 +62,11 @@
           aria-label="过滤"
         />
       </div>
-      <div class="overflow-x-auto">
+      <div class="shrink-0 overflow-x-auto">
         <table class="table table-sm table-zebra">
           <thead>
             <tr>
-              <th v-for="h in head" :key="h">{{ h }}</th>
+              <th v-for="(h, i) in head" :key="h" :class="i === 0 && section === 'rules' ? 'w-12' : ''">{{ h }}</th>
               <th>来源</th>
             </tr>
           </thead>
@@ -97,7 +97,7 @@
           </tbody>
         </table>
       </div>
-      <p v-if="section === 'rules'" class="mt-2 text-xs text-base-content/50">
+      <p v-if="section === 'rules'" class="mt-2 shrink-0 text-xs text-base-content/50">
         兜底出口：{{ data.fallback.outbound }}（{{ data.fallback.origin }}）。
         规则集以 ruleset(名称) 表示，不展开条目。
       </p>

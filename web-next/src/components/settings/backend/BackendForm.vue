@@ -37,7 +37,7 @@
         <TextInput
           class="w-full"
           v-model="model.port"
-          placeholder="9090"
+          placeholder="2025"
         />
       </div>
     </div>

@@ -6,6 +6,7 @@ export type AdminStatus = {
   generation?: string
   previous_generation?: string
   sync_warning?: string
+  mihomo?: EffectiveConfig['mihomo']
   upload_rate?: number
   download_rate?: number
   upload_total?: number
@@ -88,6 +89,7 @@ export type EffectiveConfig = {
     source?: string
     checked_at?: string
     used_last_good: boolean
+    degraded?: boolean
     error?: string
     nodes: number
     groups: number
