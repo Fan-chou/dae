@@ -1207,3 +1207,11 @@ R4 的 220→223 现场验收，与 `92a44aff`（跨族固定目标、替身重�
 
 脚本、客户端／服务端程序、Initial 生成器源码、归档、汇总与 `manifest.json`（含二进制与产物校验值）在忽略目录 `build/udp-field-20261009/`。
 
+#### 生产开启 observe（10 月 9 日 19:03）
+
+验收后决定在 223 生产上开启 observe，不开 enforce：223 现有节点为 SS2022、AnyTLS 和 Hysteria2，均不在自动重建的执行范围内，enforce 只会记排除；enforce 还要求明确的客户端、分组、peer 列表与 `request_reply` 契约。
+
+`udp_reply_drought_mode: observe` 写在手工维护的 `/etc/dae/config.dae` 的 `global` 块（`local.dae` 由 luci-app-kdae 生成，不改）。不设客户端、分组和 peer，即观察所有客户端在所有代理分组上的 UDP；只记录证据，不重建。修改前备份为 `/etc/dae/config.dae.bak.202610091903`，校验通过后重载，dae 进程未重启。
+
+开启后从 220 发起一条经代理的 QUIC 测试流（www.google.com:443），快照记到 2 次写入、7 次回复，分组为 `Google`，覆盖状态为 `observed`。开启前已存在的流记为 `retained_owner_not_observed`。回滚：恢复上述备份并 `dae reload`，或把该行改为 `off`。
+
