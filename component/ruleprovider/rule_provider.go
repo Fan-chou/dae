@@ -550,14 +550,36 @@ func prepareStableProviderBatch(ctx context.Context, providers []config.RuleProv
 	return prepared, nil
 }
 
+// maxConcurrentProviderFetches bounds how many providers are fetched at once.
+const maxConcurrentProviderFetches = 8
+
 func prepareProviderBatch(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) ([]preparedProvider, error) {
 	prepared := make([]preparedProvider, len(providers))
 	preparationErrors := make([]error, len(providers))
-	// Keep the established request order for compatibility. Cross-provider
-	// acceptance is decided only by generation tokens or cache batch identity.
-	for index := len(providers) - 1; index >= 0; index-- {
-		prepared[index], preparationErrors[index] = prepareProvider(ctx, providers[index], baseDir, client, options)
+	// Cross-provider acceptance is decided only by generation tokens or cache
+	// batch identity, never by the order or timing of the requests, so they run
+	// side by side: a configuration with dozens of rule sets would otherwise
+	// wait for each download in turn, twice.
+	workers := maxConcurrentProviderFetches
+	if workers > len(providers) {
+		workers = len(providers)
 	}
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range next {
+				prepared[index], preparationErrors[index] = prepareProvider(ctx, providers[index], baseDir, client, options)
+			}
+		}()
+	}
+	for index := len(providers) - 1; index >= 0; index-- {
+		next <- index
+	}
+	close(next)
+	wg.Wait()
 	for index, provider := range providers {
 		if err := preparationErrors[index]; err != nil {
 			return nil, fmt.Errorf("rule provider %q: %w", provider.Name, err)
@@ -2865,6 +2887,11 @@ func preflightProviderYAMLScalars(body []byte) error {
 			lineStart = len(body) + 1
 		}
 
+		if scalar.kind == yamlScalarPreflightNone {
+			// A quoted scalar that has just closed leaves its length behind;
+			// the next item starts counting from zero.
+			scalar = yamlScalarPreflightState{}
+		}
 		if scalar.kind == yamlScalarPreflightBlock {
 			consumed, err := scalar.consumeBlockLine(line)
 			if err != nil {

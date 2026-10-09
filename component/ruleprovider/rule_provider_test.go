@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -830,6 +832,19 @@ func TestSafeTransportAllowsOnlyHTTP1Protocols(t *testing.T) {
 	}
 	if !transport.Protocols.HTTP1() || transport.Protocols.HTTP2() || transport.Protocols.UnencryptedHTTP2() {
 		t.Fatalf("safeTransport() Protocols = %s, want HTTP1 only", *transport.Protocols)
+	}
+}
+
+// A transport that was used before holds the ALPN list it built then. If it
+// still offered h2, a server that accepts it would send HTTP/2 frames to a
+// transport that only reads HTTP/1 ("malformed HTTP response").
+func TestSafeTransportDoesNotOfferH2InALPN(t *testing.T) {
+	got, err := safeTransport(&http.Transport{TLSClientConfig: &tls.Config{NextProtos: []string{"h2", "http/1.1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protos := got.(*http.Transport).TLSClientConfig.NextProtos; !reflect.DeepEqual(protos, []string{"http/1.1"}) {
+		t.Fatalf("ALPN = %v, want [http/1.1]", protos)
 	}
 }
 
@@ -3559,5 +3574,65 @@ func TestExpandRulesetRejectsOversizedProviderBeforeAllocation(t *testing.T) {
 	}
 	if original.AndFunctions[0].Name != "ruleset" {
 		t.Fatalf("original routing rule mutated: %#v", original)
+	}
+}
+
+// Each item of a list is its own scalar. Quoted items (the v2fly style,
+// - "+.example.com") used to add up, so a long list failed the length limit
+// that is meant for a single value.
+func TestPreflightCountsQuotedListItemsSeparately(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("payload:\n")
+	for i := 0; i < 20000; i++ {
+		fmt.Fprintf(&body, "- \"+.host%d.example.com\"\n", i)
+		fmt.Fprintf(&body, "- '+.single%d.example.com'\n", i)
+	}
+	if err := preflightProviderYAML([]byte(body.String())); err != nil {
+		t.Fatalf("preflightProviderYAML() = %v for a list of short quoted items", err)
+	}
+	long := "payload:\n- \"" + strings.Repeat("a", maxProviderRuleLength+1) + "\"\n"
+	if err := preflightProviderYAML([]byte(long)); err == nil {
+		t.Fatal("a single quoted scalar over the limit was accepted")
+	}
+}
+
+// Rule sets are downloaded side by side, not one after another.
+func TestLoadFetchesProvidersConcurrently(t *testing.T) {
+	const providers = 8
+	var inFlight, peak atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+		inFlight.Add(-1)
+		_, _ = fmt.Fprintf(w, "payload:\n  - %s.example.com\n", strings.TrimPrefix(r.URL.Path, "/"))
+	}))
+	defer server.Close()
+
+	var specs []config.RuleProvider
+	for i := 0; i < providers; i++ {
+		name := fmt.Sprintf("p%d", i)
+		specs = append(specs, config.RuleProvider{Name: name, Type: "http", URL: server.URL + "/" + name, Path: "persist/" + name + ".yaml", Behavior: "domain", Format: "yaml", MaxSize: 1024})
+	}
+	registry, err := loadWithOptions(context.Background(), specs, t.TempDir(), http.DefaultClient, loadOptions{allowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registry) != providers {
+		t.Fatalf("loaded %d providers, want %d", len(registry), providers)
+	}
+	if peak.Load() < 4 {
+		t.Fatalf("at most %d downloads ran at once; they should overlap", peak.Load())
+	}
+	for i := 0; i < providers; i++ {
+		name := fmt.Sprintf("p%d", i)
+		if got := registry[name].Functions; len(got) != 1 {
+			t.Fatalf("%s: %#v", name, got)
+		}
 	}
 }

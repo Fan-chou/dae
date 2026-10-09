@@ -79,6 +79,10 @@ func safeTransport(roundTripper http.RoundTripper) (http.RoundTripper, error) {
 		tlsConfig.ServerName = ""
 		tlsConfig.VerifyPeerCertificate = nil
 		tlsConfig.VerifyConnection = nil
+		// A transport that was used before carries the ALPN list it built
+		// then, which offers h2. A server that picks it would answer HTTP/2
+		// frames to a transport that only speaks HTTP/1.
+		tlsConfig.NextProtos = []string{"http/1.1"}
 		clone.TLSClientConfig = tlsConfig
 	}
 	// Do not retain a caller-provided dial function: it could ignore the
