@@ -184,7 +184,7 @@ func (f *pinnedRebuildFixture) qualifyPin(t *testing.T) time.Time {
 }
 
 func TestUDPRebuildResolveDNSRealProxy(t *testing.T) {
-	for _, kind := range []string{"shadowsocks", "socks5"} {
+	for _, kind := range []string{"shadowsocks", "shadowsocks2022", "socks5"} {
 		t.Run(kind, func(t *testing.T) {
 			runUDPRebuildResolveDNSRealProxy(t, newPinnedRebuildFixture(t, kind))
 		})
@@ -784,7 +784,7 @@ func TestUDPRebuildResolveDNSWriteRetryCleanupKeepsPin(t *testing.T) {
 }
 
 func TestUDPRebuildResolveDNSIPv6RealProxy(t *testing.T) {
-	for _, kind := range []string{"shadowsocks", "socks5"} {
+	for _, kind := range []string{"shadowsocks", "shadowsocks2022", "socks5"} {
 		t.Run(kind, func(t *testing.T) {
 			// Client and application target are IPv6; the proxy relay is IPv4.
 			f := newPinnedRebuildFixtureFamily(t, kind, true)

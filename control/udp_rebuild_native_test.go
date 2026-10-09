@@ -10,7 +10,7 @@ import (
 )
 
 func TestUDPRebuildNativePeerWithMappingEnabled(t *testing.T) {
-	for _, kind := range []string{"shadowsocks", "socks5"} {
+	for _, kind := range []string{"shadowsocks", "shadowsocks2022", "socks5"} {
 		t.Run(kind, func(t *testing.T) {
 			store := openCrossFamilyTestStore(t, t.TempDir())
 			f := newRebuildFixtureWithStore(t, kind, "enforce", false, store)

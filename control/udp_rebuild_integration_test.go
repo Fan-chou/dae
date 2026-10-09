@@ -42,6 +42,7 @@ type rebuildRelay struct {
 	seen        map[string]int
 	first       netip.AddrPort
 	badPeer     netip.AddrPort
+	ss2022      *ss2022RelayCodec
 	drop        atomic.Bool
 	wg          sync.WaitGroup
 	err         chan error
@@ -93,7 +94,13 @@ func newRebuildRelay(t *testing.T, kind string, badPeer netip.AddrPort) (*rebuil
 	addr := r.udp.LocalAddr().String()
 	var d netproxy.Dialer
 	var err error
-	if kind == "shadowsocks" {
+	if kind == "shadowsocks2022" {
+		var psk string
+		if r.ss2022, psk, err = newSS2022RelayCodec(); err != nil {
+			t.Fatal(err)
+		}
+		d, err = protocol.NewDialer("shadowsocks_2022", direct.FullconeDirect, protocol.Header{IsClient: true, ProxyAddress: addr, Cipher: ss2022FixtureCipher, Password: psk})
+	} else if kind == "shadowsocks" {
 		conf := ciphers.AeadCiphersConf["aes-128-gcm"]
 		r.key = &ss.Key{CipherConf: conf, MasterKey: common.EVPBytesToKey("fixture-password", conf.KeyLen)}
 		d, err = protocol.NewDialer("shadowsocks", direct.FullconeDirect, protocol.Header{IsClient: true, ProxyAddress: addr, Cipher: "aes-128-gcm", Password: "fixture-password"})
@@ -189,7 +196,10 @@ func (r *rebuildRelay) accept() {
 	}
 }
 
-func (r *rebuildRelay) decode(b []byte) (netip.AddrPort, []byte, error) {
+func (r *rebuildRelay) decode(client netip.AddrPort, b []byte) (netip.AddrPort, []byte, error) {
+	if r.ss2022 != nil {
+		return r.ss2022.decode(client, b)
+	}
 	if r.key != nil {
 		plain, e := ss.DecryptUDPFromPool(r.key, b, ss.ShadowsocksReusedInfo)
 		if e != nil {
@@ -214,6 +224,14 @@ func (r *rebuildRelay) decode(b []byte) (netip.AddrPort, []byte, error) {
 	return netip.AddrPortFrom(m.IP, m.Port), append([]byte(nil), b[n:]...), nil
 }
 func (r *rebuildRelay) reply(client, peer netip.AddrPort, b []byte) error {
+	if r.ss2022 != nil {
+		wire, e := r.ss2022.encode(client, peer, b)
+		if e != nil {
+			return e
+		}
+		_, e = r.udp.WriteToUDPAddrPort(wire, client)
+		return e
+	}
 	m := ss.Metadata{Metadata: protocol.Metadata{Type: protocol.MetadataTypeIPv4, IP: peer.Addr(), Port: peer.Port()}}
 	if peer.Addr().Is6() {
 		m.Type = protocol.MetadataTypeIPv6
@@ -247,7 +265,7 @@ func (r *rebuildRelay) serve() {
 		if e != nil {
 			return
 		}
-		peer, payload, e := r.decode(b[:n])
+		peer, payload, e := r.decode(client, b[:n])
 		if e != nil {
 			r.err <- e
 			return
@@ -415,6 +433,10 @@ func newRebuildFixtureFamilies(t *testing.T, kind, mode string, gated bool, stor
 	d := componentdialer.NewDialer(f.dial, &componentdialer.GlobalOption{Log: log}, componentdialer.InstanceOption{DisableCheck: true}, &componentdialer.Property{})
 	d.Property().Name = "proxy"
 	d.Property().Protocol = kind
+	if kind == "shadowsocks2022" {
+		// ss:// links with a 2022 cipher keep the shadowsocks node protocol.
+		d.Property().Protocol = "shadowsocks"
+	}
 	d.Property().Address = r.udp.LocalAddr().String()
 	g := newTestFixedOutboundGroup(d)
 	g.Name = "game"
@@ -526,7 +548,7 @@ func (f *rebuildFixture) qualifyEvidence(t *testing.T) time.Time {
 }
 
 func TestUDPRebuildRealProxyIsolation(t *testing.T) {
-	for _, kind := range []string{"shadowsocks", "socks5"} {
+	for _, kind := range []string{"shadowsocks", "shadowsocks2022", "socks5"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newRebuildFixture(t, kind, "enforce")
 			f.qualify(t)

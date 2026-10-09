@@ -120,4 +120,4 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026100
 
 // Published outbound includes UDP lifecycle fixes, actual reply peer attribution,
 // explicit BBR supply state, opt-in TCP MSS and verified UDP recovery capabilities.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261004163218-8647a14b7f36
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261009111629-0db0543ddc65
