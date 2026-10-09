@@ -141,3 +141,22 @@ func TestOnlyTheConfigurationThatRunsIsPublished(t *testing.T) {
 	require.Equal(t, "Rocket_Proxy", CurrentEffectiveConfig().Fallback.Outbound)
 	require.Equal(t, originMihomo, CurrentEffectiveConfig().Fallback.Origin)
 }
+
+func TestCurrentDisplayNames(t *testing.T) {
+	effectiveState.mu.Lock()
+	saved := effectiveState.current
+	effectiveState.current = &EffectiveConfig{
+		Nodes:  []EffectiveNode{{Tag: "n1", DisplayName: "🇭🇰 香港 01"}, {Tag: "n2"}},
+		Groups: []EffectiveGroup{{Name: "g1", DisplayName: "🚀 节点选择"}, {Name: "g2"}},
+	}
+	effectiveState.mu.Unlock()
+	defer func() {
+		effectiveState.mu.Lock()
+		effectiveState.current = saved
+		effectiveState.mu.Unlock()
+	}()
+	got := CurrentDisplayNames()
+	if len(got) != 2 || got["n1"] != "🇭🇰 香港 01" || got["g1"] != "🚀 节点选择" {
+		t.Fatalf("unexpected display names: %v", got)
+	}
+}

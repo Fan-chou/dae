@@ -48,7 +48,7 @@
           :key="group.name"
           :value="group.name"
         >
-          {{ group.name }}
+          {{ displayName(group.name) }}
         </option>
         <option value="direct">direct</option>
         <option value="block">block</option>
@@ -104,6 +104,7 @@
   </div>
 </template>
 <script setup lang="ts">
+import { displayName } from '@/fdae/client'
 import TextInput from '@/components/common/TextInput.vue'
 import { computed } from 'vue'
 import { useNow } from '@vueuse/core'

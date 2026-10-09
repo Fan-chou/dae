@@ -166,6 +166,13 @@ mihomo {
 `,
 }
 
+const displayNames = () => {
+  const e = effective()
+  const out = {}
+  for (const x of [...e.nodes, ...e.groups]) if (x.display_name) out[x.tag || x.name] = x.display_name
+  return out
+}
+
 const effective = () => ({
   loaded_at: new Date().toISOString(),
   mihomo: {
@@ -232,7 +239,7 @@ http
     req.on('data', (c) => (body += c))
     req.on('end', () => {
       if (p === '/v1/status') return send(res, 200, { ...status(), generation: 'generation-2106476694' })
-      if (p === '/v1/groups') return send(res, 200, { groups: groups() })
+      if (p === '/v1/groups') return send(res, 200, { groups: groups(), display_names: displayNames() })
       const g = p.match(/^\/v1\/groups\/([^/]+)(\/delay)?$/)
       if (g) {
         const name = decodeURIComponent(g[1])

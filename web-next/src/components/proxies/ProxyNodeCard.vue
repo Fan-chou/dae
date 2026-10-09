@@ -10,8 +10,8 @@
         class="-mt-[2px] shrink-0 align-middle"
         :icon="node.icon"
         :fill="active ? 'fill-primary-content' : 'fill-base-content'"
-      /><span v-if="active" class="text-primary-content">{{ node.name }}</span
-      ><span v-else class="text-base-content">{{ node.name }}</span>
+      /><span v-if="active" class="text-primary-content">{{ displayName(node.name) }}</span
+      ><span v-else class="text-base-content">{{ displayName(node.name) }}</span>
     </div>
 
     <div class="flex h-4 w-full items-center justify-between">
@@ -34,7 +34,7 @@
 </template>
 
 <script setup lang="ts">
-import { state as fdaeState } from '@/fdae/client'
+import { state as fdaeState, displayName } from '@/fdae/client'
 import { PROXY_CARD_SIZE, PROXY_SORT_TYPE } from '@/constant'
 import { checkTruncation } from '@/helper/tooltip'
 import {

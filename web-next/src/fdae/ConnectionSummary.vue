@@ -32,7 +32,7 @@
         <tbody>
           <tr v-for="row in rows" :key="row.name">
             <td class="max-w-44 truncate font-mono text-xs" :title="row.name">
-              {{ row.name }}
+              {{ displayName(row.name) }}
             </td>
             <td class="text-right tabular-nums">{{ row.count }}</td>
             <td class="whitespace-nowrap text-right tabular-nums">
@@ -65,6 +65,7 @@
   </section>
 </template>
 <script setup lang="ts">
+import { displayName } from '@/fdae/client'
 import { computed, ref } from 'vue'
 import { activeConnections } from '@/store/connections'
 import { prettyBytesHelper } from '@/helper/utils'

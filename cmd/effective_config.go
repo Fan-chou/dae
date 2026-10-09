@@ -338,3 +338,27 @@ func CurrentEffectiveConfig() *EffectiveConfig {
 	defer effectiveState.mu.Unlock()
 	return effectiveState.current
 }
+
+// CurrentDisplayNames maps the internal names of the running configuration's
+// nodes and groups to the names a person gave them, for those that differ.
+// The API keeps the internal names as identifiers and sends this alongside,
+// so a panel can show emoji, spaces and other characters that cannot appear
+// in a dae identifier.
+func CurrentDisplayNames() map[string]string {
+	view := CurrentEffectiveConfig()
+	names := map[string]string{}
+	if view == nil {
+		return names
+	}
+	for _, n := range view.Nodes {
+		if n.DisplayName != "" {
+			names[n.Tag] = n.DisplayName
+		}
+	}
+	for _, g := range view.Groups {
+		if g.DisplayName != "" {
+			names[g.Name] = g.DisplayName
+		}
+	}
+	return names
+}

@@ -8,10 +8,10 @@
     />
     <HighlightText
       v-if="filter"
-      :text="name"
+      :text="shown"
       :filter="filter"
     />
-    <template v-else>{{ name }}</template>
+    <template v-else>{{ shown }}</template>
     <template v-if="dialerProxy"> ({{ dialerProxy }}) </template>
   </div>
 </template>
@@ -36,6 +36,8 @@ const props = withDefaults(
   },
 )
 
+import { displayName } from '@/fdae/client'
+const shown = computed(() => displayName(props.name))
 const node = computed(() => proxyMap.value[props.name])
 const icon = computed(() => {
   return node.value?.icon

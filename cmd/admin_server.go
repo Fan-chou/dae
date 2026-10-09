@@ -241,7 +241,7 @@ func (s *adminServer) handleGroups(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"groups": plane.AdminGroups()})
+	writeAdminJSON(w, http.StatusOK, map[string]any{"groups": plane.AdminGroups(), "display_names": CurrentDisplayNames()})
 }
 
 func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {

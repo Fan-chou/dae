@@ -1,7 +1,7 @@
 <template>
   <div class="relative flex h-18 shrink-0 flex-col justify-between">
     <div class="text-md truncate" :class="proxyGroup.icon && 'pr-10'">
-      {{ proxyGroup.name }}
+      {{ displayName(proxyGroup.name) }}
     </div>
     <div
       class="text-base-content/40 flex min-w-0 items-center gap-2 truncate text-[11px]"
@@ -55,6 +55,7 @@
 </template>
 
 <script setup lang="ts">
+import { displayName } from '@/fdae/client'
 import GroupTraffic from '@/fdae/GroupTraffic.vue'
 import {
   KEYBOARD_SHORTCUT_ACTION,

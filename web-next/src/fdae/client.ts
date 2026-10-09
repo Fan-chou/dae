@@ -36,6 +36,7 @@ export const state = reactive({
   devicePairs: [] as { ip: string; mac: string }[],
   filter: { outbound: '', mac: '', limit: 1024 },
   groups: [] as AdminGroup[],
+  displayNames: {} as Record<string, string>,
   groupsAt: 0,
   groupsError: '',
   logsAt: 0,
@@ -162,7 +163,10 @@ export function polling<T>(
 export async function fetchGroups() {
   const backend = activeBackend.value,
     revision = stateRevision
-  const body = await request<{ groups: AdminGroup[] }>(
+  const body = await request<{
+    groups: AdminGroup[]
+    display_names?: Record<string, string>
+  }>(
     '/groups',
     {},
     backend,
@@ -173,6 +177,7 @@ export async function fetchGroups() {
   if (revision !== stateRevision || backend !== activeBackend.value)
     throw new Error('后端已切换')
   state.groups = body.groups || []
+  state.displayNames = body.display_names || {}
   state.groupsAt = Date.now()
   state.groupsError = ''
   return state.groups
@@ -213,3 +218,7 @@ export async function probeGroup(group: string) {
 export function unsupported(): never {
   throw new Error('fdae 未提供此操作')
 }
+
+// Internal names are identifiers; what a person named a node or group may
+// carry emoji and spaces that identifiers cannot, and is only for display.
+export const displayName = (name: string) => state.displayNames[name] ?? name
