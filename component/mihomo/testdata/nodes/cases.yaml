@@ -1,0 +1,140 @@
+# One Mihomo proxy per case. gen_node_goldens.py runs each through the archived
+# dae-rule-sync and records the resulting dae node link or the rejection.
+# Names starting with "bad_" are expected to be rejected; the rest converted.
+ss_basic: {name: ss1, type: ss, server: hk.example.com, port: 8388, cipher: aes-128-gcm, password: pw1}
+ss_special_password: {name: ss2, type: ss, server: hk.example.com, port: 8388, cipher: aes-256-gcm, password: "p@ss:w/rd?#%"}
+ss_udp_true: {name: ss3, type: ss, server: hk.example.com, port: 8388, cipher: aes-128-gcm, password: pw, udp: true}
+ss_ipv6_server: {name: ss4, type: ss, server: "2001:db8::1", port: 8388, cipher: aes-128-gcm, password: pw}
+ss_obfs_tls: {name: ss5, type: ss, server: jp.example.com, port: 443, cipher: chacha20-ietf-poly1305, password: pw2, udp: false, plugin: obfs, plugin-opts: {mode: tls, host: bing.com}}
+ss_obfs_http_path: {name: ss6, type: ss, server: jp.example.com, port: 80, cipher: aes-128-gcm, password: pw, udp: false, plugin: simple-obfs, plugin-opts: {obfs: http, obfs-host: a.com, path: ws}}
+ss_obfs_alias_keys: {name: ss7, type: ss, server: jp.example.com, port: 80, cipher: aes-128-gcm, password: pw, udp: false, plugin: obfs-local, plugin-opts: {mode: http, obfs-uri: /x, uri: /x}}
+ss_shadowtls: {name: ss8, type: ss, server: s.example.com, port: 443, cipher: aes-128-gcm, password: pw, udp: false, plugin: shadow-tls, plugin-opts: {password: stp, version: 3, host: cloudflare.com, skip-cert-verify: true}}
+ss_shadowtls_alias: {name: ss9, type: ss, server: s.example.com, port: 443, cipher: aes-128-gcm, password: pw, udp: false, plugin: sstls, plugin-opts: {pwd: stp, v: 2, sni: a.com, insecure: "yes"}}
+ss_v2ray_ws_tls: {name: ss10, type: ss, server: v.example.com, port: 443, cipher: aes-128-gcm, password: pw, udp: false, plugin: v2ray-plugin, plugin-opts: {mode: websocket, tls: true, host: v.example.com}}
+ss_v2ray_plain: {name: ss11, type: ss, server: v.example.com, port: 80, cipher: aes-128-gcm, password: pw, udp: false, plugin: v2ray-plugin, plugin-opts: {mode: ws}}
+ss_plugin_numeric_opt: {name: ss12, type: ss, server: s.example.com, port: 443, cipher: aes-128-gcm, password: pw, udp: false, plugin: shadow-tls, plugin-opts: {password: stp, version: 3, host: a.com}}
+bad_ss_no_cipher: {name: b1, type: ss, server: x.com, port: 1, password: pw}
+bad_ss_no_password: {name: b2, type: ss, server: x.com, port: 1, cipher: aes-128-gcm}
+bad_ss_tls_true: {name: b3, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, tls: true}
+bad_ss_skip_cert: {name: b4, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, skip-cert-verify: true}
+bad_ss_udp_false_no_plugin: {name: b5, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false}
+bad_ss_udp_true_with_plugin: {name: b6, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: true, plugin: obfs, plugin-opts: {mode: tls}}
+bad_ss_sni: {name: b7, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, sni: a.com}
+bad_ss_username: {name: b8, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, username: u}
+bad_ss_plugin_unknown: {name: b9, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: gost, plugin-opts: {a: b}}
+bad_ss_plugin_opts_no_plugin: {name: b10, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, plugin-opts: {mode: tls}}
+bad_ss_obfs_bad_mode: {name: b11, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: obfs, plugin-opts: {mode: quic}}
+bad_ss_obfs_conflict: {name: b12, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: obfs, plugin-opts: {mode: tls, obfs: http}}
+bad_ss_obfs_unknown_opt: {name: b13, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: obfs, plugin-opts: {mode: tls, zzz: 1}}
+bad_ss_v2ray_quic: {name: b14, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: v2ray-plugin, plugin-opts: {mode: quic}}
+bad_ss_v2ray_bad_tls: {name: b15, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: v2ray-plugin, plugin-opts: {mode: ws, tls: maybe}}
+bad_ss_shadowtls_bad_bool: {name: b16, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: shadow-tls, plugin-opts: {password: p, insecure: maybe}}
+bad_ss_plugin_semicolon: {name: b17, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: "obfs;x", plugin-opts: {mode: tls}}
+bad_ss_opt_semicolon: {name: b18, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, udp: false, plugin: obfs, plugin-opts: {mode: tls, host: "a;b"}}
+bad_ss_hy2_field: {name: b19, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: pw, up: 10 Mbps}
+bad_ss_server_space: {name: b20, type: ss, server: "x .com", port: 1, cipher: aes-128-gcm, password: pw}
+bad_ss_port_zero: {name: b21, type: ss, server: x.com, port: 0, cipher: aes-128-gcm, password: pw}
+bad_ss_port_big: {name: b22, type: ss, server: x.com, port: 70000, cipher: aes-128-gcm, password: pw}
+bad_ss_server_empty: {name: b23, type: ss, server: "", port: 1, cipher: aes-128-gcm, password: pw}
+bad_ss_ctrl_in_password: {name: b24, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: "a\nb"}
+socks5_basic: {name: s1, type: socks5, server: 1.2.3.4, port: 1080}
+socks5_user_pass: {name: s2, type: socks5, server: 1.2.3.4, port: 1080, username: u, password: p}
+socks5_user_only: {name: s3, type: socks5, server: 1.2.3.4, port: 1080, username: u}
+socks5_pass_only: {name: s4, type: socks5, server: 1.2.3.4, port: 1080, password: p}
+socks5_udp_true: {name: s5, type: socks5, server: 1.2.3.4, port: 1080, udp: true}
+socks5_special_user: {name: s6, type: socks5, server: 1.2.3.4, port: 1080, username: "u@x", password: "p:q"}
+bad_socks5_tls: {name: b30, type: socks5, server: 1.2.3.4, port: 1080, tls: true}
+bad_socks5_skip_cert: {name: b31, type: socks5, server: 1.2.3.4, port: 1080, skip-cert-verify: true}
+bad_socks5_udp_false: {name: b32, type: socks5, server: 1.2.3.4, port: 1080, udp: false}
+bad_socks5_cipher: {name: b33, type: socks5, server: 1.2.3.4, port: 1080, cipher: aes-128-gcm}
+bad_socks5_sni: {name: b34, type: socks5, server: 1.2.3.4, port: 1080, sni: a.com}
+bad_socks5_plugin: {name: b35, type: socks5, server: 1.2.3.4, port: 1080, plugin: obfs}
+anytls_basic: {name: a1, type: anytls, server: a.example.com, port: 443, password: pw}
+anytls_sni_insecure: {name: a2, type: anytls, server: a.example.com, port: 443, password: pw, sni: a.example.com, skip-cert-verify: true}
+anytls_servername: {name: a3, type: anytls, server: a.example.com, port: 443, password: pw, servername: sn.example.com}
+anytls_skip_false: {name: a4, type: anytls, server: a.example.com, port: 443, password: pw, skip-cert-verify: false, tls: true, udp: true}
+anytls_special_password: {name: a5, type: anytls, server: a.example.com, port: 443, password: "p/w:?#"}
+bad_anytls_no_password: {name: b40, type: anytls, server: a.example.com, port: 443}
+bad_anytls_tls_false: {name: b41, type: anytls, server: a.example.com, port: 443, password: pw, tls: false}
+bad_anytls_udp_false: {name: b42, type: anytls, server: a.example.com, port: 443, password: pw, udp: false}
+bad_anytls_username: {name: b43, type: anytls, server: a.example.com, port: 443, password: pw, username: u}
+bad_anytls_cipher: {name: b44, type: anytls, server: a.example.com, port: 443, password: pw, cipher: aes-128-gcm}
+bad_anytls_hy2_field: {name: b45, type: anytls, server: a.example.com, port: 443, password: pw, up: 10 Mbps}
+bad_anytls_sni_conflict: {name: b46, type: anytls, server: a.example.com, port: 443, password: pw, sni: a.com, servername: b.com}
+hy2_basic: {name: h1, type: hysteria2, server: h.example.com, port: 443, password: pw}
+hy2_alias_type: {name: h2, type: hy2, server: h.example.com, port: 443, password: pw}
+hy2_auth_field: {name: h3, type: hysteria2, server: h.example.com, port: 443, auth: authpw}
+hy2_auth_same: {name: h4, type: hysteria2, server: h.example.com, port: 443, password: pw, auth: pw}
+hy2_bandwidth_mbps: {name: h5, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 50 Mbps, down: 200 Mbps}
+hy2_bandwidth_plain_int: {name: h6, type: hysteria2, server: h.example.com, port: 443, password: pw, up: "30", down: "100"}
+hy2_bandwidth_gbps: {name: h7, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 1 Gbps, down: 2 Gbps}
+hy2_bandwidth_bytes: {name: h8, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 10 MBps, down: 20 MBps}
+hy2_bandwidth_fraction: {name: h9, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 1.5 Mbps, down: 2.5 Mbps}
+hy2_bandwidth_up_only: {name: h10, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 100 Mbps}
+hy2_bandwidth_nonint_mbps: {name: h11, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 1 Kbps, down: 10 Mbps}
+hy2_bandwidth_lowercase_unit: {name: h12, type: hysteria2, server: h.example.com, port: 443, password: pw, up: 80 mbps, down: 80 kbps}
+hy2_obfs: {name: h13, type: hysteria2, server: h.example.com, port: 443, password: pw, obfs: salamander, obfs-password: op}
+hy2_obfs_upper: {name: h14, type: hysteria2, server: h.example.com, port: 443, password: pw, obfs: Salamander, obfs-password: op}
+hy2_sni_insecure: {name: h15, type: hysteria2, server: h.example.com, port: 443, password: pw, sni: h.example.com, skip-cert-verify: true}
+hy2_pin: {name: h16, type: hysteria2, server: h.example.com, port: 443, password: pw, fingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"}
+bad_hy2_ca_path: {name: h17, type: hysteria2, server: h.example.com, port: 443, password: pw, ca: /etc/ssl/ca.pem}
+hy2_ports: {name: h18, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "20000-30000"}
+hy2_ports_only: {name: h19, type: hysteria2, server: h.example.com, ports: "443,5000-6000", password: pw}
+hy2_ports_spaces: {name: h20, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "1000 - 2000, 3000"}
+hy2_servername: {name: h21, type: hysteria2, server: h.example.com, port: 443, password: pw, servername: sn.example.com}
+hy2_tls_true: {name: h22, type: hysteria2, server: h.example.com, port: 443, password: pw, tls: true, udp: true}
+bad_hy2_no_auth: {name: b50, type: hysteria2, server: h.example.com, port: 443}
+bad_hy2_auth_conflict: {name: b51, type: hysteria2, server: h.example.com, port: 443, password: a, auth: b}
+bad_hy2_obfs_unknown: {name: b52, type: hysteria2, server: h.example.com, port: 443, password: pw, obfs: xor, obfs-password: p}
+bad_hy2_obfs_no_password: {name: b53, type: hysteria2, server: h.example.com, port: 443, password: pw, obfs: salamander}
+bad_hy2_obfs_password_alone: {name: b54, type: hysteria2, server: h.example.com, port: 443, password: pw, obfs-password: p}
+bad_hy2_bw_zero: {name: b55, type: hysteria2, server: h.example.com, port: 443, password: pw, up: "0"}
+bad_hy2_bw_garbage: {name: b56, type: hysteria2, server: h.example.com, port: 443, password: pw, up: fast}
+bad_hy2_bw_negative: {name: b57, type: hysteria2, server: h.example.com, port: 443, password: pw, up: "-5"}
+bad_hy2_ports_all: {name: b58, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: all}
+bad_hy2_ports_zero: {name: b59, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "0-100"}
+bad_hy2_ports_big: {name: b60, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "1-70000"}
+bad_hy2_ports_empty_part: {name: b61, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "100,,200"}
+bad_hy2_ports_open_range: {name: b62, type: hysteria2, server: h.example.com, port: 443, password: pw, ports: "100-"}
+bad_hy2_fingerprint_impersonation: {name: b63, type: hysteria2, server: h.example.com, port: 443, password: pw, fingerprint: chrome}
+bad_hy2_fingerprint_short: {name: b64, type: hysteria2, server: h.example.com, port: 443, password: pw, fingerprint: "aabb"}
+bad_hy2_tls_false: {name: b65, type: hysteria2, server: h.example.com, port: 443, password: pw, tls: false}
+bad_hy2_udp_false: {name: b66, type: hysteria2, server: h.example.com, port: 443, password: pw, udp: false}
+bad_hy2_alpn: {name: b67, type: hysteria2, server: h.example.com, port: 443, password: pw, alpn: [h3]}
+bad_hy2_ca_str: {name: b68, type: hysteria2, server: h.example.com, port: 443, password: pw, ca-str: x}
+bad_hy2_cwnd: {name: b69, type: hysteria2, server: h.example.com, port: 443, password: pw, cwnd: 10}
+bad_hy2_hop_interval: {name: b70, type: hysteria2, server: h.example.com, port: 443, password: pw, hop-interval: 10}
+bad_hy2_client_fp: {name: b71, type: hysteria2, server: h.example.com, port: 443, password: pw, client-fingerprint: chrome}
+bad_hy2_sni_conflict: {name: b72, type: hysteria2, server: h.example.com, port: 443, password: pw, sni: a.com, servername: b.com}
+bad_type_vmess: {name: u1, type: vmess, server: x.com, port: 1}
+bad_type_vless: {name: u2, type: vless, server: x.com, port: 1}
+bad_type_empty: {name: u3, type: "", server: x.com, port: 1}
+bad_type_trojan: {name: u4, type: trojan, server: x.com, port: 1, password: p}
+type_uppercase: {name: u5, type: SS, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+type_hy2_uppercase: {name: u6, type: Hysteria2, server: x.com, port: 1, password: p}
+unknown_field_dialer_proxy: {name: f1, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p, dialer-proxy: other}
+unknown_field_tfo: {name: f2, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p, tfo: true, ip-version: ipv4}
+bad_name_direct: {name: DIRECT, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+bad_name_reject: {name: REJECT, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+bad_name_maps_to_direct: {name: "direct", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+bad_name_maps_to_block: {name: "block", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+bad_name_space_only: {name: "   ", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_ascii: {name: Tokyo_01, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_hyphen: {name: Tokyo-01, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_digit_start: {name: 01-Tokyo, type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_flag_emoji: {name: "🇭🇰 HK-01 | IEPL", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_cjk: {name: "香港 01", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_cjk_mixed: {name: "香港 HK-02 ⚡ 高速", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_arrow: {name: "HK -> JP relay", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_fat_arrow: {name: "A => B", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_symbols: {name: "[VIP] US/LA (x2) #3 @home", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_emoji_unmapped: {name: "😀😀", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_emoji_mapped: {name: "🚀 Rocket 🔥", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_zwj: {name: "a‍b️", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_long: {name: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_abcdefghijklmnop", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_long_hyphen: {name: "Tokyo-ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz-0123456789-abc", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_leading_underscore: {name: "__x__", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_only_symbols: {name: "!!!", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_greek: {name: "αβγ", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_tab_newline: {name: "a\tb\nc", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}
+name_digits_only: {name: "12345", type: ss, server: x.com, port: 1, cipher: aes-128-gcm, password: p}

@@ -123,5 +123,8 @@ DAT/ext 当初是为绕开内联规则体积。进程内之后,先确认 `compon
 - [x] 切片 1:`component/ruleprovider/document.go`——`FetchDocument`。内部 `document` 行为不对用户配置开放;非法/超限/不可达的源回退到 last-good,无缓存则报错,从不返回未校验内容。`go test -race ./component/ruleprovider ./config` 通过。
 - [x] 切片 2:`mihomo {}` 配置段(`config/mihomo.go`):`routing_subscription`/`routing_file`(互斥)/`interval`/`max_size`;订阅 URL 视为机密,错误与诊断仅使用脱敏形式。admin 配置接口只暴露 `global`/`routing` 两段,不会泄露该段。`node_resolve_dns`/`isolate_transport_groups` 待节点/分组转换切片按实际形态再加。
 - [x] 切片 3:`component/mihomo/document.go`——`Parse` 把 Mihomo YAML 解成按源顺序的文档模型(proxies/groups 保留节点,rule-providers/rules/sub-rules 类型化);新增旧实现没有的防护:别名展开节点数上限(200 万)、嵌套深度上限(64);错误信息不回显字段值。
-- [ ] 切片 4 起(节点转换:anytls/ss/socks5/hysteria2)。
+- [x] 切片 4:节点转换(`proxy.go`、`names.go`):anytls/ss(含 obfs/shadow-tls/v2ray-plugin)/socks5/hysteria2,名称清洗、重名与保留名检查,链接最终由 dae 自己的 dialer 解析器校验(注入式 `LinkValidator`)。
+  - **对照基准已建立**:`hack/mihomo-oracle/gen_node_goldens.py` 用归档的旧 sidecar 对 `testdata/nodes/cases.yaml` 的 137 个单代理用例生成 `golden.json`(67 转换 / 70 拒绝);`TestProxyConversionMatchesArchivedSidecar` 要求接受/拒绝、安全名、协议、链接逐项一致。当前 137/137 一致,并用人为改坏验证过测试有效。
+  - **与旧行为保持一致、但应单独评估的点**(记入有意变更候选):① 中文等非 ASCII 节点名会清洗成 `n_01` 这类名字,不同地区的同号节点会撞名并使整份转换失败;② `dialer-proxy`、`tfo` 等未知字段被静默忽略(`dialer-proxy` 会改变真实出站路径);③ `node_resolve_dns` 覆盖尚未实现(待配置形态确定)。
+- [ ] 切片 5 起(分组转换:select/fallback/url-test)。
 - [ ] kdae 中旧入口(`tools/dae-rule-sync`、`Makefile` 目标、`openwrt/kdae-rule-sync`、`build-ipk.sh`)暂不删除,切换 223 时同一提交移除。

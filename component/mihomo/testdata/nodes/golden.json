@@ -1,0 +1,751 @@
+{
+ "anytls_basic": {
+  "link": "anytls://pw@a.example.com:443",
+  "name": "a1",
+  "ok": true,
+  "safe": "a1",
+  "type": "anytls"
+ },
+ "anytls_servername": {
+  "link": "anytls://pw@a.example.com:443?sni=sn.example.com",
+  "name": "a3",
+  "ok": true,
+  "safe": "a3",
+  "type": "anytls"
+ },
+ "anytls_skip_false": {
+  "link": "anytls://pw@a.example.com:443",
+  "name": "a4",
+  "ok": true,
+  "safe": "a4",
+  "type": "anytls"
+ },
+ "anytls_sni_insecure": {
+  "link": "anytls://pw@a.example.com:443?insecure=1&sni=a.example.com",
+  "name": "a2",
+  "ok": true,
+  "safe": "a2",
+  "type": "anytls"
+ },
+ "anytls_special_password": {
+  "link": "anytls://p%2Fw%3A%3F%23@a.example.com:443",
+  "name": "a5",
+  "ok": true,
+  "safe": "a5",
+  "type": "anytls"
+ },
+ "bad_anytls_cipher": {
+  "error": "mihomo proxy \"b44\" anytls has unsupported fields",
+  "ok": false
+ },
+ "bad_anytls_hy2_field": {
+  "error": "mihomo proxy \"b45\" anytls has unsupported fields",
+  "ok": false
+ },
+ "bad_anytls_no_password": {
+  "error": "mihomo proxy \"b40\" anytls password is required",
+  "ok": false
+ },
+ "bad_anytls_sni_conflict": {
+  "error": "mihomo proxy \"b46\" has conflicting sni and servername",
+  "ok": false
+ },
+ "bad_anytls_tls_false": {
+  "error": "mihomo proxy \"b41\" anytls tls=false is unsupported",
+  "ok": false
+ },
+ "bad_anytls_udp_false": {
+  "error": "mihomo proxy \"b42\" anytls udp=false is unsupported by dae",
+  "ok": false
+ },
+ "bad_anytls_username": {
+  "error": "mihomo proxy \"b43\" anytls has unsupported fields",
+  "ok": false
+ },
+ "bad_hy2_alpn": {
+  "error": "mihomo proxy \"b67\" hysteria2 has fields unsupported by kdae",
+  "ok": false
+ },
+ "bad_hy2_auth_conflict": {
+  "error": "mihomo proxy \"b51\" hysteria2 has conflicting password and auth",
+  "ok": false
+ },
+ "bad_hy2_bw_garbage": {
+  "error": "mihomo proxy \"b56\" has an invalid hysteria2 up",
+  "ok": false
+ },
+ "bad_hy2_bw_negative": {
+  "error": "mihomo proxy \"b57\" has an invalid hysteria2 up",
+  "ok": false
+ },
+ "bad_hy2_bw_zero": {
+  "error": "mihomo proxy \"b55\" has an invalid hysteria2 up",
+  "ok": false
+ },
+ "bad_hy2_ca_path": {
+  "error": "mihomo proxy \"h17\" generated hysteria2 link cannot be parsed by dae",
+  "ok": false
+ },
+ "bad_hy2_ca_str": {
+  "error": "mihomo proxy \"b68\" hysteria2 has fields unsupported by kdae",
+  "ok": false
+ },
+ "bad_hy2_client_fp": {
+  "error": "mihomo proxy \"b71\" hysteria2 has unsupported fields",
+  "ok": false
+ },
+ "bad_hy2_cwnd": {
+  "error": "mihomo proxy \"b69\" hysteria2 has fields unsupported by kdae",
+  "ok": false
+ },
+ "bad_hy2_fingerprint_impersonation": {
+  "error": "mihomo proxy \"b63\" hysteria2 fingerprint is a client impersonation name; kdae has no mapping",
+  "ok": false
+ },
+ "bad_hy2_fingerprint_short": {
+  "error": "mihomo proxy \"b64\" has an invalid hysteria2 fingerprint",
+  "ok": false
+ },
+ "bad_hy2_hop_interval": {
+  "error": "mihomo proxy \"b70\" hysteria2 has fields unsupported by kdae",
+  "ok": false
+ },
+ "bad_hy2_no_auth": {
+  "error": "mihomo proxy \"b50\" hysteria2 password is required",
+  "ok": false
+ },
+ "bad_hy2_obfs_no_password": {
+  "error": "mihomo proxy \"b53\" hysteria2 obfs=salamander requires obfs-password",
+  "ok": false
+ },
+ "bad_hy2_obfs_password_alone": {
+  "error": "mihomo proxy \"b54\" hysteria2 obfs-password requires obfs",
+  "ok": false
+ },
+ "bad_hy2_obfs_unknown": {
+  "error": "mihomo proxy \"b52\" hysteria2 has unsupported obfs",
+  "ok": false
+ },
+ "bad_hy2_ports_all": {
+  "error": "mihomo proxy \"b58\" has an invalid hysteria2 ports",
+  "ok": false
+ },
+ "bad_hy2_ports_big": {
+  "error": "mihomo proxy \"b60\" has an invalid hysteria2 ports",
+  "ok": false
+ },
+ "bad_hy2_ports_empty_part": {
+  "error": "mihomo proxy \"b61\" has an invalid hysteria2 ports",
+  "ok": false
+ },
+ "bad_hy2_ports_open_range": {
+  "error": "mihomo proxy \"b62\" has an invalid hysteria2 ports",
+  "ok": false
+ },
+ "bad_hy2_ports_zero": {
+  "error": "mihomo proxy \"b59\" has an invalid hysteria2 ports",
+  "ok": false
+ },
+ "bad_hy2_sni_conflict": {
+  "error": "mihomo proxy \"b72\" has conflicting sni and servername",
+  "ok": false
+ },
+ "bad_hy2_tls_false": {
+  "error": "mihomo proxy \"b65\" hysteria2 tls=false is unsupported",
+  "ok": false
+ },
+ "bad_hy2_udp_false": {
+  "error": "mihomo proxy \"b66\" hysteria2 udp=false is unsupported by dae",
+  "ok": false
+ },
+ "bad_name_direct": {
+  "error": "proxy \"DIRECT\" uses a reserved Mihomo member name",
+  "ok": false
+ },
+ "bad_name_maps_to_block": {
+  "error": "mihomo proxy \"block\" maps to reserved dae outbound \"block\"",
+  "ok": false
+ },
+ "bad_name_maps_to_direct": {
+  "error": "mihomo proxy \"direct\" maps to reserved dae outbound \"direct\"",
+  "ok": false
+ },
+ "bad_name_reject": {
+  "error": "proxy \"REJECT\" uses a reserved Mihomo member name",
+  "ok": false
+ },
+ "bad_name_space_only": {
+  "error": "proxy has empty name",
+  "ok": false
+ },
+ "bad_socks5_cipher": {
+  "error": "mihomo proxy \"b33\" socks5 has unsupported fields",
+  "ok": false
+ },
+ "bad_socks5_plugin": {
+  "error": "mihomo proxy \"b35\" socks5 has unsupported fields",
+  "ok": false
+ },
+ "bad_socks5_skip_cert": {
+  "error": "mihomo proxy \"b31\" socks5 skip-cert-verify is unsupported",
+  "ok": false
+ },
+ "bad_socks5_sni": {
+  "error": "mihomo proxy \"b34\" socks5 has unsupported fields",
+  "ok": false
+ },
+ "bad_socks5_tls": {
+  "error": "mihomo proxy \"b30\" socks5 tls=true is unsupported",
+  "ok": false
+ },
+ "bad_socks5_udp_false": {
+  "error": "mihomo proxy \"b32\" socks5 udp=false is unsupported",
+  "ok": false
+ },
+ "bad_ss_ctrl_in_password": {
+  "error": "mihomo proxy \"b24\" has a control character in password",
+  "ok": false
+ },
+ "bad_ss_hy2_field": {
+  "error": "mihomo proxy \"b19\" ss has unsupported fields",
+  "ok": false
+ },
+ "bad_ss_no_cipher": {
+  "error": "mihomo proxy \"b1\" ss cipher and password are required",
+  "ok": false
+ },
+ "bad_ss_no_password": {
+  "error": "mihomo proxy \"b2\" ss cipher and password are required",
+  "ok": false
+ },
+ "bad_ss_obfs_bad_mode": {
+  "error": "mihomo proxy \"b11\" has unsupported simple-obfs mode",
+  "ok": false
+ },
+ "bad_ss_obfs_conflict": {
+  "error": "mihomo proxy \"b12\" has conflicting simple-obfs options",
+  "ok": false
+ },
+ "bad_ss_obfs_unknown_opt": {
+  "error": "mihomo proxy \"b13\" uses unsupported simple-obfs option",
+  "ok": false
+ },
+ "bad_ss_opt_semicolon": {
+  "error": "mihomo proxy \"b18\" has an invalid plugin option value",
+  "ok": false
+ },
+ "bad_ss_plugin_opts_no_plugin": {
+  "error": "mihomo proxy \"b10\" has plugin options without a plugin",
+  "ok": false
+ },
+ "bad_ss_plugin_semicolon": {
+  "error": "mihomo proxy \"b17\" has an invalid ss plugin",
+  "ok": false
+ },
+ "bad_ss_plugin_unknown": {
+  "error": "mihomo proxy \"b9\" uses unsupported ss plugin",
+  "ok": false
+ },
+ "bad_ss_port_big": {
+  "error": "mihomo proxy \"b22\" has an invalid port",
+  "ok": false
+ },
+ "bad_ss_port_zero": {
+  "error": "mihomo proxy \"b21\" has an invalid port",
+  "ok": false
+ },
+ "bad_ss_server_empty": {
+  "error": "mihomo proxy \"b23\" has an invalid server",
+  "ok": false
+ },
+ "bad_ss_server_space": {
+  "error": "mihomo proxy \"b20\" has an invalid server",
+  "ok": false
+ },
+ "bad_ss_shadowtls_bad_bool": {
+  "error": "mihomo proxy \"b16\" has an invalid shadow-tls option",
+  "ok": false
+ },
+ "bad_ss_skip_cert": {
+  "error": "mihomo proxy \"b4\" ss skip-cert-verify is unsupported",
+  "ok": false
+ },
+ "bad_ss_sni": {
+  "error": "mihomo proxy \"b7\" ss has unsupported fields",
+  "ok": false
+ },
+ "bad_ss_tls_true": {
+  "error": "mihomo proxy \"b3\" ss tls=true is unsupported",
+  "ok": false
+ },
+ "bad_ss_udp_false_no_plugin": {
+  "error": "mihomo proxy \"b5\" ss udp=false is unsupported",
+  "ok": false
+ },
+ "bad_ss_udp_true_with_plugin": {
+  "error": "mihomo proxy \"b6\" ss udp=true is unsupported with an ss plugin",
+  "ok": false
+ },
+ "bad_ss_username": {
+  "error": "mihomo proxy \"b8\" ss has unsupported fields",
+  "ok": false
+ },
+ "bad_ss_v2ray_bad_tls": {
+  "error": "mihomo proxy \"b15\" has an invalid v2ray-plugin tls option",
+  "ok": false
+ },
+ "bad_ss_v2ray_quic": {
+  "error": "mihomo proxy \"b14\" has unsupported v2ray-plugin mode",
+  "ok": false
+ },
+ "bad_type_empty": {
+  "error": "mihomo proxy \"u3\" has empty type",
+  "ok": false
+ },
+ "bad_type_trojan": {
+  "error": "mihomo proxy \"u4\" uses unsupported type \"trojan\"",
+  "ok": false
+ },
+ "bad_type_vless": {
+  "error": "mihomo proxy \"u2\" uses unsupported type \"vless\"",
+  "ok": false
+ },
+ "bad_type_vmess": {
+  "error": "mihomo proxy \"u1\" uses unsupported type \"vmess\"",
+  "ok": false
+ },
+ "hy2_alias_type": {
+  "link": "hysteria2://pw@h.example.com:443",
+  "name": "h2",
+  "ok": true,
+  "safe": "h2",
+  "type": "hysteria2"
+ },
+ "hy2_auth_field": {
+  "link": "hysteria2://authpw@h.example.com:443",
+  "name": "h3",
+  "ok": true,
+  "safe": "h3",
+  "type": "hysteria2"
+ },
+ "hy2_auth_same": {
+  "link": "hysteria2://pw@h.example.com:443",
+  "name": "h4",
+  "ok": true,
+  "safe": "h4",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_bytes": {
+  "link": "hysteria2://pw@h.example.com:443?downmbps=160&upmbps=80",
+  "name": "h8",
+  "ok": true,
+  "safe": "h8",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_fraction": {
+  "link": "hysteria2://pw@h.example.com:443?maxRx=312500&maxTx=187500",
+  "name": "h9",
+  "ok": true,
+  "safe": "h9",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_gbps": {
+  "link": "hysteria2://pw@h.example.com:443?downmbps=2000&upmbps=1000",
+  "name": "h7",
+  "ok": true,
+  "safe": "h7",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_lowercase_unit": {
+  "link": "hysteria2://pw@h.example.com:443?maxRx=10000&maxTx=10000000",
+  "name": "h12",
+  "ok": true,
+  "safe": "h12",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_mbps": {
+  "link": "hysteria2://pw@h.example.com:443?downmbps=200&upmbps=50",
+  "name": "h5",
+  "ok": true,
+  "safe": "h5",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_nonint_mbps": {
+  "link": "hysteria2://pw@h.example.com:443?maxRx=1250000&maxTx=125",
+  "name": "h11",
+  "ok": true,
+  "safe": "h11",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_plain_int": {
+  "link": "hysteria2://pw@h.example.com:443?downmbps=100&upmbps=30",
+  "name": "h6",
+  "ok": true,
+  "safe": "h6",
+  "type": "hysteria2"
+ },
+ "hy2_bandwidth_up_only": {
+  "link": "hysteria2://pw@h.example.com:443?upmbps=100",
+  "name": "h10",
+  "ok": true,
+  "safe": "h10",
+  "type": "hysteria2"
+ },
+ "hy2_basic": {
+  "link": "hysteria2://pw@h.example.com:443",
+  "name": "h1",
+  "ok": true,
+  "safe": "h1",
+  "type": "hysteria2"
+ },
+ "hy2_obfs": {
+  "link": "hysteria2://pw@h.example.com:443?obfs=salamander&obfs-password=op",
+  "name": "h13",
+  "ok": true,
+  "safe": "h13",
+  "type": "hysteria2"
+ },
+ "hy2_obfs_upper": {
+  "link": "hysteria2://pw@h.example.com:443?obfs=salamander&obfs-password=op",
+  "name": "h14",
+  "ok": true,
+  "safe": "h14",
+  "type": "hysteria2"
+ },
+ "hy2_pin": {
+  "link": "hysteria2://pw@h.example.com:443?pinSHA256=aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+  "name": "h16",
+  "ok": true,
+  "safe": "h16",
+  "type": "hysteria2"
+ },
+ "hy2_ports": {
+  "link": "hysteria2://pw@h.example.com:20000-30000",
+  "name": "h18",
+  "ok": true,
+  "safe": "h18",
+  "type": "hysteria2"
+ },
+ "hy2_ports_only": {
+  "link": "hysteria2://pw@h.example.com:443,5000-6000",
+  "name": "h19",
+  "ok": true,
+  "safe": "h19",
+  "type": "hysteria2"
+ },
+ "hy2_ports_spaces": {
+  "link": "hysteria2://pw@h.example.com:1000-2000,3000",
+  "name": "h20",
+  "ok": true,
+  "safe": "h20",
+  "type": "hysteria2"
+ },
+ "hy2_servername": {
+  "link": "hysteria2://pw@h.example.com:443?sni=sn.example.com",
+  "name": "h21",
+  "ok": true,
+  "safe": "h21",
+  "type": "hysteria2"
+ },
+ "hy2_sni_insecure": {
+  "link": "hysteria2://pw@h.example.com:443?insecure=1&sni=h.example.com",
+  "name": "h15",
+  "ok": true,
+  "safe": "h15",
+  "type": "hysteria2"
+ },
+ "hy2_tls_true": {
+  "link": "hysteria2://pw@h.example.com:443",
+  "name": "h22",
+  "ok": true,
+  "safe": "h22",
+  "type": "hysteria2"
+ },
+ "name_arrow": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "HK -> JP relay",
+  "ok": true,
+  "safe": "HK_JP_relay",
+  "type": "ss"
+ },
+ "name_ascii": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "Tokyo_01",
+  "ok": true,
+  "safe": "Tokyo_01",
+  "type": "ss"
+ },
+ "name_cjk": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "香港 01",
+  "ok": true,
+  "safe": "n_01",
+  "type": "ss"
+ },
+ "name_cjk_mixed": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "香港 HK-02 ⚡ 高速",
+  "ok": true,
+  "safe": "HK-02_Bolt",
+  "type": "ss"
+ },
+ "name_digit_start": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "01-Tokyo",
+  "ok": true,
+  "safe": "n_01-Tokyo",
+  "type": "ss"
+ },
+ "name_digits_only": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "12345",
+  "ok": true,
+  "safe": "n_12345",
+  "type": "ss"
+ },
+ "name_emoji_mapped": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "🚀 Rocket 🔥",
+  "ok": true,
+  "safe": "Rocket_Rocket_Fire",
+  "type": "ss"
+ },
+ "name_emoji_unmapped": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "😀😀",
+  "ok": true,
+  "safe": "mihomo_91ad485bf369",
+  "type": "ss"
+ },
+ "name_fat_arrow": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "A => B",
+  "ok": true,
+  "safe": "A_B",
+  "type": "ss"
+ },
+ "name_flag_emoji": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "🇭🇰 HK-01 | IEPL",
+  "ok": true,
+  "safe": "HK_HK-01_IEPL",
+  "type": "ss"
+ },
+ "name_greek": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "αβγ",
+  "ok": true,
+  "safe": "mihomo_a36d0b22783c",
+  "type": "ss"
+ },
+ "name_hyphen": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "Tokyo-01",
+  "ok": true,
+  "safe": "Tokyo-01",
+  "type": "ss"
+ },
+ "name_leading_underscore": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "__x__",
+  "ok": true,
+  "safe": "__x__",
+  "type": "ss"
+ },
+ "name_long": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_abcdefghijklmnop",
+  "ok": true,
+  "safe": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234_3838ef",
+  "type": "ss"
+ },
+ "name_long_hyphen": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "Tokyo-ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwxyz-0123456789-abc",
+  "ok": true,
+  "safe": "Tokyo-ABCDEFGHIJKLMNOPQRSTUVWXYZ-abcdefghijklmnopqrstuvwx_2bbd4e",
+  "type": "ss"
+ },
+ "name_only_symbols": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "!!!",
+  "ok": true,
+  "safe": "mihomo_e84c538e7fe2",
+  "type": "ss"
+ },
+ "name_symbols": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "[VIP] US/LA (x2) #3 @home",
+  "ok": true,
+  "safe": "VIP_US_LA_x2_3_home",
+  "type": "ss"
+ },
+ "name_tab_newline": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "a\tb\nc",
+  "ok": true,
+  "safe": "a_b_c",
+  "type": "ss"
+ },
+ "name_zwj": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "a‍b️",
+  "ok": true,
+  "safe": "ab",
+  "type": "ss"
+ },
+ "socks5_basic": {
+  "link": "socks5://1.2.3.4:1080",
+  "name": "s1",
+  "ok": true,
+  "safe": "s1",
+  "type": "socks5"
+ },
+ "socks5_pass_only": {
+  "link": "socks5://:p@1.2.3.4:1080",
+  "name": "s4",
+  "ok": true,
+  "safe": "s4",
+  "type": "socks5"
+ },
+ "socks5_special_user": {
+  "link": "socks5://u%40x:p%3Aq@1.2.3.4:1080",
+  "name": "s6",
+  "ok": true,
+  "safe": "s6",
+  "type": "socks5"
+ },
+ "socks5_udp_true": {
+  "link": "socks5://1.2.3.4:1080",
+  "name": "s5",
+  "ok": true,
+  "safe": "s5",
+  "type": "socks5"
+ },
+ "socks5_user_only": {
+  "link": "socks5://u@1.2.3.4:1080",
+  "name": "s3",
+  "ok": true,
+  "safe": "s3",
+  "type": "socks5"
+ },
+ "socks5_user_pass": {
+  "link": "socks5://u:p@1.2.3.4:1080",
+  "name": "s2",
+  "ok": true,
+  "safe": "s2",
+  "type": "socks5"
+ },
+ "ss_basic": {
+  "link": "ss://aes-128-gcm:pw1@hk.example.com:8388",
+  "name": "ss1",
+  "ok": true,
+  "safe": "ss1",
+  "type": "ss"
+ },
+ "ss_ipv6_server": {
+  "link": "ss://aes-128-gcm:pw@[2001:db8::1]:8388",
+  "name": "ss4",
+  "ok": true,
+  "safe": "ss4",
+  "type": "ss"
+ },
+ "ss_obfs_alias_keys": {
+  "link": "ss://aes-128-gcm:pw@jp.example.com:80?plugin=simple-obfs%3Bobfs%3Dhttp%3Bobfs-uri%3D%2Fx",
+  "name": "ss7",
+  "ok": true,
+  "safe": "ss7",
+  "type": "ss"
+ },
+ "ss_obfs_http_path": {
+  "link": "ss://aes-128-gcm:pw@jp.example.com:80?plugin=simple-obfs%3Bobfs%3Dhttp%3Bobfs-host%3Da.com%3Bobfs-uri%3D%2Fws",
+  "name": "ss6",
+  "ok": true,
+  "safe": "ss6",
+  "type": "ss"
+ },
+ "ss_obfs_tls": {
+  "link": "ss://chacha20-ietf-poly1305:pw2@jp.example.com:443?plugin=simple-obfs%3Bobfs%3Dtls%3Bobfs-host%3Dbing.com",
+  "name": "ss5",
+  "ok": true,
+  "safe": "ss5",
+  "type": "ss"
+ },
+ "ss_plugin_numeric_opt": {
+  "link": "ss://aes-128-gcm:pw@s.example.com:443?plugin=shadow-tls%3Bpassword%3Dstp%3Bversion%3D3%3Bhost%3Da.com",
+  "name": "ss12",
+  "ok": true,
+  "safe": "ss12",
+  "type": "ss"
+ },
+ "ss_shadowtls": {
+  "link": "ss://aes-128-gcm:pw@s.example.com:443?plugin=shadow-tls%3Bpassword%3Dstp%3Bversion%3D3%3Bhost%3Dcloudflare.com%3BallowInsecure%3Dtrue",
+  "name": "ss8",
+  "ok": true,
+  "safe": "ss8",
+  "type": "ss"
+ },
+ "ss_shadowtls_alias": {
+  "link": "ss://aes-128-gcm:pw@s.example.com:443?plugin=shadow-tls%3Bpassword%3Dstp%3Bversion%3D2%3Bsni%3Da.com%3BallowInsecure%3Dtrue",
+  "name": "ss9",
+  "ok": true,
+  "safe": "ss9",
+  "type": "ss"
+ },
+ "ss_special_password": {
+  "link": "ss://aes-256-gcm:p%40ss%3Aw%2Frd%3F%23%25@hk.example.com:8388",
+  "name": "ss2",
+  "ok": true,
+  "safe": "ss2",
+  "type": "ss"
+ },
+ "ss_udp_true": {
+  "link": "ss://aes-128-gcm:pw@hk.example.com:8388",
+  "name": "ss3",
+  "ok": true,
+  "safe": "ss3",
+  "type": "ss"
+ },
+ "ss_v2ray_plain": {
+  "link": "ss://aes-128-gcm:pw@v.example.com:80?plugin=v2ray-plugin",
+  "name": "ss11",
+  "ok": true,
+  "safe": "ss11",
+  "type": "ss"
+ },
+ "ss_v2ray_ws_tls": {
+  "link": "ss://aes-128-gcm:pw@v.example.com:443?plugin=v2ray-plugin%3Btls%3Bhost%3Dv.example.com",
+  "name": "ss10",
+  "ok": true,
+  "safe": "ss10",
+  "type": "ss"
+ },
+ "type_hy2_uppercase": {
+  "link": "hysteria2://p@x.com:1",
+  "name": "u6",
+  "ok": true,
+  "safe": "u6",
+  "type": "hysteria2"
+ },
+ "type_uppercase": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "u5",
+  "ok": true,
+  "safe": "u5",
+  "type": "ss"
+ },
+ "unknown_field_dialer_proxy": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "f1",
+  "ok": true,
+  "safe": "f1",
+  "type": "ss"
+ },
+ "unknown_field_tfo": {
+  "link": "ss://aes-128-gcm:p@x.com:1",
+  "name": "f2",
+  "ok": true,
+  "safe": "f2",
+  "type": "ss"
+ }
+}
