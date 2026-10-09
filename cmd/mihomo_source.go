@@ -8,6 +8,7 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,11 +40,15 @@ type MihomoStatus struct {
 	// and the previous valid copy was used instead.
 	UsedLastGood bool `json:"used_last_good"`
 	// Error is the reason the last attempt failed; empty on success.
-	Error           string            `json:"error,omitempty"`
-	Nodes           int               `json:"nodes"`
-	Groups          int               `json:"groups"`
-	Rules           int               `json:"rules"`
-	Providers       int               `json:"providers"`
+	Error     string `json:"error,omitempty"`
+	Nodes     int    `json:"nodes"`
+	Groups    int    `json:"groups"`
+	Rules     int    `json:"rules"`
+	Providers int    `json:"providers"`
+	// Degraded is set when the source could not be read and there was no
+	// earlier copy, so dae started without the routing the source provides.
+	// It retries soon instead of waiting for the next interval.
+	Degraded        bool              `json:"degraded,omitempty"`
 	SkippedRules    []mihomoEventInfo `json:"skipped_rules,omitempty"`
 	UnusedProviders []string          `json:"unused_providers,omitempty"`
 	IgnoredFields   []string          `json:"ignored_fields,omitempty"`
@@ -159,7 +164,13 @@ func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *h
 // ones written in the configuration, so rules written by hand keep priority,
 // and its MATCH becomes the fallback. Nothing is merged unless the whole
 // source converts.
-func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) (*mihomoMerge, error) {
+//
+// With startup set, a remote source that cannot be read and has no earlier copy
+// does not stop dae from starting: a router that boots before its uplink is up
+// would otherwise lose all connectivity. dae then runs with what the
+// configuration itself defines, says so in the status, and retries shortly.
+// A reload never does this, so a mistyped URL cannot replace working routing.
+func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, startup bool) (*mihomoMerge, error) {
 	m := conf.Mihomo
 	if !m.Enabled() {
 		setMihomoStatus(MihomoStatus{})
@@ -167,9 +178,9 @@ func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string,
 	}
 	status := MihomoStatus{Enabled: true, Source: m.RedactedSource(), CheckedAt: time.Now()}
 	fail := func(err error) (*mihomoMerge, error) {
-		status.Error = err.Error()
+		status.Error = m.ScrubSecrets(err.Error())
 		setMihomoStatus(status)
-		return nil, fmt.Errorf("load mihomo routing source %s: %w", status.Source, err)
+		return nil, errors.New(m.ScrubSecrets(fmt.Sprintf("load mihomo routing source %s: %v", status.Source, err)))
 	}
 	for _, p := range conf.RuleProvider {
 		if p.Name == mihomoDocumentName {
@@ -179,6 +190,13 @@ func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string,
 
 	result, fetched, err := fetchMihomo(ctx, m, baseDir, client)
 	if err != nil {
+		if startup && m.RoutingSubscription != "" {
+			status.Error = m.ScrubSecrets(err.Error())
+			status.Degraded = true
+			setMihomoStatus(status)
+			logrus.WithField("error", status.Error).Warnf("[Mihomo] routing source %s is unavailable and has no earlier copy; starting without it and retrying", status.Source)
+			return nil, nil
+		}
 		return fail(err)
 	}
 	status.UsedLastGood = fetched.UsedLastGood
@@ -231,11 +249,11 @@ func refreshMihomoSource(ctx context.Context, conf *config.Config, baseDir strin
 	status.CheckedAt = time.Now()
 	result, fetched, err := fetchMihomo(ctx, m, baseDir, client)
 	if err != nil {
-		status.Error = err.Error()
+		status.Error = m.ScrubSecrets(err.Error())
 		setMihomoStatus(status)
-		return ruleprovider.RefreshReport{}, err
+		return ruleprovider.RefreshReport{}, errors.New(status.Error)
 	}
-	status.Error, status.UsedLastGood = "", fetched.UsedLastGood
+	status.Error, status.UsedLastGood, status.Degraded = "", fetched.UsedLastGood, false
 	status.Enabled, status.Source = true, m.RedactedSource()
 	status.SkippedRules = nil
 	fillMihomoStatus(&status, result)
@@ -297,6 +315,8 @@ func mihomoWarning(status MihomoStatus) string {
 	switch {
 	case !status.Enabled:
 		return ""
+	case status.Degraded:
+		return "Mihomo routing source is unavailable and has no earlier copy; running without it: " + status.Error
 	case status.Error != "" && status.UsedLastGood:
 		return "Mihomo routing source failed, using the last good copy: " + status.Error
 	case status.Error != "":

@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -71,7 +72,7 @@ func (m Mihomo) Enabled() bool {
 func (m Mihomo) RedactedSource() string {
 	switch {
 	case m.RoutingSubscription != "":
-		return redactRuleProviderURL(m.RoutingSubscription)
+		return redactSubscription(m.RoutingSubscription)
 	case m.RoutingFile != "":
 		return m.RoutingFile
 	}
@@ -115,4 +116,34 @@ func (m Mihomo) Validate() error {
 		return fmt.Errorf("mihomo: max_size is outside bounds")
 	}
 	return nil
+}
+
+// redactSubscription keeps only the scheme and host of a subscription URL.
+// Both the path and the query commonly carry the access token.
+func redactSubscription(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<invalid url>"
+	}
+	return u.Scheme + "://" + u.Host + "/…"
+}
+
+// ScrubSecrets removes the parts of the subscription URL that may carry a
+// token from text that quotes it, such as the error of a failed fetch.
+func (m Mihomo) ScrubSecrets(text string) string {
+	raw := m.RoutingSubscription
+	if raw == "" {
+		return text
+	}
+	text = strings.ReplaceAll(text, raw, redactSubscription(raw))
+	u, err := url.Parse(raw)
+	if err != nil {
+		return text
+	}
+	for _, secret := range []string{u.RawQuery, u.Path, u.EscapedPath()} {
+		if len(secret) > 1 {
+			text = strings.ReplaceAll(text, secret, "…")
+		}
+	}
+	return text
 }

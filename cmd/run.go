@@ -241,7 +241,7 @@ var (
 			}
 
 			// Read config from --config cfgFile.
-			conf, includes, err := readConfig(cfgFile)
+			conf, includes, err := readConfigAtStartup(cfgFile)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{
 					"err": err,

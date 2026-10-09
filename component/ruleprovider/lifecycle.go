@@ -12,14 +12,19 @@ import (
 // independent of provider storage and any control-plane implementation.
 type RefreshLifecycleConfig struct {
 	Interval time.Duration
-	Refresh  func(context.Context) (RefreshReport, error)
-	Reload   func(context.Context) error
-	OnError  func(error)
+	// NextInterval, when set, is asked for the wait before each round and
+	// replaces Interval; a non-positive answer falls back to Interval. It lets
+	// a lifecycle retry soon after a failure and settle back afterwards.
+	NextInterval func() time.Duration
+	Refresh      func(context.Context) (RefreshReport, error)
+	Reload       func(context.Context) error
+	OnError      func(error)
 }
 
 // RefreshLifecycle coordinates refresh rounds and optional periodic execution.
 type RefreshLifecycle struct {
 	interval time.Duration
+	next     func() time.Duration
 	refresh  func(context.Context) (RefreshReport, error)
 	reload   func(context.Context) error
 	onError  func(error)
@@ -56,6 +61,7 @@ func NewRefreshLifecycle(config RefreshLifecycleConfig) (*RefreshLifecycle, erro
 
 	return &RefreshLifecycle{
 		interval: config.Interval,
+		next:     config.NextInterval,
 		refresh:  config.Refresh,
 		reload:   config.Reload,
 		onError:  config.OnError,
@@ -94,13 +100,13 @@ func (l *RefreshLifecycle) Run(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	ticker := time.NewTicker(l.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(l.wait())
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 			_, err := l.Refresh(ctx)
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -108,8 +114,18 @@ func (l *RefreshLifecycle) Run(ctx context.Context) error {
 			if err != nil {
 				l.onError(err)
 			}
+			timer.Reset(l.wait())
 		}
 	}
+}
+
+func (l *RefreshLifecycle) wait() time.Duration {
+	if l.next != nil {
+		if d := l.next(); d > 0 {
+			return d
+		}
+	}
+	return l.interval
 }
 
 func (l *RefreshLifecycle) joinRound() *refreshLifecycleRound {

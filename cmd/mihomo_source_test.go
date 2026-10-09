@@ -176,7 +176,7 @@ routing { fallback: direct }
 	status := CurrentMihomoStatus()
 	require.NotContains(t, status.Error, "TOPSECRET")
 	require.NotContains(t, status.Source, "TOPSECRET")
-	require.Equal(t, "https://mihomo-source.invalid/sub", status.Source)
+	require.Equal(t, "https://mihomo-source.invalid/…", status.Source)
 	require.Less(t, time.Since(start), time.Minute)
 }
 
@@ -235,4 +235,51 @@ func TestPreviewWithoutMihomoSource(t *testing.T) {
 	var out strings.Builder
 	require.NoError(t, previewMihomo(context.Background(), configPath, &out))
 	require.Contains(t, out.String(), "No mihomo routing source")
+}
+
+func writeSubscriptionConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.dae")
+	require.NoError(t, os.WriteFile(path, []byte(`global {}
+node {
+  mine: 'socks5://9.9.9.9:1080'
+}
+mihomo {
+  routing_subscription: 'https://sub.invalid/token-abc123'
+  interval: 1h
+}
+routing {
+  fallback: direct
+}
+`), 0o600))
+	return path
+}
+
+func TestStartupToleratesUnreachableSourceWithoutACopy(t *testing.T) {
+	path := writeSubscriptionConfig(t)
+
+	// A reload must not: a mistyped URL cannot replace working routing.
+	_, _, err := readConfig(path)
+	require.Error(t, err)
+
+	conf, _, err := readConfigAtStartup(path)
+	require.NoError(t, err)
+	require.Len(t, conf.Node, 1)
+	require.Equal(t, "direct", conf.Routing.Fallback)
+
+	status := CurrentMihomoStatus()
+	require.True(t, status.Degraded)
+	require.NotEmpty(t, status.Error)
+	require.Contains(t, mihomoWarning(status), "running without it")
+	require.NotContains(t, status.Error+status.Source, "token-abc123")
+
+	// It keeps trying soon, even though the configured interval is an hour.
+	require.Equal(t, time.Hour, ruleProviderRefreshInterval(conf))
+}
+
+func TestStartupStillRejectsABrokenLocalSource(t *testing.T) {
+	_, path := writeMihomoFixture(t, "proxies: [")
+	_, _, err := readConfigAtStartup(path)
+	require.Error(t, err)
 }

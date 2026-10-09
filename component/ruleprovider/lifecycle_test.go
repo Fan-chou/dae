@@ -505,3 +505,40 @@ func TestRefreshLifecycleRunCancelsInFlightRefreshOnShutdown(t *testing.T) {
 		t.Fatal("timed out waiting for in-flight Run() shutdown")
 	}
 }
+
+func TestRefreshLifecycleNextIntervalOverridesInterval(t *testing.T) {
+	ticks := make(chan struct{}, 4)
+	var calls atomic.Int32
+	lifecycle, err := NewRefreshLifecycle(RefreshLifecycleConfig{
+		Interval: time.Hour,
+		NextInterval: func() time.Duration {
+			if calls.Load() < 2 {
+				return time.Millisecond
+			}
+			return time.Hour
+		},
+		Refresh: func(context.Context) (RefreshReport, error) {
+			calls.Add(1)
+			ticks <- struct{}{}
+			return RefreshReport{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lifecycle.Run(ctx) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ticks:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("round %d did not run on the short interval", i)
+		}
+	}
+	select {
+	case <-ticks:
+		t.Fatal("round ran again although the interval is back to an hour")
+	case <-time.After(50 * time.Millisecond):
+	}
+}

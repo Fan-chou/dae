@@ -42,9 +42,15 @@ func newRuleProviderLifecycleHolder(conf *config.Config, baseDir string, interva
 	}
 	lifecycle, err := ruleprovider.NewRefreshLifecycle(ruleprovider.RefreshLifecycleConfig{
 		Interval: interval,
-		Refresh:  holder.refresh,
-		Reload:   holder.queueReload,
-		OnError:  holder.logError,
+		NextInterval: func() time.Duration {
+			if CurrentMihomoStatus().Degraded {
+				return min(interval, mihomoDegradedRetry)
+			}
+			return interval
+		},
+		Refresh: holder.refresh,
+		Reload:  holder.queueReload,
+		OnError: holder.logError,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -95,6 +101,10 @@ func (h *ruleProviderLifecycleHolder) logError(err error) {
 	}
 }
 
+// mihomoDegradedRetry is how soon a Mihomo source that could not be read at
+// startup is tried again.
+const mihomoDegradedRetry = 2 * time.Minute
+
 func ruleProviderRefreshInterval(conf *config.Config) time.Duration {
 	if conf == nil {
 		return 0
@@ -108,6 +118,10 @@ func ruleProviderRefreshInterval(conf *config.Config) time.Duration {
 		if provider.Interval > 0 && (interval == 0 || provider.Interval < interval) {
 			interval = provider.Interval
 		}
+	}
+	if interval == 0 && conf.Mihomo.Enabled() && CurrentMihomoStatus().Degraded {
+		// Nothing is scheduled, but the source is missing: keep trying.
+		interval = time.Hour
 	}
 	return interval
 }

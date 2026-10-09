@@ -200,7 +200,18 @@ func preprocessWanInterfaceAuto(params *config.Config) error {
 	return nil
 }
 
+// readConfig reads a configuration for a reload or for validation of an edit.
 func readConfig(cfgFile string) (conf *config.Config, includes []string, err error) {
+	return readConfigAt(cfgFile, false)
+}
+
+// readConfigAtStartup is readConfig for a cold start, where an unreachable
+// Mihomo source with no earlier copy is tolerated; see applyMihomoSource.
+func readConfigAtStartup(cfgFile string) (conf *config.Config, includes []string, err error) {
+	return readConfigAt(cfgFile, true)
+}
+
+func readConfigAt(cfgFile string, startup bool) (conf *config.Config, includes []string, err error) {
 	merger := config.NewMerger(cfgFile)
 	sections, includes, err := merger.Merge()
 	if err != nil {
@@ -209,7 +220,7 @@ func readConfig(cfgFile string) (conf *config.Config, includes []string, err err
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err
 	}
-	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient)
+	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, startup)
 	if err != nil {
 		return nil, nil, err
 	}

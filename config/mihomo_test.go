@@ -22,7 +22,7 @@ func TestMihomoSectionDefaultsAndSubscription(t *testing.T) {
 	require.Equal(t, time.Hour, conf.Mihomo.Interval)
 	require.EqualValues(t, MihomoDefaultMaxSize, conf.Mihomo.MaxSize)
 	require.NotContains(t, conf.Mihomo.RedactedSource(), "SECRET")
-	require.Equal(t, "https://example.com/sub", conf.Mihomo.RedactedSource())
+	require.Equal(t, "https://example.com/…", conf.Mihomo.RedactedSource())
 }
 
 func TestMihomoSectionAbsentIsDisabled(t *testing.T) {
@@ -100,4 +100,13 @@ func TestMihomoSectionNodeSettings(t *testing.T) {
 func TestMihomoNodeSettingsNeedASource(t *testing.T) {
 	_, err := newWithMihomo(t, `mihomo { node_resolve_dns { 'n1=8.8.8.8' } }`)
 	require.Error(t, err)
+}
+
+func TestMihomoSubscriptionPathAndQueryAreScrubbed(t *testing.T) {
+	m := Mihomo{RoutingSubscription: "https://sub.example.com/api/PATHTOKEN/clash?token=QTOKEN"}
+	require.Equal(t, "https://sub.example.com/…", m.RedactedSource())
+	text := m.ScrubSecrets(`Get "https://sub.example.com/api/PATHTOKEN/clash": EOF; path /api/PATHTOKEN/clash and q token=QTOKEN`)
+	for _, secret := range []string{"PATHTOKEN", "QTOKEN"} {
+		require.NotContains(t, text, secret)
+	}
 }
