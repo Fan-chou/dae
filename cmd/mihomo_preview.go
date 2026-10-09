@@ -8,6 +8,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -80,7 +81,7 @@ func previewMihomo(ctx context.Context, cfgPath string, w io.Writer) error {
 	baseDir := filepath.Dir(cfgPath)
 	result, fetched, err := fetchMihomo(ctx, conf.Mihomo, baseDir, http.DefaultClient)
 	if err != nil {
-		return fmt.Errorf("load mihomo routing source %s: %w", conf.Mihomo.RedactedSource(), err)
+		return errors.New(conf.Mihomo.ScrubSecrets(fmt.Sprintf("load mihomo routing source %s: %v", conf.Mihomo.RedactedSource(), err)))
 	}
 
 	fmt.Fprintf(w, "source: %s\n", conf.Mihomo.RedactedSource())

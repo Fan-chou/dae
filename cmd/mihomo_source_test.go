@@ -283,3 +283,11 @@ func TestStartupStillRejectsABrokenLocalSource(t *testing.T) {
 	_, _, err := readConfigAtStartup(path)
 	require.Error(t, err)
 }
+
+func TestPreviewErrorKeepsSubscriptionTokenOut(t *testing.T) {
+	path := writeSubscriptionConfig(t)
+	var out strings.Builder
+	err := previewMihomo(context.Background(), path, &out)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "token-abc123")
+}
