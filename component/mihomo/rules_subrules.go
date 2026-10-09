@@ -68,9 +68,12 @@ type expander struct {
 // called sub-rule, evaluated once per call (memoID). Definitions nobody
 // calls are ignored.
 //
-// SUB-RULE is only expressible as a whole top-level rule or sub-rule line. One
-// nested inside AND/OR/NOT would have to be expanded under a boolean operator,
-// which changes what the rule means, so it is rejected.
+// SUB-RULE is only valid as a whole top-level rule or sub-rule line. Mihomo
+// itself refuses to load one nested inside AND/OR/NOT ("unsupported rule type
+// [SUB-RULE] on logic rule"): a sub-rule selects an outbound, so it has no
+// meaning as a yes/no condition. There is no reference behavior to preserve,
+// so such a rule is rejected rather than given an invented meaning. (A
+// SUB-RULE's own guard may of course be an AND/OR/NOT expression.)
 func expandSubRules(top []*parsedRule, defs map[string]*parsedSubRule) ([]*parsedRule, error) {
 	x := &expander{defs: defs}
 	out := make([]*parsedRule, 0, len(top))
@@ -106,7 +109,7 @@ func (x *expander) call(call *parsedRule, inherited *expr, depth int, path []str
 		return nil, fail(ErrSubRuleCall, name, "SUB-RULE call cannot carry an action or options")
 	}
 	if containsSubRule(call.expr.guard) {
-		return nil, fail(ErrSubRuleEmbedded, "", "SUB-RULE is nested inside an ordinary AND/OR/NOT expression and cannot be expanded without changing kdae semantics")
+		return nil, fail(ErrSubRuleEmbedded, "", "SUB-RULE inside AND/OR/NOT is not valid Mihomo (it refuses to load such a rule: a sub-rule yields an outbound, not a yes/no condition)")
 	}
 	guard := combineGuards(inherited, call.expr.guard)
 	x.memo++
@@ -179,7 +182,7 @@ func rejectEmbedded(rule *parsedRule) error {
 	}
 	return &SubRuleError{
 		Index: rule.index, Line: rule.line, Kind: ErrSubRuleEmbedded,
-		Reason: "SUB-RULE is nested inside an ordinary AND/OR/NOT expression and cannot be expanded without changing kdae semantics",
+		Reason: "SUB-RULE inside AND/OR/NOT is not valid Mihomo (it refuses to load such a rule: a sub-rule yields an outbound, not a yes/no condition)",
 	}
 }
 
