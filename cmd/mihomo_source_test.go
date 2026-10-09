@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -198,4 +199,40 @@ func TestRuleProviderRefreshIntervalIncludesMihomoSource(t *testing.T) {
 	conf.Mihomo.Interval = 0
 	conf.RuleProvider = nil
 	require.Zero(t, ruleProviderRefreshInterval(conf))
+}
+
+func TestPreviewShowsMergeWithoutCredentials(t *testing.T) {
+	_, configPath := writeMihomoFixture(t, testMihomoYAML)
+	var out strings.Builder
+	require.NoError(t, previewMihomo(context.Background(), configPath, &out))
+	text := out.String()
+	t.Log("\n" + text)
+
+	require.NotContains(t, text, "pw", "node passwords must not be printed")
+	require.NotContains(t, text, "socks5://")
+	require.NotContains(t, text, "ss://")
+	// Hand-written first, Mihomo's after, in that order.
+	handRule := strings.Index(text, "dip(224.0.0.0/3) -> direct(must)")
+	mihomoRule := strings.Index(text, "ruleset(ads) -> block")
+	require.True(t, handRule >= 0 && mihomoRule > handRule, "hand-written rule must precede Mihomo rules")
+	require.Contains(t, text, "== added from the Mihomo source")
+	require.Contains(t, text, "fallback: Rocket_Proxy (from the Mihomo MATCH, replacing the configured one)")
+	require.Contains(t, text, "3 nodes, 3 groups")
+}
+
+func TestPreviewReportsAClash(t *testing.T) {
+	_, configPath := writeMihomoFixture(t, strings.ReplaceAll(testMihomoYAML, `"🚀 Proxy"`, "hand"))
+	var out strings.Builder
+	err := previewMihomo(context.Background(), configPath, &out)
+	require.Error(t, err)
+	require.Contains(t, out.String(), "cannot merge")
+}
+
+func TestPreviewWithoutMihomoSource(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	require.NoError(t, os.WriteFile(configPath, []byte("global {}\nrouting { fallback: direct }\n"), 0o600))
+	var out strings.Builder
+	require.NoError(t, previewMihomo(context.Background(), configPath, &out))
+	require.Contains(t, out.String(), "No mihomo routing source")
 }
