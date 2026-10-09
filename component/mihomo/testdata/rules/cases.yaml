@@ -4487,3 +4487,37 @@ cases:
   dscp_slash_list:
     rules:
     - DSCP,10/20,PROXY
+  src_mac:
+    rules:
+    - SRC-MAC,AA:BB:CC:DD:EE:FF,PROXY
+  src_mac_multi:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee:ff/12:34:56:78:9a:bc,PROXY
+  src_mac_dedupe:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee:ff/AA:BB:CC:DD:EE:FF,PROXY
+  src_mac_dash_form:
+    rules:
+    - SRC-MAC,aa-bb-cc-dd-ee-ff,PROXY
+  src_mac_in_and:
+    rules:
+    - AND,((SRC-MAC,aa:bb:cc:dd:ee:ff),(NETWORK,udp)),PROXY
+  src_mac_adjacent_same_outbound:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee:01,PROXY
+    - SRC-MAC,aa:bb:cc:dd:ee:02,PROXY
+  src_mac_invalid:
+    rules:
+    - SRC-MAC,not-a-mac,PROXY
+  src_mac_too_short:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee,PROXY
+  src_mac_eui64:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee:ff:00:11,PROXY
+  src_mac_empty_part:
+    rules:
+    - SRC-MAC,aa:bb:cc:dd:ee:ff//11:22:33:44:55:66,PROXY
+  src_mac_negated:
+    rules:
+    - NOT,((SRC-MAC,aa:bb:cc:dd:ee:ff)),PROXY

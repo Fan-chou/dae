@@ -3251,7 +3251,13 @@ func (state *yamlFlowState) scan(content []byte) yamlFlowLineInfo {
 		case '\'', '"':
 			quote = char
 		case '&', '*':
-			if index == 0 || isYAMLDelimiter(content[index-1]) {
+			// An alias or anchor starts a node. After a blank or an opening
+			// bracket that is always true; after ',', ':' or '?' it is only
+			// true inside a flow collection ([...], {...}). In a block
+			// scalar those are ordinary characters: DOMAIN-WILDCARD,*.example.com
+			// is plain text, not an alias.
+			if index == 0 || isYAMLBlank(content[index-1]) || content[index-1] == '[' || content[index-1] == '{' ||
+				(depth > 0 && isYAMLDelimiter(content[index-1])) {
 				info.hasAliasOrAnchor = true
 			}
 		case '[', '{':
@@ -3396,7 +3402,19 @@ func parseItem(raw, behavior string) (*config_parser.Function, error) {
 			name = "ip_no_resolve"
 		}
 		return &config_parser.Function{Name: name, Params: []*config_parser.Param{{Val: prefix.Masked().String()}}}, nil
-	case "DOMAIN-WILDCARD", "GEOSITE", "GEOIP", "IP-ASN", "PROCESS-NAME", "DST-PORT", "SRC-IP-CIDR", "NETWORK", "AND", "OR", "NOT":
+	case "DOMAIN-WILDCARD":
+		if behavior == "ipcidr" {
+			return nil, fmt.Errorf("domain rule %q is unsupported in ipcidr provider", raw)
+		}
+		if strings.Contains(value, ",") {
+			return nil, fmt.Errorf("domain rule %q has multiple values", raw)
+		}
+		pattern, err := routing.WildcardDomainRegex(value)
+		if err != nil {
+			return nil, err
+		}
+		return &config_parser.Function{Name: "domain", Params: []*config_parser.Param{{Key: "regex", Val: pattern}}}, nil
+	case "GEOSITE", "GEOIP", "IP-ASN", "PROCESS-NAME", "DST-PORT", "SRC-IP-CIDR", "NETWORK", "AND", "OR", "NOT":
 		return nil, fmt.Errorf("unsupported provider rule type %q", kind)
 	}
 	if strings.ContainsAny(raw, " ,\t\r") {

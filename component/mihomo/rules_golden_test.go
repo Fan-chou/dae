@@ -75,14 +75,26 @@ var mihomoAligned = map[string]func(t *testing.T, got *LoweredRules){
 	"domain_regex_with_paren_and_quote": programHas(`[domain(regex=^[(]x[^"']+\.com$)] -> PROXY`),
 	// Upstream Mihomo reads only no-resolve and src, only for IP rules, and
 	// ignores every other option; the rule stays active and the ignored option
-	// is reported. (match-mac is deliberately absent: it belongs to the
-	// deployed fork, so it keeps its conservative skip.)
+	// is reported.
 	"domain_src_option":                        programHasIgnoring(`[domain(full=a.com)] -> PROXY`, 1),
 	"opt_unknown":                              programHasIgnoring(`[domain(full=a.com)] -> PROXY`, 1),
 	"no_resolve_on_domain_atom":                programHasIgnoring(`[domain(full=a.com) & port(443)] -> PROXY`, 1),
 	"opt_src_on_rule_set_like_domain_in_logic": programHasIgnoring(`[domain(full=a.com) & port(443)] -> PROXY`, 1),
 	"ip_unknown_option":                        programHasIgnoring(`[ip(1.2.3.0/24)] -> PROXY`, 1),
 	"ip_unknown_option_with_no_resolve":        programHasIgnoring(`[ip_no_resolve(1.2.3.0/24)] -> PROXY`, 1),
+	// match-mac, as the deployed Mihomo fork reads it (feat: extend source IP
+	// rules by MAC): only SRC-IP-CIDR, or IP-CIDR with src, use it. On an
+	// IP-CIDR without src the fork ignores it and keeps the destination rule;
+	// on any other rule it is an unknown parameter and ignored.
+	"ip_match_mac_without_src": programHasIgnoring(`[ip(10.0.0.0/8)] -> PROXY`, 1),
+	"domain_match_mac":         programHasIgnoring(`[domain(full=a.com)] -> PROXY`, 1),
+	// SRC-MAC is a fork rule type; dae's mac() matches the same address.
+	"src_mac":                        programHas(`[mac(aa:bb:cc:dd:ee:ff)] -> PROXY`),
+	"src_mac_multi":                  programHas(`[mac(aa:bb:cc:dd:ee:ff)] -> PROXY`, `[mac(12:34:56:78:9a:bc)] -> PROXY`),
+	"src_mac_dedupe":                 programHas(`[mac(aa:bb:cc:dd:ee:ff)] -> PROXY`),
+	"src_mac_dash_form":              programHas(`[mac(aa:bb:cc:dd:ee:ff)] -> PROXY`),
+	"src_mac_in_and":                 programHas(`[l4proto(udp) & mac(aa:bb:cc:dd:ee:ff)] -> PROXY`),
+	"src_mac_adjacent_same_outbound": programHas(`[mac(aa:bb:cc:dd:ee:01)] -> PROXY`, `[mac(aa:bb:cc:dd:ee:02)] -> PROXY`),
 	// DSCP is the 6-bit DSCP of the IP header on both sides.
 	"dscp":            programHas(`[dscp(46)] -> PROXY`),
 	"dscp_slash_list": programHas(`[dscp(10)] -> PROXY`, `[dscp(20)] -> PROXY`),

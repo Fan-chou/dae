@@ -135,3 +135,49 @@ func TestDocumentBehaviorIsNotAvailableToRuleProviders(t *testing.T) {
 		t.Fatal("Load accepted the internal document behavior")
 	}
 }
+
+func TestClassicalProviderLowersDomainWildcardToAnchoredRegex(t *testing.T) {
+	dir := t.TempDir()
+	body := "payload:\n  - DOMAIN-WILDCARD,*.Example.com\n  - DOMAIN-SUFFIX,plain.example.com\n"
+	if err := os.WriteFile(filepath.Join(dir, "p.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := config.RuleProvider{Name: "p", Type: "file", Path: "p.yaml", Behavior: "classical", Format: "yaml", MaxSize: 1024}
+	registry, err := loadWithOptions(context.Background(), []config.RuleProvider{spec}, dir, nil, loadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := registry["p"].Functions
+	if len(functions) != 2 || functions[0].Name != "domain" || functions[0].Params[0].Key != "regex" ||
+		functions[0].Params[0].Val != `^.*\.example\.com$` {
+		t.Fatalf("functions = %#v", functions)
+	}
+
+	// An ipcidr provider cannot hold domain rules.
+	ipSpec := config.RuleProvider{Name: "q", Type: "file", Path: "p.yaml", Behavior: "ipcidr", Format: "yaml", MaxSize: 1024}
+	if _, err := loadWithOptions(context.Background(), []config.RuleProvider{ipSpec}, dir, nil, loadOptions{}); err == nil {
+		t.Fatal("ipcidr provider accepted DOMAIN-WILDCARD")
+	}
+}
+
+func TestPlainScalarsWithStarAfterCommaAreNotAliases(t *testing.T) {
+	for _, body := range []string{
+		"payload:\n  - DOMAIN-WILDCARD,*.example.com\n",
+		"payload:\n  - DOMAIN-SUFFIX,a&b.example.com\n",
+	} {
+		if err := preflightProviderYAML([]byte(body)); err != nil {
+			t.Fatalf("preflight(%q) = %v, want accepted", body, err)
+		}
+	}
+	for _, body := range []string{
+		"payload:\n  - *anchor\n",
+		"payload:\n  - &anchor a.example.com\n",
+		"payload: [*anchor, b.example.com]\n",
+		"payload: [a.example.com, *anchor]\n",
+		"payload: {x: *anchor}\n",
+	} {
+		if err := preflightProviderYAML([]byte(body)); err == nil {
+			t.Fatalf("preflight(%q) accepted an alias or anchor", body)
+		}
+	}
+}

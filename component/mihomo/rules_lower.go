@@ -8,7 +8,7 @@ package mihomo
 import (
 	"errors"
 	"fmt"
-	"regexp"
+	"net"
 	"strconv"
 	"strings"
 
@@ -477,9 +477,9 @@ func (l *lowerer) lowerAtom(a atom, negated bool) (*config_parser.Function, erro
 		return nil, err
 	}
 	if typ == "DOMAIN-WILDCARD" {
-		re, err := wildcardRegex(value)
+		re, err := routing.WildcardDomainRegex(value)
 		if err != nil {
-			return nil, err
+			return nil, unsupported("%v", err)
 		}
 		value = re
 	}
@@ -518,6 +518,23 @@ func (l *lowerer) lowerAtom(a atom, negated bool) (*config_parser.Function, erro
 		param.Val = v
 	case "PROCESS-NAME":
 		name = "pname"
+	case "SRC-MAC":
+		// Fork rule type. The payload is one or more MAC addresses joined by
+		// "/", compared case-insensitively. Negation is not exact: for traffic
+		// whose MAC is unknown, NOT(SRC-MAC) matches in Mihomo, while dae's
+		// negated mac() deliberately excludes unknown MACs.
+		if negated {
+			return nil, unsupported("NOT SRC-MAC has no exact kdae equivalent")
+		}
+		macs, err := parseSrcMAC(value)
+		if err != nil {
+			return nil, err
+		}
+		name = "mac"
+		params = params[:0]
+		for _, m := range macs {
+			params = append(params, &config_parser.Param{Val: m})
+		}
 	case "DSCP":
 		// The 6-bit DSCP of the IP header, which is what dae's dscp reads.
 		// Mihomo's payload is a list of numbers and ranges (46, 0-10/46).
@@ -546,31 +563,27 @@ func (l *lowerer) lowerAtom(a atom, negated bool) (*config_parser.Function, erro
 		}
 	}
 	if hasOption(options, "match-mac") {
-		if name != "sip" {
-			return nil, unsupported("Mihomo atom %q option %q requires a source IP matcher", a.typ, "match-mac")
-		}
-		if param.Key == "" {
-			param.Key = "match_mac"
+		if name == "sip" {
+			if param.Key == "" {
+				param.Key = "match_mac"
+			}
+		} else {
+			// IP-CIDR without src: the fork ignores it and keeps the rule.
+			l.ignoredOption("match-mac", "only source IP rules read it")
 		}
 	}
 	return &config_parser.Function{Name: name, Not: negated, Params: params}, nil
 }
 
 // atomOptions returns the options that mean something for this atom type and
-// records the others as ignored: upstream Mihomo reads no-resolve and src for
-// IP rules only. match-mac belongs to the deployed fork and is only defined
-// as a source-IP modifier, so on any other atom the rule is skipped.
+// records the others as ignored: Mihomo reads no-resolve and src for IP rules
+// only, and the deployed fork's match-mac only modifies a source-IP rule.
 func (l *lowerer) atomOptions(typ string, options []string) ([]string, error) {
 	var applicable []string
 	for _, option := range options {
 		option = strings.TrimSpace(option)
 		switch {
-		case strings.EqualFold(option, "match-mac"):
-			if !isSourceIPAtom(typ) {
-				return nil, unsupported("Mihomo atom %q option %q has no exact kdae equivalent", typ, option)
-			}
-			applicable = append(applicable, option)
-		case strings.EqualFold(option, "no-resolve"), strings.EqualFold(option, "src"):
+		case strings.EqualFold(option, "match-mac"), strings.EqualFold(option, "no-resolve"), strings.EqualFold(option, "src"):
 			if isSourceIPAtom(typ) {
 				applicable = append(applicable, option)
 			} else {
@@ -581,6 +594,29 @@ func (l *lowerer) atomOptions(typ string, options []string) ([]string, error) {
 		}
 	}
 	return applicable, nil
+}
+
+// parseSrcMAC splits a SRC-MAC payload and returns the distinct addresses in
+// canonical lower-case form.
+func parseSrcMAC(payload string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(payload, "/") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, unsupported("source MAC couldn't be empty")
+		}
+		hw, err := net.ParseMAC(part)
+		if err != nil || len(hw) != 6 {
+			return nil, unsupported("invalid source MAC")
+		}
+		canonical := hw.String()
+		if !seen[canonical] {
+			seen[canonical] = true
+			out = append(out, canonical)
+		}
+	}
+	return out, nil
 }
 
 // parseDSCP expands a Mihomo DSCP payload ("46", "0-10/46", "10,20") to values.
@@ -617,30 +653,6 @@ func parseDSCP(payload string) ([]int, error) {
 		return nil, unsupported("invalid DSCP value")
 	}
 	return values, nil
-}
-
-// wildcardRegex converts Mihomo's DOMAIN-WILDCARD (* and ?) to the anchored
-// full-string regex dae's domain matcher takes. Domains are matched in lower
-// case, so the pattern is lowered before its literals are quoted.
-func wildcardRegex(pattern string) (string, error) {
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" {
-		return "", unsupported("DOMAIN-WILDCARD has an empty pattern")
-	}
-	var b strings.Builder
-	b.WriteByte('^')
-	for _, r := range strings.ToLower(pattern) {
-		switch r {
-		case '*':
-			b.WriteString(".*")
-		case '?':
-			b.WriteByte('.')
-		default:
-			b.WriteString(regexp.QuoteMeta(string(r)))
-		}
-	}
-	b.WriteByte('$')
-	return b.String(), nil
 }
 
 // ---- rule options ----
@@ -682,11 +694,15 @@ func exprSearch(e *expr, match func(atom) bool) bool {
 // option is ignored and the rule stays active. The same is done here, with an
 // ignore event so the report shows what was dropped.
 //
-// Two options are not guessed at. src on a rule set is honored by Mihomo (the
-// provider's addresses are matched against the source) and dae has no
-// source-address form of a rule set. match-mac is not in upstream Mihomo at
-// all; the deployed fork defines it, so where it cannot be applied as a
-// source-IP modifier the rule is skipped rather than given a meaning here.
+// src on a rule set is the exception: Mihomo honors it (the provider's
+// addresses are matched against the source) and dae has no source-address form
+// of a rule set, so that rule is skipped.
+//
+// match-mac is not in upstream Mihomo; the deployed fork (feat: extend source
+// IP rules by MAC) reads it only as a source-IP modifier: SRC-IP-CIDR, or
+// IP-CIDR/IP-CIDR6 together with src. On an IP-CIDR without src the fork
+// ignores it and the rule stays a destination rule; on any other rule the
+// parameter is unknown and ignored. The same is done here.
 func (l *lowerer) ruleOptions(e *expr, a action) (*expr, error) {
 	srcFromAction := a.hasOption("src")
 	hasSourceIP := exprSearch(e, func(x atom) bool { return isSourceIPAtom(x.typ) })
@@ -703,7 +719,7 @@ func (l *lowerer) ruleOptions(e *expr, a action) (*expr, error) {
 			}
 		case strings.EqualFold(option, "match-mac"):
 			if !exprSearch(e, func(x atom) bool { return acceptsMatchMac(x, srcFromAction) }) {
-				return nil, unsupported("Mihomo rule option %q has no source IP matcher", option)
+				l.ignoredOption(option, "only source IP rules read it")
 			}
 		default:
 			l.ignoredOption(option, "unknown to Mihomo")

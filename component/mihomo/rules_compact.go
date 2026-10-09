@@ -31,7 +31,7 @@ import (
 // another. ruleset and route_expr are deliberately absent: they are expanded
 // later and cannot take extra parameters.
 var mergeableSets = map[string]struct{}{
-	"domain": {}, "ip": {}, "dip": {}, "sip": {}, "dport": {}, "sport": {}, "pname": {}, "l4proto": {},
+	"domain": {}, "ip": {}, "dip": {}, "sip": {}, "mac": {}, "dport": {}, "sport": {}, "pname": {}, "l4proto": {},
 }
 
 func mergeablePlain(r *config_parser.RoutingRule) (*config_parser.Function, bool) {

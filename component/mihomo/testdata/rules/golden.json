@@ -939,6 +939,120 @@
   "ok": true,
   "routes_dae": "    sip(\"192.168.0.0/16\") -> PROXY\n    fallback: PROXY\n"
  },
+ "src_mac": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_adjacent_same_outbound": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   },
+   {
+    "index": 1,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_dash_form": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_dedupe": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_empty_part": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_eui64": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_in_and": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_invalid": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_multi": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_negated": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
+ "src_mac_too_short": {
+  "events": [
+   {
+    "index": 0,
+    "kind": "skip"
+   }
+  ],
+  "ok": true,
+  "routes_dae": "    fallback: PROXY\n"
+ },
  "src_match_mac": {
   "events": [],
   "ok": true,
