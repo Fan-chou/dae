@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/dae/component/ruleprovider"
@@ -43,12 +44,52 @@ func TestRealWorldMatchesArchivedSidecar(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Logf("new: %d nodes, %d groups, %d rules -> %d terms; sidecar: %d terms", len(got.Nodes), len(got.Groups), len(got.Rules), len(gotProg), len(wantProg))
-	require.Equal(t, len(wantProg), len(gotProg))
+	// Rules match first-come, so what must agree is the sequence of outcomes
+	// and, within each stretch of one outcome, the set of terms. The order
+	// inside such a stretch cannot change which outcome a flow gets; the
+	// sidecar and this code just sort provider entries differently.
+	gotRuns, wantRuns := outcomeRuns(gotProg), outcomeRuns(wantProg)
+	require.Equal(t, len(wantRuns), len(gotRuns), "number of outcome stretches")
 	n := 0
-	for i := range wantProg {
-		if wantProg[i] != gotProg[i] && n < 10 {
+	for i := range wantRuns {
+		if wantRuns[i].outcome != gotRuns[i].outcome || !equalTermSets(wantRuns[i].terms, gotRuns[i].terms) {
 			n++
-			t.Errorf("term %d differs:\n  sidecar: %.300s\n  new:     %.300s", i, wantProg[i], gotProg[i])
+			if n <= 5 {
+				t.Errorf("stretch %d differs: sidecar %q (%d terms), new %q (%d terms)", i, wantRuns[i].outcome, len(wantRuns[i].terms), gotRuns[i].outcome, len(gotRuns[i].terms))
+			}
 		}
 	}
+	require.Zero(t, n, "differing stretches")
+}
+
+type outcomeRun struct {
+	outcome string
+	terms   map[string]int
+}
+
+// outcomeRuns splits a canonical program into stretches of the same outcome.
+// The sidecar writes a regexp's backslash doubled; that is only its encoding.
+func outcomeRuns(program []string) []outcomeRun {
+	var runs []outcomeRun
+	for _, term := range program {
+		term = strings.ReplaceAll(term, `\\`, `\`)
+		outcome := term[strings.LastIndex(term, "-> ")+3:]
+		if len(runs) == 0 || runs[len(runs)-1].outcome != outcome {
+			runs = append(runs, outcomeRun{outcome: outcome, terms: map[string]int{}})
+		}
+		runs[len(runs)-1].terms[term]++
+	}
+	return runs
+}
+
+func equalTermSets(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, n := range a {
+		if b[k] != n {
+			return false
+		}
+	}
+	return true
 }

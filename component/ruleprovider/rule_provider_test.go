@@ -875,7 +875,7 @@ func TestLoadRejectsBlockedProviderBeforeTransportIO(t *testing.T) {
 	}
 }
 
-func TestExpandRoutingRulesRejectsOversizedCartesianProductWithoutPublishing(t *testing.T) {
+func TestExpandRoutingRulesFailureDoesNotPublish(t *testing.T) {
 	dir := t.TempDir()
 	writeRules := func(name string, count int) {
 		t.Helper()
@@ -891,7 +891,7 @@ func TestExpandRoutingRulesRejectsOversizedCartesianProductWithoutPublishing(t *
 	writeRules("b", 400)
 	sections, err := config_parser.Parse(`
 routing {
-  ruleset(a) && ruleset(b) -> proxy
+  ruleset(a) && ruleset(b) && ruleset(missing) -> proxy
   fallback: direct
 }
 `)
@@ -910,7 +910,7 @@ routing {
 		Routing: routing,
 	}
 	if err := LoadAndExpand(context.Background(), conf, dir, nil); err == nil {
-		t.Fatalf("LoadAndExpand() error = %v, want expansion limit error", err)
+		t.Fatalf("LoadAndExpand() error = %v, want unknown provider error", err)
 	}
 	if len(conf.Routing.Rules) != 1 || conf.Routing.Rules[0].AndFunctions[0].Name != "ruleset" {
 		t.Fatalf("routing rules mutated after failed expansion: %#v", conf.Routing.Rules)
@@ -919,6 +919,54 @@ routing {
 		if _, err := os.Stat(filepath.Join(dir, "persist.d", "rule-providers", name, "current")); !os.IsNotExist(err) {
 			t.Fatalf("cache current for %s = %v, want absent", name, err)
 		}
+	}
+}
+
+// Entries of one rule set are alternatives, so a rule that ANDs two large
+// sets with other conditions stays one rule instead of a cartesian product.
+func TestExpandRulesetMergesEntriesOfTheSameFunction(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		var body strings.Builder
+		for i := 0; i < 400; i++ {
+			fmt.Fprintf(&body, "%s-%d.example.com\n", name, i)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name+".txt"), []byte(body.String()), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+	}
+	sections, err := config_parser.Parse(`
+routing {
+  ruleset(a) && ruleset(b) && l4proto(udp) -> proxy
+  fallback: direct
+}
+`)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	var routing config.Routing
+	if err := config.SectionParser(reflect.ValueOf(&routing), sections[0]); err != nil {
+		t.Fatalf("SectionParser() error = %v", err)
+	}
+	conf := &config.Config{
+		RuleProvider: []config.RuleProvider{
+			{Name: "a", Type: "file", Path: "a.txt", Behavior: "domain", Format: "text", MaxSize: 1 << 20},
+			{Name: "b", Type: "file", Path: "b.txt", Behavior: "domain", Format: "text", MaxSize: 1 << 20},
+		},
+		Routing: routing,
+	}
+	if err := LoadAndExpand(context.Background(), conf, dir, nil); err != nil {
+		t.Fatalf("LoadAndExpand() error = %v", err)
+	}
+	if len(conf.Routing.Rules) != 1 {
+		t.Fatalf("rules = %d, want 1", len(conf.Routing.Rules))
+	}
+	rule := conf.Routing.Rules[0]
+	if len(rule.AndFunctions) != 3 || rule.AndFunctions[0].Name != "domain" || rule.AndFunctions[1].Name != "domain" || rule.AndFunctions[2].Name != "l4proto" {
+		t.Fatalf("functions = %#v", rule.AndFunctions)
+	}
+	if len(rule.AndFunctions[0].Params) != 400 || len(rule.AndFunctions[1].Params) != 400 {
+		t.Fatalf("params = %d, %d, want 400 each", len(rule.AndFunctions[0].Params), len(rule.AndFunctions[1].Params))
 	}
 }
 
@@ -3475,7 +3523,7 @@ func TestLoadAcceptsFreshValidProviderSemanticChange(t *testing.T) {
 	}
 }
 
-func TestLoadAndExpandDoesNotPublishHTTPCacheWhenExpansionExceedsLimit(t *testing.T) {
+func TestLoadAndExpandDoesNotPublishHTTPCacheWhenExpansionFails(t *testing.T) {
 	makeBody := func(prefix string) string {
 		var body strings.Builder
 		for i := 0; i < 400; i++ {
@@ -3489,7 +3537,7 @@ func TestLoadAndExpandDoesNotPublishHTTPCacheWhenExpansionExceedsLimit(t *testin
 	defer serverB.Close()
 	sections, err := config_parser.Parse(`
 routing {
-  ruleset(a) && ruleset(b) -> proxy
+  ruleset(a) && ruleset(b) && ruleset(missing) -> proxy
   fallback: direct
 }
 `)
@@ -3509,7 +3557,7 @@ routing {
 		Routing: routing,
 	}
 	if err := loadAndExpandWithOptions(context.Background(), conf, dir, http.DefaultClient, loadOptions{allowPrivate: true}); err == nil {
-		t.Fatal("loadAndExpandWithOptions() error = nil for oversized Cartesian product")
+		t.Fatal("loadAndExpandWithOptions() error = nil for a rule naming an undeclared provider")
 	}
 	if len(conf.Routing.Rules) != 1 || conf.Routing.Rules[0].AndFunctions[0].Name != "ruleset" {
 		t.Fatalf("routing rules mutated after failed expansion: %#v", conf.Routing.Rules)

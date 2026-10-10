@@ -3591,12 +3591,13 @@ func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_p
 				return nil, fmt.Errorf("routing rule references invalid rule provider %q", function.Params[0].Val)
 			}
 		}
-		if len(current) > maxExpandedRoutingRules/len(provider.Functions) {
+		replacements := mergeAlternatives(provider.Functions)
+		if len(current) > maxExpandedRoutingRules/len(replacements) {
 			return nil, fmt.Errorf("ruleset expansion exceeds %d routing rules", maxExpandedRoutingRules)
 		}
-		next := make([]*config_parser.RoutingRule, 0, len(current)*len(provider.Functions))
+		next := make([]*config_parser.RoutingRule, 0, len(current)*len(replacements))
 		for _, candidate := range current {
-			for _, replacement := range provider.Functions {
+			for _, replacement := range replacements {
 				copy := cloneRule(candidate)
 				copy.AndFunctions[index] = cloneFunction(replacement)
 				next = append(next, copy)
@@ -3605,6 +3606,42 @@ func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_p
 		current = next
 	}
 	return current, nil
+}
+
+// mergeAlternatives folds the entries of a rule set into one function per
+// function name. The entries are alternatives (any one of them matches), and
+// f(a) OR f(b) is f(a, b), so the match is unchanged. Without this a rule
+// such as ruleset(x) & dport(853) & l4proto(udp) expands into one rule per
+// entry, which for a few thousand entries overruns the kernel's rule table
+// while dae's optimizer, which only merges neighbours, cannot bring it back.
+// Negated functions and functions with nested expressions stay as they are,
+// and the first appearance of each name fixes its place.
+func mergeAlternatives(functions []*config_parser.Function) []*config_parser.Function {
+	merged := make([]*config_parser.Function, 0, len(functions))
+	index := map[string]int{}
+	for _, function := range functions {
+		simple := function != nil && !function.Not && function.EvaluationID == 0 && len(function.Params) > 0
+		if simple {
+			for _, param := range function.Params {
+				if param == nil || len(param.AndFunctions) != 0 || len(param.Annotation) != 0 {
+					simple = false
+					break
+				}
+			}
+		}
+		if !simple {
+			merged = append(merged, function)
+			continue
+		}
+		if at, ok := index[function.Name]; ok {
+			merged[at].Params = append(merged[at].Params, function.Params...)
+			continue
+		}
+		index[function.Name] = len(merged)
+		copy := cloneFunction(function)
+		merged = append(merged, copy)
+	}
+	return merged
 }
 
 func cloneRule(rule *config_parser.RoutingRule) *config_parser.RoutingRule {
