@@ -136,3 +136,5 @@ cp -p $d/libexec-dae/* /usr/libexec/dae/
 ## 2026-10-10 实际切换记录(223)
 
 按本清单执行:备份在 `/root/pre-mihomo-202610100842`(旧 `dae`、`libexec-dae`、`uci-dae`、`init-dae`、`etc-dae.tar`、`www.tar`、ACL/menu),旧面板目录留在 `/www/kdae-ui.old.pre-mihomo`。先在 `/tmp` 里对迁移脚本做了演练(包装 `uci` 使写操作为空),再正式迁移并重启。结果:`Routing match set len: 412/1024`;`/v1/status` 的 `mihomo` 为 8 节点 / 39 组 / 90 规则、未降级、未用旧副本;LAN 客户端的连接经 AI / Google / Cherry_Proxy / CN_CN 等组走真实节点;HTTPS 面板与同源代理 `/cgi-bin/kdae-proxy/v1/*` 正常。未做:`kdae-ui-cert` 与证书续期(单独一步)。
+
+面板的纯 HTTP 入口(2026-10-10):223 上手工建了 `uhttpd.kdae`(:2080,文档根 `/www/kdae-http`,只含 `/kdae-ui/` 与 `/cgi-bin/kdae-proxy`;`/cgi-bin/luci`、`/etc/...` 均 404),`http://192.168.124.223:2080/` 可直接打开面板,LuCI 仍强制 HTTPS。这一步已写进 `kdae-ui` 包(`kdae-ui-http`)。HTTP 下 service worker 不可用(无离线缓存/添加到主屏幕),登录密钥在 LAN 内明文传输。

@@ -35,7 +35,14 @@ define Package/kdae-ui/install
 	$(INSTALL_BIN) ./files/kdae-proxy.cgi $(1)/www/cgi-bin/kdae-proxy
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/www/kdae-ui/ca
 	$(INSTALL_BIN) ./files/kdae-ui-cert $(1)/usr/sbin/kdae-ui-cert
+	$(INSTALL_BIN) ./files/kdae-ui-http $(1)/usr/sbin/kdae-ui-http
 	$(INSTALL_DATA) ./files/ca-index.html $(1)/www/kdae-ui/ca/index.html
+	# A plain-HTTP door for the panel alone (see postinst): its document root
+	# holds the panel and its proxy and nothing else, so LuCI is not served there.
+	$(INSTALL_DIR) $(1)/www/kdae-http/cgi-bin
+	ln -sfn ../kdae-ui $(1)/www/kdae-http/kdae-ui
+	ln -sfn ../../cgi-bin/kdae-proxy $(1)/www/kdae-http/cgi-bin/kdae-proxy
+	$(INSTALL_DATA) ./files/kdae-http-index.html $(1)/www/kdae-http/index.html
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
 	echo /etc/kdae-ui > $(1)/lib/upgrade/keep.d/kdae-ui
 endef
@@ -46,6 +53,7 @@ define Package/kdae-ui/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 /usr/sbin/kdae-ui-cert || echo "kdae-ui: certificate setup failed; run kdae-ui-cert" >&2
+/usr/sbin/kdae-ui-http || echo "kdae-ui: could not open the plain-HTTP port; run kdae-ui-http" >&2
 if ! grep -q kdae-ui-cert /etc/crontabs/root 2>/dev/null; then
 	echo '17 4 * * * /usr/sbin/kdae-ui-cert >/dev/null 2>&1' >> /etc/crontabs/root
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
@@ -57,6 +65,7 @@ define Package/kdae-ui/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 sed -i '/kdae-ui-cert/d' /etc/crontabs/root 2>/dev/null
+uci -q delete uhttpd.kdae && uci -q commit uhttpd && /etc/init.d/uhttpd reload >/dev/null 2>&1 || true
 exit 0
 endef
 

@@ -151,10 +151,15 @@ fi
 )
 ui_data=$(mktemp -d)
 mkdir -p "$ui_data/www/kdae-ui/assets" "$ui_data/www/kdae-ui/ca" "$ui_data/www/cgi-bin" \
-	"$ui_data/usr/sbin" "$ui_data/lib/upgrade/keep.d"
+	"$ui_data/www/kdae-http/cgi-bin" "$ui_data/usr/sbin" "$ui_data/lib/upgrade/keep.d"
 cp -a "$KDAE_UI_DIR/dist/." "$ui_data/www/kdae-ui/"
 install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-proxy.cgi" "$ui_data/www/cgi-bin/kdae-proxy"
 install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-ui-cert" "$ui_data/usr/sbin/kdae-ui-cert"
+install -m 0755 "$ROOT/openwrt/kdae-ui/files/kdae-ui-http" "$ui_data/usr/sbin/kdae-ui-http"
+# The panel alone, for the plain-HTTP port (see kdae-ui-http); LuCI is not under it.
+ln -sfn ../kdae-ui "$ui_data/www/kdae-http/kdae-ui"
+ln -sfn ../../cgi-bin/kdae-proxy "$ui_data/www/kdae-http/cgi-bin/kdae-proxy"
+install -m 0644 "$ROOT/openwrt/kdae-ui/files/kdae-http-index.html" "$ui_data/www/kdae-http/index.html"
 install -m 0644 "$ROOT/openwrt/kdae-ui/files/ca-index.html" "$ui_data/www/kdae-ui/ca/index.html"
 # The local CA must survive sysupgrade, or every device has to trust it again.
 printf '/etc/kdae-ui\n' > "$ui_data/lib/upgrade/keep.d/kdae-ui"
@@ -178,6 +183,7 @@ Description: Vue panel for kdae /v1 (not Clash-compatible), with a local CA for 
 " "$ui_data" '#!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 /usr/sbin/kdae-ui-cert || echo "kdae-ui: certificate setup failed; run kdae-ui-cert" >&2
+/usr/sbin/kdae-ui-http || echo "kdae-ui: could not open the plain-HTTP port; run kdae-ui-http" >&2
 if ! grep -q kdae-ui-cert /etc/crontabs/root 2>/dev/null; then
 	echo "17 4 * * * /usr/sbin/kdae-ui-cert >/dev/null 2>&1" >> /etc/crontabs/root
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
@@ -185,6 +191,7 @@ fi
 exit 0' '#!/bin/sh
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 sed -i "/kdae-ui-cert/d" /etc/crontabs/root 2>/dev/null
+uci -q delete uhttpd.kdae && uci -q commit uhttpd && /etc/init.d/uhttpd reload >/dev/null 2>&1 || true
 exit 0'
 rm -rf "$ui_data"
 

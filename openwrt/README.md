@@ -10,6 +10,8 @@ Packages:
 - `luci-app-kdae` — start/stop, validate, reload, Mihomo source status, panel link
 - `kdae-ui` — Vite-built Vue panel at `/www/kdae-ui/` (`web-next/dist`, based on zashboard; override with `KDAE_UI_DIR`). Also issues a private CA and a Safari-compliant HTTPS certificate for uhttpd (`kdae-ui-cert`); the CA is offered at `/kdae-ui/ca/`.
 
+`kdae-ui` also opens the panel over plain HTTP on its own port, **2080** (`kdae-ui-http`, a second uhttpd instance `uhttpd.kdae`). Its document root `/www/kdae-http` holds only `/kdae-ui/` and the `/cgi-bin/kdae-proxy` proxy, so LuCI is not served there and still redirects to HTTPS on 80/443. This is for devices that do not trust the router's CA (a phone, before the profile is installed); the panel's login secret then crosses the LAN unencrypted, and the service worker (offline cache, "add to home screen") needs HTTPS. Change the port with `uci set uhttpd.kdae.listen_http=...`, or remove the door with `uci delete uhttpd.kdae; uci commit uhttpd; /etc/init.d/uhttpd reload`; the package leaves an existing instance alone.
+
 Do not enable `DAE_ALLOW_TCP_SOCKMAP` on kernels older than 6.6.94.
 
 ImmortalWrt 24.10 `opkg` still expects **gzipped tar** ipk files (`debian-binary` + `data.tar.gz` + `control.tar.gz`), not Debian `ar` archives. The local feed uses `src/gz kdae file:///www/kdae-feed`.
