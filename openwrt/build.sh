@@ -173,5 +173,5 @@ ipk luci-app-fdae all "$s" "fdae luci-base" "$desc" "" "$WORK/luci.post"
 apk luci-app-fdae noarch "$s" "fdae luci-base" "$desc" "" "$WORK/luci.post"
 
 make_apks
-( cd "$OUT" && sha256sum ./*.ipk ./*.apk 2>/dev/null > SHA256SUMS )
+( cd "$OUT" && rm -f SHA256SUMS && sha256sum ./* > SHA256SUMS )
 ls -la "$OUT"
