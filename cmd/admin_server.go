@@ -139,6 +139,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
 	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
+	registerAdminUI(mux)
 	server := &http.Server{
 		Addr:         listen,
 		Handler:      s.withAdminCORS(mux),

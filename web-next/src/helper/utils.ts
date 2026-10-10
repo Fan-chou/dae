@@ -83,22 +83,22 @@ export const getUrlFromBackend = (end: {
 export const getBackendProbeUrl = (end: Omit<Backend, 'uuid'>) =>
   getUrlFromBackend(end)
 
-// Where a new connection form starts. The packaged panel is served by the
-// router under /kdae-ui/ and reaches fdae through the same-origin proxy there,
-// over whatever scheme it was loaded with, so that is what to offer. Anywhere
-// else (a dev server, a copy on another machine) fdae listens on its admin
-// port, 2025 by default, on the host that served the page.
+// Where a new connection form starts. The panel is served by fdae itself
+// under /kdae-ui/, on the admin port, so the API is on the same origin: offer
+// the address the page was loaded from. Anywhere else (a dev server, a copy on
+// another machine) fdae listens on its admin port, 2025 by default, on the
+// host that served the page.
 export const defaultBackendForm = (): Omit<Backend, 'uuid'> => {
   const { protocol, hostname, port, pathname } = window.location
-  const secure = protocol === 'https:'
   const base = { type: 'fdae' as BackendType, password: '', label: '' }
   if (/\/kdae-ui(\/|$)/.test(pathname)) {
+    const secure = protocol === 'https:'
     return {
       ...base,
       protocol: secure ? 'https' : 'http',
       host: hostname,
       port: port || (secure ? '443' : '80'),
-      secondaryPath: '/cgi-bin/kdae-proxy',
+      secondaryPath: '',
     }
   }
   return {
