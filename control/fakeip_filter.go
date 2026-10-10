@@ -7,6 +7,7 @@ package control
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"strings"
 
@@ -253,6 +254,11 @@ func hostnamesFromNodeList(tagToNodeList map[string][]string) []string {
 				continue
 			}
 			host = strings.ToLower(host)
+			// An address literal is never looked up by name, and as a domain
+			// it only makes the matcher warn about a bad character.
+			if _, err := netip.ParseAddr(host); err == nil {
+				continue
+			}
 			if _, ok := seen[host]; ok {
 				continue
 			}

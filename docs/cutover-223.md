@@ -7,7 +7,7 @@
 - 系统是 ImmortalWrt 25.12,包管理器是 **apk**。仓库里的 `openwrt/scripts/build-ipk.sh` 只产出 opkg 风格的 ipk,**没有 apk 产物**。
 - 223 上 `/usr/bin/dae`、`/usr/libexec/dae/*.sh`、luci 视图、`/www/kdae-ui` 都是手工部署的,apk 数据库里只有过期的 `kdae-20260822` 和 `kdae-rule-sync-20260822`,没有 `luci-app-kdae`、`kdae-ui`。所以这次切换是**手工拷文件**,不是装包。切完之前不要对 kdae 相关包跑 `apk upgrade`,它会把二进制换回旧版。
 - `/etc/init.d/dae` 比仓库多三行本地设置(`GOMEMLIMIT=256MiB`、`GOMAXPROCS=2`、`KDAE_EVIDENCE_KEY_FILE`),**不要用仓库的 `dae.init` 覆盖它**。这次切换不需要改 init。
-- 旧布局:`config.dae` 的 `include {}` 里有 `local.dae`、`current/nodes.dae`、`current/groups.dae`、`routing.dae`;sidecar 由 `/etc/init.d/dae-rule-sync` 和 `/usr/libexec/dae/dae-rule-sync` 提供;UCI 里订阅 `role=routing`、8 条 `mixin`(`resolve_dns`)、`isolate_transport_groups='Fuel_YouTuBe'`、`generation_dir='/etc/dae'`。
+- 旧布局:`config.dae` 的 `include {}` 里有 `local.dae`、`current/nodes.dae`、`current/groups.dae`、`routing.dae`;sidecar 只是 `/usr/libexec/dae/dae-rule-sync`,由 `kdae-sync.sh`(LuCI 同步按钮)手动触发,**没有 init 服务也没有定时任务**;UCI 里订阅 `role=routing`、8 条 `mixin`(`resolve_dns`)、`isolate_transport_groups='Fuel_YouTuBe'`、`generation_dir='/etc/dae'`。
 - 用 223 的真实订阅在 220 上验证过:转换/合并/加载通过,`Routing match set len: 406/1024`,与旧 sidecar 输出等价。**没有验证的**:真实流量走 lan/wan 数据面(220 没绑网卡,节点在 223 内网 220 够不到)。
 
 ## 0. 准备(开发机)
@@ -39,21 +39,17 @@ cp -p /usr/bin/dae $d/dae
 cp -rp /usr/libexec/dae $d/libexec-dae
 cp -p /etc/config/dae $d/uci-dae
 cp -p /etc/init.d/dae $d/init-dae
-tar -C /etc -cf $d/etc-dae.tar --exclude=dae/persist.d --exclude=dae/generations dae
+printf 'dae/persist.d\ndae/generations\n' > /tmp/ex
+tar -C /etc -X /tmp/ex -cf $d/etc-dae.tar dae   # busybox tar 没有 --exclude
 tar -C /www -cf $d/www.tar kdae-ui luci-static/resources/view/kdae cgi-bin/kdae-proxy
 ls -la $d
 ```
 
 `persist.d` 里是规则集缓存和 geodata(约 25 MB),`generations` 是旧 sidecar 的历史代,都不需要备份;`current` 要留着(回滚时 sidecar 路径要用)。
 
-## 2. 停掉旧 sidecar
+## 2. 旧 sidecar
 
-```sh
-/etc/init.d/dae-rule-sync stop
-/etc/init.d/dae-rule-sync disable
-```
-
-**确认**:`pgrep -a dae-rule-sync` 无输出。dae 本身还在跑,此时流量不受影响。
+223 上没有需要停的服务(见上)。切换后不要再点 LuCI 里旧的同步按钮;新版 `sync.js`/`kdae-sync.sh` 已经改成走 `dae` 自己的读取。
 
 ## 3. 部署新文件
 
@@ -133,5 +129,10 @@ cp -p $d/libexec-dae/* /usr/libexec/dae/
 ## 已知没验证的
 
 - 真实 lan/wan 数据面流量(见上)。
+- 注意 223 上没有 python3;busybox 的 `tar` 没有 `--exclude`,用 `-X`;不要手敲 `rpcd -h`(它会起一个多余的 rpcd 进程)。
 - 这些 shell 脚本只在 busybox 容器里跑过,没在真实 OpenWrt 上跑过;第一次在 223 上跑时留意 `ash` 与容器里 busybox 的差异。
 - Safari/iPhone 证书流程。
+
+## 2026-10-10 实际切换记录(223)
+
+按本清单执行:备份在 `/root/pre-mihomo-202610100842`(旧 `dae`、`libexec-dae`、`uci-dae`、`init-dae`、`etc-dae.tar`、`www.tar`、ACL/menu),旧面板目录留在 `/www/kdae-ui.old.pre-mihomo`。先在 `/tmp` 里对迁移脚本做了演练(包装 `uci` 使写操作为空),再正式迁移并重启。结果:`Routing match set len: 412/1024`;`/v1/status` 的 `mihomo` 为 8 节点 / 39 组 / 90 规则、未降级、未用旧副本;LAN 客户端的连接经 AI / Google / Cherry_Proxy / CN_CN 等组走真实节点;HTTPS 面板与同源代理 `/cgi-bin/kdae-proxy/v1/*` 正常。未做:`kdae-ui-cert` 与证书续期(单独一步)。
