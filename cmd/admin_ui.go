@@ -13,14 +13,14 @@ import (
 )
 
 const (
-	adminUIPrefix     = "/kdae-ui/"
-	adminUIDefaultDir = "/usr/share/kdae-ui"
+	adminUIPrefix     = "/fdae-ui/"
+	adminUIDefaultDir = "/usr/share/fdae-ui"
 )
 
-// adminUIDir is where the built panel lives. The kdae-ui package puts it in
-// /usr/share/kdae-ui; KDAE_UI_DIR points a development build somewhere else.
+// adminUIDir is where the built panel lives. The fdae-ui package puts it in
+// /usr/share/fdae-ui; FDAE_UI_DIR points a development build somewhere else.
 func adminUIDir() string {
-	if dir := strings.TrimSpace(os.Getenv("KDAE_UI_DIR")); dir != "" {
+	if dir := strings.TrimSpace(os.Getenv("FDAE_UI_DIR")); dir != "" {
 		return dir
 	}
 	return adminUIDefaultDir
@@ -52,7 +52,7 @@ func adminUIHandler(dir string) http.Handler {
 }
 
 // noListingFS hides directories that have no index.html, so a path like
-// /kdae-ui/assets/ is a plain 404 rather than a listing.
+// /fdae-ui/assets/ is a plain 404 rather than a listing.
 type noListingFS struct{ fs http.FileSystem }
 
 func (n noListingFS) Open(name string) (http.File, error) {

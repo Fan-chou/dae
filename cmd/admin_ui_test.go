@@ -23,7 +23,7 @@ func TestAdminUIServesPanelWithoutSecretAndNothingElse(t *testing.T) {
 	if err := os.WriteFile(secret, []byte("nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("KDAE_UI_DIR", dir)
+	t.Setenv("FDAE_UI_DIR", dir)
 	mux := http.NewServeMux()
 	registerAdminUI(mux)
 
@@ -32,26 +32,26 @@ func TestAdminUIServesPanelWithoutSecretAndNothingElse(t *testing.T) {
 		mux.ServeHTTP(rec, httptest.NewRequest(method, target, nil))
 		return rec
 	}
-	if rec := get(http.MethodGet, "/kdae-ui/"); rec.Code != 200 || !strings.Contains(rec.Body.String(), "panel") {
+	if rec := get(http.MethodGet, "/fdae-ui/"); rec.Code != 200 || !strings.Contains(rec.Body.String(), "panel") {
 		t.Fatalf("index = %d %q", rec.Code, rec.Body.String())
 	} else if rec.Header().Get("Cache-Control") != "no-cache" {
 		t.Fatalf("index cache = %q", rec.Header().Get("Cache-Control"))
 	}
-	if rec := get(http.MethodGet, "/kdae-ui/assets/app.js"); rec.Code != 200 || !strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
+	if rec := get(http.MethodGet, "/fdae-ui/assets/app.js"); rec.Code != 200 || !strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
 		t.Fatalf("asset = %d %q", rec.Code, rec.Header().Get("Cache-Control"))
 	}
-	if rec := get(http.MethodGet, "/kdae-ui/assets/"); rec.Code != 404 {
+	if rec := get(http.MethodGet, "/fdae-ui/assets/"); rec.Code != 404 {
 		t.Fatalf("directory listing = %d, want 404", rec.Code)
 	}
-	for _, p := range []string{"/kdae-ui/../secret.txt", "/kdae-ui/%2e%2e/secret.txt", "/kdae-ui/..%2fsecret.txt"} {
+	for _, p := range []string{"/fdae-ui/../secret.txt", "/fdae-ui/%2e%2e/secret.txt", "/fdae-ui/..%2fsecret.txt"} {
 		if rec := get(http.MethodGet, p); rec.Code == 200 && strings.Contains(rec.Body.String(), "nope") {
 			t.Fatalf("%s escaped the panel directory", p)
 		}
 	}
-	if rec := get(http.MethodPost, "/kdae-ui/"); rec.Code != http.StatusMethodNotAllowed {
+	if rec := get(http.MethodPost, "/fdae-ui/"); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST = %d", rec.Code)
 	}
-	if rec := get(http.MethodGet, "/"); rec.Code != http.StatusFound || rec.Header().Get("Location") != "/kdae-ui/" {
+	if rec := get(http.MethodGet, "/"); rec.Code != http.StatusFound || rec.Header().Get("Location") != "/fdae-ui/" {
 		t.Fatalf("root = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 	if rec := get(http.MethodGet, "/v1/status"); rec.Code != 404 {

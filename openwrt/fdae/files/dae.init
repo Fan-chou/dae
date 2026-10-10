@@ -1,0 +1,177 @@
+#!/bin/sh /etc/rc.common
+# fdae: the service keeps the name "dae" so existing settings, logs and
+# habits carry over. Installing a new package only replaces files; the running
+# dae is left alone until `switch` (the button in LuCI) moves it to the new one.
+
+USE_PROCD=1
+START=99
+
+extra_command "apply" "Write local.dae from the settings, validate, and reload dae if it is running"
+extra_command "pending" "Say whether the installed dae differs from the running one"
+extra_command "switch" "Restart onto the installed dae; put the old one back if it does not come up"
+extra_command "switch_state" "Show how the last switch went"
+extra_command "switch_run" "Internal: the work of switch"
+extra_command "recover" "Remove leftover eBPF/TC state after a crash"
+
+CONF="dae"
+PROG="/usr/bin/dae"
+LIBEXEC="/usr/libexec/fdae"
+LOG_DIR="/var/log/dae"
+STATE="/var/run/fdae-switch.state"
+
+add_env() {
+	procd_append_param env "$1"
+}
+
+start_service() {
+	config_load "$CONF"
+
+	local enabled config_file log_maxbackups log_maxsize tcp_sockmap
+	config_get_bool enabled "config" "enabled" "0"
+	[ "$enabled" -eq 1 ] || return 1
+
+	config_get config_file "config" "config_file" "/etc/dae/config.dae"
+	config_get log_maxbackups "config" "log_maxbackups" "1"
+	config_get log_maxsize "config" "log_maxsize" "1"
+	config_get_bool tcp_sockmap "config" "tcp_sockmap" "0"
+
+	# The settings are the source of truth: bring local.dae up to date. A
+	# failure keeps the previous local.dae, which validate below then judges.
+	"$LIBEXEC/write-local.sh" || logger -t fdae "could not write local.dae from the settings; keeping the previous one"
+	"$PROG" validate -c "$config_file" || return 1
+
+	procd_open_instance "$CONF"
+	procd_set_param command "$PROG" run --config "$config_file" \
+		--logfile "$LOG_DIR/dae.log" \
+		--logfile-maxbackups "$log_maxbackups" \
+		--logfile-maxsize "$log_maxsize"
+	procd_set_param limits core="unlimited" nofile="1000000 1000000"
+	procd_set_param respawn
+	procd_set_param stderr 1
+	[ "$tcp_sockmap" -eq 1 ] && procd_append_param env DAE_ALLOW_TCP_SOCKMAP=1
+	config_list_foreach "config" env add_env
+	procd_close_instance
+}
+
+reload_service() {
+	apply
+}
+
+apply() {
+	"$LIBEXEC/apply.sh"
+}
+
+running_pid() {
+	pidof dae | cut -d' ' -f1
+}
+
+# pending prints key=value lines. The running process keeps the file it was
+# started from; after an update that file is no longer at $PROG.
+pending() {
+	local pid exe running_version="" pending=0
+	pid="$(running_pid)"
+	if [ -n "$pid" ]; then
+		exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+		running_version="$("/proc/$pid/exe" --version 2>/dev/null | head -n 1)"
+		[ "$exe" = "$PROG" ] || pending=1
+	fi
+	echo "running=$([ -n "$pid" ] && echo 1 || echo 0)"
+	echo "pending=$pending"
+	echo "running_version=$running_version"
+	echo "installed_version=$("$PROG" --version 2>/dev/null | head -n 1)"
+}
+
+set_state() {
+	printf 'state=%s\nmessage=%s\ntime=%s\n' "$1" "$2" "$(date +%s)" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+# healthy: the admin API answers when one is configured, otherwise the process
+# merely has to stay up for a few seconds.
+healthy() {
+	local config_file listen waited=0
+	config_load "$CONF"
+	config_get config_file "config" "config_file" "/etc/dae/config.dae"
+	config_get listen "config" "admin_listen" ""
+	while [ "$waited" -lt 40 ]; do
+		sleep 2
+		waited=$((waited + 2))
+		[ -n "$(running_pid)" ] || continue
+		if [ -n "$listen" ]; then
+			"$PROG" mihomo status -c "$config_file" >/dev/null 2>&1 && return 0
+		elif [ "$waited" -ge 10 ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+do_switch() {
+	local config_file pid
+	config_load "$CONF"
+	config_get config_file "config" "config_file" "/etc/dae/config.dae"
+
+	set_state running "checking the new version against the current settings"
+	if ! "$PROG" validate -c "$config_file" >/dev/null 2>&1; then
+		set_state failed "the new version rejects the current configuration; nothing was changed"
+		return 1
+	fi
+
+	pid="$(running_pid)"
+	if [ -n "$pid" ] && [ "$(readlink "/proc/$pid/exe")" != "$PROG" ]; then
+		if ! cp "/proc/$pid/exe" "$LIBEXEC/dae.prev.tmp" || ! mv "$LIBEXEC/dae.prev.tmp" "$LIBEXEC/dae.prev"; then
+			rm -f "$LIBEXEC/dae.prev.tmp"
+			set_state failed "could not keep a copy of the running version to go back to; nothing was changed"
+			return 1
+		fi
+	fi
+
+	set_state running "restarting onto the new version"
+	/etc/init.d/dae restart
+	if healthy; then
+		set_state ok "now running the new version"
+		return 0
+	fi
+
+	set_state running "the new version did not come up; going back to the previous one"
+	/etc/init.d/dae stop
+	if [ -x "$LIBEXEC/dae.prev" ] && cp "$LIBEXEC/dae.prev" "$PROG.tmp" && mv "$PROG.tmp" "$PROG"; then
+		/etc/init.d/dae start
+		if healthy; then
+			set_state failed "the new version did not come up; the previous version is running again"
+			return 1
+		fi
+	fi
+	set_state failed "neither version came up; see $LOG_DIR/dae.log, then run: /etc/init.d/dae recover"
+	return 1
+}
+
+# switch returns at once; the work runs on its own because it takes longer than
+# an rpc call may. Follow it with switch_state. A switch that has been "running"
+# for several minutes died with its shell and does not block a new one.
+switch() {
+	local state time now
+	state="$(sed -n 's/^state=//p' "$STATE" 2>/dev/null)"
+	time="$(sed -n 's/^time=//p' "$STATE" 2>/dev/null)"
+	now="$(date +%s)"
+	if [ "$state" = running ] && [ $((now - ${time:-0})) -lt 300 ]; then
+		echo "a switch is already in progress"
+		return 1
+	fi
+	set_state running "starting"
+	setsid /etc/init.d/dae switch_run </dev/null >/dev/null 2>&1 &
+	echo "switching; follow it with: /etc/init.d/dae switch_state"
+}
+
+switch_run() {
+	do_switch
+}
+
+switch_state() {
+	cat "$STATE" 2>/dev/null || echo "state=idle"
+}
+
+recover() {
+	stop 2>/dev/null || true
+	[ -x "$LIBEXEC/recover.sh" ] || return 1
+	"$LIBEXEC/recover.sh"
+}

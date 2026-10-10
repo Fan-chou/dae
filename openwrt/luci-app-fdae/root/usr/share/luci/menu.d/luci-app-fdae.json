@@ -1,0 +1,26 @@
+{
+	"admin/services/fdae": {
+		"title": "fdae",
+		"action": { "type": "firstchild" },
+		"depends": {
+			"acl": [ "luci-app-fdae" ],
+			"fs": { "/etc/init.d/dae": "executable" },
+			"uci": { "dae": true }
+		}
+	},
+	"admin/services/fdae/settings": {
+		"title": "设置",
+		"order": 10,
+		"action": { "type": "view", "path": "fdae/settings" }
+	},
+	"admin/services/fdae/config": {
+		"title": "配置",
+		"order": 20,
+		"action": { "type": "view", "path": "fdae/config" }
+	},
+	"admin/services/fdae/log": {
+		"title": "日志",
+		"order": 30,
+		"action": { "type": "view", "path": "fdae/log" }
+	}
+}

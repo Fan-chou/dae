@@ -8,7 +8,7 @@
 
 使用 Node 22.12+ 和 pnpm，执行 `pnpm install --frozen-lockfile`、`pnpm build`。
 无字体构建可用 `FONT=none pnpm build`。输出 dist，按站点实际静态目录部署。
-OpenWrt 打包默认使用此目录；可通过 KDAE_UI_DIR 指向旧 web/ 构建目录回退。生产服务不会因本地构建而更新。
+OpenWrt 打包默认使用此目录；可通过 FDAE_UI_DIR 指向旧 web/ 构建目录回退。生产服务不会因本地构建而更新。
 
 ## 后端语义
 

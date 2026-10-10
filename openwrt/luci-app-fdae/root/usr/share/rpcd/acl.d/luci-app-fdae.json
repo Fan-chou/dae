@@ -1,0 +1,21 @@
+{
+	"luci-app-fdae": {
+		"description": "Grant access to fdae settings, config and log",
+		"read": {
+			"file": {
+				"/etc/dae/config.dae": [ "read" ],
+				"/etc/dae/local.dae": [ "read" ],
+				"/etc/init.d/dae": [ "exec" ],
+				"/usr/bin/dae": [ "exec" ],
+				"/usr/bin/tail": [ "exec" ]
+			},
+			"uci": [ "dae" ]
+		},
+		"write": {
+			"file": {
+				"/etc/dae/config.dae": [ "write" ]
+			},
+			"uci": [ "dae" ]
+		}
+	}
+}
