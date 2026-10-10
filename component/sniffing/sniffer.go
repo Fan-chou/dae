@@ -265,8 +265,17 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 	}()
 	for {
 		if s.stream {
+			bufLen := s.buf.Len()
 			if err := s.readStreamOnce(); err != nil {
 				return "", err
+			}
+			if bufLen > 0 && s.buf.Len() == bufLen {
+				// A read round that added no bytes is a clean peer FIN
+				// (ReadFromOnce reports EOF as (0, nil)). The pending ErrNeedMore
+				// can never be satisfied, and re-sniffing the unchanged buffer
+				// would spin on Read until the deadline; end as not found and let
+				// routing fall back to the IP verdict.
+				return "", ErrNotFound
 			}
 		} else {
 			s.closeDataReady()
