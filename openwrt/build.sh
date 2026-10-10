@@ -78,7 +78,7 @@ S
 
 # ipk <name> <arch> <stagedir> <depends> <description> [prerm] [postinst]
 ipk() {
-	name=$1 arch=$2 stage=$3 deps=$4 desc=$5 prerm=${6:-} post=${7:-}
+	local name=$1 arch=$2 stage=$3 deps=$4 desc=$5 prerm=${6:-} post=${7:-} w size
 	w="$WORK/ipk-$name-$arch"
 	mkdir -p "$w/control"
 	size=$(du -sk "$stage" | cut -f1)
@@ -111,7 +111,7 @@ APKS=
 # apk <name> <arch> <stagedir> <depends> <description> [pre-deinstall] [post]
 # Collected here and made in one container run afterwards.
 apk() {
-	name=$1 arch=$2 stage=$3 deps=$4 desc=$5 pre=${6:-} post=${7:-}
+	local name=$1 arch=$2 stage=$3 deps=$4 desc=$5 pre=${6:-} post=${7:-} rel extra
 	rel="apk-$name-$arch"
 	mkdir -p "$WORK/$rel"
 	[ -z "$pre" ] || cp "$pre" "$WORK/$rel/pre-deinstall"
@@ -131,10 +131,12 @@ make_apks() {
 	cat > "$WORK/mkapk.sh" <<'S'
 set -eu
 apk add -q apk-tools >/dev/null
-chown -R 0:0 /work
+# the build user owns the mount; packages must record root
+cp -a /work /s
+chown -R 0:0 /s
 while IFS='|' read -r name arch stage deps desc extra; do
 	[ -n "$name" ] || continue
-	rel=/work/apk-$name-$arch
+	rel=/s/apk-$name-$arch
 	scripts=
 	for s in pre-deinstall post-install post-upgrade; do
 		[ ! -f "$rel/$s" ] || scripts="$scripts --script $s:$rel/$s"
@@ -143,12 +145,13 @@ while IFS='|' read -r name arch stage deps desc extra; do
 	apk mkpkg --info "name:$name" --info "version:$VERSION-r1" --info "arch:$arch" \
 		--info "description:$desc" --info "license:AGPL-3.0-only" --info "url:https://github.com/Fan-chou/dae" \
 		--info "depends:$deps" $extra $scripts \
-		--files "/work/stage-$name-$arch" --output "/out/$name-$VERSION-r1-$arch.apk"
+		--files "/s/stage-$name-$arch" --output "/out/$name-$VERSION-r1-$arch.apk"
 done < /work/apks.list
+chown "$HOST_UID:$HOST_GID" /out/*.apk
 S
 	printf '%s\n' "$APKS" > "$WORK/apks.list"
 	# stages are referenced by path inside the container
-	docker run --rm ${FDAE_DOCKER_ARGS:-} -e VERSION="$VERSION" -v "$WORK:/work" -v "$OUT:/out" alpine:edge sh /work/mkapk.sh
+	docker run --rm ${FDAE_DOCKER_ARGS:-} -e VERSION="$VERSION" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$WORK:/work" -v "$OUT:/out" alpine:edge sh /work/mkapk.sh
 }
 
 built=0
