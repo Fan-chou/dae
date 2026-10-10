@@ -1,9 +1,13 @@
 package routing
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
@@ -21,19 +25,71 @@ type OrderedRule struct {
 	Outbound config_parser.Function
 }
 
+// Expanded provider rules inline every rule-set entry, so one route_expr can
+// be hundreds of kilobytes and the expanded rule list lives as long as the
+// loaded config. Large expressions are deflated; "z." marks them ('.' is not in
+// the base64url alphabet, so plain values never collide with it) and plain
+// values written before this format still decode.
+const (
+	compressedPrefix        = "z."
+	compressMinBytes        = 1024
+	maxDecompressedExprSize = 256 << 20
+)
+
 func EncodeOrderedExpr(e *OrderedExpr) (*config_parser.Function, error) {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return nil, err
 	}
-	return &config_parser.Function{Name: "route_expr", Params: []*config_parser.Param{{Val: base64.RawURLEncoding.EncodeToString(b)}}}, nil
+	val := ""
+	if len(b) >= compressMinBytes {
+		var buf bytes.Buffer
+		zw, err := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := zw.Write(b); err != nil {
+			return nil, err
+		}
+		if err := zw.Close(); err != nil {
+			return nil, err
+		}
+		val = compressedPrefix + base64.RawURLEncoding.EncodeToString(buf.Bytes())
+	} else {
+		val = base64.RawURLEncoding.EncodeToString(b)
+	}
+	return &config_parser.Function{Name: "route_expr", Params: []*config_parser.Param{{Val: val}}}, nil
 }
+
+func decodeOrderedPayload(val string) ([]byte, error) {
+	if !strings.HasPrefix(val, compressedPrefix) {
+		return base64.RawURLEncoding.DecodeString(val)
+	}
+	packed, err := base64.RawURLEncoding.DecodeString(val[len(compressedPrefix):])
+	if err != nil {
+		return nil, err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(packed))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	data, err := io.ReadAll(io.LimitReader(zr, maxDecompressedExprSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxDecompressedExprSize {
+		return nil, fmt.Errorf("route_expr expands beyond %d bytes", maxDecompressedExprSize)
+	}
+	return data, nil
+}
+
 func DecodeOrderedExpr(f *config_parser.Function) (*OrderedExpr, error) {
 	if len(f.Params) != 1 || f.Params[0].Key != "" {
 		return nil, fmt.Errorf("route_expr requires one expression")
 	}
 	var e OrderedExpr
-	data, err := base64.RawURLEncoding.DecodeString(f.Params[0].Val)
+	data, err := decodeOrderedPayload(f.Params[0].Val)
 	if err != nil {
 		return nil, err
 	}
