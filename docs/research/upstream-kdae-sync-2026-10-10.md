@@ -91,6 +91,11 @@ cleanup, CapabilityCallback, waiter handoff, receive ring buffer and its
 bounded-storage test, `abortAfterStartupFailure`, unpooled send-side datagram
 frames). The carry's 11 conflicts were because the fork already had each piece.
 
-Not carried: a3269acd (http3 control
-stream and request replay; 9 conflicts), 8126b16b (atomic congestion pointer,
+Already present: a3269acd (http3 control stream kept open, GOAWAY handling,
+PUSH_PROMISE per-stream handling, replay gated on H3_REQUEST_REJECTED/GetBody).
+A trial cherry-pick conflicted only because the fork already had every hunk;
+the patch's frames/conn/server/integration hunks reverse-apply cleanly to our
+tree, and our transport/control-stream tests are supersets.
+
+Not carried: 8126b16b (atomic congestion pointer,
 collides with the fork's application-limited logic).
