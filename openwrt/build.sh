@@ -14,6 +14,12 @@ HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 OUT=${1:-"$ROOT/build/openwrt"}
 UI=${FDAE_UI:-"$ROOT/web-next/dist"}
+[ -f "$UI/index.html" ] || { echo "no built panel in $UI (build web-next first)" >&2; exit 1; }
+# A panel older than its sources is the mistake this guards against.
+if [ -d "$ROOT/web-next/src" ] && [ -n "$(find "$ROOT/web-next/src" "$ROOT/web-next/package.json" -newer "$UI/index.html" -print -quit)" ]; then
+	echo "$UI is older than web-next/src: rebuild the panel (FDAE_ALLOW_STALE_UI=1 to package it anyway)" >&2
+	[ "${FDAE_ALLOW_STALE_UI:-0}" = 1 ] || exit 1
+fi
 mkdir -p "$OUT"
 OUT=$(CDPATH= cd -- "$OUT" && pwd)
 
