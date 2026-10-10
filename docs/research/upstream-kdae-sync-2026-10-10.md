@@ -159,6 +159,51 @@ remaining direct uses of `shard.pool` are reads, ranges and deletes (nil-safe).
   tproxy.c / bpf_test.c). Hardening, not performance; only worth it if 06451485
   or c71c20d6 is taken, since all three edit the same C.
 
+### Tier B outcome
+
+`c71c20d6` landed by hand (a3a87c7b), capacities only: the redirect-rebind and
+event-rate contract from `b90041cc` is not carried, and the redirect_track
+usage warning now reads the map's real capacity instead of a hard-coded
+65536. Measured on 223 after the switch: the five hash maps went from about
+9.6 MB to about 2.3 MB of kernel memory (conn_state 4.3 -> 1.1 MB,
+redirect_track 1.06 -> 0.27, routing_handoff 1.06 -> 0.30, cookie_pid
+1.05 -> 0.26, domain_routing 2.1 -> 0.31).
+
+`968893cb` (GOMAXPROCS default) not carried: 223 pins `GOMAXPROCS=2` through
+UCI, so it would change nothing there.
+
+Separate from upstream, a heap profile of 223 showed 16.7 MB (31% of the heap)
+in `routing.EncodeOrderedExpr` strings, one live copy of the expanded
+`route_expr` values (cumulative allocation was about 3.75x that, one per
+expansion). Values of 1 KiB or more are now zlib-compressed with a `z.`
+prefix (plain values still decode). After the switch the entry is gone from
+the in-use profile and the heap went from 54 MB to 32 MB (RSS 119 -> 98 MB),
+with the same `Routing match set len: 412/1024` and 90 rules.
+
+### Tier C outcome: `06451485` not ported as a whole
+
+A trial cherry-pick (in a throwaway worktree) gave 10 conflicts in
+`control/kern/tproxy.c`, about 200 lines in the connection-state and egress
+paths, plus one in `kern/tests/bpf_test.go`. The patch's context assumes
+upstream code fdae does not have (`routing_generation_matches`); fdae has its
+own TCP SYN-only expiry and the FakeIP stateless path and first-fragment
+listener fixtures. Of its six items:
+
+- already in fdae: refresh-only updates skip `conntrack_args_map`
+  (`conntrack_args_are_empty`), and the lazy 1 s `cookie_pid_map` refresh;
+- not in fdae, independent and small: stop writing the write-only
+  `routing_epoch_map` (also drops it from the required-maps check);
+- not in fdae, entangled with the conn-state machine: publishing
+  `routing_handoff_map` only when needed, the duplicate `conn_state_map`
+  lookup on WAN-ingress UDP, and parsing a combined LAN/WAN egress packet once.
+
+Upstream gives no before/after numbers for this commit, the 220 smoke runs
+mostly on the eBPF bypass and cannot resolve a few map operations per packet,
+and 223's dae sits near 0.2% CPU. A kernel hot-path rewrite on the real
+gateway is not justified without a measured bottleneck. Revisit with
+per-packet CPU data under proxied load. `b90041cc` (userspace-owned event
+rate constants, edits the same C) stays out for the same reason.
+
 ## D. Do not port (depends on parts the forks do not have, or no gain here)
 
 - `0f50b3ac` + `042a5429` + `59ab7143` UDP write batching on by default. The
