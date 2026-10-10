@@ -102,8 +102,7 @@ collides with the fork's application-limited logic).
 
 # Batch 3 evaluation: performance commits (not yet applied)
 
-Upstream head `2064c47a`. `git apply --check` against fdae `49b95e2c` is noted
-per commit. Nothing below is carried yet; this is the triage.
+Upstream head `2064c47a`. Triage first, outcome of tier A below it.
 
 ## A. Small, self-contained; port first
 
@@ -117,6 +116,21 @@ per commit. Nothing below is carried yet; this is the triage.
   in `udpDNSBufPool`, nil `reply.release`, `clear` of QUIC key material in
   `Keys.Close`). The QUIC-key clear is the only one with a security flavor.
 - `16f5c017` reuse janitor pin-snapshot scratch (test file conflicts; hand port).
+
+### Tier A outcome
+
+Landed: `ad123a49` (2a0794ed), `73ebcd23` (b3f37258), `ad565882` (5033bce1),
+`16f5c017` (704f1bd7). `723ee85c` was already present: all four hunks came in
+with the earlier adapted sync `79362d29`, so nothing was ported.
+
+`73ebcd23` needed fdae-only follow-up (ba105975): the lazy shard maps broke
+three direct `shard.pool[...] =` writes that upstream does not have, namely the
+UDP rebuild commit (`udp_rebuild.go`), the rebuild handoff
+(`udp_rebuild_peer.go`) and the `putPooledUdpEndpointForTest` helper. A rebuild
+into a shard that had never held an endpoint would panic on a nil map. It only
+showed up in the full `-race -short ./control` run, not in a filtered run.
+All writers now go through `poolLocked()` under the shard write lock; the
+remaining direct uses of `shard.pool` are reads, ranges and deletes (nil-safe).
 
 ## B. Worth doing, needs a decision or a measurement
 
