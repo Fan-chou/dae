@@ -1936,116 +1936,6 @@ func TestLoadRejects304GenerationDriftAgainstCachedSnapshot(t *testing.T) {
 	}
 }
 
-func TestMultiProviderLoadRejectsUnversionedStableMixedBodies(t *testing.T) {
-	const (
-		oldABody = "payload:\n  - a-old.example\n"
-		oldBBody = "payload:\n  - b-old.example\n"
-		newBBody = "payload:\n  - b-new.example\n"
-	)
-	var requestMu sync.Mutex
-	requests := make(map[string]int)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestMu.Lock()
-		requests[r.URL.Path]++
-		requestNumber := requests[r.URL.Path]
-		requestMu.Unlock()
-
-		switch r.URL.Path {
-		case "/a":
-			_, _ = fmt.Fprint(w, oldABody)
-		case "/b":
-			if requestNumber <= 2 {
-				_, _ = fmt.Fprint(w, oldBBody)
-				return
-			}
-			_, _ = fmt.Fprint(w, newBBody)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	providers := []config.RuleProvider{
-		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
-		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
-	}
-	dir := t.TempDir()
-	options := loadOptions{allowPrivate: true}
-
-	initialRegistry, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
-	if err != nil {
-		t.Fatalf("initial unversioned A/B load error = %v", err)
-	}
-	if initialRegistry["a"].Functions[0].Params[0].Val != "a-old.example" || initialRegistry["b"].Functions[0].Params[0].Val != "b-old.example" {
-		t.Fatalf("initial registry = %#v, want A-old/B-old", initialRegistry)
-	}
-
-	descriptorA := testCacheDescriptor(t, providers[0], dir)
-	descriptorB := testCacheDescriptor(t, providers[1], dir)
-	initialA, err := readCacheSnapshot(descriptorA)
-	if err != nil {
-		t.Fatalf("read initial A snapshot error = %v", err)
-	}
-	initialB, err := readCacheSnapshot(descriptorB)
-	if err != nil {
-		t.Fatalf("read initial B snapshot error = %v", err)
-	}
-	initialAState, err := readCurrentState(descriptorA.root)
-	if err != nil {
-		t.Fatalf("read initial A current state error = %v", err)
-	}
-	initialBState, err := readCurrentState(descriptorB.root)
-	if err != nil {
-		t.Fatalf("read initial B current state error = %v", err)
-	}
-	if initialA.metadata.Generation != "" || initialB.metadata.Generation != "" {
-		t.Fatalf("initial snapshots unexpectedly have generation tokens: A=%#v B=%#v", initialA.metadata, initialB.metadata)
-	}
-
-	registry, loadErr := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
-	if loadErr == nil {
-		aValue, bValue := "<missing>", "<missing>"
-		if rules, ok := registry["a"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
-			aValue = rules.Functions[0].Params[0].Val
-		}
-		if rules, ok := registry["b"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
-			bValue = rules.Functions[0].Params[0].Val
-		}
-		t.Fatalf("unversioned stable mixed batch was accepted: a=%q b=%q registry=%#v", aValue, bValue, registry)
-	}
-	if registry != nil {
-		t.Fatalf("unversioned stable mixed batch returned registry with error: err=%v registry=%#v", loadErr, registry)
-	}
-	message := strings.ToLower(loadErr.Error())
-	if !strings.Contains(message, "batch") ||
-		(!strings.Contains(message, "consisten") && !strings.Contains(message, "fence") && !strings.Contains(message, "freshness") && !strings.Contains(message, "generation")) {
-		t.Fatalf("unversioned stable mixed batch error = %v, want explicit batch consistency/fence error", loadErr)
-	}
-
-	afterA, err := readCacheSnapshot(descriptorA)
-	if err != nil {
-		t.Fatalf("read final A snapshot error = %v", err)
-	}
-	afterB, err := readCacheSnapshot(descriptorB)
-	if err != nil {
-		t.Fatalf("read final B snapshot error = %v", err)
-	}
-	afterAState, err := readCurrentState(descriptorA.root)
-	if err != nil {
-		t.Fatalf("read final A current state error = %v", err)
-	}
-	afterBState, err := readCurrentState(descriptorB.root)
-	if err != nil {
-		t.Fatalf("read final B current state error = %v", err)
-	}
-	if !reflect.DeepEqual(afterA, initialA) || !reflect.DeepEqual(afterAState, initialAState) {
-		t.Fatalf("rejected unversioned mixed batch changed A current/cache: initial=%#v/%#v after=%#v/%#v", initialAState, initialA, afterAState, afterA)
-	}
-	if !reflect.DeepEqual(afterB, initialB) || !reflect.DeepEqual(afterBState, initialBState) {
-		t.Fatalf("rejected unversioned mixed batch changed B current/cache: initial=%#v/%#v after=%#v/%#v", initialBState, initialB, afterBState, afterB)
-	}
-}
-
 func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) {
 	const (
 		aOldBody = "payload:\n  - a-old.example\n"
@@ -3682,5 +3572,151 @@ func TestLoadFetchesProvidersConcurrently(t *testing.T) {
 		if got := registry[name].Functions; len(got) != 1 {
 			t.Fatalf("%s: %#v", name, got)
 		}
+	}
+}
+
+// A partial upstream update of independent HTTP providers is published as one
+// batch: the providers that did not change are rebound to the same batch
+// identity instead of blocking the whole refresh forever.
+func TestMultiProviderLoadPublishesPartialUnversionedUpdateAsOneBatch(t *testing.T) {
+	var mu sync.Mutex
+	bodies := map[string]string{
+		"/a": "payload:\n  - a1.example\n",
+		"/b": "payload:\n  - b1.example\n",
+		"/c": "payload:\n  - c1.example\n",
+	}
+	etags := map[string]string{"/a": `W/"a1"`, "/b": `W/"b1"`, "/c": `W/"c1"`}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		body, ok := bodies[r.URL.Path]
+		etag := etags[r.URL.Path]
+		mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	set := func(path, body, etag string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if body != "" {
+			bodies[path] = body
+		}
+		if etag != "" {
+			etags[path] = etag
+		}
+	}
+	providers := []config.RuleProvider{
+		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "c", Type: "http", URL: server.URL + "/c", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+	}
+	dir := t.TempDir()
+	options := loadOptions{allowPrivate: true}
+	first := func(reg Registry, name string) string { return reg[name].Functions[0].Params[0].Val }
+
+	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err != nil {
+		t.Fatalf("initial load error = %v", err)
+	}
+
+	// Only B changes upstream.
+	set("/b", "payload:\n  - b2.example\n", `W/"b2"`)
+	reg, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
+	if err != nil {
+		t.Fatalf("partial update was rejected: %v", err)
+	}
+	if first(reg, "a") != "a1.example" || first(reg, "b") != "b2.example" || first(reg, "c") != "c1.example" {
+		t.Fatalf("registry after partial update = a:%q b:%q c:%q", first(reg, "a"), first(reg, "b"), first(reg, "c"))
+	}
+
+	// The published caches form one batch again, so a cache-only load works.
+	cacheOnly := options
+	cacheOnly.noNetwork = true
+	cached, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, cacheOnly)
+	if err != nil {
+		t.Fatalf("cache-only load after partial update error = %v", err)
+	}
+	if first(cached, "b") != "b2.example" || first(cached, "a") != "a1.example" {
+		t.Fatalf("cache-only registry = a:%q b:%q", first(cached, "a"), first(cached, "b"))
+	}
+	ids := map[string]bool{}
+	for _, p := range providers {
+		snapshot, err := readCacheSnapshot(testCacheDescriptor(t, p, dir))
+		if err != nil {
+			t.Fatalf("read snapshot %s: %v", p.Name, err)
+		}
+		if snapshot.metadata.BatchIdentity == "" {
+			t.Fatalf("provider %s has no batch identity after the update", p.Name)
+		}
+		ids[snapshot.metadata.BatchIdentity] = true
+	}
+	if len(ids) != 1 {
+		t.Fatalf("providers carry %d different batch identities after one publish, want 1", len(ids))
+	}
+
+	// Nothing changed again: accepted, nothing new to publish.
+	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err != nil {
+		t.Fatalf("steady round after the update error = %v", err)
+	}
+
+	// An ETag-only change with the same body must not wedge the batch.
+	set("/c", "", `W/"c-rotated"`)
+	for round := 1; round <= 2; round++ {
+		if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err != nil {
+			t.Fatalf("round %d after an ETag-only change error = %v", round, err)
+		}
+	}
+	snapshotC, err := readCacheSnapshot(testCacheDescriptor(t, providers[2], dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotC.metadata.ETag != `W/"c-rotated"` {
+		t.Fatalf("cached ETag = %q, want the rotated value", snapshotC.metadata.ETag)
+	}
+}
+
+// A source that cannot be fetched is not a consistent member of the batch: the
+// last-good copy must never be published alongside fresh siblings.
+func TestMultiProviderLoadStillRejectsPartialUpdateWhenAProviderFellBackToLastGood(t *testing.T) {
+	var mu sync.Mutex
+	bDown := false
+	version := 1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		down, v := bDown, version
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/a":
+			w.Header().Set("ETag", fmt.Sprintf(`W/"a%d"`, v))
+			_, _ = fmt.Fprintf(w, "payload:\n  - a%d.example\n", v)
+		case "/b":
+			if down {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("ETag", `W/"b1"`)
+			_, _ = fmt.Fprint(w, "payload:\n  - b1.example\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	providers := []config.RuleProvider{
+		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+	}
+	dir := t.TempDir()
+	options := loadOptions{allowPrivate: true}
+	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err != nil {
+		t.Fatalf("initial load error = %v", err)
+	}
+	mu.Lock()
+	bDown, version = true, 2
+	mu.Unlock()
+	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err == nil {
+		t.Fatal("a fresh provider was published next to a last-good fallback")
 	}
 }

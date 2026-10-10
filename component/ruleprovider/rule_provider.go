@@ -132,14 +132,18 @@ func (o loadOptions) parseBody(body []byte, provider config.RuleProvider) (Provi
 
 type preparedProvider struct {
 	// uncached marks a provider a cache-only check had nothing to check against.
-	uncached             bool
-	name                 string
-	rules                ProviderRules
-	generation           string
-	batchIdentity        string
-	usedLastGood         bool
-	descriptor           cacheDescriptor
-	candidate            *cacheCandidate
+	uncached      bool
+	name          string
+	rules         ProviderRules
+	generation    string
+	batchIdentity string
+	usedLastGood  bool
+	descriptor    cacheDescriptor
+	candidate     *cacheCandidate
+	// rebind is the unchanged current content as a candidate. It is used only
+	// to republish a provider that did not change next to siblings that did
+	// (see rebindUnchangedIntoPartialBatch).
+	rebind               *cacheCandidate
 	expectedCurrent      currentState
 	expectedCurrentKnown bool
 }
@@ -615,10 +619,51 @@ func prepareStableProviderBatch(ctx context.Context, providers []config.RuleProv
 			return nil, err
 		}
 	}
+	if !options.noNetwork {
+		rebindUnchangedIntoPartialBatch(prepared)
+	}
 	if err := validateUnversionedBatchConsistency(prepared); err != nil {
 		return nil, err
 	}
 	return prepared, nil
+}
+
+// rebindUnchangedIntoPartialBatch lets a partial upstream update through.
+// Independent HTTP sources have no common generation, so a round in which only
+// some of them changed used to be rejected outright, and since a rejected
+// round leaves the cache as it was, every later round saw the same difference:
+// one rotated ETag or one updated rule set blocked the whole set indefinitely.
+//
+// The unchanged providers are republished with their cached content under the
+// batch identity of this publish, so the result is the same single atomic
+// transaction a fully changed batch gets and the caches keep sharing one
+// identity. This is only done when every unchanged provider was actually
+// confirmed by the source in this round; a provider that fell back to its
+// last-good copy is not a member of a consistent batch, and such a round is
+// still rejected by the consistency check.
+func rebindUnchangedIntoPartialBatch(prepared []preparedProvider) {
+	if !requiresUnversionedBatchIdentity(prepared) {
+		return
+	}
+	fresh := 0
+	for _, provider := range prepared {
+		if provider.candidate != nil {
+			fresh++
+		}
+	}
+	if fresh == 0 || fresh == len(prepared) {
+		return
+	}
+	for _, provider := range prepared {
+		if provider.candidate == nil && (provider.usedLastGood || provider.rebind == nil) {
+			return
+		}
+	}
+	for index := range prepared {
+		if prepared[index].candidate == nil {
+			prepared[index].candidate = prepared[index].rebind
+		}
+	}
 }
 
 // maxConcurrentProviderFetches bounds how many providers are fetched at once.
@@ -781,6 +826,23 @@ func validateProviderDefinition(provider config.RuleProvider, baseDir string, al
 	return nil
 }
 
+// unchangedRebind builds a candidate that republishes the cached content of a
+// provider whose source did not change. The content, validators and update
+// time stay as cached; only the batch binding is new.
+func unchangedRebind(descriptor cacheDescriptor, cached cacheSnapshot, preparedAt time.Time, expectedCurrent currentState) *cacheCandidate {
+	return &cacheCandidate{
+		descriptor:           descriptor,
+		body:                 append([]byte(nil), cached.body...),
+		etag:                 cached.metadata.ETag,
+		modified:             cached.metadata.LastModified,
+		generation:           cached.metadata.Generation,
+		preparedAt:           preparedAt,
+		updatedAt:            cached.metadata.UpdatedAt,
+		expectedCurrent:      expectedCurrent,
+		expectedCurrentKnown: true,
+	}
+}
+
 func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir string, client *http.Client, options loadOptions) (preparedProvider, error) {
 	descriptor, err := newCacheDescriptor(provider, baseDir)
 	if err != nil {
@@ -843,7 +905,11 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, "", batchIdentity, candidate, false), nil
+		prepared := makePrepared(rules, "", batchIdentity, candidate, false)
+		if candidate == nil {
+			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
+		}
+		return prepared, nil
 	case "http":
 		cached, cacheErr := readCacheSnapshot(descriptor)
 		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider, options)
@@ -886,7 +952,9 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 					return preparedProvider{}, fmt.Errorf("provider returned 304 generation %q inconsistent with cached generation %q", fetched.generation, generation)
 				}
 			}
-			return makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false), nil
+			prepared := makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false)
+			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
+			return prepared, nil
 		}
 		rules, parseErr := options.parseBody(fetched.body, provider)
 		if parseErr != nil {
@@ -917,7 +985,11 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		return makePrepared(rules, fetched.generation, batchIdentity, candidate, false), nil
+		prepared := makePrepared(rules, fetched.generation, batchIdentity, candidate, false)
+		if candidate == nil {
+			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
+		}
+		return prepared, nil
 	default:
 		return preparedProvider{}, fmt.Errorf("unsupported provider type %q", provider.Type)
 	}
