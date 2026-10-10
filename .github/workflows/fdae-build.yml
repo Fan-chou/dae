@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: web-next/package.json
       - uses: actions/setup-node@v5
@@ -41,7 +41,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           FONT=none pnpm build
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: panel
           path: web-next/dist
@@ -85,7 +85,7 @@ jobs:
       - name: Smoke test
         if: matrix.goarch == 'amd64'
         run: build/dae-amd64 --version
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: dae-${{ matrix.goarch }}
           path: build/dae-${{ matrix.goarch }}
@@ -98,7 +98,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Build ipk and apk
@@ -113,7 +113,7 @@ jobs:
           # the plain binaries ride along
           cp artifacts/dae-amd64/dae-amd64 artifacts/dae-arm64/dae-arm64 out/
           (cd out && sha256sum * | grep -v SHA256SUMS > SHA256SUMS)
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: fdae-openwrt
           path: out/*
@@ -126,7 +126,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: fdae-openwrt
           path: out
