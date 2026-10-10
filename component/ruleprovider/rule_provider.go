@@ -84,6 +84,41 @@ type loadOptions struct {
 	// parse then validates the body instead of the rule-provider parsers.
 	document bool
 	parse    func(body []byte, provider config.RuleProvider) (ProviderRules, error)
+	// noNetwork answers http providers from their cache and never asks the
+	// network; a provider with no usable cache is an error.
+	noNetwork bool
+	// validateOnly is noNetwork for a check that must not change anything: a
+	// provider with no cache counts as empty, and nothing is recovered or
+	// published.
+	validateOnly bool
+	// reuseFresh answers from the cache, without asking the network, when every
+	// http provider's copy is younger than its interval and they were
+	// published together; otherwise it behaves as usual.
+	reuseFresh bool
+}
+
+// CacheMode says how much a load may rely on what is already cached.
+type CacheMode int
+
+const (
+	// CacheNever asks the network, using the cache only as a fallback.
+	CacheNever CacheMode = iota
+	// CacheReuseFresh skips the network when every cached copy is still
+	// within its interval.
+	CacheReuseFresh
+	// CacheOnly never asks the network and never writes: it checks what is
+	// already there.
+	CacheOnly
+)
+
+func (m CacheMode) options() loadOptions {
+	switch m {
+	case CacheReuseFresh:
+		return loadOptions{reuseFresh: true}
+	case CacheOnly:
+		return loadOptions{noNetwork: true, validateOnly: true}
+	}
+	return loadOptions{}
 }
 
 const documentBehavior = "document"
@@ -96,6 +131,8 @@ func (o loadOptions) parseBody(body []byte, provider config.RuleProvider) (Provi
 }
 
 type preparedProvider struct {
+	// uncached marks a provider a cache-only check had nothing to check against.
+	uncached             bool
 	name                 string
 	rules                ProviderRules
 	generation           string
@@ -357,6 +394,11 @@ func LoadAndExpand(ctx context.Context, conf *config.Config, baseDir string, cli
 	return loadAndExpandWithOptions(ctx, conf, baseDir, client, loadOptions{})
 }
 
+// LoadAndExpandCached is LoadAndExpand with a cache mode.
+func LoadAndExpandCached(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, mode CacheMode) error {
+	return loadAndExpandWithOptions(ctx, conf, baseDir, client, mode.options())
+}
+
 // Refresh prepares a complete provider snapshot, validates that the current
 // routing rules can expand against it, then publishes any changed providers.
 // It intentionally leaves conf.Routing.Rules unchanged so callers can retain
@@ -431,7 +473,7 @@ func loadAndExpandWithOptions(ctx context.Context, conf *config.Config, baseDir 
 		conf.Routing.Rules = rules
 		return nil
 	}
-	if baseDir != "" {
+	if baseDir != "" && !options.validateOnly {
 		if err := recoverPendingPublish(baseDir); err != nil {
 			return err
 		}
@@ -440,12 +482,23 @@ func loadAndExpandWithOptions(ctx context.Context, conf *config.Config, baseDir 
 	if err != nil {
 		return err
 	}
+	if options.validateOnly {
+		for _, provider := range prepared {
+			if provider.uncached {
+				// A rule may name a provider that has never been fetched; there
+				// is nothing to expand it against until the first real start.
+				return nil
+			}
+		}
+	}
 	rules, err := ExpandRoutingRules(conf.Routing.Rules, registry)
 	if err != nil {
 		return err
 	}
-	if err := publishPrepared(prepared); err != nil {
-		return err
+	if !options.validateOnly {
+		if err := publishPrepared(prepared); err != nil {
+			return err
+		}
 	}
 	conf.Routing.Rules = rules
 	return nil
@@ -513,9 +566,23 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 		seen[provider.Name] = struct{}{}
 	}
 
-	prepared, err := prepareStableProviderBatch(ctx, normalized, baseDir, client, options)
-	if err != nil {
-		return nil, nil, err
+	var prepared []preparedProvider
+	if options.reuseFresh && cachesAreFresh(normalized, baseDir, options) {
+		cached := options
+		cached.reuseFresh, cached.noNetwork = false, true
+		// A cache that no longer converts or no longer forms one batch is not
+		// worth failing a start over: fall back to asking the network.
+		prepared, _ = prepareStableProviderBatch(ctx, normalized, baseDir, client, cached)
+	}
+	if prepared == nil {
+		options.reuseFresh = false
+		prepared, err = prepareStableProviderBatch(ctx, normalized, baseDir, client, options)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !options.noNetwork {
+			markChecked(prepared, time.Now().UTC())
+		}
 	}
 	for index, provider := range normalized {
 		registry[provider.Name] = prepared[index].rules
@@ -528,10 +595,14 @@ func prepareStableProviderBatch(ctx context.Context, providers []config.RuleProv
 	if err != nil {
 		return nil, err
 	}
+	if options.validateOnly {
+		// Checking what is cached: there is no remote generation to agree on.
+		return prepared, nil
+	}
 	if err := validateBatchGeneration(prepared); err != nil {
 		return nil, err
 	}
-	if requiresUnversionedBatchIdentity(prepared) {
+	if requiresUnversionedBatchIdentity(prepared) && !options.noNetwork {
 		// Retain the existing second fetch as an update probe. It does not prove
 		// that independent providers share a remote generation; acceptance below
 		// still requires either fresh candidates for every provider or a durable
@@ -776,6 +847,18 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	case "http":
 		cached, cacheErr := readCacheSnapshot(descriptor)
 		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider, options)
+		if options.noNetwork {
+			if cachedRulesErr == nil {
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, false), nil
+			}
+			if options.validateOnly {
+				// Nothing to check against yet; the first real start fetches it.
+				p := makePrepared(ProviderRules{}, "", "", nil, false)
+				p.uncached = true
+				return p, nil
+			}
+			return preparedProvider{}, fmt.Errorf("no usable cache: %w", cachedRulesErr)
+		}
 		fetched, fetchErr := fetchHTTP(ctx, provider.URL, provider.MaxSize, client, options.allowPrivate, cached)
 		if fetchErr != nil {
 			if cachedRulesErr == nil {
@@ -3731,4 +3814,119 @@ func redactProviderFetchError(err error) error {
 		return securityError(redacted)
 	}
 	return redacted
+}
+
+// cachesAreFresh reports whether every http provider has a cached copy for its
+// current source that is younger than its interval, and that the copies were
+// published together. A reuse that failed the second condition would only be
+// rejected later by the batch fence.
+func cachesAreFresh(providers []config.RuleProvider, baseDir string, options loadOptions) bool {
+	now := time.Now().UTC()
+	batch := ""
+	for _, provider := range providers {
+		if provider.Type != "http" {
+			continue
+		}
+		descriptor, err := newCacheDescriptor(provider, baseDir)
+		if err != nil {
+			return false
+		}
+		snapshot, err := readCacheSnapshot(descriptor)
+		if err != nil || !cacheMetadataMatches(snapshot.metadata, descriptor) {
+			return false
+		}
+		if provider.Interval <= 0 || now.Sub(lastChecked(descriptor, snapshot)) >= provider.Interval {
+			return false
+		}
+		if _, err := options.parseBody(snapshot.body, provider); err != nil {
+			return false
+		}
+		if len(providers) > 1 {
+			identity := cacheSnapshotBatchIdentity(snapshot)
+			if identity == "" || (batch != "" && identity != batch) {
+				return false
+			}
+			batch = identity
+		}
+	}
+	return true
+}
+
+// checkedFile records when a provider's source was last asked and answered.
+// The cache's own updated_at only moves when the content changes, so a source
+// that rarely changes would look stale forever; this file moves on every
+// successful check, including "not modified". It lives beside the cache, not
+// in it, and losing it only costs one extra fetch.
+const checkedFile = "checked"
+
+func markChecked(prepared []preparedProvider, at time.Time) {
+	for _, provider := range prepared {
+		// A provider answered from its last good copy was not checked.
+		if provider.descriptor.sourceType != "http" || provider.usedLastGood || provider.uncached {
+			continue
+		}
+		root := provider.descriptor.root
+		if info, err := os.Stat(root); err != nil || !info.IsDir() {
+			continue // not published yet; its updated_at is the check
+		}
+		tmp := filepath.Join(root, checkedFile+".tmp")
+		line := provider.descriptor.sourceKey + " " + at.Format(time.RFC3339Nano) + "\n"
+		if err := os.WriteFile(tmp, []byte(line), 0o600); err != nil {
+			continue
+		}
+		if err := os.Rename(tmp, filepath.Join(root, checkedFile)); err != nil {
+			_ = os.Remove(tmp)
+		}
+	}
+}
+
+// lastChecked is the later of the cached content's age and the last
+// successful check of the same source.
+func lastChecked(descriptor cacheDescriptor, snapshot cacheSnapshot) time.Time {
+	latest := snapshot.metadata.UpdatedAt
+	raw, err := os.ReadFile(filepath.Join(descriptor.root, checkedFile))
+	if err != nil {
+		return latest
+	}
+	key, stamp, ok := strings.Cut(strings.TrimSpace(string(raw)), " ")
+	if !ok || key != descriptor.sourceKey {
+		return latest
+	}
+	if at, err := time.Parse(time.RFC3339Nano, stamp); err == nil && at.After(latest) {
+		latest = at
+	}
+	return latest
+}
+
+// OldestCheck reports when the least recently checked cached http source was
+// last asked, so a refresh schedule can pick up where the previous run left
+// off instead of waiting a full interval again. ok is false when nothing is
+// cached. documents are internal opaque documents (see FetchDocument).
+func OldestCheck(providers, documents []config.RuleProvider, baseDir string) (oldest time.Time, ok bool) {
+	consider := func(provider config.RuleProvider) {
+		provider = normalizeProvider(provider)
+		if provider.Type != "http" {
+			return
+		}
+		descriptor, err := newCacheDescriptor(provider, baseDir)
+		if err != nil {
+			return
+		}
+		snapshot, err := readCacheSnapshot(descriptor)
+		if err != nil || !cacheMetadataMatches(snapshot.metadata, descriptor) {
+			return
+		}
+		at := lastChecked(descriptor, snapshot)
+		if !ok || at.Before(oldest) {
+			oldest, ok = at, true
+		}
+	}
+	for _, provider := range providers {
+		consider(provider)
+	}
+	for _, document := range documents {
+		document.Behavior, document.Format = documentBehavior, "yaml"
+		consider(document)
+	}
+	return oldest, ok
 }

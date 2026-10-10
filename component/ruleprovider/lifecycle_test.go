@@ -542,3 +542,31 @@ func TestRefreshLifecycleNextIntervalOverridesInterval(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestRefreshLifecycleInitialWaitReplacesTheFirstInterval(t *testing.T) {
+	ran := make(chan struct{}, 4)
+	lifecycle, err := NewRefreshLifecycle(RefreshLifecycleConfig{
+		Interval:    time.Hour,
+		InitialWait: func() time.Duration { return 20 * time.Millisecond },
+		Refresh: func(context.Context) (RefreshReport, error) {
+			ran <- struct{}{}
+			return RefreshReport{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = lifecycle.Run(ctx) }()
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first round did not run after InitialWait")
+	}
+	select {
+	case <-ran:
+		t.Fatal("a second round ran before the interval")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

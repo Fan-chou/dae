@@ -130,7 +130,7 @@ func convertMihomoBody(body []byte, opts mihomo.Options) (*mihomo.Result, error)
 
 // fetchMihomo reads the source through the verified cache and converts it. The
 // returned report says whether the copy changed or was the previous valid one.
-func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *http.Client) (*mihomo.Result, ruleprovider.Document, error) {
+func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *http.Client, cache ruleprovider.CacheMode) (*mihomo.Result, ruleprovider.Document, error) {
 	opts := mihomoOptions(m, baseDir)
 	var (
 		lastSum    [sha256.Size]byte
@@ -144,7 +144,9 @@ func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *h
 		lastSum, lastResult = sha256.Sum256(body), result
 		return nil
 	}
-	fetched, err := ruleprovider.FetchDocument(ctx, mihomoDocumentSpec(m), baseDir, client, validate)
+	spec := mihomoDocumentSpec(m)
+	spec.Interval = m.Interval
+	fetched, err := ruleprovider.FetchDocumentCached(ctx, spec, baseDir, client, validate, cache)
 	if err != nil {
 		return nil, ruleprovider.Document{}, err
 	}
@@ -170,7 +172,7 @@ func fetchMihomo(ctx context.Context, m config.Mihomo, baseDir string, client *h
 // would otherwise lose all connectivity. dae then runs with what the
 // configuration itself defines, says so in the status, and retries shortly.
 // A reload never does this, so a mistyped URL cannot replace working routing.
-func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, startup bool) (*mihomoMerge, error) {
+func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, startup bool, cache ruleprovider.CacheMode) (*mihomoMerge, error) {
 	m := conf.Mihomo
 	if !m.Enabled() {
 		setMihomoStatus(MihomoStatus{})
@@ -188,7 +190,7 @@ func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string,
 		}
 	}
 
-	result, fetched, err := fetchMihomo(ctx, m, baseDir, client)
+	result, fetched, err := fetchMihomo(ctx, m, baseDir, client, cache)
 	if err != nil {
 		if startup && m.RoutingSubscription != "" {
 			status.Error = m.ScrubSecrets(err.Error())
@@ -247,7 +249,7 @@ func refreshMihomoSource(ctx context.Context, conf *config.Config, baseDir strin
 	}
 	status := CurrentMihomoStatus()
 	status.CheckedAt = time.Now()
-	result, fetched, err := fetchMihomo(ctx, m, baseDir, client)
+	result, fetched, err := fetchMihomo(ctx, m, baseDir, client, ruleprovider.CacheNever)
 	if err != nil {
 		status.Error = m.ScrubSecrets(err.Error())
 		setMihomoStatus(status)

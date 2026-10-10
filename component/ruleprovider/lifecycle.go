@@ -16,15 +16,20 @@ type RefreshLifecycleConfig struct {
 	// replaces Interval; a non-positive answer falls back to Interval. It lets
 	// a lifecycle retry soon after a failure and settle back afterwards.
 	NextInterval func() time.Duration
-	Refresh      func(context.Context) (RefreshReport, error)
-	Reload       func(context.Context) error
-	OnError      func(error)
+	// InitialWait, when set and positive, is the wait before the first round.
+	// A start that reused fresh cached sources uses it to refresh when they
+	// fall due, not a whole interval after the start.
+	InitialWait func() time.Duration
+	Refresh     func(context.Context) (RefreshReport, error)
+	Reload      func(context.Context) error
+	OnError     func(error)
 }
 
 // RefreshLifecycle coordinates refresh rounds and optional periodic execution.
 type RefreshLifecycle struct {
 	interval time.Duration
 	next     func() time.Duration
+	initial  func() time.Duration
 	refresh  func(context.Context) (RefreshReport, error)
 	reload   func(context.Context) error
 	onError  func(error)
@@ -62,6 +67,7 @@ func NewRefreshLifecycle(config RefreshLifecycleConfig) (*RefreshLifecycle, erro
 	return &RefreshLifecycle{
 		interval: config.Interval,
 		next:     config.NextInterval,
+		initial:  config.InitialWait,
 		refresh:  config.Refresh,
 		reload:   config.Reload,
 		onError:  config.OnError,
@@ -100,7 +106,13 @@ func (l *RefreshLifecycle) Run(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	timer := time.NewTimer(l.wait())
+	first := l.wait()
+	if l.initial != nil {
+		if d := l.initial(); d > 0 {
+			first = d
+		}
+	}
+	timer := time.NewTimer(first)
 	defer timer.Stop()
 	for {
 		select {

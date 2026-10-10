@@ -208,6 +208,9 @@ type readMode struct {
 	// fetchGeodata downloads the dat files even if they are present; without
 	// it only missing ones are filled in.
 	fetchGeodata bool
+	// cache says how far the remote parts may be answered from what is
+	// already cached instead of asking the network.
+	cache ruleprovider.CacheMode
 }
 
 var (
@@ -215,11 +218,17 @@ var (
 	// it cannot replace working routing.
 	readStrict = readMode{}
 	// A cold start: dae comes up without what it cannot reach yet and retries.
-	readColdStart = readMode{tolerateMihomo: true, fetchGeodata: true}
-	// `dae validate`, which the service script runs before every start: it must
-	// not fail only because the uplink is not up yet, but it is not the place to
-	// download the dat files, which `run` does right after.
-	readValidate = readMode{tolerateMihomo: true}
+	//
+	// Copies still within their interval are used as they are: the refresh
+	// schedule keeps them current, and a restart should not wait on the
+	// network (or on a slow uplink) to bring back what it had a minute ago.
+	readColdStart = readMode{tolerateMihomo: true, fetchGeodata: true, cache: ruleprovider.CacheReuseFresh}
+	// `dae validate`, which the service script runs before every start: it
+	// checks the configuration against what is already cached and never asks the
+	// network, writes the cache or downloads the dat files. That keeps it fast
+	// and independent of the uplink; `run` does the fetching right after. A
+	// source with nothing cached yet is not an error here.
+	readValidate = readMode{tolerateMihomo: true, cache: ruleprovider.CacheOnly}
 )
 
 // readConfig reads a configuration for a reload or for validation of an edit.
@@ -241,15 +250,17 @@ func readConfigAt(cfgFile string, mode readMode) (conf *config.Config, includes 
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err
 	}
-	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, mode.tolerateMihomo)
+	merge, err := applyMihomoSource(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, mode.tolerateMihomo, mode.cache)
 	if err != nil {
 		return nil, nil, err
 	}
-	loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), mode.fetchGeodata)
+	if mode.cache != ruleprovider.CacheOnly {
+		loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), mode.fetchGeodata, mode.cache == ruleprovider.CacheReuseFresh)
+	}
 	// Taken before rule sets are expanded: after that there is one rule per
 	// entry, which is no longer something to read.
 	rememberEffectiveConfig(conf, buildEffectiveConfig(conf, merge))
-	if err := ruleprovider.LoadAndExpand(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient); err != nil {
+	if err := ruleprovider.LoadAndExpandCached(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, mode.cache); err != nil {
 		return nil, nil, fmt.Errorf("load native rule providers: %w", err)
 	}
 	return conf, includes, nil
@@ -269,9 +280,12 @@ func emptyConfig() (conf *config.Config, err error) {
 // loadGeodata makes the dat files named by the geodata section available. A
 // cold start fetches them; a reload only fills in what is missing, since the
 // refresh schedule keeps them current and a reload should not wait on it.
-func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll bool) {
+func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll, reuseFresh bool) {
 	if !conf.Geodata.Enabled() {
 		setGeodataStatus(GeodataStatus{})
+		return
+	}
+	if reuseFresh && geodataFresh(conf.Geodata, dir) {
 		return
 	}
 	if !fetchAll {
@@ -287,4 +301,22 @@ func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll 
 	}
 	// Failures are logged and kept in the status; see syncGeodata.
 	_, _ = syncGeodata(ctx, conf.Geodata, dir, http.DefaultClient)
+}
+
+// geodataFresh reports whether every dat file the section names is present and
+// younger than its interval.
+func geodataFresh(g config.Geodata, dir string) bool {
+	if g.Interval <= 0 {
+		return false
+	}
+	for name, url := range map[string]string{"geoip.dat": g.GeoIP, "geosite.dat": g.GeoSite} {
+		if url == "" {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || time.Since(info.ModTime()) >= g.Interval {
+			return false
+		}
+	}
+	return true
 }

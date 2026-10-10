@@ -36,6 +36,12 @@ func FetchDocument(ctx context.Context, provider config.RuleProvider, baseDir st
 	return fetchDocument(ctx, provider, baseDir, client, validate, loadOptions{})
 }
 
+// FetchDocumentCached is FetchDocument with a cache mode. The provider's
+// Interval says how long a cached copy counts as fresh.
+func FetchDocumentCached(ctx context.Context, provider config.RuleProvider, baseDir string, client *http.Client, validate func([]byte) error, mode CacheMode) (Document, error) {
+	return fetchDocument(ctx, provider, baseDir, client, validate, mode.options())
+}
+
 func fetchDocument(ctx context.Context, provider config.RuleProvider, baseDir string, client *http.Client, validate func([]byte) error, options loadOptions) (Document, error) {
 	if validate == nil {
 		return Document{}, errors.New("document validator is required")
@@ -56,16 +62,20 @@ func fetchDocument(ctx context.Context, provider config.RuleProvider, baseDir st
 		return ProviderRules{}, nil
 	}
 
-	if err := recoverPendingPublish(baseDir); err != nil {
-		return Document{}, err
+	if !options.validateOnly {
+		if err := recoverPendingPublish(baseDir); err != nil {
+			return Document{}, err
+		}
 	}
 	_, prepared, err := prepareProviders(ctx, []config.RuleProvider{provider}, baseDir, client, options)
 	if err != nil {
 		return Document{}, err
 	}
-	published, err := publishPreparedWithContext(ctx, prepared)
-	if err != nil {
-		return Document{}, err
+	published := false
+	if !options.validateOnly {
+		if published, err = publishPreparedWithContext(ctx, prepared); err != nil {
+			return Document{}, err
+		}
 	}
 	snapshot, err := readCacheSnapshot(prepared[0].descriptor)
 	if err != nil {

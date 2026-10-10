@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/mihomo"
+	"github.com/daeuniverse/dae/component/ruleprovider"
 	"github.com/daeuniverse/dae/config"
 	"github.com/spf13/cobra"
 )
@@ -79,7 +80,7 @@ func previewMihomo(ctx context.Context, cfgPath string, w io.Writer) error {
 	}
 
 	baseDir := filepath.Dir(cfgPath)
-	result, fetched, err := fetchMihomo(ctx, conf.Mihomo, baseDir, http.DefaultClient)
+	result, fetched, err := fetchMihomo(ctx, conf.Mihomo, baseDir, http.DefaultClient, ruleprovider.CacheNever)
 	if err != nil {
 		return errors.New(conf.Mihomo.ScrubSecrets(fmt.Sprintf("load mihomo routing source %s: %v", conf.Mihomo.RedactedSource(), err)))
 	}

@@ -48,15 +48,48 @@ func newRuleProviderLifecycleHolder(conf *config.Config, baseDir string, interva
 			}
 			return interval
 		},
-		Refresh: holder.refresh,
-		Reload:  holder.queueReload,
-		OnError: holder.logError,
+		InitialWait: holder.initialWait(interval),
+		Refresh:     holder.refresh,
+		Reload:      holder.queueReload,
+		OnError:     holder.logError,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return holder, lifecycle, nil
 }
+
+// initialWait is how long after a start the first refresh is due. A start that
+// fetched everything gets a whole interval, as before. One that reused cached
+// copies still within their interval gets what is left of it, so the data is
+// never older than one interval plus a refresh round, however often dae
+// restarts. It never waits less than initialRefreshFloor, and a degraded
+// Mihomo source keeps its own faster retry.
+func (h *ruleProviderLifecycleHolder) initialWait(interval time.Duration) func() time.Duration {
+	return func() time.Duration {
+		if interval <= 0 || CurrentMihomoStatus().Degraded {
+			return 0
+		}
+		h.mu.RLock()
+		conf, baseDir := h.conf, h.baseDir
+		h.mu.RUnlock()
+		var documents []config.RuleProvider
+		if conf.Mihomo.Enabled() && conf.Mihomo.RoutingSubscription != "" {
+			spec := mihomoDocumentSpec(conf.Mihomo)
+			spec.Interval = conf.Mihomo.Interval
+			documents = append(documents, spec)
+		}
+		oldest, ok := ruleprovider.OldestCheck(conf.RuleProvider, documents, baseDir)
+		if !ok {
+			return 0
+		}
+		return min(max(interval-time.Since(oldest), initialRefreshFloor), interval)
+	}
+}
+
+// initialRefreshFloor keeps a start that reused almost-due copies from
+// refreshing the moment dae comes up.
+const initialRefreshFloor = 30 * time.Second
 
 func (h *ruleProviderLifecycleHolder) refresh(ctx context.Context) (ruleprovider.RefreshReport, error) {
 	h.mu.RLock()
