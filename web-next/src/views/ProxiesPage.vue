@@ -65,8 +65,10 @@ import {
   folderManagerOpen,
   isProxyFolderModeActive,
 } from '@/store/proxyFolders'
-import { useResizeObserver, useSessionStorage } from '@vueuse/core'
+import { useResizeObserver, useSessionStorage, useWindowSize } from '@vueuse/core'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+
+const { width: windowWidth } = useWindowSize()
 
 const { padding } = usePaddingForViews({
   offsetTop: 0,
@@ -327,6 +329,8 @@ const displayTwoColumns = computed(() => {
   ) {
     return false
   }
+  // Two compact cards side by side leave a phone with truncated node names.
+  if (windowWidth.value < 480) return false
   return twoColumnProxyGroup.value && renderPageItems.value.length > 1
 })
 

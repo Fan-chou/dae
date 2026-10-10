@@ -128,7 +128,9 @@ export const connectionAccessor: ConnectionAccessor = {
     const clash = asClash(connection)
     const host = getHostname(clash)
     if (connection.fdae)
-      return connection.fdae.domain || '—'
+      // No sniffed domain is a fact worth showing, not something to paper over
+      // with the IP the row already has in its own column.
+      return connection.fdae.domain || '无域名'
 
     if (host.includes(':')) {
       return `[${host}]:${clash.metadata.destinationPort}`
