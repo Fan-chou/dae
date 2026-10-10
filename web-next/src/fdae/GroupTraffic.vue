@@ -1,6 +1,6 @@
 <template>
   <span class="text-xs text-base-content/45 tabular-nums" :title="title"
-    >{{ count ? label + ' · ' + count + ' 条' : '无连接' }}</span
+    >{{ count ? label + ' · ' + count + ' 条连接' : '无连接' }}</span
   >
 </template>
 <script setup lang="ts">
