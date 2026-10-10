@@ -351,7 +351,7 @@ func (p *UdpEndpointPool) rebindNormalRebuildOwner(key UdpEndpointKey, s *udpReb
 	s.successorIntent = false
 	next.prepared.Store(false)
 	s.owner.Store(&udpRebuildOwnership{endpoint: next, revision: next.rebuildRevision})
-	shard.pool[key] = next
+	shard.poolLocked()[key] = next
 	p.registerEndpoint(next)
 	return true
 }
