@@ -86,7 +86,11 @@ allocations (scratch kept per call); 18f87d1c frames after a remote reset
 returned to the pool (hand ported; the `ReadBuffered` hint is not carried).
 Already present: ba274cf4, 271dd429, 1c9ad297, 5c51f15d (peerParams atomic).
 
-Not carried: edf4a231 (dial cleanup, waiter handoff, queue bounds, datagram
-ownership; 11 conflicts in connection/datagram queue), a3269acd (http3 control
+Already present (checked piece by piece, nothing to port): edf4a231 (dial
+cleanup, CapabilityCallback, waiter handoff, receive ring buffer and its
+bounded-storage test, `abortAfterStartupFailure`, unpooled send-side datagram
+frames). The carry's 11 conflicts were because the fork already had each piece.
+
+Not carried: a3269acd (http3 control
 stream and request replay; 9 conflicts), 8126b16b (atomic congestion pointer,
 collides with the fork's application-limited logic).
