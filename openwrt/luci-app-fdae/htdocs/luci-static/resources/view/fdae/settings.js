@@ -150,7 +150,9 @@ return view.extend({
 					banner.style.display = '';
 					banner.replaceChildren(
 						E('div', { style: 'margin-bottom:6px' },
-							_('已安装新版本（%s），运行中的仍是 %s。').format(p.installed_version || '?', p.running_version || '?')),
+							p.installed_version === p.running_version
+								? _('已安装新的构建（版本号相同），运行中的还是旧构建。')
+								: _('已安装新版本（%s），运行中的仍是 %s。').format(p.installed_version || '?', p.running_version || '?')),
 						button('apply', _('切换到新版本'), startSwitch),
 						E('span', { style: 'margin-left:8px;opacity:.7' },
 							_('会短暂重启；新版本没起来时自动换回旧版本。'))

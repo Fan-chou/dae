@@ -61,8 +61,15 @@ apply() {
 	"$LIBEXEC/apply.sh"
 }
 
+# pidof also matches this very script (it is called dae), so go by the binary.
 running_pid() {
-	pidof dae | cut -d' ' -f1
+	local p
+	for p in $(pidof dae); do
+		case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+		"$PROG"|"$PROG (deleted)") echo "$p"; return 0 ;;
+		esac
+	done
+	return 1
 }
 
 # pending prints key=value lines. The running process keeps the file it was
@@ -72,13 +79,13 @@ pending() {
 	pid="$(running_pid)"
 	if [ -n "$pid" ]; then
 		exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
-		running_version="$("/proc/$pid/exe" --version 2>/dev/null | head -n 1)"
+		running_version="$("/proc/$pid/exe" --version 2>&1 | head -n 1)"
 		[ "$exe" = "$PROG" ] || pending=1
 	fi
 	echo "running=$([ -n "$pid" ] && echo 1 || echo 0)"
 	echo "pending=$pending"
 	echo "running_version=$running_version"
-	echo "installed_version=$("$PROG" --version 2>/dev/null | head -n 1)"
+	echo "installed_version=$("$PROG" --version 2>&1 | head -n 1)"
 }
 
 set_state() {
