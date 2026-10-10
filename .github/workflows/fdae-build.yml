@@ -1,0 +1,136 @@
+name: fdae build
+
+# Binaries (amd64, arm64), OpenWrt ipk and apk packages, one workflow.
+# Tags v* also publish a GitHub release with everything attached.
+on:
+  push:
+    tags: ["v*"]
+    branches: [fdae]
+    paths:
+      - ".github/workflows/fdae-build.yml"
+      - "openwrt/**"
+      - "web-next/**"
+      - "**.go"
+      - "control/kern/**"
+      - "go.mod"
+      - "go.sum"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: 0
+  GOTOOLCHAIN: local
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web-next/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web-next/pnpm-lock.yaml
+      - name: Build the panel
+        working-directory: web-next
+        run: |
+          pnpm install --frozen-lockfile
+          FONT=none pnpm build
+      - uses: actions/upload-artifact@v5
+        with:
+          name: panel
+          path: web-next/dist
+          if-no-files-found: error
+
+  binary:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: ./.github/actions/setup-kdae-go
+        with:
+          go-version: "1.27"
+      - name: Install clang
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm
+      - name: Version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"
+          else v="unstable-$(git log -1 --format=%cd --date=format:%Y%m%d).r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Build dae
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: v1
+        run: |
+          export GOFLAGS="-trimpath -modcacherw"
+          export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
+          export OUTPUT="$PWD/build/dae-${{ matrix.goarch }}"
+          mkdir -p build
+          make dae OUTPUT="$OUTPUT" VERSION="$VERSION"
+          file "$OUTPUT"
+      - name: Smoke test
+        if: matrix.goarch == 'amd64'
+        run: build/dae-amd64 --version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dae-${{ matrix.goarch }}
+          path: build/dae-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  packages:
+    needs: [panel, binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Build ipk and apk
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            export FDAE_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          FDAE_UI="$PWD/artifacts/panel" \
+          FDAE_BIN_x86_64="$PWD/artifacts/dae-amd64/dae-amd64" \
+          FDAE_BIN_aarch64="$PWD/artifacts/dae-arm64/dae-arm64" \
+          openwrt/build.sh "$PWD/out"
+          # the plain binaries ride along
+          cp artifacts/dae-amd64/dae-amd64 artifacts/dae-arm64/dae-arm64 out/
+          (cd out && sha256sum * | grep -v SHA256SUMS > SHA256SUMS)
+      - uses: actions/upload-artifact@v5
+        with:
+          name: fdae-openwrt
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: fdae-openwrt
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

@@ -1,10 +1,12 @@
 # 223 切换清单:旧 sidecar → dae 进程内 Mihomo
 
+> 历史记录:223 已按本清单完成切换,之后又改用 `fdae` 软件包(见文末)。文中的 kdae 脚本、路径已不存在。
+
 给执行切换的人(223 由用户自己切)。每步都写了怎么确认成功、失败怎么退。
 
 ## 先知道的几件事(2026-10-10 只读查看 223 得到)
 
-- 系统是 ImmortalWrt 25.12,包管理器是 **apk**。仓库里的 `openwrt/scripts/build-ipk.sh` 只产出 opkg 风格的 ipk,**没有 apk 产物**。
+- 系统是 ImmortalWrt 25.12,包管理器是 **apk**。仓库里的 (当时)旧的 `build-ipk.sh` 只产出 ipk,没有 apk 产物;现已由 `openwrt/build.sh` 同时产出 ipk 与 apk。
 - 223 上 `/usr/bin/dae`、`/usr/libexec/dae/*.sh`、luci 视图、`/www/kdae-ui` 都是手工部署的,apk 数据库里只有过期的 `kdae-20260822` 和 `kdae-rule-sync-20260822`,没有 `luci-app-kdae`、`kdae-ui`。所以这次切换是**手工拷文件**,不是装包。切完之前不要对 kdae 相关包跑 `apk upgrade`,它会把二进制换回旧版。
 - `/etc/init.d/dae` 比仓库多三行本地设置(`GOMEMLIMIT=256MiB`、`GOMAXPROCS=2`、`KDAE_EVIDENCE_KEY_FILE`),**不要用仓库的 `dae.init` 覆盖它**。这次切换不需要改 init。
 - 旧布局:`config.dae` 的 `include {}` 里有 `local.dae`、`current/nodes.dae`、`current/groups.dae`、`routing.dae`;sidecar 只是 `/usr/libexec/dae/dae-rule-sync`,由 `kdae-sync.sh`(LuCI 同步按钮)手动触发,**没有 init 服务也没有定时任务**;UCI 里订阅 `role=routing`、8 条 `mixin`(`resolve_dns`)、`isolate_transport_groups='Fuel_YouTuBe'`、`generation_dir='/etc/dae'`。
@@ -17,7 +19,7 @@
 ```bash
 export PATH="$PWD/hack/bin:$PATH"; . hack/env.sh
 make dae                      # 默认 MAX_MATCH_SET_LEN=1024,当前订阅 406/1024
-(cd web-next && npm ci && FONT=none npx vite build)   # 产出 web-next/dist
+(cd web-next && pnpm install --frozen-lockfile && FONT=none pnpm build)   # 产出 web-next/dist
 ```
 
 需要拷到 223 的文件:
@@ -138,3 +140,9 @@ cp -p $d/libexec-dae/* /usr/libexec/dae/
 按本清单执行:备份在 `/root/pre-mihomo-202610100842`(旧 `dae`、`libexec-dae`、`uci-dae`、`init-dae`、`etc-dae.tar`、`www.tar`、ACL/menu),旧面板目录留在 `/www/kdae-ui.old.pre-mihomo`。先在 `/tmp` 里对迁移脚本做了演练(包装 `uci` 使写操作为空),再正式迁移并重启。结果:`Routing match set len: 412/1024`;`/v1/status` 的 `mihomo` 为 8 节点 / 39 组 / 90 规则、未降级、未用旧副本;LAN 客户端的连接经 AI / Google / Cherry_Proxy / CN_CN 等组走真实节点;HTTPS 面板与同源代理 `/cgi-bin/kdae-proxy/v1/*` 正常。未做:`kdae-ui-cert` 与证书续期(单独一步)。
 
 面板的纯 HTTP 入口(2026-10-10):223 上手工建了 `uhttpd.kdae`(:2080,文档根 `/www/kdae-http`,只含 `/kdae-ui/` 与 `/cgi-bin/kdae-proxy`;`/cgi-bin/luci`、`/etc/...` 均 404),`http://192.168.124.223:2080/` 可直接打开面板,LuCI 仍强制 HTTPS。这一步已写进 `kdae-ui` 包(`kdae-ui-http`)。HTTP 下 service worker 不可用(无离线缓存/添加到主屏幕),登录密钥在 LAN 内明文传输。
+
+## 2026-10-10 换成 fdae 软件包(223)
+
+`kdae`/`kdae-rule-sync` 两个旧 apk 用 `apk del --no-scripts` 摘除,装上 `fdae` + `luci-app-fdae`(`apk add --allow-untrusted`)。旧 `/etc/init.d/dae` 因为是改过的配置文件没被覆盖,手工换成包里的;`/etc/config/dae` 保留,三个环境变量(`GOMEMLIMIT`、`GOMAXPROCS`、`KDAE_EVIDENCE_KEY_FILE`)移进 UCI `list env`。随后验证"装新版本不重启":版本升级安装后 dae PID 不变、`pending=1`;`/etc/init.d/dae switch` 接力成功(`switch_state` 为 ok)。回退分支(新版起不来→换回旧版)只读过代码,没有在 223 上触发。
+
+清理:`uhttpd.kdae`(:2080)与 `/www/kdae-http`、`/www/kdae-ui*`、`/www/cgi-bin/kdae-proxy`、旧 LuCI 视图/菜单/ACL、`/usr/libexec/dae`、18 个 `dae.bak.*`、`/etc/dae/{current,generations,generated,generation.lock,routing.dae*}`。保留 `/root/pre-mihomo-*` 与 `/root/pre-fdae-*` 备份。面板改由 dae 自己在 `http://192.168.124.223:2025/fdae-ui/` 提供;上面 :2080 与证书两节不再适用。dae 已设为开机自启。

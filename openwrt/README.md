@@ -1,22 +1,74 @@
-# OpenWrt packaging for kdae
+# fdae on OpenWrt
 
-This tree is consumed by the independent `openwrt-kdae-feed` repository
-and by `openwrt/scripts/build-ipk.sh` when the ImmortalWrt SDK is not
-installed.
+Two packages:
 
-Packages:
+| package | contents |
+|---|---|
+| `fdae` | `/usr/bin/dae`, `/etc/init.d/dae`, `/etc/config/dae`, `/etc/dae/config.dae`, the panel in `/usr/share/fdae-ui`, helper scripts in `/usr/libexec/fdae` |
+| `luci-app-fdae` | LuCI: Services → fdae (settings, config, log) |
 
-- `kdae` — binary as `/usr/bin/dae`, `PROVIDES`/`CONFLICTS`/`REPLACES` official `dae`
-- `luci-app-kdae` — start/stop, validate, reload, Mihomo source status, panel link
-- `kdae-ui` — Vite-built Vue panel at `/www/kdae-ui/` (`web-next/dist`, based on zashboard; override with `KDAE_UI_DIR`). Also issues a private CA and a Safari-compliant HTTPS certificate for uhttpd (`kdae-ui-cert`); the CA is offered at `/kdae-ui/ca/`.
+The service keeps the name `dae`, so existing UCI settings, logs and habits
+carry over. The panel is served by dae itself on its admin address:
+`http://<admin_listen>/fdae-ui/`. There is no CGI, uhttpd instance, certificate
+or sidecar; the Mihomo source (subscription or local YAML) is read, converted
+and merged by dae in-process.
 
-`kdae-ui` also opens the panel over plain HTTP on its own port, **2080** (`kdae-ui-http`, a second uhttpd instance `uhttpd.kdae`). Its document root `/www/kdae-http` holds only `/kdae-ui/` and the `/cgi-bin/kdae-proxy` proxy, so LuCI is not served there and still redirects to HTTPS on 80/443. This is for devices that do not trust the router's CA (a phone, before the profile is installed); the panel's login secret then crosses the LAN unencrypted, and the service worker (offline cache, "add to home screen") needs HTTPS. Change the port with `uci set uhttpd.kdae.listen_http=...`, or remove the door with `uci delete uhttpd.kdae; uci commit uhttpd; /etc/init.d/uhttpd reload`; the package leaves an existing instance alone.
+## Layout
 
-Do not enable `DAE_ALLOW_TCP_SOCKMAP` on kernels older than 6.6.94.
+```
+openwrt/
+  build.sh                 ipk + apk for fdae and luci-app-fdae
+  fdae/files/              init script, UCI defaults, default config.dae, apply/write-local/recover scripts
+  fdae/tests/              shell tests (apply_test.sh)
+  luci-app-fdae/           LuCI views, menu, ACL
+```
 
-ImmortalWrt 24.10 `opkg` still expects **gzipped tar** ipk files (`debian-binary` + `data.tar.gz` + `control.tar.gz`), not Debian `ar` archives. The local feed uses `src/gz kdae file:///www/kdae-feed`.
+Settings live in UCI (`/etc/config/dae`). `write-local.sh` renders them to
+`/etc/dae/local.dae`; `apply.sh` writes, validates (`dae validate`,
+`dae mihomo preview`) and only then asks a running dae to reload. A failed
+check leaves the running service alone.
 
+## Updating
 
-## Mihomo routing source
+Installing a package only replaces files. **It never restarts dae.** When the
+installed binary differs from the running one, Services → fdae → Settings shows
+a "switch to the new version" button (CLI: `/etc/init.d/dae pending`,
+`switch`, `switch_state`). The switch:
 
-`dae` fetches, converts and merges the complete Mihomo YAML itself (the `mihomo {}` section of `local.dae`, written from UCI by `kdae-write-local.sh`). There is no generation directory, no `routing.dae` and no sidecar binary. Moving an existing install over: run `/usr/libexec/dae/kdae-migrate-mihomo.sh` once, then restart the service. `dae mihomo preview -c /etc/dae/config.dae` shows what the source converts to; `dae mihomo status -c ...` asks the running daemon how its last read went.
+1. validates the current configuration with the new binary (fails → nothing changes);
+2. keeps a copy of the running binary as `/usr/libexec/fdae/dae.prev`;
+3. restarts onto the new binary and waits for it to answer;
+4. if it does not come up, puts the old binary back and starts it again.
+
+There is a brief interruption during step 3.
+
+## Install
+
+```sh
+apk add --allow-untrusted ./fdae-*.apk ./luci-app-fdae-*.apk      # apk (25.12)
+opkg install ./fdae_*.ipk ./luci-app-fdae_*.ipk                   # opkg
+```
+
+Coming from `kdae` / `kdae-rule-sync`: remove them first without running their
+scripts (`apk del --no-scripts kdae kdae-rule-sync`), keep `/etc/config/dae`,
+then install. If `/etc/init.d/dae` was left behind, replace it with the one
+from the package (`/etc/init.d/dae.apk-new`).
+
+## Build
+
+```sh
+make dae                                   # needs clang; see AGENTS.md for the Go cache env
+(cd web-next && pnpm install --frozen-lockfile && FONT=none pnpm build)
+FDAE_BIN_x86_64=$PWD/dae openwrt/build.sh  # also FDAE_BIN_aarch64, FDAE_UI, FDAE_VERSION
+```
+
+apk files are made with `apk mkpkg` in an `alpine:edge` container (apk-tools 3
+is what OpenWrt 25.12 uses); `FDAE_NO_APK=1` skips them, `FDAE_DOCKER_ARGS`
+passes extra `docker run` arguments. GitHub Actions (`.github/workflows/fdae-build.yml`)
+builds the binaries, packages and, for `v*` tags, a release.
+
+## Tests
+
+```sh
+sh openwrt/fdae/tests/apply_test.sh
+```
