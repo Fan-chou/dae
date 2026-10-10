@@ -99,3 +99,64 @@ tree, and our transport/control-stream tests are supersets.
 
 Not carried: 8126b16b (atomic congestion pointer,
 collides with the fork's application-limited logic).
+
+# Batch 3 evaluation: performance commits (not yet applied)
+
+Upstream head `2064c47a`. `git apply --check` against fdae `49b95e2c` is noted
+per commit. Nothing below is carried yet; this is the triage.
+
+## A. Small, self-contained; port first
+
+- `ad123a49` build DNS response-routing bin128 strings lazily (applies clean;
+  saves one 128-byte string per answer IP when no `ip()` rule exists).
+- `73ebcd23` create UDP endpoint shard maps lazily (clean; about 1 MiB resident
+  heap saved at start, matters on a 1 GB router).
+- `ad565882` reject oversized datagrams after batch use instead of livelocking
+  (clean; a correctness fix for the opt-in batch code fdae already has).
+- `723ee85c` pool hygiene (hand port: zero `udpIngressTask` before Put, `*[]byte`
+  in `udpDNSBufPool`, nil `reply.release`, `clear` of QUIC key material in
+  `Keys.Close`). The QUIC-key clear is the only one with a security flavor.
+- `16f5c017` reuse janitor pin-snapshot scratch (test file conflicts; hand port).
+
+## B. Worth doing, needs a decision or a measurement
+
+- `c71c20d6` right-size the eBPF hash maps. Measured on 223 (read-only, now):
+  `conn_state_map` 834 live entries of 262144 slots (4.3 MB), `redirect_track` 95
+  of 65536 (1.06 MB), `routing_handoff` 62 of 65536 (1.06 MB), `cookie_pid_map`
+  0 of 65536 (1.05 MB), `domain_routing` 2.1 MB; about 9.6 MB of kernel memory for
+  under 1000 entries. Saving would be about 6 to 7 MB. Touches `tproxy.c`
+  (BPF object regeneration), the `bpf_conn_state_map_size` default and tests.
+  Applies with conflicts in `config/config.go` and `bpf_stub.go`. Risk: a busy
+  network could hit 65536 conn_state entries; upstream says full maps fall back
+  to the slow path and are counted. Needs your call on the new sizes.
+- `968893cb` stop pinning GOMAXPROCS to 1. 223 already sets `GOMAXPROCS=2` through
+  UCI, so this only changes the default for other deployments. Upstream's own
+  data show single-stream is 12% worse at more Ps and 4-stream much better.
+  Low value for 223; take only if the packaged default should change.
+
+## C. Large datapath change; port only with the BPF test suite on 220
+
+- `06451485` cut redundant per-packet map work in the eBPF hot path (tproxy.c
+  +350 lines, 222 lines of kernel fixtures, routing_epoch and control_plane
+  changes; conflicts in the kernel test files). Real gain on the hot path, but it
+  rewrites handoff semantics. Needs `make ebpf`, `ebpf-sync-check`, `ebpf-test`
+  and the live iperf smoke before it can go to 223.
+- `b90041cc` event rate-limit constants owned by userspace (conflicts in
+  tproxy.c / bpf_test.c). Hardening, not performance; only worth it if 06451485
+  or c71c20d6 is taken, since all three edit the same C.
+
+## D. Do not port (depends on parts the forks do not have, or no gain here)
+
+- `0f50b3ac` + `042a5429` + `59ab7143` UDP write batching on by default. The
+  aggregator is installed only for transports implementing
+  `netproxy.PacketBatchWriter`. In our outbound fork that is direct and socks5
+  only; the anytls UoT batch writer (where upstream measured the gain) is not
+  carried. Direct sendmmsg showed no throughput gain upstream, and default-on
+  adds up to 1 ms of tail latency. `59ab7143` is a refactor coupled to it.
+- `b4a6352e` UDP GSO/GRO and page trimming: applies clean but adds only new,
+  unwired files here; the wiring lives in later commits. `mem_trim` is the
+  separate, more interesting half (RSS release on small boxes) and could be
+  evaluated alone.
+- `555e2bd4`, `5f8dfdc7` TCP MSS clamp / gather writes: need the `ReadBufferer`
+  chain in outbound and quic-go, which were deliberately not carried.
+- `22be0ef2`, `d326fb32`: docs only.
