@@ -3720,3 +3720,100 @@ func TestMultiProviderLoadStillRejectsPartialUpdateWhenAProviderFellBackToLastGo
 		t.Fatal("a fresh provider was published next to a last-good fallback")
 	}
 }
+
+// refreshLike mirrors Refresh: prepare the whole batch, then publish it, and
+// report what Refresh would report as Changed.
+func refreshLike(t *testing.T, providers []config.RuleProvider, dir string) bool {
+	t.Helper()
+	_, prepared, err := prepareProviders(context.Background(), providers, dir, http.DefaultClient, loadOptions{allowPrivate: true})
+	if err != nil {
+		t.Fatalf("prepare error = %v", err)
+	}
+	changed, err := publishPreparedWithContext(context.Background(), prepared)
+	if err != nil {
+		t.Fatalf("publish error = %v", err)
+	}
+	return changed
+}
+
+// Only a content change may make the caller reload. Validator-only changes and
+// the rebinds of unchanged providers bring the cache up to date silently, and
+// the number of retained versions stays bounded however often that happens.
+func TestPartialUnversionedPublishReportsOnlyContentChangesAndKeepsVersionsBounded(t *testing.T) {
+	var mu sync.Mutex
+	bodies := map[string]string{"/a": "payload:\n  - a.example\n", "/b": "payload:\n  - b0.example\n", "/c": "payload:\n  - c.example\n"}
+	etags := map[string]string{"/a": `W/"a"`, "/b": `W/"b0"`, "/c": `W/"c"`}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		body, etag := bodies[r.URL.Path], etags[r.URL.Path]
+		mu.Unlock()
+		w.Header().Set("ETag", etag)
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	set := func(path, body, etag string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if body != "" {
+			bodies[path] = body
+		}
+		if etag != "" {
+			etags[path] = etag
+		}
+	}
+	providers := []config.RuleProvider{
+		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "c", Type: "http", URL: server.URL + "/c", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+	}
+	dir := t.TempDir()
+
+	if !refreshLike(t, providers, dir) {
+		t.Fatal("the first fetch must report a change")
+	}
+	if refreshLike(t, providers, dir) {
+		t.Fatal("a round without any difference reported a change")
+	}
+
+	for round := 1; round <= 6; round++ {
+		set("/c", "", fmt.Sprintf(`W/"c-rotated-%d"`, round))
+		if refreshLike(t, providers, dir) {
+			t.Fatalf("round %d: an ETag-only change reported a content change", round)
+		}
+	}
+	snapshotC, err := readCacheSnapshot(testCacheDescriptor(t, providers[2], dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotC.metadata.ETag != `W/"c-rotated-6"` {
+		t.Fatalf("cached ETag = %q, want the latest value", snapshotC.metadata.ETag)
+	}
+
+	before, err := readCacheSnapshot(testCacheDescriptor(t, providers[0], dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := 1; round <= 6; round++ {
+		set("/b", fmt.Sprintf("payload:\n  - b%d.example\n", round), fmt.Sprintf(`W/"b%d"`, round))
+		if !refreshLike(t, providers, dir) {
+			t.Fatalf("round %d: a content change was not reported", round)
+		}
+	}
+	after, err := readCacheSnapshot(testCacheDescriptor(t, providers[0], dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.metadata.UpdatedAt.Equal(before.metadata.UpdatedAt) {
+		t.Fatalf("an unchanged provider's updated_at moved from %v to %v", before.metadata.UpdatedAt, after.metadata.UpdatedAt)
+	}
+
+	for _, provider := range providers {
+		entries, err := os.ReadDir(filepath.Join(testCacheDescriptor(t, provider, dir).root, "versions"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) > maxCacheVersions {
+			t.Fatalf("provider %s keeps %d versions after repeated publishes, want at most %d", provider.Name, len(entries), maxCacheVersions)
+		}
+	}
+}

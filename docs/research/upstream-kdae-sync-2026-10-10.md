@@ -219,3 +219,40 @@ rate constants, edits the same C) stays out for the same reason.
 - `555e2bd4`, `5f8dfdc7` TCP MSS clamp / gather writes: need the `ReadBufferer`
   chain in outbound and quic-go, which were deliberately not carried.
 - `22be0ef2`, `d326fb32`: docs only.
+
+# Rule provider batch fence: partial updates were rejected forever
+
+Found on 223 while checking the hourly refresh (not an upstream item). The
+rule-provider cache requires, for a batch of independent HTTP sources without a
+generation token, that either every provider has fresh content or none has.
+A round where only some changed was rejected, a rejected round leaves the cache
+as it was, so the next round saw the same difference: one updated rule set, or
+one source that only rotated its (weak) ETag, blocked updates for the whole set.
+
+Reproduced on 220 with six local providers (real code, `loadWithOptions`):
+
+| round | upstream | before | after |
+|---|---|---|---|
+| 3 to 5 | one of six changed | rejected, every retry | accepted, 1 of 6 updated |
+| 6 / 5 | two of six changed | rejected | accepted |
+| 7 | all six changed | accepted | accepted |
+| 9 / 6 | ETag flaps, same body | rejected | accepted |
+| 10 / 7 | ETag stays flapped | rejected | accepted |
+
+Live on 223: from 20:39 every round failed with the fence error
+(`rules-cn-ipv6` had a new body, `rules-telegram` flipped between a weak and a
+strong ETag for the same content); versions on disk were still from 08:44.
+
+Fix: when some providers have fresh content and the rest were confirmed
+unchanged in the same round, the unchanged ones are republished with their
+cached content under the new batch identity (still one atomic transaction, one
+shared identity, cache-only starts keep working). A provider that fell back to
+its last-good copy still blocks the round. This is not the per-provider
+independent publish that was first offered: it keeps the batch transaction and
+the recovery code as they are, at the cost of rewriting the unchanged providers
+on each real update (versions stay bounded at 3 per provider).
+
+Reload behaviour: `Changed` (which makes the lifecycle reload) is now true only
+when some provider's content differs from the cache. A validator-only change
+or the rebinds bring the cache up to date and report no change, so a source
+whose ETag alternates between edges does not cause an hourly reload.

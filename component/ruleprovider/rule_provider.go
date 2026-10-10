@@ -149,14 +149,18 @@ type preparedProvider struct {
 }
 
 type cacheCandidate struct {
-	descriptor           cacheDescriptor
-	body                 []byte
-	etag                 string
-	modified             string
-	generation           string
-	preparedAt           time.Time
-	updatedAt            time.Time
-	batchIdentity        string
+	descriptor    cacheDescriptor
+	body          []byte
+	etag          string
+	modified      string
+	generation    string
+	preparedAt    time.Time
+	updatedAt     time.Time
+	batchIdentity string
+	// contentChanged is false for a candidate that only carries new validators
+	// (ETag, Last-Modified) for the same body and for a rebind. Such a publish
+	// brings the cache up to date but must not make the caller reload.
+	contentChanged       bool
 	expectedCurrent      currentState
 	expectedCurrentKnown bool
 }
@@ -826,6 +830,12 @@ func validateProviderDefinition(provider config.RuleProvider, baseDir string, al
 	return nil
 }
 
+// cachedBodyMatches reports whether body is byte-identical to the usable
+// cached copy.
+func cachedBodyMatches(cacheErr, cachedRulesErr error, cached cacheSnapshot, body []byte) bool {
+	return cacheErr == nil && cachedRulesErr == nil && cached.metadata.SHA256 == digest(body)
+}
+
 // unchangedRebind builds a candidate that republishes the cached content of a
 // provider whose source did not change. The content, validators and update
 // time stay as cached; only the batch binding is new.
@@ -893,6 +903,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			body:                 append([]byte(nil), body...),
 			preparedAt:           preparedAt,
 			updatedAt:            time.Now().UTC(),
+			contentChanged:       !cachedBodyMatches(cacheErr, cachedRulesErr, cached, body),
 			expectedCurrent:      expectedCurrent,
 			expectedCurrentKnown: true,
 		}
@@ -971,6 +982,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			generation:           fetched.generation,
 			preparedAt:           preparedAt,
 			updatedAt:            time.Now().UTC(),
+			contentChanged:       !cachedBodyMatches(cacheErr, cachedRulesErr, cached, fetched.body),
 			expectedCurrent:      expectedCurrent,
 			expectedCurrentKnown: true,
 		}
@@ -1626,9 +1638,12 @@ func publishPrepared(prepared []preparedProvider) error {
 	return err
 }
 
-// publishPreparedWithContext returns whether it replaced at least one current
-// cache snapshot. It keeps the established publishPrepared API for callers
-// that do not need cancellation or the publication result.
+// publishPreparedWithContext returns whether the published content differs from
+// what was cached: a publish that only brings validators up to date, or
+// republishes unchanged providers next to changed ones, still rewrites the
+// cache but does not count as a change (a change makes the caller reload).
+// publishPrepared keeps the established API for callers that do not need
+// cancellation or the publication result.
 func publishPreparedWithContext(ctx context.Context, prepared []preparedProvider) (bool, error) {
 	cachePublishMu.Lock()
 	defer cachePublishMu.Unlock()
@@ -1846,7 +1861,16 @@ func publishPreparedWithContext(ctx context.Context, prepared []preparedProvider
 			return false, fmt.Errorf("prune provider cache %q: %w", cache.candidate.descriptor.name, err)
 		}
 	}
-	return true, nil
+	// The cache was rewritten in any case; report a change (which makes the
+	// caller reload) only when some provider's content actually differs.
+	changed := false
+	for _, cache := range caches {
+		if cache.candidate.contentChanged {
+			changed = true
+			break
+		}
+	}
+	return changed, nil
 }
 
 func validatePreparedCandidates(prepared []preparedProvider) error {
