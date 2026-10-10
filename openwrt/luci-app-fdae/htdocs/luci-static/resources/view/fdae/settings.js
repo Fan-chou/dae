@@ -43,7 +43,11 @@ function loadMihomo() {
 
 function notify(res, okMsg) {
 	const text = [res.stdout, res.stderr].filter(Boolean).join('\n').trim();
-	ui.addNotification(null, E('pre', {}, text || okMsg), res.code ? 'error' : 'info');
+	// A failed call that printed nothing is almost always a dropped connection
+	// (the service restarting under the page); say so instead of showing an
+	// empty red box.
+	ui.addNotification(null, E('pre', {}, text || (res.code ? _('命令没有返回内容，连接可能被中断，请刷新页面确认状态。') : okMsg)),
+		res.code ? 'error' : 'info');
 }
 
 function button(style, label, handler) {
@@ -54,7 +58,7 @@ function button(style, label, handler) {
 			return;
 		b.disabled = true;
 		Promise.resolve(handler()).catch(function (e) {
-			ui.addNotification(null, E('p', {}, e.message), 'error');
+			ui.addNotification(null, E('p', {}, (e && e.message) || String(e || _('操作失败'))), 'error');
 		}).finally(function () {
 			b.disabled = false;
 		});
@@ -169,8 +173,14 @@ return view.extend({
 				});
 			}
 
-			function showSwitch() {
+			// While dae restarts the router may not answer for a moment; an
+			// empty reply then means "still going", not "nothing to show".
+			function showSwitch(waiting) {
 				return runInit(['switch_state']).then(function (res) {
+					if (waiting && res.code && !res.stdout) {
+						progress.replaceChildren(E('strong', { style: 'color:#c80' }, _('正在切换，连接可能短暂中断…')));
+						return true;
+					}
 					const st = parseLines(res.stdout);
 					if (!st.state || st.state === 'idle')
 						return false;
@@ -180,17 +190,20 @@ return view.extend({
 				});
 			}
 
-			function followSwitch() {
-				return showSwitch().then(function (busy) {
-					if (busy)
-						return new Promise(function (ok) { setTimeout(ok, 2000); }).then(followSwitch);
+			function followSwitch(since) {
+				since = since || Date.now();
+				return showSwitch(true).then(function (busy) {
+					if (busy && Date.now() - since < 180000)
+						return new Promise(function (ok) { setTimeout(ok, 2000); }).then(function () { return followSwitch(since); });
 					return refresh();
 				});
 			}
 
 			function startSwitch() {
 				return runInit(['switch']).then(function (res) {
-					if (res.code)
+					// Failed without a word: the connection dropped, but the
+					// switch may well have started; follow it instead of failing.
+					if (res.code && (res.stdout || res.stderr))
 						return notify(res, '');
 					return followSwitch();
 				});
