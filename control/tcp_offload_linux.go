@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"structs"
 
@@ -892,27 +893,43 @@ func tcpConnPendingBytes(conn *net.TCPConn) (int, error) {
 	return pending, ctrlErr
 }
 
-func tcpConnInfo(conn *net.TCPConn) (*unix.TCPInfo, error) {
+// tcpInfoProbe carries one TCP_INFO read through RawConn.Control. The closure
+// escapes through the interface call, so a per-call closure would heap-allocate
+// the 232-byte tcp_info on every poll (the offload fuse polls it constantly);
+// pooling the probe and its bound callback makes the read allocation-free.
+type tcpInfoProbe struct {
+	info  unix.TCPInfo
+	errno syscall.Errno
+	fn    func(fd uintptr)
+}
+
+var tcpInfoProbePool = sync.Pool{New: func() any {
+	p := &tcpInfoProbe{}
+	p.fn = p.read
+	return p
+}}
+
+func (p *tcpInfoProbe) read(fd uintptr) {
+	size := uint32(unsafe.Sizeof(p.info))
+	_, _, p.errno = unix.Syscall6(unix.SYS_GETSOCKOPT, fd, unix.SOL_TCP, unix.TCP_INFO,
+		uintptr(unsafe.Pointer(&p.info)), uintptr(unsafe.Pointer(&size)), 0)
+}
+
+func tcpConnInfo(conn *net.TCPConn) (unix.TCPInfo, error) {
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
-		return nil, err
+		return unix.TCPInfo{}, err
 	}
-	var (
-		info    *unix.TCPInfo
-		ctrlErr error
-	)
-	if err := rawConn.Control(func(fd uintptr) {
-		info, ctrlErr = unix.GetsockoptTCPInfo(int(fd), unix.SOL_TCP, unix.TCP_INFO)
-	}); err != nil {
-		return nil, err
+	p := tcpInfoProbePool.Get().(*tcpInfoProbe)
+	defer tcpInfoProbePool.Put(p)
+	p.info, p.errno = unix.TCPInfo{}, 0
+	if err := rawConn.Control(p.fn); err != nil {
+		return unix.TCPInfo{}, err
 	}
-	if ctrlErr != nil {
-		return nil, ctrlErr
+	if p.errno != 0 {
+		return unix.TCPInfo{}, p.errno
 	}
-	if info == nil {
-		return nil, fmt.Errorf("empty tcp_info")
-	}
-	return info, nil
+	return p.info, nil
 }
 
 func tcpConnRxBytes(conn *net.TCPConn) (uint64, error) {
