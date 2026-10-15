@@ -200,3 +200,26 @@ func TestCaptureSiteNormalizationAndSeparateCounters(t *testing.T) {
 		t.Fatal(s)
 	}
 }
+
+// A closed collector can outlive its control plane through long-lived flows
+// that keep it as owner; Close must release the record history it buffered.
+func TestCloseReleasesRings(t *testing.T) {
+	c, err := New(1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.store(Record{})
+	c.storeEvidence(Evidence{})
+	if len(c.ring) == 0 || len(c.evidence.ring) == 0 {
+		t.Fatal("expected buffered records before Close")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.ring) != 0 || c.bytes != 0 || len(c.evidence.ring) != 0 || c.evidence.bytes != 0 {
+		t.Fatalf("rings not released: capture=%d/%d evidence=%d/%d", len(c.ring), c.bytes, len(c.evidence.ring), c.evidence.bytes)
+	}
+	if s := c.Snapshot(0); len(s.Records) != 0 {
+		t.Fatalf("closed collector returned %d records", len(s.Records))
+	}
+}

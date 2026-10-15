@@ -390,6 +390,13 @@ func (c *Collector) Close() error {
 			c.mu.Lock()
 			clear(c.flows)
 			c.mu.Unlock()
+			// A retired collector stays reachable through any long-lived Flow or
+			// Trace that still holds it as owner. Drop the rings (up to 12 MiB)
+			// so those references pin only the small struct, not the history.
+			c.ringMu.Lock()
+			c.ring, c.bytes = nil, 0
+			c.evidence.ring, c.evidence.bytes = nil, 0
+			c.ringMu.Unlock()
 		})
 	}
 	return nil
