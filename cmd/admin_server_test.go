@@ -30,6 +30,10 @@ type stubAdminPlane struct {
 	connSrc      string
 	connMac      string
 	connections  control.AdminConnectionsSnapshot
+
+	kernelCalls int
+	kernelLimit int
+	kernelSrc   string
 }
 
 func (s *stubAdminPlane) AdminGroups() []control.AdminGroup { return s.groups }
@@ -50,6 +54,21 @@ func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
 	s.delayFor = groupName
 	return s.delayErr
 }
+func (s *stubAdminPlane) AdminKernelConnections(limit int, src string) control.AdminKernelConnectionsSnapshot {
+	s.kernelCalls++
+	s.kernelLimit = limit
+	s.kernelSrc = src
+	if src == "bad" {
+		return control.AdminKernelConnectionsSnapshot{Available: true, Error: "invalid src", Connections: []control.AdminKernelConnection{}}
+	}
+	return control.AdminKernelConnectionsSnapshot{
+		Available:   true,
+		Accounting:  true,
+		Total:       1,
+		Connections: []control.AdminKernelConnection{{ID: "udp:a>b", Network: "udp", Src: "192.168.124.200:1", Dst: "1.1.1.1:2", Upload: 7}},
+	}
+}
+
 func (s *stubAdminPlane) AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot {
 	s.connLimit = limit
 	s.connOutbound = outbound
@@ -252,6 +271,65 @@ func TestAdminGetConnectionsForwardsFiltersAndOmitsURI(t *testing.T) {
 	server.withAdminAuth(server.handleConnections)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid limit status = %d", rec.Code)
+	}
+}
+
+func TestAdminKernelConnectionsEndpoint(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.secret = "test-token"
+	get := func(target string, auth bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		if auth {
+			req.Header.Set("Authorization", "Bearer test-token")
+		}
+		rec := httptest.NewRecorder()
+		server.withAdminAuth(server.handleKernelConnections)(rec, req)
+		return rec
+	}
+
+	if rec := get("/v1/kernel-connections", false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d", rec.Code)
+	}
+	if plane.kernelCalls != 0 {
+		t.Fatal("unauthenticated request reached the conntrack reader")
+	}
+
+	rec := get("/v1/kernel-connections?limit=64&src=192.168.124.200", true)
+	if rec.Code != http.StatusOK || plane.kernelLimit != 64 || plane.kernelSrc != "192.168.124.200" {
+		t.Fatalf("status=%d limit=%d src=%q body=%s", rec.Code, plane.kernelLimit, plane.kernelSrc, rec.Body.String())
+	}
+	var snap control.AdminKernelConnectionsSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Available || !snap.Accounting || len(snap.Connections) != 1 || snap.Connections[0].Upload != 7 {
+		t.Fatalf("snap = %+v", snap)
+	}
+
+	if rec := get("/v1/kernel-connections?limit=nope", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status = %d", rec.Code)
+	}
+	if rec := get("/v1/kernel-connections?src=bad", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid src status = %d", rec.Code)
+	}
+
+	// The default connection list must never read conntrack.
+	before := plane.kernelCalls
+	req := httptest.NewRequest(http.MethodGet, "/v1/connections", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	server.withAdminAuth(server.handleConnections)(httptest.NewRecorder(), req)
+	if plane.kernelCalls != before {
+		t.Fatal("/v1/connections triggered a conntrack read")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/kernel-connections", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec = httptest.NewRecorder()
+	server.withAdminAuth(server.handleKernelConnections)(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d", rec.Code)
 	}
 }
 

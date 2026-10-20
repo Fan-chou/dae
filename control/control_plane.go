@@ -94,6 +94,10 @@ type ControlPlane struct {
 	wanInterface []string
 	lanInterface []string
 
+	// kernelConns serves /v1/kernel-connections; created on first use so a
+	// plane nobody asks about pays nothing.
+	kernelConns atomic.Pointer[KernelConnectionsCollector]
+
 	sniffingTimeout        time.Duration
 	tproxyPortProtect      bool
 	blockQuic              bool

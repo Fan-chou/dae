@@ -45,6 +45,7 @@ type adminPlane interface {
 	SetGroupSelection(groupName, memberName string) error
 	TriggerLatencyChecksForGroup(groupName string) error
 	AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot
+	AdminKernelConnections(limit int, src string) control.AdminKernelConnectionsSnapshot
 }
 
 type adminPlaneProvider func() adminPlane
@@ -135,6 +136,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/groups", s.withAdminAuth(s.handleGroups))
 	mux.HandleFunc("/v1/groups/", s.withAdminAuth(s.handleGroup))
 	mux.HandleFunc("/v1/connections", s.withAdminAuth(s.handleConnections))
+	mux.HandleFunc("/v1/kernel-connections", s.withAdminAuth(s.handleKernelConnections))
 	mux.HandleFunc("/v1/config", s.withAdminAuth(s.handleConfig))
 	mux.HandleFunc("/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
@@ -304,6 +306,36 @@ func (s *adminServer) handleConnections(w http.ResponseWriter, r *http.Request) 
 		limit = parsed
 	}
 	snap := plane.AdminConnections(limit, r.URL.Query().Get("outbound"), r.URL.Query().Get("src"), r.URL.Query().Get("mac"))
+	writeAdminJSON(w, http.StatusOK, snap)
+}
+
+// handleKernelConnections lists flows the kernel forwards without dae's
+// userspace relay. It reads the conntrack table, so it is its own endpoint and
+// only runs when a client asks for it; /v1/connections never triggers it.
+func (s *adminServer) handleKernelConnections(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		return
+	}
+	limit := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := parsePositiveInt(raw, 1024)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = parsed
+	}
+	snap := plane.AdminKernelConnections(limit, r.URL.Query().Get("src"))
+	if snap.Error == "invalid src" {
+		writeAdminError(w, http.StatusBadRequest, "invalid src")
+		return
+	}
 	writeAdminJSON(w, http.StatusOK, snap)
 }
 

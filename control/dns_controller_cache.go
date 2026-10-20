@@ -68,6 +68,51 @@ func (c *DnsController) decrementDnsCacheSize() {
 	}
 }
 
+// DomainsForIPs maps each wanted address to the domain of the freshest cached
+// A/AAAA answer that contains it. It reads the cache only (a lock-free Range),
+// so it never delays a DNS query; callers use it for display, not routing. An
+// address shared by several domains (CDNs) resolves to the most recently
+// received one, and clients that resolve elsewhere (DoH) leave it unmapped.
+func (c *DnsController) DomainsForIPs(wanted map[netip.Addr]struct{}) map[netip.Addr]string {
+	if c == nil || c.dnsControllerStore == nil || len(wanted) == 0 {
+		return nil
+	}
+	out := make(map[netip.Addr]string, len(wanted))
+	at := make(map[netip.Addr]time.Time, len(wanted))
+	c.dnsCache.Range(func(_, value any) bool {
+		cache, ok := value.(*DnsCache)
+		if !ok || cache == nil || cache.RouteOnly {
+			return true
+		}
+		for _, rr := range cache.Answer {
+			var raw []byte
+			switch body := rr.(type) {
+			case *dnsmessage.A:
+				raw = body.A
+			case *dnsmessage.AAAA:
+				raw = body.AAAA
+			default:
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(raw)
+			if !ok {
+				continue
+			}
+			ip = ip.Unmap()
+			if _, want := wanted[ip]; !want {
+				continue
+			}
+			if prev, seen := at[ip]; seen && !cache.ReceivedAt.After(prev) {
+				continue
+			}
+			out[ip] = strings.TrimSuffix(rr.Header().Name, ".")
+			at[ip] = cache.ReceivedAt
+		}
+		return true
+	})
+	return out
+}
+
 func (c *DnsController) CloneCacheForReload() map[string]*DnsCache {
 	if c == nil || c.dnsControllerStore == nil {
 		return nil
