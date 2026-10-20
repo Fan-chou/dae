@@ -125,5 +125,8 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026101
 // (a hostile length used to panic), and returns the simple-obfs first-request
 // build error instead of dereferencing a nil request. hysteria2 with UDP port
 // hopping over a proxied underlay no longer advertises an OOB/SyscallConn
-// surface it cannot back, which used to abort the quic-go dial.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020141647-821f6901529a
+// surface it cannot back, which used to abort the quic-go dial. It also carries
+// the SS2022 UDP replay-window shift fix, the hysteria2 FastOpen deadline
+// handling, the VMess request padding fill (pool residue used to be sent) and
+// the REALITY spiderX parse-error handling.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020142427-17ab089ea888

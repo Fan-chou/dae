@@ -125,9 +125,9 @@ Not carried (same reasoning as 2026-10-10):
 Most are the perf stack, bbr3, batching or refactors (not carried, see above) or were
 already picked under a different patch id. The standalone correctness fixes were
 triaged by dropping each commit's own `_test.go` files onto the pin and running them,
-and by trial cherry-picks where a commit has no tests. The result is on a local branch,
-`sync/upstream-20261020-fixes` (in `/root/dev/outbound-sync`, worktree under the
-session scratchpad), 4 commits on top of `821f690`. **Not pushed, dae pin not bumped.**
+and by trial cherry-picks where a commit has no tests. The result is on the branch
+`sync/upstream-20261020-fixes`, 4 commits on top of `821f690`, pushed to `Fan-chou/outbound` and pinned in dae
+(`17ab089`).
 
 Carried on that branch (all builds, `go vet`, `go test -short ./...` pass; the touched
 packages also under `-race`):
