@@ -15,20 +15,25 @@ import (
 	"testing"
 	"time"
 
+	"net/netip"
+
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
+
+	"github.com/daeuniverse/dae/common/consts"
+	ob "github.com/daeuniverse/dae/component/outbound"
+	"github.com/daeuniverse/dae/component/outbound/dialer"
 )
 
 type liveCounters struct {
-	up, down, doneCalls, finalUp, finalDown atomic.Int64
+	up, down, finalUp, finalDown atomic.Int64
 }
 
 func (c *liveCounters) accounting() *tcpOffloadLiveAccounting {
 	return &tcpOffloadLiveAccounting{
-		Upload:       func(n int64) { c.up.Add(n) },
-		Download:     func(n int64) { c.down.Add(n) },
-		DownloadDone: func() { c.doneCalls.Add(1) },
+		Upload:   func(n int64) { c.up.Add(n) },
+		Download: func(n int64) { c.down.Add(n) },
 	}
 }
 
@@ -88,9 +93,6 @@ func TestTCPOffloadLiveAccountingReportsIncrementsOnce(t *testing.T) {
 	if c.up.Load() != 150 || c.down.Load() != 70 {
 		t.Fatalf("idle reports changed totals: up=%d down=%d", c.up.Load(), c.down.Load())
 	}
-	if c.doneCalls.Load() != 0 {
-		t.Fatal("live reports must not trigger the first-byte observation")
-	}
 }
 
 func TestTCPOffloadLiveAccountingFinalRecordsOnlyRemainder(t *testing.T) {
@@ -98,24 +100,20 @@ func TestTCPOffloadLiveAccountingFinalRecordsOnlyRemainder(t *testing.T) {
 	s := &tcpRelayOffloadSession{live: c.accounting(), reportedLeftRx: 150, reportedRightRx: 70}
 	full := func(dst *atomic.Int64) func(int64) { return func(n int64) { dst.Add(n) } }
 
-	// Everything already reported live: nothing is recorded again, but the
-	// first-byte observation still fires because download bytes exist.
+	// Everything already reported live: nothing is recorded again.
 	s.recordFinal(150, 70, full(&c.finalDown), full(&c.finalUp))
-	if c.finalUp.Load() != 0 || c.finalDown.Load() != 0 {
-		t.Fatalf("double count: up=%d down=%d", c.finalUp.Load(), c.finalDown.Load())
-	}
-	if c.doneCalls.Load() != 1 {
-		t.Fatalf("DownloadDone calls=%d, want 1", c.doneCalls.Load())
+	if c.up.Load() != 0 || c.down.Load() != 0 || c.finalUp.Load() != 0 || c.finalDown.Load() != 0 {
+		t.Fatalf("double count: live up=%d down=%d final up=%d down=%d", c.up.Load(), c.down.Load(), c.finalUp.Load(), c.finalDown.Load())
 	}
 
-	// Growth after the last report is recorded once, as the remainder, and
-	// goes through the full recorder (which owns the first-byte observation).
+	// Growth after the last report is recorded once, as the remainder, through
+	// the live recorders: the full recorders would measure TTFB at close.
 	s.recordFinal(180, 100, full(&c.finalDown), full(&c.finalUp))
-	if c.finalUp.Load() != 30 || c.finalDown.Load() != 30 {
-		t.Fatalf("remainder wrong: up=%d down=%d", c.finalUp.Load(), c.finalDown.Load())
+	if c.up.Load() != 30 || c.down.Load() != 30 {
+		t.Fatalf("remainder wrong: up=%d down=%d", c.up.Load(), c.down.Load())
 	}
-	if c.doneCalls.Load() != 1 {
-		t.Fatalf("DownloadDone must not fire when the full recorder ran, calls=%d", c.doneCalls.Load())
+	if c.finalUp.Load() != 0 || c.finalDown.Load() != 0 {
+		t.Fatalf("remainder must not use the full recorders: up=%d down=%d", c.finalUp.Load(), c.finalDown.Load())
 	}
 
 	// A session without live reporting keeps the original behaviour.
@@ -124,6 +122,72 @@ func TestTCPOffloadLiveAccountingFinalRecordsOnlyRemainder(t *testing.T) {
 	plain.recordFinal(10, 20, full(&down), full(&up))
 	if up.Load() != 10 || down.Load() != 20 {
 		t.Fatalf("non-live session changed: up=%d down=%d", up.Load(), down.Load())
+	}
+}
+
+// A sockmap-offloaded flow used to observe first-byte only at session end, as
+// the whole flow lifetime. Against a millisecond baseline that is always
+// "slow", which counts toward moving the site off a healthy dialer. The first
+// non-zero live report must instead confirm the first byte right away.
+func TestTCPOffloadFirstByteConfirmedByLiveReportNotAtClose(t *testing.T) {
+	d := newTestEndpointDialer()
+	other := newTestEndpointDialer()
+	defer d.Close()
+	defer other.Close()
+	g := newTestOutboundGroup(ob.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, d, other)
+	defer g.Close()
+	nt := dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	for range 3 {
+		other.ObserveHandshake(&nt, time.Millisecond)
+	}
+	if !other.ObserveTTFB(&nt, 4*time.Second) {
+		t.Fatal("fixture: a lifetime-sized TTFB must classify as slow")
+	}
+
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+	flow, err := manager.adoptTCP(
+		&memoryLayoutConn{id: 5}, nil,
+		TcpFlowBinding{Egress: TcpEgressBinding{Dialer: other, Outbound: g, NetworkType: nt, SniffedDomain: "youtube.com"}},
+		runtime, nil,
+		netip.MustParseAddrPort("192.0.2.1:1"), netip.MustParseAddrPort("198.51.100.1:443"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow.startUnixNano = time.Now().Add(-4 * time.Second).UnixNano()
+
+	selected := func() *dialer.Dialer {
+		t.Helper()
+		sel, _, _, err := g.SelectWithExclusionResultForSite(&nt, true, nil, "youtube.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sel
+	}
+	if selected() != d {
+		t.Fatal("fixture: unpinned fallback group must select the first dialer")
+	}
+
+	s, _, rightPeer := newLiveAccountingSession(t, flow.offloadLiveAccounting())
+	if _, err := rightPeer.Write(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	reportUntil(t, s, func() bool { return flow.downloadBytes.Load() == 100 })
+	// The flow is still open: its first byte must already be on record.
+	if !flow.firstByte.Load() {
+		t.Fatal("first live download report did not confirm the first byte")
+	}
+	if selected() != other {
+		t.Fatal("confirmed first byte did not pin the site while the flow was open")
+	}
+
+	// Session end must not add a lifetime-sized observation or double count.
+	s.recordFinal(0, 100, flow.recordDownload, flow.recordUpload)
+	if got := flow.downloadBytes.Load(); got != 100 {
+		t.Fatalf("download bytes after close = %d, want 100", got)
 	}
 }
 
@@ -146,7 +210,7 @@ func TestTCPOffloadLiveAccountingRealRedirect(t *testing.T) {
 
 	var up, down atomic.Int64
 	add := func(dst *atomic.Int64) func(int64) { return func(n int64) { dst.Add(n) } }
-	live := &tcpOffloadLiveAccounting{Upload: add(&up), Download: add(&down), DownloadDone: func() {}}
+	live := &tcpOffloadLiveAccounting{Upload: add(&up), Download: add(&down)}
 
 	left, client := offloadTCPPair(t)
 	server, right := offloadTCPPair(t) // production egress is dialed

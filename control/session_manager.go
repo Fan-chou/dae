@@ -506,15 +506,16 @@ func (f *FlowRuntime) recordDownload(n int64) {
 	f.observeFirstByte()
 }
 
-// recordDownloadBytes counts download bytes without the first-byte
-// observation, for periodic reports that cannot tell when the first byte
-// actually arrived.
-func (f *FlowRuntime) recordDownloadBytes(n int64) {
+// recordDownloadLive counts download bytes reported by an offloaded relay's
+// periodic tcp_info snapshots. The first report only confirms that a byte
+// arrived; see confirmFirstByte.
+func (f *FlowRuntime) recordDownloadLive(n int64) {
 	RecordDownloadTraffic(n)
 	if f == nil || n <= 0 {
 		return
 	}
 	f.addDownloadBytes(uint64(n))
+	f.confirmFirstByte()
 }
 
 func (f *FlowRuntime) addDownloadBytes(n uint64) {
@@ -526,13 +527,29 @@ func (f *FlowRuntime) addDownloadBytes(n uint64) {
 // observeFirstByte feeds the time-to-first-byte of the flow to the dialer
 // quality trackers, once per flow.
 func (f *FlowRuntime) observeFirstByte() {
+	f.reportFirstByte(true)
+}
+
+// confirmFirstByte records that the first download byte has arrived without
+// claiming when. Offloaded relays learn about payload only from periodic
+// tcp_info reports, so there is no honest TTFB: measuring at report time (or
+// worse, at session end) would turn the whole flow lifetime into a "slow"
+// verdict. The flow still counts as a confirmed first-byte success.
+func (f *FlowRuntime) confirmFirstByte() {
+	f.reportFirstByte(false)
+}
+
+func (f *FlowRuntime) reportFirstByte(measured bool) {
 	if f == nil {
 		return
 	}
 	if f.firstByte.CompareAndSwap(false, true) && f.binding.Egress.Dialer != nil && f.binding.Egress.NetworkType.L4Proto != "" {
-		ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
-		nt := f.binding.Egress.NetworkType
-		slow := f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
+		slow := false
+		if measured {
+			ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
+			nt := f.binding.Egress.NetworkType
+			slow = f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
+		}
 		f.binding.Egress.Quality.FirstByte(slow)
 		recoveryHandled := f.binding.Egress.SelectPath.RecoveryFirstByte(slow)
 		if g := f.binding.Egress.Outbound; g != nil && !recoveryHandled && !f.binding.Egress.Quality.ControlsPin() {
