@@ -147,18 +147,18 @@ func (s *tcpRelayOffloadSession) reportLive() {
 }
 
 // recordFinal records what Run returned (session totals) minus what live
-// reports already covered, so no byte is counted twice.
+// reports already covered, so no byte is counted twice. With live reporting
+// the remainder goes through the same recorders as the live reports: the
+// full download recorder would measure TTFB against the flow lifetime.
 func (s *tcpRelayOffloadSession) recordFinal(leftRx, rightRx int64, leftRecord, rightRecord func(int64)) {
+	if s.live != nil {
+		leftRecord, rightRecord = s.live.Download, s.live.Upload
+	}
 	if d := leftRx - s.reportedLeftRx; d > 0 {
 		rightRecord(d) // left (client) received => upload
 	}
 	if d := rightRx - s.reportedRightRx; d > 0 {
 		leftRecord(d) // right (egress) received => download
-	} else if rightRx > 0 && s.live != nil && s.live.DownloadDone != nil {
-		// Every download byte was already reported live, which skips the
-		// first-byte observation the full recorder performs; keep it firing
-		// once per flow, at session end, as before live reporting existed.
-		s.live.DownloadDone()
 	}
 }
 
