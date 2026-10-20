@@ -120,4 +120,8 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026101
 
 // Published outbound includes UDP lifecycle fixes, actual reply peer attribution,
 // explicit BBR supply state, opt-in TCP MSS and verified UDP recovery capabilities.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261010025257-909593ea53cd
+// The current pin adds the upstream Vision TLS 1.3 framing and DirectCopy
+// transition fix, bounds the ServerHello session_id_len in the Vision filter
+// (a hostile length used to panic), and returns the simple-obfs first-request
+// build error instead of dereferencing a nil request.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020134410-2f4699a083bb

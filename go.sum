@@ -21,6 +21,8 @@ github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261009111629-0db0543ddc65 h1:+
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261009111629-0db0543ddc65/go.mod h1:Uz4Vs5q6xBnrYgFQOOZJxcryIVYNd6Y1Bnr56/6etgE=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261010025257-909593ea53cd h1:z9tz5j5YI3sqzU15O0/9Cs9xvn39QqrDRXiiGe+aJrc=
 github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261010025257-909593ea53cd/go.mod h1:Uz4Vs5q6xBnrYgFQOOZJxcryIVYNd6Y1Bnr56/6etgE=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020134410-2f4699a083bb h1:FV8XSbcBTAknKPiTsmvf9lMR/cTztpzI4JN+r01uU5A=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020134410-2f4699a083bb/go.mod h1:Uz4Vs5q6xBnrYgFQOOZJxcryIVYNd6Y1Bnr56/6etgE=
 github.com/Fan-chou/quic-go v0.0.0-20261003051923-42916a975611 h1:LGe1CblbcCH2aKb3ZpI5NEWFusml0SUXJqo3qN3slcs=
 github.com/Fan-chou/quic-go v0.0.0-20261003051923-42916a975611/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Fan-chou/quic-go v0.0.0-20261010024030-18f87d1c8c58 h1:2kUlbR7qSrZfPLPK1EbSGDBE/zW+2iOZn55WgVlz25M=
