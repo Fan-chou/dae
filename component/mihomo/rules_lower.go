@@ -383,6 +383,25 @@ func needsOrdered(e *expr, negated bool) bool {
 	return false
 }
 
+// withoutAlwaysTrue drops the MATCH conjuncts of an AND. Lowering spells an
+// unconditional MATCH as port(0-65535), which costs a match entry in every
+// routing walk and is not a real transport predicate. When every conjunct is
+// MATCH the list is returned unchanged so the rule keeps one atom.
+func withoutAlwaysTrue(children []*expr, negated bool) []*expr {
+	kept := make([]*expr, 0, len(children))
+	for _, c := range children {
+		if !negated && c.kind == kindAtom && c.memoID == 0 && !c.noResolve &&
+			c.atom != nil && strings.EqualFold(c.atom.typ, "MATCH") {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if len(kept) == 0 {
+		return children
+	}
+	return kept
+}
+
 type term []*config_parser.Function
 
 // terms lowers e to a disjunction of conjunctions. An empty result is "never
@@ -488,6 +507,11 @@ func (l *lowerer) ordered(e *expr, inhibit, negated bool) (*routing.OrderedExpr,
 		if err != nil {
 			return nil, err
 		}
+		if result.MemoID != 0 {
+			// The guard folded down to a node that already carries a memo id
+			// (a nested SUB-RULE guard). Keep both ids by tagging a wrapper.
+			result = &routing.OrderedExpr{Op: "and", Children: []*routing.OrderedExpr{result}}
+		}
 		result.MemoID = id
 		if negated {
 			result = &routing.OrderedExpr{Op: "not", Children: []*routing.OrderedExpr{result}}
@@ -504,12 +528,21 @@ func (l *lowerer) ordered(e *expr, inhibit, negated bool) (*routing.OrderedExpr,
 			op = "or"
 		}
 		out := &routing.OrderedExpr{Op: op}
-		for _, c := range e.children {
+		children := e.children
+		if op == "and" {
+			children = withoutAlwaysTrue(children, negated)
+		}
+		for _, c := range children {
 			child, err := l.ordered(c, inhibit, negated)
 			if err != nil {
 				return nil, err
 			}
 			out.Children = append(out.Children, child)
+		}
+		if len(out.Children) == 1 {
+			// `X AND true` is X. The memo branch above wraps a result that
+			// already carries a memo id before it tags it.
+			return out.Children[0], nil
 		}
 		return out, nil
 	case kindAtom:

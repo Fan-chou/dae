@@ -47,6 +47,8 @@ var ruleDeviations = map[string]string{
 	"domain_wildcard_star":           devRegexEscape,
 	"domain_wildcard_q":              devRegexEscape,
 	"domain_wildcard_upper_special":  devRegexEscape,
+	"sub_leaf_match":                 devAlwaysTrueFolded,
+	"sub_leaf_match_then_more":       devAlwaysTrueFolded,
 }
 
 // mihomoAligned lists cases where Mihomo itself loads the rules and the
@@ -179,6 +181,12 @@ func programHasIgnoring(term string, n int) func(*testing.T, *LoweredRules) {
 // the cap, MATCH included). Counting after merging keeps them. The result is
 // checked against the same rules lowered without merging and without a cap.
 const devMergeCap = "rule cap applied after adjacent rules are merged"
+
+// devAlwaysTrueFolded: the sidecar spells a MATCH conjunct as port(0-65535),
+// which only costs a match entry in every routing walk. Lowering drops it
+// (`X AND true` is X), so the oracle's program is compared with that conjunct
+// removed.
+const devAlwaysTrueFolded = "MATCH conjunct dropped instead of spelled port(0-65535)"
 
 // devRegexEscape: the sidecar writes routes.dae with every backslash doubled,
 // but dae's parser does not unescape double-quoted values, so the regex dae
@@ -321,6 +329,15 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 			require.NoError(t, err)
 			gotProg, err := canonProgram(got.Rules, got.Fallback)
 			require.NoError(t, err)
+			if deviation == devAlwaysTrueFolded {
+				changed := false
+				for i, line := range wantProg {
+					if folded := strings.ReplaceAll(line, " & port(0-65535)", ""); folded != line {
+						wantProg[i], changed = folded, true
+					}
+				}
+				require.True(t, changed, "stale deviation: the sidecar no longer spells MATCH as port(0-65535)")
+			}
 			require.Equal(t, wantProg, gotProg)
 
 			var wantEvents, gotEvents []string
