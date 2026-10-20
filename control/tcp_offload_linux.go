@@ -111,11 +111,58 @@ type tcpRelayOffloadSession struct {
 	// Returning to redirection could overtake a queued SK_PASS tail.
 	fallbackReady bool
 
+	// live, when set, receives tcp_info receive deltas while the session runs
+	// so an offloaded flow's byte counters (flow list, global rate) advance
+	// during the transfer instead of jumping once at close. reportedLeftRx
+	// and reportedRightRx are what live has already been given; they are only
+	// touched by the Run goroutine and by the caller after Run returns.
+	live            *tcpOffloadLiveAccounting
+	reportedLeftRx  int64
+	reportedRightRx int64
+
 	forceCloseOnce sync.Once
 	closeOnce      sync.Once
 }
 
-func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64)) (offloaded bool, reason string, err error) {
+// reportLive pushes the tcp_info receive growth since the previous report to
+// the live recorders. It reads two getsockopt(TCP_INFO) from the control
+// plane only; the kernel redirect path is untouched. Once the sockets are
+// force-closed the final snapshot owns accounting and this is a no-op.
+func (s *tcpRelayOffloadSession) reportLive() {
+	if s.live == nil || s.accounted.Load() {
+		return
+	}
+	l, r, err := s.rxDeltas()
+	if err != nil {
+		return
+	}
+	if d := l - s.reportedLeftRx; d > 0 {
+		s.reportedLeftRx = l
+		s.live.Upload(d) // left (client) received => upload
+	}
+	if d := r - s.reportedRightRx; d > 0 {
+		s.reportedRightRx = r
+		s.live.Download(d) // right (egress) received => download
+	}
+}
+
+// recordFinal records what Run returned (session totals) minus what live
+// reports already covered, so no byte is counted twice.
+func (s *tcpRelayOffloadSession) recordFinal(leftRx, rightRx int64, leftRecord, rightRecord func(int64)) {
+	if d := leftRx - s.reportedLeftRx; d > 0 {
+		rightRecord(d) // left (client) received => upload
+	}
+	if d := rightRx - s.reportedRightRx; d > 0 {
+		leftRecord(d) // right (egress) received => download
+	} else if rightRx > 0 && s.live != nil && s.live.DownloadDone != nil {
+		// Every download byte was already reported live, which skips the
+		// first-byte observation the full recorder performs; keep it firing
+		// once per flow, at session end, as before live reporting existed.
+		s.live.DownloadDone()
+	}
+}
+
+func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64), live *tcpOffloadLiveAccounting) (offloaded bool, reason string, err error) {
 	if c == nil || c.core == nil {
 		return false, "", nil
 	}
@@ -149,18 +196,14 @@ func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netpr
 		return false, "", err
 	}
 	defer func() { _ = session.Close() }()
+	session.live = live
 
 	if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		c.log.Debugf("TCP relay eBPF offload: %v <-> %v", session.left.RemoteAddr(), session.right.RemoteAddr())
 	}
 
 	leftRx, rightRx, err := session.Run(ctx)
-	if leftRx > 0 {
-		rightRecord(leftRx) // left (client) received => upload
-	}
-	if rightRx > 0 {
-		leftRecord(rightRx) // right (egress) received => download
-	}
+	session.recordFinal(leftRx, rightRx, leftRecord, rightRecord)
 	return true, "", err
 }
 
@@ -510,6 +553,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		// starve it.
 		if time.Since(lastGuard) >= tcpOffloadEpollWaitCap {
 			lastGuard = time.Now()
+			s.reportLive()
 			engage, startFallback, err := s.fuseStep()
 			if err != nil {
 				s.forceClose()

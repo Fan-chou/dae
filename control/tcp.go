@@ -365,7 +365,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// the user-space relay. A registered offload session blocks until both
 	// sockets close; any pre-registration failure falls through silently.
 	var offloadErr error
-	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, flow.recordDownload, flow.recordUpload)
+	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, flow.recordDownload, flow.recordUpload, flow.offloadLiveAccounting())
 	if offloadErr != nil {
 		captureOutcome = "offload_error"
 		if captureError != nil {

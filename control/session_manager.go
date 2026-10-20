@@ -502,9 +502,33 @@ func (f *FlowRuntime) recordDownload(n int64) {
 	if f == nil || n <= 0 {
 		return
 	}
-	f.binding.Egress.Dialer.LoadBytes(0, uint64(n))
-	f.downloadBytes.Add(uint64(n))
-	f.capture.Load().Add(0, uint64(n))
+	f.addDownloadBytes(uint64(n))
+	f.observeFirstByte()
+}
+
+// recordDownloadBytes counts download bytes without the first-byte
+// observation, for periodic reports that cannot tell when the first byte
+// actually arrived.
+func (f *FlowRuntime) recordDownloadBytes(n int64) {
+	RecordDownloadTraffic(n)
+	if f == nil || n <= 0 {
+		return
+	}
+	f.addDownloadBytes(uint64(n))
+}
+
+func (f *FlowRuntime) addDownloadBytes(n uint64) {
+	f.binding.Egress.Dialer.LoadBytes(0, n)
+	f.downloadBytes.Add(n)
+	f.capture.Load().Add(0, n)
+}
+
+// observeFirstByte feeds the time-to-first-byte of the flow to the dialer
+// quality trackers, once per flow.
+func (f *FlowRuntime) observeFirstByte() {
+	if f == nil {
+		return
+	}
 	if f.firstByte.CompareAndSwap(false, true) && f.binding.Egress.Dialer != nil && f.binding.Egress.NetworkType.L4Proto != "" {
 		ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
 		nt := f.binding.Egress.NetworkType
