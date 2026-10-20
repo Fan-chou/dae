@@ -122,3 +122,42 @@ func TestNestedSubRuleGuardsKeepTheirMemoIds(t *testing.T) {
 	collect(e)
 	require.Len(t, ids, 2, "both guards keep a distinct memo id")
 }
+
+// An ignored IN-PORT inside an OR is a branch that never matches. It must not
+// leave a !port(0-65535) atom in the rule, but the ignore still gets reported.
+func TestIgnoredBranchInOrIsDroppedAndReported(t *testing.T) {
+	env := RuleEnv{
+		Providers: map[string]string{"rules-a": "rules-a"},
+		Outbounds: map[string]string{"G": "G"},
+	}
+	lower := func(body string) *LoweredRules {
+		got, err := LowerRules(
+			[]Rule{{Raw: "SUB-RULE,(RULE-SET,rules-a),sub", Index: 0, Line: 1}, {Raw: "MATCH,DIRECT", Index: 1, Line: 2}},
+			[]SubRule{{Name: "sub", Rules: []Rule{{Raw: body, Index: 0, Line: 1}}}},
+			env,
+		)
+		require.NoError(t, err)
+		return got
+	}
+
+	got := lower("OR,((SRC-IP-CIDR,192.168.1.1/32),(IN-PORT,7890)),G")
+	require.Len(t, got.Rules, 1)
+	require.False(t, hasPortRange(t, got.Rules, "0-65535"))
+	canon, err := canonProgram(got.Rules, got.Fallback)
+	require.NoError(t, err)
+	require.Len(t, canon, 2)
+	require.Contains(t, canon[0], "ruleset(rules-a)")
+	require.NotContains(t, canon[0], "port")
+	var ignored int
+	for _, e := range got.Events {
+		if e.Kind == EventIgnore {
+			ignored++
+		}
+	}
+	require.Equal(t, 1, ignored, "the dropped branch is still reported")
+
+	// Every branch ignored: nothing can match, but the rule keeps an atom.
+	dead := lower("OR,((IN-PORT,1),(IN-PORT,2)),G")
+	require.Len(t, dead.Rules, 1)
+	require.True(t, hasPortRange(t, dead.Rules, "0-65535"))
+}

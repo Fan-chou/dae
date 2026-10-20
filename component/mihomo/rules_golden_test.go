@@ -49,6 +49,7 @@ var ruleDeviations = map[string]string{
 	"domain_wildcard_upper_special":  devRegexEscape,
 	"sub_leaf_match":                 devAlwaysTrueFolded,
 	"sub_leaf_match_then_more":       devAlwaysTrueFolded,
+	"ordered_or_with_ignored":        devNeverMatchDropped,
 }
 
 // mihomoAligned lists cases where Mihomo itself loads the rules and the
@@ -187,6 +188,13 @@ const devMergeCap = "rule cap applied after adjacent rules are merged"
 // (`X AND true` is X), so the oracle's program is compared with that conjunct
 // removed.
 const devAlwaysTrueFolded = "MATCH conjunct dropped instead of spelled port(0-65535)"
+
+// devNeverMatchDropped: in an ordered rule the sidecar keeps an ignored
+// IN-PORT/IP-ASN branch as a never-matching term (`!port(0-65535)`), which is
+// a dead rule. Lowering leaves the branch out (`X OR false` is X) and still
+// reports the ignore event, so the oracle's program is compared without its
+// dead terms.
+const devNeverMatchDropped = "never-matching OR branch dropped instead of spelled !port(0-65535)"
 
 // devRegexEscape: the sidecar writes routes.dae with every backslash doubled,
 // but dae's parser does not unescape double-quoted values, so the regex dae
@@ -337,6 +345,16 @@ func TestRuleLoweringMatchesArchivedSidecar(t *testing.T) {
 					}
 				}
 				require.True(t, changed, "stale deviation: the sidecar no longer spells MATCH as port(0-65535)")
+			}
+			if deviation == devNeverMatchDropped {
+				var live []string
+				for _, line := range wantProg {
+					if !strings.Contains(line, "!port(0-65535)") {
+						live = append(live, line)
+					}
+				}
+				require.NotEqual(t, len(wantProg), len(live), "stale deviation: the sidecar no longer keeps a never-matching term")
+				wantProg = live
 			}
 			require.Equal(t, wantProg, gotProg)
 

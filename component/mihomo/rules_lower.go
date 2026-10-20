@@ -383,6 +383,28 @@ func needsOrdered(e *expr, negated bool) bool {
 	return false
 }
 
+// neverMatches reports an atom that lowers to "no terms": IN-PORT and IP-ASN
+// depend on runtime data that is not modeled, so terms() treats them as a
+// branch that never matches, negated or not.
+func neverMatches(e *expr) bool {
+	if e.kind != kindAtom || e.atom == nil || e.memoID != 0 {
+		return false
+	}
+	typ := strings.ToUpper(e.atom.typ)
+	return typ == "IN-PORT" || typ == "IP-ASN"
+}
+
+// hasLiveBranch reports whether at least one branch can match. An OR whose
+// branches never match keeps them all, so the rule still has an atom.
+func hasLiveBranch(children []*expr) bool {
+	for _, c := range children {
+		if !neverMatches(c) {
+			return true
+		}
+	}
+	return false
+}
+
 // withoutAlwaysTrue drops the MATCH conjuncts of an AND. Lowering spells an
 // unconditional MATCH as port(0-65535), which costs a match entry in every
 // routing walk and is not a real transport predicate. When every conjunct is
@@ -528,11 +550,22 @@ func (l *lowerer) ordered(e *expr, inhibit, negated bool) (*routing.OrderedExpr,
 			op = "or"
 		}
 		out := &routing.OrderedExpr{Op: op}
-		children := e.children
-		if op == "and" {
+		children, dropFalse := e.children, false
+		switch op {
+		case "and":
 			children = withoutAlwaysTrue(children, negated)
+		case "or":
+			dropFalse = hasLiveBranch(children)
 		}
 		for _, c := range children {
+			if dropFalse && neverMatches(c) {
+				// `X OR false` is X. terms() is what reports the ignored atom,
+				// so call it for the event and keep the branch out of the tree.
+				if _, err := l.terms(c, negated, 1); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			child, err := l.ordered(c, inhibit, negated)
 			if err != nil {
 				return nil, err
