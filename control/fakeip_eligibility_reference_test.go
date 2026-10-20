@@ -73,7 +73,16 @@ func (m *RoutingMatcher) fakeIPEvalKnownReference(match compiledRoutingMatch, in
 			return fakeIPKleeneTrue, true
 		}
 		return fakeIPKleeneFalse, true
-	case consts.MatchType_L4Proto, consts.MatchType_Port, consts.MatchType_SourcePort:
+	case consts.MatchType_Port, consts.MatchType_SourcePort:
+		// A range covering every port is a tautology, not a transport
+		// predicate. Mihomo lowering uses port(0-65535) for an unconditional
+		// MATCH (e.g. SUB-RULE,(RULE-SET,x),sub with a MATCH body), so
+		// treating it as FALSE would disable every such domain rule.
+		if fakeIPPortIsFullRange(match) {
+			return fakeIPKleeneTrue, true
+		}
+		return fakeIPKleeneFalse, true
+	case consts.MatchType_L4Proto:
 		// DNS has no dest 5-tuple. Treat transport predicates as FALSE so
 		// QUIC-intercept rules (domain && udp && dport -> block) do not
 		// stop the walk; the later domain-only proxy rule can still hit.

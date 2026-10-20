@@ -64,6 +64,11 @@ func fakeIPMatchIsDomain(matchType consts.MatchType) bool {
 	return matchType == consts.MatchType_DomainSet
 }
 
+// fakeIPPortIsFullRange reports a port/sport range that every port satisfies.
+func fakeIPPortIsFullRange(match compiledRoutingMatch) bool {
+	return match.portStart == 0 && match.portEnd == 65535
+}
+
 func fakeIPMacIsZero(mac [6]byte) bool {
 	return mac == [6]byte{}
 }
@@ -212,7 +217,16 @@ func (f *fakeIPEligibilityFacts) evalKnown(match compiledRoutingMatch, index int
 			return fakeIPKleeneTrue, true
 		}
 		return fakeIPKleeneFalse, true
-	case consts.MatchType_L4Proto, consts.MatchType_Port, consts.MatchType_SourcePort:
+	case consts.MatchType_Port, consts.MatchType_SourcePort:
+		// A range covering every port is a tautology, not a transport
+		// predicate. Mihomo lowering uses port(0-65535) for an unconditional
+		// MATCH (e.g. SUB-RULE,(RULE-SET,x),sub with a MATCH body), so
+		// treating it as FALSE would disable every such domain rule.
+		if fakeIPPortIsFullRange(match) {
+			return fakeIPKleeneTrue, true
+		}
+		return fakeIPKleeneFalse, true
+	case consts.MatchType_L4Proto:
 		// DNS has no dest 5-tuple. Treat transport predicates as FALSE so
 		// QUIC-intercept rules (domain && udp && dport -> block) do not
 		// stop the walk; the later domain-only proxy rule can still hit.
@@ -237,7 +251,8 @@ func (f *fakeIPEligibilityFacts) evalKnown(match compiledRoutingMatch, index int
 }
 
 // FakeIPEligibility walks traffic routing with Kleene three-value first-match.
-// Rules without domain() are skipped. l4proto/dport/sport are FALSE (continue).
+// Rules without domain() are skipped. l4proto and dport/sport are FALSE
+// (continue), except a port range covering 0-65535, which is TRUE.
 // DNS sip/mac are evaluated from this query when present. dest ip() uses real
 // A/AAAA answers when provided; missing dest stays UNKNOWN. Multiple dests:
 // any PROXY wins, all DIRECT is DIRECT, Direct+Unknown stays UNKNOWN (ShouldFake

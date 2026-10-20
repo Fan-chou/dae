@@ -25,6 +25,10 @@ func TestFakeIPEligibilityOptimizedMatchesReference(t *testing.T) {
    fallback: direct`,
 		`domain(suffix: example.com) && mac('aa:bb:cc:dd:ee:ff') -> proxy
    fallback: direct`,
+		`domain(suffix: example.com) && port(0-65535) -> direct
+   domain(suffix: other.example) && !port(0-65535) -> direct
+   domain(suffix: other.example) && sport(0-65535) && ip(203.0.113.0/24) -> direct
+   fallback: proxy`,
 	}
 	for i, policy := range policies {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {

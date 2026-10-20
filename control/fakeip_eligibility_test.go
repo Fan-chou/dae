@@ -202,6 +202,43 @@ fallback: Apple_Proxy
 	}
 }
 
+// Mihomo lowering writes an unconditional MATCH as port(0-65535), so
+// `SUB-RULE,(RULE-SET,x),sub` with a MATCH body becomes `domain && port(0-65535)`.
+func TestFakeIPEligibility_FullPortRangeIsTautology(t *testing.T) {
+	m := testFakeIPMatcher(t, `
+domain(suffix: baidu.com) && port(0-65535) -> CN_CN
+domain(suffix: weibo.com) && sport(0-65535) -> CN_CN
+domain(suffix: never.example) && !port(0-65535) -> CN_CN
+domain(suffix: openai.com) && port(0-65535) -> Apple_Proxy
+fallback: Apple_Proxy
+`, []string{"CN_CN", "Apple_Proxy"})
+	m.fakeIPLeafIsProxy = func(idx consts.OutboundIndex) bool { return idx != consts.OutboundUserDefinedMin }
+	for name, want := range map[string]FakeIPEligibility{
+		"www.baidu.com":   FakeIPEligibilityDirect,
+		"www.weibo.com":   FakeIPEligibilityDirect,
+		"never.example":   FakeIPEligibilityProxy, // !tautology never hits; falls to fallback
+		"chat.openai.com": FakeIPEligibilityProxy,
+		"unlisted.test":   FakeIPEligibilityProxy,
+	} {
+		if got := m.FakeIPEligibility(name, ipv4Ver()); got != want {
+			t.Errorf("%s: got %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestFakeIPEligibility_PartialPortRangeStaysFalse(t *testing.T) {
+	m := testFakeIPMatcher(t, `
+domain(suffix: example.com) && port(1-65535) -> CN_CN
+domain(suffix: example.com) && port(0-65534) -> CN_CN
+domain(suffix: example.com) -> Apple_Proxy
+fallback: CN_CN
+`, []string{"CN_CN", "Apple_Proxy"})
+	m.fakeIPLeafIsProxy = func(idx consts.OutboundIndex) bool { return idx != consts.OutboundUserDefinedMin }
+	if got := m.FakeIPEligibility("www.example.com", ipv4Ver()); got != FakeIPEligibilityProxy {
+		t.Fatalf("got %v, want PROXY (partial port ranges are not tautologies)", got)
+	}
+}
+
 func TestFakeIPEligibility_FallbackProxyIsProxy(t *testing.T) {
 	m := testFakeIPMatcher(t, `
 domain(suffix: lan) -> direct
