@@ -29,7 +29,7 @@
 </template>
 
 <script setup lang="ts">
-import { state } from '@/fdae/client'
+import { totalConnectionCount } from '@/fdae/kernelConnections'
 import { prettyBytesHelper } from '@/helper/utils'
 import {
   activeConnections,
@@ -50,10 +50,7 @@ const statItems = computed(() => {
     {
       key: 'connections',
       icon: ArrowsRightLeftIcon,
-      value: state.status
-        ? (state.status.active_connections ?? 0) +
-          (state.status.udp_sessions ?? 0)
-        : '—',
+      value: totalConnectionCount() ?? '—',
     },
     {
       key: 'download',

@@ -30,6 +30,12 @@
         </div>
         <div class="text-base-content/50 text-xs">
           {{ $t('total') }} {{ ulTotalStr }}
+          <span
+            v-if="kernelUl"
+            title="内核直接转发、当前仍在跟踪的连接的累计字节，不含在左侧总量内"
+          >
+            · 内核转发 {{ kernelUl }}
+          </span>
         </div>
       </div>
 
@@ -60,6 +66,12 @@
         </div>
         <div class="text-base-content/50 text-xs">
           {{ $t('total') }} {{ dlTotalStr }}
+          <span
+            v-if="kernelDl"
+            title="内核直接转发、当前仍在跟踪的连接的累计字节，不含在左侧总量内"
+          >
+            · 内核转发 {{ kernelDl }}
+          </span>
         </div>
       </div>
 
@@ -103,7 +115,10 @@ import {
 } from '@/components/charts/chartTooltip'
 import type { ChartTooltipParam } from '@/components/charts/chartTypes'
 import { prettyBytesHelper } from '@/helper/utils'
-import { state } from '@/fdae/client'
+import {
+  kernelTrackedBytes,
+  totalConnectionCount,
+} from '@/fdae/kernelConnections'
 import {
   activeConnections,
   downloadTotal,
@@ -133,11 +148,15 @@ const ulSpeedParts = computed(() => splitBytes(uploadSpeed.value))
 const dlSpeedParts = computed(() => splitBytes(downloadSpeed.value))
 const ulTotalStr = computed(() => prettyBytesHelper(uploadTotal.value))
 const dlTotalStr = computed(() => prettyBytesHelper(downloadTotal.value))
-const connectionCount = computed(() =>
-  state.status
-    ? (state.status.active_connections ?? 0) + (state.status.udp_sessions ?? 0)
-    : null,
-)
+const connectionCount = computed(() => totalConnectionCount())
+const kernelUl = computed(() => {
+  const tracked = kernelTrackedBytes()
+  return tracked ? prettyBytesHelper(tracked.up) : ''
+})
+const kernelDl = computed(() => {
+  const tracked = kernelTrackedBytes()
+  return tracked ? prettyBytesHelper(tracked.down) : ''
+})
 const memoryStr = computed(() =>
   prettyBytesHelper(memory.value, { binary: true }),
 )

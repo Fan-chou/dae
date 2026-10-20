@@ -80,7 +80,11 @@
         class="flex cursor-pointer items-center gap-1.5"
         title="同时列出由内核直接转发、不经过 fdae 用户态的连接（读取 conntrack）。关闭时不会读取。"
       >
-        <input v-model="includeKernel" type="checkbox" class="checkbox checkbox-sm" />
+        <input
+          v-model="includeKernel"
+          type="checkbox"
+          class="checkbox checkbox-sm"
+        />
         <span>含内核转发</span>
       </label>
       <button class="btn btn-ghost btn-sm" @click="clear">清除筛选</button>
@@ -124,6 +128,9 @@
       <span v-if="kernelState.truncated" class="text-warning"
         >内核转发已按流量截断</span
       >
+      <span v-if="kernelState.at && !kernelState.global" class="text-warning"
+        >已按源 IP / MAC 缩小，概览汇总暂不计入内核转发</span
+      >
       <span v-if="kernelState.error" class="text-warning">{{
         kernelState.error
       }}</span>
@@ -138,9 +145,9 @@
         （仅对之后新建的连接生效）</span
       >
       <span class="text-base-content/40"
-        >内核转发的流量为 IP
-        层字节（含头部），比 fdae 转发的应用层字节略大；域名来自 DNS
-        缓存反查，可能不准；MAC 来自 fdae 数据面学到的 IP-MAC 对应，未学到时为空；出站统一显示 direct。</span
+        >内核转发的流量为 IP 层字节（含头部），比 fdae
+        转发的应用层字节略大；域名来自 DNS 缓存反查，可能不准；MAC 来自 fdae
+        数据面学到的 IP-MAC 对应，未学到时为空；出站统一显示 direct。</span
       >
     </div>
   </div>

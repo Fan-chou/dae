@@ -1,5 +1,6 @@
 import { fetchMemoryAPI, fetchTrafficAPI } from '@/assembly/overview'
 import { state } from '@/fdae/client'
+import { kernelOverview } from '@/fdae/kernelConnections'
 import { ref, watch } from 'vue'
 import { activeConnections, downloadTotal, uploadTotal } from './connections'
 
@@ -64,7 +65,8 @@ export const initSatistic = () => {
         value: [
           timestamp,
           (state.status?.active_connections ?? 0) +
-            (state.status?.udp_sessions ?? 0),
+            (state.status?.udp_sessions ?? 0) +
+            (kernelOverview()?.total ?? 0),
         ],
         name: timestamp,
       })
@@ -89,8 +91,13 @@ export const initSatistic = () => {
 
       const timestamp = Date.now().valueOf()
 
-      downloadSpeed.value = data.down
-      uploadSpeed.value = data.up
+      // 内核直接转发的流量不经过 fdae，status 里没有；这里把内核合计速率并进来。
+      const kernel = kernelOverview()
+      const down = data.down + (kernel?.downSpeed ?? 0)
+      const up = data.up + (kernel?.upSpeed ?? 0)
+
+      downloadSpeed.value = down
+      uploadSpeed.value = up
       // 总量由连接 WS 消息携带,在 store/connections 写入;
       // 统计流带上这两个字段时才以它为准,缺失时不覆盖。
       if (data.downTotal != null && data.upTotal != null) {
@@ -99,11 +106,11 @@ export const initSatistic = () => {
       }
 
       downloadSpeedHistory.value.push({
-        value: [timestamp, data.down],
+        value: [timestamp, down],
         name: timestamp,
       })
       uploadSpeedHistory.value.push({
-        value: [timestamp, data.up],
+        value: [timestamp, up],
         name: timestamp,
       })
 

@@ -28,8 +28,9 @@
       }}</span>
     </div>
     <p class="mt-2">
-      全局流量与连接数来自 fdae 运行状态；仅包含 fdae
-      跟踪的流量。分类图表基于已加载连接（{{ state.loaded }}/{{
+      全局连接数与速率 = fdae 运行状态 + 内核转发（读取
+      conntrack，开启「含内核转发」时）；累计总量仅含
+      fdae，内核转发另列。分类图表基于已加载连接（{{ state.loaded }}/{{
         state.total
       }}），受列表上限、筛选和采样影响。
     </p>

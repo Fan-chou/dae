@@ -7,6 +7,7 @@
         class="select select-sm"
         aria-label="汇总维度"
       >
+        <option value="forwarder">转发方</option>
         <option value="source">源 IP</option>
         <option value="mac">MAC</option>
         <option value="outbound">出站</option>
@@ -14,9 +15,17 @@
       </select>
     </div>
     <p class="mt-2 text-xs text-base-content/50">
-      当前快照 {{ state.loaded }} /
-      {{ state.total }} 条；流量为这些连接的累计值，沿用连接页服务端筛选。{{
-        state.truncated ? '快照已截断。' : ''
+      当前快照 fdae {{ state.loaded }} / {{ state.total }} 条<template
+        v-if="includeKernel && kernelState.at"
+      >
+        · 内核转发 {{ kernelState.loaded }} /
+        {{ kernelState.total }} 条</template
+      >；流量为这些连接的累计值，沿用连接页服务端筛选。{{
+        state.truncated || kernelState.truncated ? '快照已截断。' : ''
+      }}{{
+        includeKernel && kernelState.at && !kernelState.accounting
+          ? '内核未启用流量计数，内核转发行不含流量。'
+          : ''
       }}
     </p>
     <div class="mt-3 max-h-80 overflow-auto">
@@ -70,7 +79,10 @@ import { computed, ref } from 'vue'
 import { activeConnections } from '@/store/connections'
 import { prettyBytesHelper } from '@/helper/utils'
 import { state } from './client'
-const dimension = ref<'source' | 'mac' | 'outbound' | 'destination'>('source')
+import { includeKernel, kernelState } from './kernelConnections'
+const dimension = ref<
+  'forwarder' | 'source' | 'mac' | 'outbound' | 'destination'
+>('source')
 const rows = computed(() => {
   const groups = new Map<
     string,
@@ -80,13 +92,17 @@ const rows = computed(() => {
     const raw = connection.fdae
     if (!raw) continue
     const name =
-      (dimension.value === 'source'
-        ? connection.metadata.sourceIP
-        : dimension.value === 'mac'
-          ? raw.mac
-          : dimension.value === 'outbound'
-            ? raw.outbound
-            : raw.domain || connection.metadata.destinationIP) || '未提供'
+      (dimension.value === 'forwarder'
+        ? connection.kernel
+          ? '内核转发'
+          : 'fdae 用户态'
+        : dimension.value === 'source'
+          ? connection.metadata.sourceIP
+          : dimension.value === 'mac'
+            ? raw.mac
+            : dimension.value === 'outbound'
+              ? raw.outbound
+              : raw.domain || connection.metadata.destinationIP) || '未提供'
     const row = groups.get(name) || { name, count: 0, upload: 0, download: 0 }
     row.count++
     row.upload += raw.upload

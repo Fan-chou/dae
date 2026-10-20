@@ -8,7 +8,7 @@
       class="flex flex-col items-start gap-0.5"
     >
       <div class="text-base-content/45 text-[11px] leading-tight">
-        {{ $t(stat.label) }}
+        {{ stat.raw ? stat.label : $t(stat.label) }}
       </div>
       <div class="text-base-content/80 text-sm leading-tight tabular-nums">
         {{ stat.value }}
@@ -18,7 +18,10 @@
 </template>
 
 <script setup lang="ts">
-import { state } from '@/fdae/client'
+import {
+  kernelTrackedBytes,
+  totalConnectionCount,
+} from '@/fdae/kernelConnections'
 import { prettyBytesHelper } from '@/helper/utils'
 import {
   activeConnections,
@@ -28,13 +31,12 @@ import {
 import { downloadSpeed, memory, uploadSpeed } from '@/store/overview'
 import { computed } from 'vue'
 
-const statistics = computed(() => [
+const statistics = computed<
+  { label: string; value: string | number; raw?: boolean }[]
+>(() => [
   {
     label: 'connections',
-    value: state.status
-      ? (state.status.active_connections ?? 0) +
-        (state.status.udp_sessions ?? 0)
-      : '—',
+    value: totalConnectionCount() ?? '—',
   },
   {
     label: 'memoryUsage',
@@ -56,5 +58,25 @@ const statistics = computed(() => [
     label: 'ulSpeed',
     value: `${prettyBytesHelper(uploadSpeed.value)}/s`,
   },
+  ...kernelRows(),
 ])
+
+// 累计总量只含 fdae；内核转发另列当前正在跟踪的连接的字节。
+function kernelRows() {
+  const tracked = kernelTrackedBytes()
+  return tracked
+    ? [
+        {
+          label: '内核转发下载',
+          raw: true,
+          value: prettyBytesHelper(tracked.down),
+        },
+        {
+          label: '内核转发上传',
+          raw: true,
+          value: prettyBytesHelper(tracked.up),
+        },
+      ]
+    : []
+}
 </script>

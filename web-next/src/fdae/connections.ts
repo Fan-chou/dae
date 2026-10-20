@@ -15,6 +15,7 @@ import {
   includeKernel,
   kernelState,
   mapKernelConnection,
+  summarizeKernel,
   withKernelRates,
   type KernelRow,
 } from './kernelConnections'
@@ -83,6 +84,7 @@ export function subscribeConnections() {
   let kernelAt = 0,
     kernelKey = '',
     kernelConnections: Connection[] = []
+  let kernelSums = { upSpeed: 0, downSpeed: 0, upBytes: 0, downBytes: 0 }
   return polling<ConnectionsSnapshot>(async (backend) => {
     const source =
       sourceIPFilter.value?.length === 1 ? sourceIPFilter.value[0]! : ''
@@ -101,6 +103,7 @@ export function subscribeConnections() {
     })
     if (source) kernelQuery.set('src', source)
     if (state.filter.mac) kernelQuery.set('mac', state.filter.mac)
+    const kernelClosed: Connection[] = []
     try {
       const kernelRequest = wantKernel
         ? fetchKernelConnections(kernelQuery, backend).then(
@@ -166,25 +169,19 @@ export function subscribeConnections() {
         for (const pair of state.devicePairs)
           pairs.set(JSON.stringify(pair), pair)
       }
-      for (const row of active) {
-        const ip = row.metadata.sourceIP
-        const mac = row.fdae?.mac?.toLowerCase() || ''
-        if (!ip) continue
-        const pair = { ip, mac: mac === '00:00:00:00:00:00' ? '' : mac }
-        pairs.set(JSON.stringify(pair), pair)
-      }
-      state.devicePairs = [...pairs.values()].slice(-2048)
       if (!wantKernel) {
         kernelPrev = new Map()
         kernelAt = 0
         kernelKey = ''
         kernelConnections = []
+        kernelSums = { upSpeed: 0, downSpeed: 0, upBytes: 0, downBytes: 0 }
         kernelState.at = 0
         kernelState.error = ''
       } else if (kernelResult && 'error' in kernelResult) {
         // A failing conntrack read must not take the proxy list down with it.
         kernelState.error = String(kernelResult.error.message)
         kernelConnections = []
+        kernelSums = { upSpeed: 0, downSpeed: 0, upBytes: 0, downBytes: 0 }
         kernelAt = 0
       } else if (kernelResult) {
         const ks = kernelResult.value
@@ -218,15 +215,46 @@ export function subscribeConnections() {
             rows.map((r) => [r.id, { upload: r.upload, download: r.download }]),
           )
           kernelAt = at
-          kernelConnections = rows.map((row) =>
+          const next = rows.map((row) =>
             mapKernelConnection(row, ks.accounting, (item) =>
               mapConnection(item, scope),
             ),
           )
+          // A flow that left a complete (untruncated) snapshot has ended or
+          // gone idle; one that fell off a truncated list may still be live.
+          if (!ks.truncated) {
+            const alive = new Set(next.map((row) => row.id))
+            for (const old of kernelConnections) {
+              if (alive.has(old.id)) continue
+              // The same tuple can come back later; keep the closed copy's
+              // id distinct so it does not mark the new flow as closed.
+              kernelClosed.push({
+                ...old,
+                id: old.id + '#' + at,
+                downloadSpeed: 0,
+                uploadSpeed: 0,
+              })
+            }
+          }
+          kernelConnections = next
+          kernelSums = summarizeKernel(rows, ks.accounting)
         }
         kernelState.loaded = kernelConnections.length
         kernelState.at = Date.now()
       }
+      // Overview numbers are global, so they only take the kernel side
+      // when the kernel query was not narrowed by a source or MAC filter.
+      Object.assign(kernelState, kernelSums, {
+        global: wantKernel && !!kernelState.at && !source && !state.filter.mac,
+      })
+      for (const row of active.concat(kernelConnections)) {
+        const ip = row.metadata.sourceIP
+        const mac = row.fdae?.mac?.toLowerCase() || ''
+        if (!ip) continue
+        const pair = { ip, mac: mac === '00:00:00:00:00:00' ? '' : mac }
+        pairs.set(JSON.stringify(pair), pair)
+      }
+      state.devicePairs = [...pairs.values()].slice(-2048)
       Object.assign(state, {
         connectionsAt: now,
         connectionsError: '',
@@ -239,7 +267,7 @@ export function subscribeConnections() {
         active: kernelConnections.length
           ? active.concat(kernelConnections)
           : active,
-        closed,
+        closed: kernelClosed.length ? closed.concat(kernelClosed) : closed,
         resetHistory,
         // Prefer the totals read together with the flow list; /v1/status is a
         // separate request taken at a slightly different moment.
