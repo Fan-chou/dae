@@ -171,9 +171,20 @@ Looked at and deliberately not carried:
   (anytls UDP framing), `0f24c13`, `8396fb0` (REALITY retries): conflict with fork code
   that is already restructured; not reviewed further.
 
-Open and worth a careful manual port: `2735b84` (direct UDP receiver). Its two fixes
-are an fd-number reuse race between `recvfrom` and fd close (a drain can read a
-datagram from a different socket) and a fatal `EpollWait` error that silently
-blackholes every later registration. It conflicts in
-`protocol/direct/packet_receiver_linux.go` and changes locking on the direct UDP hot
-path, so it should go in with a real UDP load check, not as a drive-by.
+`2735b84` (direct UDP receiver) needs no port; the earlier note here that it was "open
+and worth a careful manual port" was wrong. The cherry-pick conflicted because the fork
+already fixed both problems in its own way:
+
+- fd reuse between `recvfrom` and close: `directPacketReceiverEntry.receive` runs the
+  peek and the recv inside `raw.Control`, which holds the socket reference, so close is
+  deferred until the callback returns. `TestDirectPacketReceiverCloseProtectsInFlightRead`
+  pauses a read in flight, closes the socket and checks it (100 runs under `-race`: pass).
+- fatal `EpollWait` error: `packetReceiverRegistry.fail` delivers an error to registered
+  endpoints and leaves the registry unusable, so `register` returns false and dae
+  (`control/udp_endpoint_pool.go`, `startTransportReceiver() == false` -> `go
+  ue.startReadLoop()`) falls back to a blocking `ReadFrom` loop per endpoint; new sockets
+  are not blackholed. Covered by `TestDirectPacketReceiverFailureRetiresRegistry`.
+- upstream's version holds the registry read lock across the syscalls and adds a
+  per-entry pending queue; porting it would add locking to the hot path for no gain.
+- `git diff 909593ea 17ab089 -- protocol/direct netproxy pool` is empty: the direct UDP
+  receive code is identical before and after this session's pin changes.
