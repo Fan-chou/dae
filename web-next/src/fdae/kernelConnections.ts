@@ -68,14 +68,17 @@ export function mapKernelConnection(
     src: row.src,
     dst: row.dst,
     domain: row.domain,
-    outbound: '',
+    mac: row.mac,
+    // 内核直接转发的流量没有经过 fdae 的出站选择；conntrack 里这类流量按定义
+    // 就是直连，所以统一标成 direct（与用户态直连行一致），而不是留空。
+    outbound: 'direct',
+    dialer: 'direct',
     upload: row.upload,
     download: row.download,
   })
   return {
     ...base,
     id: 'kernel:' + row.id,
-    chains: [],
     start: '',
     kernel: row,
     uploadSpeed: row.uploadSpeed,

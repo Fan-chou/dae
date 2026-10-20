@@ -34,6 +34,7 @@ type stubAdminPlane struct {
 	kernelCalls int
 	kernelLimit int
 	kernelSrc   string
+	kernelMac   string
 }
 
 func (s *stubAdminPlane) AdminGroups() []control.AdminGroup { return s.groups }
@@ -54,10 +55,14 @@ func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
 	s.delayFor = groupName
 	return s.delayErr
 }
-func (s *stubAdminPlane) AdminKernelConnections(limit int, src string) control.AdminKernelConnectionsSnapshot {
+func (s *stubAdminPlane) AdminKernelConnections(limit int, src, mac string) control.AdminKernelConnectionsSnapshot {
 	s.kernelCalls++
 	s.kernelLimit = limit
 	s.kernelSrc = src
+	s.kernelMac = mac
+	if mac == "bad" {
+		return control.AdminKernelConnectionsSnapshot{Available: true, Error: "invalid mac", Connections: []control.AdminKernelConnection{}}
+	}
 	if src == "bad" {
 		return control.AdminKernelConnectionsSnapshot{Available: true, Error: "invalid src", Connections: []control.AdminKernelConnection{}}
 	}
@@ -296,8 +301,8 @@ func TestAdminKernelConnectionsEndpoint(t *testing.T) {
 		t.Fatal("unauthenticated request reached the conntrack reader")
 	}
 
-	rec := get("/v1/kernel-connections?limit=64&src=192.168.124.200", true)
-	if rec.Code != http.StatusOK || plane.kernelLimit != 64 || plane.kernelSrc != "192.168.124.200" {
+	rec := get("/v1/kernel-connections?limit=64&src=192.168.124.200&mac=3e:0a:a5:de:ae:a3", true)
+	if rec.Code != http.StatusOK || plane.kernelLimit != 64 || plane.kernelSrc != "192.168.124.200" || plane.kernelMac != "3e:0a:a5:de:ae:a3" {
 		t.Fatalf("status=%d limit=%d src=%q body=%s", rec.Code, plane.kernelLimit, plane.kernelSrc, rec.Body.String())
 	}
 	var snap control.AdminKernelConnectionsSnapshot
@@ -313,6 +318,9 @@ func TestAdminKernelConnectionsEndpoint(t *testing.T) {
 	}
 	if rec := get("/v1/kernel-connections?src=bad", true); rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid src status = %d", rec.Code)
+	}
+	if rec := get("/v1/kernel-connections?mac=bad", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid mac status = %d", rec.Code)
 	}
 
 	// The default connection list must never read conntrack.

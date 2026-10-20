@@ -10,12 +10,15 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/cilium/ebpf"
 )
 
 // This file serves the kernel-path view of GET /v1/kernel-connections: flows
@@ -332,11 +335,15 @@ func scanConntrack(r io.Reader, visit func(*ctEntry)) (lines int, err error) {
 
 // AdminKernelConnection is one flow the kernel forwards on its own.
 type AdminKernelConnection struct {
-	ID              string `json:"id"`
-	Network         string `json:"network"`
-	Src             string `json:"src"`
-	Dst             string `json:"dst"`
-	Domain          string `json:"domain,omitempty"`
+	ID      string `json:"id"`
+	Network string `json:"network"`
+	Src     string `json:"src"`
+	Dst     string `json:"dst"`
+	Domain  string `json:"domain,omitempty"`
+	// Mac is the client's MAC as learned by dae's datapath (the same
+	// association its MAC-based routing uses). conntrack has no L2 data, so
+	// it is empty when the client has not been seen on a LAN interface.
+	Mac             string `json:"mac,omitempty"`
 	State           string `json:"state,omitempty"`
 	Upload          uint64 `json:"upload"`
 	Download        uint64 `json:"download"`
@@ -391,7 +398,10 @@ type kernelCollectInput struct {
 	daeMark   uint32
 	userspace map[kernelFlowKey]struct{}
 	src       netip.Addr // optional: only flows from this source
-	cap       int
+	// srcSet, when non-nil, restricts flows to these sources (the addresses
+	// of one MAC); an empty non-nil set matches nothing.
+	srcSet map[netip.Addr]struct{}
+	cap    int
 }
 
 func ctLess(a, b *ctEntry) bool {
@@ -492,6 +502,11 @@ func collectKernelConnections(r io.Reader, in kernelCollectInput) (entries []ctE
 		if in.src.IsValid() && e.src.Addr() != in.src {
 			return
 		}
+		if in.srcSet != nil {
+			if _, ok := in.srcSet[e.src.Addr()]; !ok {
+				return
+			}
+		}
 		total++
 		if len(h) < in.cap {
 			h.push(e)
@@ -535,6 +550,56 @@ func kernelConnectionFromEntry(e *ctEntry) AdminKernelConnection {
 	}
 }
 
+// kernelMacResolver maps between client addresses and MACs using the
+// datapath's own learned associations. Lookups are bpf map reads from the
+// control plane; nothing here touches the packet path.
+type kernelMacResolver struct {
+	macOf   func(netip.Addr) ([6]byte, bool)
+	addrsOf func(mac [6]byte) []netip.Addr
+}
+
+// newKernelMacResolver reads ip_mac_assoc_map / mac_assoc_map. It returns nil
+// when the datapath is not loaded.
+func newKernelMacResolver(c *ControlPlane) *kernelMacResolver {
+	if c == nil || c.core == nil {
+		return nil
+	}
+	bpf := c.core.bpf.Load()
+	if bpf == nil {
+		return nil
+	}
+	return newKernelMacResolverFromMaps(bpf.IpMacAssocMap, bpf.MacAssocMap)
+}
+
+func newKernelMacResolverFromMaps(ipMac, macAssoc *ebpf.Map) *kernelMacResolver {
+	if ipMac == nil || macAssoc == nil {
+		return nil
+	}
+	return &kernelMacResolver{
+		macOf: func(a netip.Addr) ([6]byte, bool) {
+			key := bpfIpMacAssocKey{Ip: a.As16()}
+			var val bpfMacAssocKey
+			if err := ipMac.Lookup(&key, &val); err != nil {
+				return [6]byte{}, false
+			}
+			return val.Mac, val.Mac != [6]byte{}
+		},
+		addrsOf: func(mac [6]byte) []netip.Addr {
+			var entry bpfMacAssocEntry
+			if err := macAssoc.Lookup(&bpfMacAssocKey{Mac: mac}, &entry); err != nil {
+				return nil
+			}
+			out := make([]netip.Addr, 0, macAssocIPSlots)
+			for i := range entry.Ips {
+				if ip := entry.Ips[i].Ip; !ip16Unspecified(ip) {
+					out = append(out, netip.AddrFrom16(ip).Unmap())
+				}
+			}
+			return out
+		},
+	}
+}
+
 // KernelConnectionsCollector serves GET /v1/kernel-connections. It rate limits
 // the conntrack read: concurrent and repeated requests inside the minimum
 // interval share one scan.
@@ -544,6 +609,8 @@ type KernelConnectionsCollector struct {
 	acctPath    string
 	minInterval time.Duration
 	now         func() time.Time
+	// macResolver is replaceable in tests; nil means newKernelMacResolver.
+	macResolver func(*ControlPlane) *kernelMacResolver
 
 	cachedAt  time.Time
 	cachedSrc string
@@ -575,7 +642,7 @@ func readConntrackAccounting(path string) bool {
 	return strings.TrimSpace(string(b)) == "1"
 }
 
-func (k *KernelConnectionsCollector) Snapshot(c *ControlPlane, limit int, src string) AdminKernelConnectionsSnapshot {
+func (k *KernelConnectionsCollector) Snapshot(c *ControlPlane, limit int, src, mac string) AdminKernelConnectionsSnapshot {
 	limit = clampAdminConnectionLimit(limit)
 	src = strings.TrimSpace(src)
 	var srcAddr netip.Addr
@@ -587,14 +654,25 @@ func (k *KernelConnectionsCollector) Snapshot(c *ControlPlane, limit int, src st
 		srcAddr = a.Unmap()
 	}
 
+	var macAddr [6]byte
+	mac = strings.TrimSpace(mac)
+	if mac != "" {
+		hw, err := net.ParseMAC(mac)
+		if err != nil || len(hw) != 6 {
+			return AdminKernelConnectionsSnapshot{Available: true, Error: "invalid mac", Connections: []AdminKernelConnection{}}
+		}
+		copy(macAddr[:], hw)
+	}
+
+	cacheKey := srcAddr.String() + "|" + macString(macAddr)
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	now := k.now()
-	if !k.cachedAt.IsZero() && now.Sub(k.cachedAt) < k.cachedFor && k.cachedSrc == srcAddr.String() {
+	if !k.cachedAt.IsZero() && now.Sub(k.cachedAt) < k.cachedFor && k.cachedSrc == cacheKey {
 		return trimKernelSnapshot(k.cached, limit)
 	}
-	snap := k.collect(c, srcAddr)
-	k.cachedAt, k.cachedSrc, k.cached = now, srcAddr.String(), snap
+	snap := k.collect(c, srcAddr, mac != "", macAddr)
+	k.cachedAt, k.cachedSrc, k.cached = now, cacheKey, snap
 	k.cachedFor = max(k.minInterval, kernelConnectionsBackoff*time.Duration(snap.ScanMs)*time.Millisecond)
 	return trimKernelSnapshot(snap, limit)
 }
@@ -607,7 +685,7 @@ func trimKernelSnapshot(s AdminKernelConnectionsSnapshot, limit int) AdminKernel
 	return s
 }
 
-func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr) AdminKernelConnectionsSnapshot {
+func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr, filterMac bool, mac [6]byte) AdminKernelConnectionsSnapshot {
 	snap := AdminKernelConnectionsSnapshot{Connections: []AdminKernelConnection{}}
 	f, err := os.Open(k.procPath)
 	if err != nil {
@@ -618,6 +696,20 @@ func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr) Ad
 	defer f.Close()
 
 	in := kernelCollectInput{src: src}
+	resolve := k.macResolver
+	if resolve == nil {
+		resolve = newKernelMacResolver
+	}
+	resolver := resolve(c)
+	if filterMac {
+		// A MAC the datapath has not learned matches nothing.
+		in.srcSet = map[netip.Addr]struct{}{}
+		if resolver != nil {
+			for _, a := range resolver.addrsOf(mac) {
+				in.srcSet[a] = struct{}{}
+			}
+		}
+	}
 	if c != nil {
 		in.daeMark = c.soMarkFromDae
 		if manager, _ := c.controlPlaneSessionManager(); manager != nil {
@@ -638,8 +730,21 @@ func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr) Ad
 	snap.Excluded = excluded
 	snap.Connections = make([]AdminKernelConnection, 0, len(entries))
 	wanted := make(map[netip.Addr]struct{}, len(entries))
+	macs := map[netip.Addr]string{} // one lookup per distinct client
 	for i := range entries {
-		snap.Connections = append(snap.Connections, kernelConnectionFromEntry(&entries[i]))
+		item := kernelConnectionFromEntry(&entries[i])
+		if resolver != nil {
+			a := entries[i].src.Addr()
+			m, seen := macs[a]
+			if !seen {
+				if hw, ok := resolver.macOf(a); ok {
+					m = macString(hw)
+				}
+				macs[a] = m
+			}
+			item.Mac = m
+		}
+		snap.Connections = append(snap.Connections, item)
 		wanted[entries[i].dst.Addr()] = struct{}{}
 	}
 	if c != nil && c.dnsController != nil {
@@ -653,8 +758,8 @@ func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr) Ad
 }
 
 // AdminKernelConnections returns the kernel-path flow list for
-// GET /v1/kernel-connections. src optionally restricts it to one client.
-func (c *ControlPlane) AdminKernelConnections(limit int, src string) AdminKernelConnectionsSnapshot {
+// GET /v1/kernel-connections. src and mac optionally restrict it to one client.
+func (c *ControlPlane) AdminKernelConnections(limit int, src, mac string) AdminKernelConnectionsSnapshot {
 	if c == nil {
 		return AdminKernelConnectionsSnapshot{Connections: []AdminKernelConnection{}}
 	}
@@ -667,7 +772,7 @@ func (c *ControlPlane) AdminKernelConnections(limit int, src string) AdminKernel
 			collector = c.kernelConns.Load()
 		}
 	}
-	return collector.Snapshot(c, limit, src)
+	return collector.Snapshot(c, limit, src, mac)
 }
 
 // userspaceFlowKeys lists the flows dae relays itself, keyed the way conntrack

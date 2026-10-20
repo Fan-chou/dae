@@ -161,6 +161,7 @@ const kernelConnections = () => {
       src: f[1],
       dst: f[2],
       domain: f[3] || undefined,
+      mac: f[1].startsWith('[') ? undefined : 'aa:bb:cc:00:00:' + (Number(f[1].split('.')[3].split(':')[0]) % 256).toString(16).padStart(2, '0'),
       state: f[4] || undefined,
       upload: Math.round(5000 + f[5] * t),
       download: Math.round(9000 + f[6] * t),

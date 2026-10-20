@@ -140,7 +140,7 @@
       <span class="text-base-content/40"
         >内核转发的流量为 IP
         层字节（含头部），比 fdae 转发的应用层字节略大；域名来自 DNS
-        缓存反查，可能不准；无 MAC，不受 MAC/出站筛选影响（筛选时隐藏）。</span
+        缓存反查，可能不准；MAC 来自 fdae 数据面学到的 IP-MAC 对应，未学到时为空；出站统一显示 direct。</span
       >
     </div>
   </div>

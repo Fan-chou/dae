@@ -143,6 +143,7 @@ export type AdminKernelConnection = {
   src: string
   dst: string
   domain?: string
+  mac?: string
   state?: string
   upload: number
   download: number

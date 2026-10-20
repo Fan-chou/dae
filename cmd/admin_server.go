@@ -45,7 +45,7 @@ type adminPlane interface {
 	SetGroupSelection(groupName, memberName string) error
 	TriggerLatencyChecksForGroup(groupName string) error
 	AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot
-	AdminKernelConnections(limit int, src string) control.AdminKernelConnectionsSnapshot
+	AdminKernelConnections(limit int, src, mac string) control.AdminKernelConnectionsSnapshot
 }
 
 type adminPlaneProvider func() adminPlane
@@ -331,9 +331,9 @@ func (s *adminServer) handleKernelConnections(w http.ResponseWriter, r *http.Req
 		}
 		limit = parsed
 	}
-	snap := plane.AdminKernelConnections(limit, r.URL.Query().Get("src"))
-	if snap.Error == "invalid src" {
-		writeAdminError(w, http.StatusBadRequest, "invalid src")
+	snap := plane.AdminKernelConnections(limit, r.URL.Query().Get("src"), r.URL.Query().Get("mac"))
+	if snap.Error == "invalid src" || snap.Error == "invalid mac" {
+		writeAdminError(w, http.StatusBadRequest, snap.Error)
 		return
 	}
 	writeAdminJSON(w, http.StatusOK, snap)

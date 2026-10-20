@@ -157,7 +157,7 @@ func TestKernelConnectionsCollectorSharesScansWithinInterval(t *testing.T) {
 	clock := time.Unix(1000, 0)
 	k := &KernelConnectionsCollector{procPath: proc, acctPath: filepath.Join(dir, "none"), minInterval: 2 * time.Second, now: func() time.Time { return clock }}
 
-	first := k.Snapshot(nil, 0, "")
+	first := k.Snapshot(nil, 0, "", "")
 	// No control plane: nothing to exclude except TIME_WAIT and loopback.
 	if !first.Available || !first.Accounting || first.Total != 6 {
 		t.Fatalf("first = %+v", first)
@@ -167,23 +167,23 @@ func TestKernelConnectionsCollectorSharesScansWithinInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock = clock.Add(time.Second)
-	if again := k.Snapshot(nil, 0, ""); again.Total != 6 {
+	if again := k.Snapshot(nil, 0, "", ""); again.Total != 6 {
 		t.Fatalf("scan was repeated inside the interval: %+v", again)
 	}
 	// A different filter is a different result and must rescan.
-	if other := k.Snapshot(nil, 0, "192.168.124.200"); other.Total != 0 {
+	if other := k.Snapshot(nil, 0, "192.168.124.200", ""); other.Total != 0 {
 		t.Fatalf("filter served from another filter's cache: %+v", other)
 	}
 	clock = clock.Add(3 * time.Second)
-	if later := k.Snapshot(nil, 0, ""); later.Total != 0 {
+	if later := k.Snapshot(nil, 0, "", ""); later.Total != 0 {
 		t.Fatalf("stale after interval: %+v", later)
 	}
-	if bad := k.Snapshot(nil, 0, "not-an-ip"); bad.Error != "invalid src" {
+	if bad := k.Snapshot(nil, 0, "not-an-ip", ""); bad.Error != "invalid src" {
 		t.Fatalf("invalid src: %+v", bad)
 	}
 	k.procPath = filepath.Join(dir, "missing")
 	clock = clock.Add(10 * time.Second)
-	if gone := k.Snapshot(nil, 0, ""); gone.Available || gone.Error == "" {
+	if gone := k.Snapshot(nil, 0, "", ""); gone.Available || gone.Error == "" {
 		t.Fatalf("missing conntrack: %+v", gone)
 	}
 }
@@ -245,11 +245,75 @@ func TestKernelConnectionsBackoffScalesWithScanCost(t *testing.T) {
 	// collector must hold the result for at least 20x that.
 	k := &KernelConnectionsCollector{procPath: proc, acctPath: filepath.Join(dir, "none"), minInterval: 2 * time.Second,
 		now: func() time.Time { clock = clock.Add(100 * time.Millisecond); return clock }}
-	first := k.Snapshot(nil, 0, "")
+	first := k.Snapshot(nil, 0, "", "")
 	if first.ScanMs == 0 {
 		t.Fatal("scan duration not measured")
 	}
 	if want := time.Duration(kernelConnectionsBackoff) * time.Duration(first.ScanMs) * time.Millisecond; k.cachedFor < want {
 		t.Fatalf("cachedFor %v, want at least %v", k.cachedFor, want)
+	}
+}
+
+func TestKernelConnectionsFilterAndLabelByMac(t *testing.T) {
+	dir := t.TempDir()
+	proc := filepath.Join(dir, "nf_conntrack")
+	if err := os.WriteFile(proc, []byte(conntrackFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	laptop := [6]byte{0x3e, 0x0a, 0xa5, 0xde, 0xae, 0xa3}
+	phone := [6]byte{0x58, 0x47, 0xca, 0x74, 0x69, 0xf8}
+	macOf := map[netip.Addr][6]byte{
+		netip.MustParseAddr("192.168.124.200"): laptop,
+		netip.MustParseAddr("192.168.124.202"): phone,
+	}
+	addrsOf := map[[6]byte][]netip.Addr{
+		laptop: {netip.MustParseAddr("192.168.124.200")},
+		phone:  {netip.MustParseAddr("192.168.124.202")},
+	}
+	resolver := &kernelMacResolver{
+		macOf:   func(a netip.Addr) ([6]byte, bool) { m, ok := macOf[a]; return m, ok },
+		addrsOf: func(m [6]byte) []netip.Addr { return addrsOf[m] },
+	}
+	newCollector := func() *KernelConnectionsCollector {
+		return &KernelConnectionsCollector{
+			procPath: proc, acctPath: filepath.Join(dir, "none"), minInterval: time.Second,
+			now:         func() time.Time { return time.Unix(1000, 0) },
+			macResolver: func(*ControlPlane) *kernelMacResolver { return resolver },
+		}
+	}
+
+	// Without a filter every client with a known MAC is labelled; unknown
+	// clients stay unlabelled rather than being guessed.
+	all := newCollector().Snapshot(nil, 0, "", "")
+	labelled := map[string]string{}
+	for _, c := range all.Connections {
+		labelled[c.Src] = c.Mac
+	}
+	if labelled["192.168.124.200:51719"] != "3e:0a:a5:de:ae:a3" || labelled["192.168.124.202:44444"] != "58:47:ca:74:69:f8" {
+		t.Fatalf("labels = %v", labelled)
+	}
+	if labelled["172.16.91.25:57416"] != "" {
+		t.Fatalf("unknown client was labelled: %q", labelled["172.16.91.25:57416"])
+	}
+
+	// A MAC filter keeps only that client's flows.
+	only := newCollector().Snapshot(nil, 0, "", "3E:0A:A5:DE:AE:A3")
+	if only.Total != 1 || len(only.Connections) != 1 || only.Connections[0].Src != "192.168.124.200:51719" {
+		t.Fatalf("mac filter: %+v", only)
+	}
+	// A MAC dae has not learned matches nothing (not everything).
+	none := newCollector().Snapshot(nil, 0, "", "aa:bb:cc:dd:ee:ff")
+	if none.Total != 0 || len(none.Connections) != 0 {
+		t.Fatalf("unknown mac matched: %+v", none)
+	}
+	if bad := newCollector().Snapshot(nil, 0, "", "zz"); bad.Error != "invalid mac" {
+		t.Fatalf("invalid mac: %+v", bad)
+	}
+
+	// Different filters must not share a cache entry.
+	k := newCollector()
+	_ = k.Snapshot(nil, 0, "", "")
+	if got := k.Snapshot(nil, 0, "", "3e:0a:a5:de:ae:a3"); got.Total != 1 {
+		t.Fatalf("mac filter served from unfiltered cache: %+v", got)
 	}
 }

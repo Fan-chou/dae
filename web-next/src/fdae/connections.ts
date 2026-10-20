@@ -91,14 +91,16 @@ export function subscribeConnections() {
     if (state.filter.outbound) query.set('outbound', state.filter.outbound)
     if (state.filter.mac) query.set('mac', state.filter.mac)
     const context = query.toString()
-    // conntrack has neither outbound nor MAC, so those filters exclude kernel
-    // flows; the source filter is applied by the server.
+    // Kernel flows are all "direct", so any other outbound filter excludes
+    // them; the source and MAC filters are applied by the server.
     const wantKernel =
-      includeKernel.value && !state.filter.outbound && !state.filter.mac
+      includeKernel.value &&
+      (!state.filter.outbound || state.filter.outbound === 'direct')
     const kernelQuery = new URLSearchParams({
       limit: String(state.filter.limit),
     })
     if (source) kernelQuery.set('src', source)
+    if (state.filter.mac) kernelQuery.set('mac', state.filter.mac)
     try {
       const kernelRequest = wantKernel
         ? fetchKernelConnections(kernelQuery, backend).then(
