@@ -118,3 +118,62 @@ Not carried (same reasoning as 2026-10-10):
   the other wrappers that need it.
 - Stop writing the write-only `routing_epoch_map` (small part of `06451485`).
 - DNS truncation / datapath family and `42b70886`: unchanged from 2026-10-10.
+
+## Addendum: second pass over olicesx/outbound fixes not in the pin
+
+`git cherry` between the fdae pin and `1cf3439` lists 141 patches without a match.
+Most are the perf stack, bbr3, batching or refactors (not carried, see above) or were
+already picked under a different patch id. The standalone correctness fixes were
+triaged by dropping each commit's own `_test.go` files onto the pin and running them,
+and by trial cherry-picks where a commit has no tests. The result is on a local branch,
+`sync/upstream-20261020-fixes` (in `/root/dev/outbound-sync`, worktree under the
+session scratchpad), 4 commits on top of `821f690`. **Not pushed, dae pin not bumped.**
+
+Carried on that branch (all builds, `go vet`, `go test -short ./...` pass; the touched
+packages also under `-race`):
+
+- `fe8ca1b` SS2022 UDP replay window: the bit-level shift went the wrong way, so the
+  filter accepted replays and rejected fresh packets (minimal case:
+  `CheckAndUpdate(100)`, `(107)`, `(100)` must reject the last). Also validates before
+  committing the window and stops count-based eviction of sessions still inside
+  `SaltStorageDuration`. Upstream's tests fail on the pin and pass after; applies clean.
+- `887df86` hysteria2 FastOpen: caller deadlines are preserved across the deferred
+  response read (its two tests fail on the pin). It needed the FastOpen half of
+  `55518b1` first (dial deadline re-armed around `readFastOpenResponse`); the other
+  halves of `55518b1` do not apply (the fork's `udpConn` already uses deadline
+  objects and already returns the datagram-dropped contract on a short buffer).
+- `8f8f64f` (conflicts in `header.go` and `reality.go` resolved by hand; upstream's
+  `CongestionOverride` is not carried):
+  - vmess `ReqInstructionDataFromPool` left the request padding region untouched, and
+    the pool does not zero, so up to 15 bytes of a previous user's buffer were sent to
+    the server on every connection. Found by reading the diff; no test exercises it.
+  - REALITY `spiderX` was parsed with `url.Parse`/`http.NewRequest` and the errors were
+    discarded, so a value such as `/\x00` panicked at load (upstream's spiderX test
+    fails on the pin; spiderX comes from the node link).
+  - the vmess `InitContext` length check is server-side only and does not matter for
+    dae as a client.
+
+Looked at and deliberately not carried:
+
+- `d4ee68e` (short `ss:` / `ssr:` links) and `d605198` (UDP underlay closed when the
+  cipher is rejected late). The parsers do panic when called directly with `ss:x`
+  (checked before and after), but the link dispatcher only hands them links that
+  already start with `ss://` / `ssr://`, and a probe through
+  `NewNetproxyDialerFromLink` did not panic on the pin. So the "reachable from a
+  subscription" claim does not hold; they were taken back out as unproven.
+- `ab18b74` vmess sticky write-init error: server-side response path only.
+- `143113c` grpc canceller, `b4a12a4` mux idempotent Close, `1a21f16` ssr http_simple
+  reassembly, `2400eca` naive GOAWAY retry, `87f3d8a` SS2022 expired-timestamp error:
+  apply clean and are small, but have no test and no evidence of impact here.
+- `aba8749`, `92845447`, `d960282`, `87f3d8a`-adjacent wrappers: need
+  `netproxy.WriteDeadlineClosesSession` and the coalesce/wrapper stack the fork lacks.
+- `aa033b7` (tuic deadline timers), `6742469` (tuic datagram queue), `c90a148`
+  (anytls UDP framing), `0f24c13`, `8396fb0` (REALITY retries): conflict with fork code
+  that is already restructured; not reviewed further.
+
+Open and worth a careful manual port: `2735b84` (direct UDP receiver). Its two fixes
+are an fd-number reuse race between `recvfrom` and fd close (a drain can read a
+datagram from a different socket) and a fatal `EpollWait` error that silently
+blackholes every later registration. It conflicts in
+`protocol/direct/packet_receiver_linux.go` and changes locking on the direct UDP hot
+path, so it should go in with a real UDP load check, not as a drive-by.
