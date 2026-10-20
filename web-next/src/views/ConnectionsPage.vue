@@ -3,20 +3,41 @@
     class="relative flex size-full flex-col overflow-hidden"
     :style="isMiddleScreen ? { paddingBottom: dockTop + 'px' } : undefined"
   >
-    <ConnectionCtrl />
-    <ConnectionScope />
-    <template v-if="isConnectionCard">
-      <ConnectionCardList />
-    </template>
+    <div class="border-base-content/10 flex shrink-0 gap-1 border-b px-3 py-1">
+      <button
+        class="btn btn-sm"
+        :class="kernelView ? 'btn-ghost' : 'btn-primary'"
+        @click="kernelView = false"
+      >
+        代理连接
+      </button>
+      <button
+        class="btn btn-sm"
+        :class="kernelView ? 'btn-primary' : 'btn-ghost'"
+        title="由内核直接转发、不经过 fdae 用户态的连接"
+        @click="kernelView = true"
+      >
+        内核转发
+      </button>
+    </div>
+    <KernelConnections v-if="kernelView" />
     <template v-else>
-      <ConnectionTable />
+      <ConnectionCtrl />
+      <ConnectionScope />
+      <template v-if="isConnectionCard">
+        <ConnectionCardList />
+      </template>
+      <template v-else>
+        <ConnectionTable />
+      </template>
+      <ConnectionDetails />
     </template>
-    <ConnectionDetails />
   </div>
 </template>
 
 <script setup lang="ts">
 import ConnectionScope from '@/fdae/ConnectionScope.vue'
+import KernelConnections from '@/fdae/KernelConnections.vue'
 import { setConnectionGeoIPEnabled } from '@/api/connectionGeoip'
 import ConnectionCardList from '@/components/connections/ConnectionCardList.vue'
 import ConnectionDetails from '@/components/connections/ConnectionDetails.vue'
@@ -31,7 +52,10 @@ import {
   connectionTableColumns,
   isConnectionCard,
 } from '@/store/settings'
-import { computed, onScopeDispose, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
+
+// 内核转发视图每次进入才挂载、才会轮询 conntrack；默认进入连接页不触发。
+const kernelView = ref(false)
 
 const isGeoIPVisible = computed(() =>
   isConnectionCard.value

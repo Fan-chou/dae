@@ -6,6 +6,7 @@ import type {
   AdminStatus,
   AdminGroup,
   AdminConnectionsSnapshot,
+  AdminKernelConnectionsSnapshot,
   AdminConfig,
   EffectiveConfig,
 } from './types'
@@ -184,6 +185,15 @@ export async function fetchGroups() {
 }
 export const fetchConnections = (query: URLSearchParams, backend?: Backend) =>
   request<AdminConnectionsSnapshot>('/connections?' + query, {}, backend)
+export const fetchKernelConnections = (
+  query: URLSearchParams,
+  backend?: Backend,
+) =>
+  request<AdminKernelConnectionsSnapshot>(
+    '/kernel-connections?' + query,
+    {},
+    backend,
+  )
 export const fetchConfig = () => request<AdminConfig>('/config')
 export const fetchEffective = () =>
   request<EffectiveConfig>('/config/effective')

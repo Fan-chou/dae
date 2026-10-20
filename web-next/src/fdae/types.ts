@@ -136,3 +136,31 @@ export type EffectiveConfig = {
   rules: { index: number; text: string; origin: EffectiveOrigin }[]
   fallback: { outbound: string; origin: EffectiveOrigin }
 }
+
+export type AdminKernelConnection = {
+  id: string
+  network: string
+  src: string
+  dst: string
+  domain?: string
+  state?: string
+  upload: number
+  download: number
+  upload_packets?: number
+  download_packets?: number
+  ttl: number
+  offloaded?: boolean
+  unreplied?: boolean
+}
+
+export type AdminKernelConnectionsSnapshot = {
+  available: boolean
+  error?: string
+  accounting: boolean
+  total: number
+  truncated: boolean
+  excluded: { userspace: number; dae: number; inactive: number; local: number }
+  connections: AdminKernelConnection[]
+  snapshot_at_ms?: number
+  scan_ms?: number
+}

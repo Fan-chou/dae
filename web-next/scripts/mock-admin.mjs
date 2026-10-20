@@ -135,6 +135,41 @@ const connections = () => {
   return { scope: 'active', total: 184, truncated: false, connections: list, snapshot_at_ms: Date.now() }
 }
 
+// Flows the kernel forwards on its own (direct fast path), as read from
+// conntrack: counters grow with time so the UI can derive speeds.
+const kernelFlows = [
+  ['udp', '192.168.124.222:41641', '43.167.220.138:41641', '', '', 120_000, 40_000, true],
+  ['tcp', '192.168.124.131:50211', '183.2.172.185:443', 'www.baidu.com', 'ESTABLISHED', 2_400_000, 90_000, true],
+  ['tcp', '192.168.124.134:43822', '36.110.167.15:443', 'cdn.bilibili.com', 'ESTABLISHED', 61_000, 3_400_000, true],
+  ['udp', '192.168.124.140:5353', '224.0.0.251:5353', '', '', 800, 0, false],
+  ['tcp', '192.168.124.139:60112', '120.53.53.53:443', '', 'ESTABLISHED', 2_000, 11_000, false],
+  ['tcp', '[2409:8a55:358e:c970::1]:52111', '[2408:8000::1]:443', 'update.example.cn', 'ESTABLISHED', 20_000, 800_000, true],
+]
+const kernelConnections = () => {
+  const t = (Date.now() - startedAt) / 1000
+  return {
+    available: true,
+    accounting: true,
+    total: kernelFlows.length,
+    truncated: false,
+    excluded: { userspace: 184, dae: 31, inactive: 412, local: 0 },
+    snapshot_at_ms: Date.now(),
+    scan_ms: 3,
+    connections: kernelFlows.map((f, i) => ({
+      id: f[0] + ':' + f[1] + '>' + f[2],
+      network: f[0],
+      src: f[1],
+      dst: f[2],
+      domain: f[3] || undefined,
+      state: f[4] || undefined,
+      upload: Math.round(5000 + f[5] * t),
+      download: Math.round(9000 + f[6] * t),
+      ttl: 431000 - i,
+      offloaded: f[7] || undefined,
+    })),
+  }
+}
+
 const logLines = () =>
   [
     'time="2026-10-09T22:41:03+08:00" level=info msg="[Mihomo] routing source loaded" nodes=7 groups=5 rules=412',
@@ -260,6 +295,7 @@ http
         }
       }
       if (p === '/v1/connections') return send(res, 200, connections())
+      if (p === '/v1/kernel-connections') return send(res, 200, kernelConnections())
       if (p === '/v1/logs') return send(res, 200, { lines: logLines() })
       if (p === '/v1/config') {
         if (req.method === 'PUT') {
