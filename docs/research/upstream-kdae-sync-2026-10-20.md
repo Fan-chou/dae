@@ -36,7 +36,7 @@ Why the SNI trio is held back:
 ## outbound: carried
 
 Branch `sync/upstream-20261020-vision` on `Fan-chou/outbound` (pushed), commit
-`2f4699a` on top of `909593ea`. dae pin: `c3d97c5c` on `fdae` (local, not pushed).
+`2f4699a` and `821f690` on top of `909593ea`, both pushed. dae pin: `c3d97c5c` then the bump to `821f690` on `fdae` (local, fdae not pushed).
 
 - Vision TLS 1.3 framing and DirectCopy transition aligned with Xray-core:
   net of olicesx `2cec762` + `3732570` (`ed6e705`, `0fb28f7`); `protocol/vless/**`,
@@ -51,8 +51,7 @@ Branch `sync/upstream-20261020-vision` on `Fan-chou/outbound` (pushed), commit
   fork has no `netproxy.WriteDeadlineClosesSession`.
 
 - hysteria2 + UDP port hopping through a proxy chain (port of `b54af9a`, commit
-  `821f690` on the same outbound branch, **local only: not pushed, dae pin not
-  bumped**). `udpHopPacketConn` always advertised the OOB/batch/`SyscallConn`
+  `821f690` on the same outbound branch, pushed and pinned in dae). `udpHopPacketConn` always advertised the OOB/batch/`SyscallConn`
   surface; when each hop's underlay is a `netproxy.FakeNetPacketConn` (any proxied
   `nextDialer`), `SyscallConn` returns an error and quic-go's `newConn`
   (`sys_conn_oob.go`) aborts the dial, so such a node could never connect. The hop

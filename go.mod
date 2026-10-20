@@ -123,5 +123,7 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026101
 // The current pin adds the upstream Vision TLS 1.3 framing and DirectCopy
 // transition fix, bounds the ServerHello session_id_len in the Vision filter
 // (a hostile length used to panic), and returns the simple-obfs first-request
-// build error instead of dereferencing a nil request.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020134410-2f4699a083bb
+// build error instead of dereferencing a nil request. hysteria2 with UDP port
+// hopping over a proxied underlay no longer advertises an OOB/SyscallConn
+// surface it cannot back, which used to abort the quic-go dial.
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020141647-821f6901529a
