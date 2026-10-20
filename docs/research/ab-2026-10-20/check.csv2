@@ -1,0 +1,16 @@
+ss2022|tls13|old|case=download ok=4 fail=0
+ss2022|tls13|old|case=upload ok=1 fail=0
+ss2022|tls13|old|case=manyconns ok=200 fail=0
+ss2022|tls13|old|case=udp ok=10 fail=0
+ss2022|tls13|new|case=download ok=4 fail=0
+ss2022|tls13|new|case=upload ok=1 fail=0
+ss2022|tls13|new|case=manyconns ok=200 fail=0
+ss2022|tls13|new|case=udp ok=10 fail=0
+reality|tls13|old|case=download ok=4 fail=0
+reality|tls13|old|case=upload ok=1 fail=0
+reality|tls13|old|case=manyconns ok=200 fail=0
+reality|tls13|old|case=udp ok=10 fail=0
+reality|tls13|new|case=download ok=4 fail=0
+reality|tls13|new|case=upload ok=1 fail=0
+reality|tls13|new|case=manyconns ok=200 fail=0
+reality|tls13|new|case=udp ok=10 fail=0

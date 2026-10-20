@@ -188,3 +188,82 @@ already fixed both problems in its own way:
   per-entry pending queue; porting it would add locking to the hot path for no gain.
 - `git diff 909593ea 17ab089 -- protocol/direct netproxy pool` is empty: the direct UDP
   receive code is identical before and after this session's pin changes.
+
+## Addendum: unified test on 220 (functional matrix and performance A/B)
+
+Old = outbound `909593ea` (pin before this session), new = `17ab089` (current pin). dae
+itself is unchanged between the two (`git diff 2d0419ec 83d76571 -- . ':!go.mod'
+':!go.sum' ':!docs'` is empty), so an outbound-level A/B is the whole comparison.
+`protocol/direct`, `netproxy` and `pool` are identical in both pins, i.e. the direct UDP
+receive path is untouched.
+
+Method: loopback only on 220 (16 cores, otherwise idle), one directory (`/root/ab2`),
+test binaries compiled once per pin (same toolchain, no `-race`), client pinned to cores
+0-1 with `GOMAXPROCS=2`, sing-box on 4-7, inner origin on 8-9, old/new interleaved with
+alternating order, 6 reps of which rep 0 is discarded, pass criteria written before the
+run (`ab-2026-10-20/CRITERIA.txt`). Raw data, scripts and harness are in
+`docs/research/ab-2026-10-20/`. Servers: sing-box 1.14.3 (vless+Vision, vless without
+flow, VMess, SS2022 `2022-blake3-aes-128-gcm`, hysteria2, vless+REALITY, socks5) and
+Xray-core 26.3.27 (Vision). Numbers are relative; 220 is not 223.
+
+### Functional (each cell: 4x8 MB download with sha256, 4 MB upload with sha256, 200
+short connections, 10 UDP echoes)
+
+| Case | old | new |
+|---|---|---|
+| Vision on sing-box and Xray; inner TLS 1.3 / 1.2 / plain; VLESS without flow | pass | pass |
+| VMess TCP + UDP | pass | pass |
+| SS2022 TCP + UDP (every UDP reply accepted, i.e. validate-then-commit is sound) | pass | pass |
+| hysteria2 TCP + UDP (FastOpen deadline path) | pass | pass |
+| VLESS + REALITY + Vision (hand-resolved `reality.go`) | pass | pass |
+| **hysteria2 port hopping chained through a socks5 proxy** | **fail (0/4, 0/1, 0/200, 0/1)** | **pass** |
+
+The hop row is the one live A/B that discriminates: on the old pin the dial never
+succeeds, which is the `b54af9a` bug. The Vision, SS2022 replay-window, FastOpen and
+VMess-padding fixes are NOT distinguishable live (the old pin passes too: in-order loopback
+UDP never exercises the wrong shift, and the padding leak is not visible to a normal
+server); their evidence is the before/after unit tests and diffs listed above.
+simpleobfs still has no live test (no server available).
+
+### Performance (6 protocols x 22 metrics; median of reps 1-5)
+
+`FLAGS: 0`. No metric was worse than the criteria allowed. Highlights (old -> new):
+
+| | single-stream down | 8-stream down | client CPU s/GB (down) | new-conn total p50 / p99 | RTT p50 / p99 | UDP 64B RTT p50 / p99 |
+|---|---|---|---|---|---|---|
+| direct (noise floor) | 229 -> 225 MB/s | 433 -> 429 | 1.56 -> 1.51 | 0.589 -> 0.599 / 0.850 -> 0.878 ms | 0.051 -> 0.052 / 0.098 -> 0.105 | 0.018 -> 0.018 / 0.031 -> 0.036 |
+| Vision | 243 -> 241 | 440 -> 438 | 1.38 -> 1.40 | 1.37 -> 1.40 / 1.82 -> 1.90 ms | 0.082 -> 0.084 / 0.138 -> 0.153 | 0.061 -> 0.060 / 0.110 -> 0.111 |
+| REALITY | 228 -> 242 | 443 -> 440 | 1.51 -> 1.42 | 1.63 -> 1.62 / 2.14 -> 2.11 | 0.083 -> 0.086 / 0.146 -> 0.145 | 0.061 -> 0.061 / 0.106 -> 0.112 |
+| VMess | 225 -> 238 | 439 -> 432 | 1.78 -> 1.67 | 0.77 -> 0.78 / 1.15 -> 1.15 | 0.089 -> 0.091 / 0.145 -> 0.162 | 0.047 -> 0.048 / 0.084 -> 0.079 |
+| SS2022 | 245 -> 245 | 433 -> 429 | 1.64 -> 1.63 | 0.82 -> 0.83 / 1.15 -> 1.24 | 0.088 -> 0.087 / 0.142 -> 0.152 | 0.054 -> 0.055 / 0.130 -> 0.138 |
+| hysteria2 | 237 -> 242 | 433 -> 441 | 3.94 -> 3.83 | 0.87 -> 0.86 / 1.23 -> 1.22 | 0.128 -> 0.132 / 0.213 -> 0.210 | 0.092 -> 0.093 / 0.163 -> 0.157 |
+
+- Vision's new handshake flush timer (100 ms, same value as the existing
+  `vless.NewConn` server-speaks-first flush) only fires when the client has not written
+  within 100 ms; the new-connection time did not move (1.37 -> 1.40 ms), no 100 ms step.
+- The `direct` row runs identical code in both pins and moves by up to +-16% on p99
+  and a few percent on throughput, so differences of that size are noise on this box.
+- No failed dial or request and no UDP loss increase in any cell. UDP burst receive
+  ratios are low for direct, SS2022 and hysteria2 at a 20k-datagram flood on loopback,
+  but identical between old and new.
+
+Microbenchmarks (`benchstat`, 10 runs, interleaved, one pinned core):
+
+| Benchmark | old | new | |
+|---|---|---|---|
+| SS2022 replay window, in order | 74.4 ns | 74.2 ns | ~ |
+| SS2022 replay window, reordered | 22.3 ns | 22.7 ns | +1.7% (p=0.002), 0.4 ns per packet |
+| SS2022 replay window, large jumps | 92.1 ns | 92.2 ns | ~ |
+| VMess request header build | 211 ns | 304 ns | +44% (p<0.001), +93 ns per new connection |
+
+The VMess cost is the random fill of the up-to-15-byte padding (previously uninitialized
+pool bytes were sent). It is once per connection and is not visible end to end
+(VMess dial p50 0.084 -> 0.085 ms).
+
+### Not covered by this run
+
+- dae's tproxy/BPF datapath, `dae reload`, and the 223 gateway.
+- FastOpen and the SS2022 replay window under packet reordering/loss on a real path.
+- REALITY `spiderX` malformed values (unit test only).
+- HTTP/2 over the tunnel, large numbers of idle connections, long soaks.
+- Any hardware other than 220.

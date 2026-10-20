@@ -1,0 +1,111 @@
+                           │  bench.old  │              bench.new              │
+                           │   sec/op    │   sec/op     vs base                │
+SlidingWindowInOrder         74.42n ± 1%   74.22n ± 1%        ~ (p=0.435 n=10)
+SlidingWindowReordered       22.30n ± 1%   22.68n ± 1%   +1.70% (p=0.002 n=10)
+SlidingWindowJumps           92.14n ± 1%   92.24n ± 1%        ~ (p=0.868 n=10)
+RC4Init                      686.4n ± 1%   687.8n ± 1%        ~ (p=0.727 n=10)
+AES128Init                   102.0n ± 1%   101.8n ± 1%        ~ (p=0.469 n=10)
+AES192Init                   103.4n ± 1%   102.2n ± 1%   -1.06% (p=0.045 n=10)
+AES256Init                   106.5n ± 1%   106.7n ± 1%        ~ (p=0.362 n=10)
+BlowFishInit                 20.96µ ± 1%   20.97µ ± 0%        ~ (p=0.756 n=10)
+Cast5Init                    413.1n ± 0%   412.1n ± 0%        ~ (p=0.362 n=10)
+DESInit                      670.8n ± 1%   670.3n ± 1%        ~ (p=0.753 n=10)
+RC4MD5Init                   813.0n ± 0%   812.2n ± 1%        ~ (p=0.971 n=10)
+ChaCha20Init                 24.97n ± 1%   24.93n ± 1%        ~ (p=0.616 n=10)
+Salsa20Init                  13.15n ± 0%   13.12n ± 2%        ~ (p=0.469 n=10)
+AES128Encrypt                4.271µ ± 0%   4.270µ ± 0%        ~ (p=0.565 n=10)
+AES192Encrypt                4.698µ ± 0%   4.703µ ± 0%        ~ (p=0.403 n=10)
+AES256Encrypt                5.126µ ± 1%   5.128µ ± 1%        ~ (p=0.592 n=10)
+BlowFishEncrypt              23.99µ ± 2%   23.95µ ± 1%        ~ (p=0.256 n=10)
+Cast5Encrypt                 24.02µ ± 1%   23.96µ ± 0%        ~ (p=0.159 n=10)
+DESEncrypt                   37.47µ ± 1%   37.45µ ± 0%        ~ (p=1.000 n=10)
+RC4MD5Encrypt                5.498µ ± 1%   5.500µ ± 1%        ~ (p=0.752 n=10)
+Chacha20Encrypt              957.6n ± 1%   955.6n ± 1%        ~ (p=0.383 n=10)
+Salsa20Encrypt               2.420µ ± 1%   2.414µ ± 0%        ~ (p=0.670 n=10)
+AES128Decrypt                3.662µ ± 1%   3.664µ ± 0%        ~ (p=0.617 n=10)
+AES192Decrypt                4.072µ ± 1%   4.066µ ± 0%        ~ (p=0.071 n=10)
+AES256Decrypt                4.499µ ± 1%   4.518µ ± 0%        ~ (p=0.223 n=10)
+BlowFishDecrypt              23.34µ ± 1%   23.39µ ± 0%        ~ (p=0.218 n=10)
+Cast5Decrypt                 23.33µ ± 1%   23.33µ ± 0%        ~ (p=0.954 n=10)
+DESDecrypt                   37.27µ ± 1%   37.33µ ± 1%        ~ (p=0.481 n=10)
+RC4MD5Decrypt                5.510µ ± 0%   5.506µ ± 1%        ~ (p=0.781 n=10)
+ChaCha20Decrypt              957.7n ± 0%   957.2n ± 0%        ~ (p=0.812 n=10)
+Salsa20Decrypt               2.417µ ± 0%   2.415µ ± 1%        ~ (p=0.927 n=10)
+ReqInstructionDataFromPool   211.1n ± 1%   304.3n ± 1%  +44.18% (p=0.000 n=10)
+geomean                      1.360µ        1.376µ        +1.14%
+
+                           │   bench.old    │               bench.new               │
+                           │      B/op      │     B/op      vs base                 │
+SlidingWindowInOrder           0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+SlidingWindowReordered         0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+SlidingWindowJumps             0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4Init                      1.125Ki ± 0%     1.125Ki ± 0%       ~ (p=1.000 n=10) ¹
+AES128Init                     624.0 ± 0%       624.0 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Init                     624.0 ± 0%       624.0 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Init                     624.0 ± 0%       624.0 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishInit                 4.844Ki ± 0%     4.844Ki ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Init                      176.0 ± 0%       176.0 ± 0%       ~ (p=1.000 n=10) ¹
+DESInit                        224.0 ± 0%       224.0 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Init                   1.141Ki ± 0%     1.141Ki ± 0%       ~ (p=1.000 n=10) ¹
+ChaCha20Init                   144.0 ± 0%       144.0 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Init                    48.00 ± 0%       48.00 ± 0%       ~ (p=1.000 n=10) ¹
+AES128Encrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Encrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Encrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishEncrypt                0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Encrypt                   0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+DESEncrypt                     0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Encrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Chacha20Encrypt                0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Encrypt                 0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES128Decrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Decrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Decrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishDecrypt                1.000 ± 0%       1.000 ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Decrypt                   1.000 ± 0%       1.000 ± 0%       ~ (p=1.000 n=10) ¹
+DESDecrypt                     0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Decrypt                  0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+ChaCha20Decrypt                0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Decrypt                 0.000 ± 0%       0.000 ± 0%       ~ (p=1.000 n=10) ¹
+ReqInstructionDataFromPool     24.00 ± 0%       24.00 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                   ²                 +0.00%                ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                           │  bench.old   │              bench.new              │
+                           │  allocs/op   │ allocs/op   vs base                 │
+SlidingWindowInOrder         0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+SlidingWindowReordered       0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+SlidingWindowJumps           0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4Init                      1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES128Init                   4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Init                   4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Init                   4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishInit                 4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Init                    4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+DESInit                      4.000 ± 0%     4.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Init                   2.000 ± 0%     2.000 ± 0%       ~ (p=1.000 n=10) ¹
+ChaCha20Init                 1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Init                  1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES128Encrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Encrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Encrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishEncrypt              0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Encrypt                 0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+DESEncrypt                   0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Encrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Chacha20Encrypt              0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Encrypt               0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES128Decrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES192Decrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+AES256Decrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+BlowFishDecrypt              0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Cast5Decrypt                 0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+DESDecrypt                   0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+RC4MD5Decrypt                0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+ChaCha20Decrypt              0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+Salsa20Decrypt               0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+ReqInstructionDataFromPool   1.000 ± 0%     1.000 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                 ²               +0.00%                ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean

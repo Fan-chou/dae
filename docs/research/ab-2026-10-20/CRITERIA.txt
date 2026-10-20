@@ -1,0 +1,9 @@
+Pass criteria, fixed before the performance run (rep 0 is a discarded warm-up; reps 1-5 count):
+- throughput (MB/s) and client CPU (cpu_s/GB): median(new)/median(old) within +-5%, or the
+  difference inside the larger of the two runs' (max-min) spread -> no regression.
+  worse than 5% AND outside spread -> FLAG.
+- latency p50 (ttfb, dial, rtt, udp rtt): FLAG when new is worse by >10% and >0.2 ms (median over reps).
+- latency p99: FLAG when worse by >25% and >1 ms (p99 is noisy on a shared workstation).
+- any failed request/loss count increase, or a FAILED row -> FLAG.
+- the `direct` row runs identical code in both pins; its deltas are the noise floor.
+- numbers are relative (old vs new) on a 16-core workstation, not absolute capacity of the gateway.
