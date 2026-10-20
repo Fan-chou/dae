@@ -62,6 +62,11 @@ export type AdminConnectionsSnapshot = {
   total: number
   truncated: boolean
   connections: AdminConnection[]
+  // Server-side read time of the byte counters and process-wide totals read
+  // at that same moment. Absent on older backends.
+  snapshot_at_ms?: number
+  upload_total?: number
+  download_total?: number
 }
 
 export type ConnectionFilter = {

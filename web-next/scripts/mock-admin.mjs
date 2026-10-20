@@ -132,7 +132,7 @@ const connections = () => {
       download: 38000 + i * 91000,
     })
   }
-  return { scope: 'active', total: 184, truncated: false, connections: list }
+  return { scope: 'active', total: 184, truncated: false, connections: list, snapshot_at_ms: Date.now() }
 }
 
 const logLines = () =>

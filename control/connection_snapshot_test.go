@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/component/outbound"
 )
@@ -152,5 +153,47 @@ func TestAdminConnectionsSnapshotTruncates(t *testing.T) {
 	}
 	if clampAdminConnectionLimit(0) != adminConnectionsDefaultLimit || clampAdminConnectionLimit(4096) != adminConnectionsMaxLimit {
 		t.Fatalf("clamp 0=%d 4096=%d", clampAdminConnectionLimit(0), clampAdminConnectionLimit(4096))
+	}
+}
+
+func TestAdminConnectionsSnapshotKeepsHeaviestFlowsWhenTruncated(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+	group := &outbound.DialerGroup{Name: "AI"}
+	// Bytes per flow, in adoption (= id) order: the heaviest ones are the
+	// newest, which an id-ordered cut would have dropped first.
+	bytes := []int64{0, 10, 5000, 700}
+	for i, n := range bytes {
+		flow, err := manager.adoptTCP(
+			&memoryLayoutConn{id: uint64(i + 1)},
+			nil,
+			TcpFlowBinding{Egress: TcpEgressBinding{Outbound: group, Target: "example.com:443"}},
+			runtime,
+			nil,
+			netip.MustParseAddrPort(fmt.Sprintf("192.168.124.202:%d", 40000+i)),
+			netip.MustParseAddrPort("198.51.100.10:443"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flow.recordUpload(n)
+		flow.recordDownload(n / 2)
+	}
+	before := time.Now().UnixMilli()
+	snap := manager.adminConnectionsSnapshot(2, adminConnectionFilter{})
+	after := time.Now().UnixMilli()
+	if snap.Total != 4 || !snap.Truncated || len(snap.Connections) != 2 {
+		t.Fatalf("snap = %+v", snap)
+	}
+	if got := snap.Connections[0].Upload; got != 5000 {
+		t.Fatalf("heaviest flow first, got upload %d", got)
+	}
+	if got := snap.Connections[1].Upload; got != 700 {
+		t.Fatalf("second heaviest, got upload %d", got)
+	}
+	if snap.SnapshotAtMs < before || snap.SnapshotAtMs > after {
+		t.Fatalf("snapshot_at_ms %d outside [%d,%d]", snap.SnapshotAtMs, before, after)
 	}
 }

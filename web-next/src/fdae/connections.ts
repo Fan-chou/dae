@@ -100,7 +100,10 @@ export function subscribeConnections() {
         previous.clear()
         previousAt = 0
       }
-      const now = Date.now(),
+      // Rates use the time the server read the counters, not when the
+      // response arrived, so network and queueing jitter do not skew them.
+      // Older backends send no timestamp; fall back to the receive time.
+      const now = snapshot.snapshot_at_ms ?? Date.now(),
         elapsed = (now - previousAt) / 1000
       const active = (snapshot.connections || []).map((row) => {
         const result = mapConnection(row, scope),
@@ -152,8 +155,10 @@ export function subscribeConnections() {
         active,
         closed,
         resetHistory,
-        uploadTotal: status.upload_total,
-        downloadTotal: status.download_total,
+        // Prefer the totals read together with the flow list; /v1/status is a
+        // separate request taken at a slightly different moment.
+        uploadTotal: snapshot.upload_total ?? status.upload_total,
+        downloadTotal: snapshot.download_total ?? status.download_total,
       }
     } catch (error) {
       if (revision === stateRevision && backend === activeBackend.value)

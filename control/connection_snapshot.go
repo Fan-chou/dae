@@ -43,6 +43,15 @@ type AdminConnectionsSnapshot struct {
 	Total       int               `json:"total"`
 	Truncated   bool              `json:"truncated"`
 	Connections []AdminConnection `json:"connections"`
+	// SnapshotAtMs is when the per-flow byte counters were read. Clients
+	// should derive rates from it rather than from their own receive time,
+	// which includes network and queueing jitter.
+	SnapshotAtMs int64 `json:"snapshot_at_ms,omitempty"`
+	// UploadTotal and DownloadTotal are the process-wide totals read at the
+	// same moment, so totals and flow list describe one instant. They include
+	// traffic that has no flow entry (DNS, closed flows).
+	UploadTotal   uint64 `json:"upload_total,omitempty"`
+	DownloadTotal uint64 `json:"download_total,omitempty"`
 }
 
 type adminConnectionFilter struct {
@@ -69,11 +78,15 @@ func (c *ControlPlane) AdminConnections(limit int, outbound, src, mac string) Ad
 	if manager == nil {
 		return AdminConnectionsSnapshot{Connections: []AdminConnection{}}
 	}
-	return manager.adminConnectionsSnapshot(clampAdminConnectionLimit(limit), adminConnectionFilter{
+	snap := manager.adminConnectionsSnapshot(clampAdminConnectionLimit(limit), adminConnectionFilter{
 		outbound: strings.TrimSpace(outbound),
 		src:      strings.TrimSpace(src),
 		mac:      strings.ToLower(strings.TrimSpace(mac)),
 	})
+	store := c.runtimeStatsStore()
+	snap.UploadTotal = store.uploadTotal.Load()
+	snap.DownloadTotal = store.downloadTotal.Load()
+	return snap
 }
 
 func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnectionFilter) AdminConnectionsSnapshot {
@@ -93,7 +106,13 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 	for _, flow := range udp {
 		appendFiltered(adminConnectionFromUDP(flow))
 	}
+	// Heaviest flows first so that truncation drops the idle ones, not the
+	// ones a monitor exists to show. Ties fall back to the numeric id order,
+	// which keeps the bounded list stable between polls.
 	sort.Slice(out, func(i, j int) bool {
+		if bi, bj := out[i].Upload+out[i].Download, out[j].Upload+out[j].Download; bi != bj {
+			return bi > bj
+		}
 		if len(out[i].ID) != len(out[j].ID) {
 			return len(out[i].ID) < len(out[j].ID)
 		}
@@ -106,10 +125,11 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 		out = []AdminConnection{}
 	}
 	return AdminConnectionsSnapshot{
-		Scope:       m.adminSnapshotID,
-		Total:       total,
-		Truncated:   total > len(out),
-		Connections: out,
+		Scope:        m.adminSnapshotID,
+		Total:        total,
+		Truncated:    total > len(out),
+		Connections:  out,
+		SnapshotAtMs: time.Now().UnixMilli(),
 	}
 }
 
