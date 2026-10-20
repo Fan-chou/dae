@@ -524,6 +524,7 @@ export const connectionTableColumns = useStorage<
   CONNECTIONS_TABLE_ACCESSOR_KEY.Destination,
   CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationPort,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Host,
+  CONNECTIONS_TABLE_ACCESSOR_KEY.Source,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Type,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Rule,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Chains,
@@ -564,6 +565,32 @@ if (cardEndpointFieldsVersion.value < 1) {
       ...connectionCardLines.value.slice(1),
     ]
   cardEndpointFieldsVersion.value = 1
+}
+
+// Existing browser layouts get the "forwarded by" column once, so kernel flows
+// are distinguishable without a trip to the column settings.
+const sourceColumnVersion = useStorage('config/fdae-source-column-version', 0)
+if (sourceColumnVersion.value < 1) {
+  const key = CONNECTIONS_TABLE_ACCESSOR_KEY.Source
+  if (!connectionTableColumns.value.includes(key)) {
+    const at = connectionTableColumns.value.indexOf(
+      CONNECTIONS_TABLE_ACCESSOR_KEY.Type,
+    )
+    connectionTableColumns.value =
+      at < 0
+        ? [...connectionTableColumns.value, key]
+        : [
+            ...connectionTableColumns.value.slice(0, at),
+            key,
+            ...connectionTableColumns.value.slice(at),
+          ]
+  }
+  if (!connectionCardLines.value.flat().includes(key)) {
+    connectionCardLines.value = connectionCardLines.value.map((line) =>
+      line.includes(CONNECTIONS_TABLE_ACCESSOR_KEY.Type) ? [key, ...line] : line,
+    )
+  }
+  sourceColumnVersion.value = 1
 }
 
 export const sourceIPLabelList = useStorage<SourceIPLabel[]>(

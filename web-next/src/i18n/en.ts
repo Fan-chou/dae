@@ -61,6 +61,7 @@ const en = {
   collapseAllGroups: 'Collapse all groups',
   rule: 'Rule',
   sourceIP: 'Source IP',
+  source: 'Forwarded by',
   activeConnections: 'Active',
   closedConnections: 'Closed',
   allConnections: 'All',

@@ -76,6 +76,13 @@
           {{ $t(key) }}
         </option>
       </select>
+      <label
+        class="flex cursor-pointer items-center gap-1.5"
+        title="同时列出由内核直接转发、不经过 fdae 用户态的连接（读取 conntrack）。关闭时不会读取。"
+      >
+        <input v-model="includeKernel" type="checkbox" class="checkbox checkbox-sm" />
+        <span>含内核转发</span>
+      </label>
       <button class="btn btn-ghost btn-sm" @click="clear">清除筛选</button>
     </div>
     <div
@@ -101,6 +108,41 @@
         >{{ state.connectionsError || '快照已过期' }} · 保留上次数据</span
       >
     </div>
+    <div
+      v-if="includeKernel"
+      class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-base-content/55"
+    >
+      <span
+        >内核转发：匹配 {{ kernelState.at ? kernelState.total : '—' }} · 已加载
+        {{ kernelState.at ? kernelState.loaded : '—' }}</span
+      >
+      <span v-if="kernelState.at"
+        >已排除 fdae 转发 {{ kernelState.excluded.userspace }} · fdae 自身连接
+        {{ kernelState.excluded.dae }} · 已结束
+        {{ kernelState.excluded.inactive }}</span
+      >
+      <span v-if="kernelState.truncated" class="text-warning"
+        >内核转发已按流量截断</span
+      >
+      <span v-if="kernelState.error" class="text-warning">{{
+        kernelState.error
+      }}</span>
+      <span v-if="kernelState.at && !kernelState.available" class="text-warning"
+        >无法读取内核连接表（conntrack）</span
+      >
+      <span
+        v-else-if="kernelState.at && !kernelState.accounting"
+        class="text-warning"
+        >内核未启用流量计数，内核转发行没有流量与速度。开启：
+        <code>sysctl -w net.netfilter.nf_conntrack_acct=1</code>
+        （仅对之后新建的连接生效）</span
+      >
+      <span class="text-base-content/40"
+        >内核转发的流量为 IP
+        层字节（含头部），比 fdae 转发的应用层字节略大；域名来自 DNS
+        缓存反查，可能不准；无 MAC，不受 MAC/出站筛选影响（筛选时隐藏）。</span
+      >
+    </div>
   </div>
 </template>
 <script setup lang="ts">
@@ -123,6 +165,7 @@ import {
 import { isConnectionCard } from '@/store/settings'
 import { useStorage } from '@/helper/storage'
 import { state } from './client'
+import { includeKernel, kernelState } from './kernelConnections'
 const sourceMacs = computed(() => {
   const result = new Map<string, string[]>()
   for (const { ip, mac } of state.devicePairs) {

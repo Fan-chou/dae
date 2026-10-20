@@ -63,6 +63,7 @@ const ru: LANG_MESSAGE = {
   collapseAllGroups: 'Свернуть все группы',
   rule: 'Правило',
   sourceIP: 'Исходный IP',
+  source: 'Пересылка',
   activeConnections: 'Активные',
   closedConnections: 'Закрытые',
   allConnections: 'Все',

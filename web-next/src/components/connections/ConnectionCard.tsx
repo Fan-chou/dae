@@ -131,6 +131,11 @@ export default defineComponent<{
             '源端口',
             true,
           ),
+        [CONNECTIONS_TABLE_ACCESSOR_KEY.Source]: () => (
+          <span class="w-20 grow truncate">
+            {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.Source)}
+          </span>
+        ),
         [CONNECTIONS_TABLE_ACCESSOR_KEY.SniffHost]: () => (
           <span class="w-80 grow truncate break-all">
             {highlightedText(CONNECTIONS_TABLE_ACCESSOR_KEY.SniffHost)}

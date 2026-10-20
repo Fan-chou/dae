@@ -51,6 +51,8 @@ export enum CONNECTIONS_TABLE_ACCESSOR_KEY {
   DestinationPort = 'destinationPort',
   MAC = 'mac',
   Dialer = 'dialer',
+  // 流量由 fdae 用户态转发，还是由内核直接转发（来自 conntrack）。
+  Source = 'source',
   SniffHost = 'sniffHost',
   Destination = 'destination',
   DestinationType = 'destinationType',
@@ -62,6 +64,7 @@ export enum CONNECTIONS_TABLE_ACCESSOR_KEY {
 // 桌面表格与卡片列表共享同一份分组能力清单。分组字段必须有稳定、可读的离散值；
 // 操作列、时间、流量与瞬时速率只用于展示/排序，不参与分组。
 export const CONNECTION_GROUPABLE_KEYS = [
+  CONNECTIONS_TABLE_ACCESSOR_KEY.Source,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Type,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Host,
   CONNECTIONS_TABLE_ACCESSOR_KEY.SniffHost,

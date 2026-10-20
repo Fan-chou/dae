@@ -309,6 +309,7 @@ const columnWidthMap = useStorage('config/table-column-width', {
   [CONNECTIONS_TABLE_ACCESSOR_KEY.UlSpeed]: 80,
   [CONNECTIONS_TABLE_ACCESSOR_KEY.Outbound]: 80,
   [CONNECTIONS_TABLE_ACCESSOR_KEY.Type]: 150,
+  [CONNECTIONS_TABLE_ACCESSOR_KEY.Source]: 90,
   [CONNECTIONS_TABLE_ACCESSOR_KEY.Process]: 150,
   [CONNECTIONS_TABLE_ACCESSOR_KEY.SourceIP]: 150,
   [CONNECTIONS_TABLE_ACCESSOR_KEY.SourcePort]: 100,
@@ -409,6 +410,13 @@ const columnDefinitions: ColumnDef<Connection>[] = [
     accessorFn: (original) =>
       getTableDisplayValue(original, CONNECTIONS_TABLE_ACCESSOR_KEY.Process),
     cell: highlightedCell(CONNECTIONS_TABLE_ACCESSOR_KEY.Process),
+  },
+  {
+    header: () => t(CONNECTIONS_TABLE_ACCESSOR_KEY.Source),
+    id: CONNECTIONS_TABLE_ACCESSOR_KEY.Source,
+    accessorFn: (original) =>
+      getTableDisplayValue(original, CONNECTIONS_TABLE_ACCESSOR_KEY.Source),
+    cell: highlightedCell(CONNECTIONS_TABLE_ACCESSOR_KEY.Source),
   },
   {
     header: () => t(CONNECTIONS_TABLE_ACCESSOR_KEY.Host),

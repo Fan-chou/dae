@@ -152,6 +152,11 @@ export type ConnectionRawMessage = ClashConnectionRawMessage
 
 export type Connection = ConnectionRawMessage & {
   fdae?: import('../fdae/types').AdminConnection
+  // Set for flows the kernel forwards on its own (read from conntrack).
+  kernel?: import('../fdae/types').AdminKernelConnection
+  // Kernel flows carry no byte counters unless nf_conntrack_acct is on;
+  // show "—" rather than zeros.
+  bytesUnavailable?: boolean
   rateKnown?: boolean
   downloadSpeed: number
   uploadSpeed: number

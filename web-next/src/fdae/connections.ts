@@ -5,11 +5,19 @@ import { activeBackend } from '@/store/setup'
 import { sourceIPFilter } from '@/store/connections'
 import {
   fetchConnections,
+  fetchKernelConnections,
   fetchStatus,
   polling,
   state,
   stateRevision,
 } from './client'
+import {
+  includeKernel,
+  kernelState,
+  mapKernelConnection,
+  withKernelRates,
+  type KernelRow,
+} from './kernelConnections'
 export function endpoint(value: string) {
   const bracket = /^\[([^\]]+)\](?::(\d+))?$/.exec(value || '')
   const pair = /^([^:]+):(\d+)$/.exec(value || '')
@@ -69,6 +77,12 @@ export function subscribeConnections() {
   let previous = new Map<string, Connection>()
   let previousContext = '',
     previousAt = 0
+  // Kernel flows are tracked on their own: they never become "closed"
+  // connections (a flow leaving the top-N or conntrack is not a close).
+  let kernelPrev = new Map<string, { upload: number; download: number }>()
+  let kernelAt = 0,
+    kernelKey = '',
+    kernelConnections: Connection[] = []
   return polling<ConnectionsSnapshot>(async (backend) => {
     const source =
       sourceIPFilter.value?.length === 1 ? sourceIPFilter.value[0]! : ''
@@ -77,11 +91,26 @@ export function subscribeConnections() {
     if (state.filter.outbound) query.set('outbound', state.filter.outbound)
     if (state.filter.mac) query.set('mac', state.filter.mac)
     const context = query.toString()
+    // conntrack has neither outbound nor MAC, so those filters exclude kernel
+    // flows; the source filter is applied by the server.
+    const wantKernel =
+      includeKernel.value && !state.filter.outbound && !state.filter.mac
+    const kernelQuery = new URLSearchParams({
+      limit: String(state.filter.limit),
+    })
+    if (source) kernelQuery.set('src', source)
     try {
+      const kernelRequest = wantKernel
+        ? fetchKernelConnections(kernelQuery, backend).then(
+            (value) => ({ value }),
+            (error: Error) => ({ error }),
+          )
+        : undefined
       const [snapshot, status] = await Promise.all([
         fetchConnections(query, backend),
         fetchStatus(backend),
       ])
+      const kernelResult = await kernelRequest
       if (revision !== stateRevision || backend !== activeBackend.value)
         throw new Error('后端已切换')
       const currentSource =
@@ -143,6 +172,59 @@ export function subscribeConnections() {
         pairs.set(JSON.stringify(pair), pair)
       }
       state.devicePairs = [...pairs.values()].slice(-2048)
+      if (!wantKernel) {
+        kernelPrev = new Map()
+        kernelAt = 0
+        kernelKey = ''
+        kernelConnections = []
+        kernelState.at = 0
+        kernelState.error = ''
+      } else if (kernelResult && 'error' in kernelResult) {
+        // A failing conntrack read must not take the proxy list down with it.
+        kernelState.error = String(kernelResult.error.message)
+        kernelConnections = []
+        kernelAt = 0
+      } else if (kernelResult) {
+        const ks = kernelResult.value
+        const key = kernelQuery.toString() + ':' + scope
+        if (key !== kernelKey) {
+          kernelPrev = new Map()
+          kernelAt = 0
+          kernelConnections = []
+          kernelKey = key
+        }
+        const at = ks.snapshot_at_ms ?? Date.now()
+        Object.assign(kernelState, {
+          error: ks.error || '',
+          available: ks.available,
+          accounting: ks.accounting,
+          total: ks.total,
+          truncated: ks.truncated,
+          scanMs: ks.scan_ms ?? 0,
+          excluded: ks.excluded,
+        })
+        // The server shares one scan between requests: an unchanged
+        // timestamp means no new data, so keep the rows and their rates.
+        if (at !== kernelAt) {
+          const rows: KernelRow[] = withKernelRates(
+            ks.connections || [],
+            kernelPrev,
+            kernelAt,
+            at,
+          )
+          kernelPrev = new Map(
+            rows.map((r) => [r.id, { upload: r.upload, download: r.download }]),
+          )
+          kernelAt = at
+          kernelConnections = rows.map((row) =>
+            mapKernelConnection(row, ks.accounting, (item) =>
+              mapConnection(item, scope),
+            ),
+          )
+        }
+        kernelState.loaded = kernelConnections.length
+        kernelState.at = Date.now()
+      }
       Object.assign(state, {
         connectionsAt: now,
         connectionsError: '',
@@ -152,7 +234,9 @@ export function subscribeConnections() {
         scope,
       })
       return {
-        active,
+        active: kernelConnections.length
+          ? active.concat(kernelConnections)
+          : active,
         closed,
         resetHistory,
         // Prefer the totals read together with the flow list; /v1/status is a

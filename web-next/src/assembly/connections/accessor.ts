@@ -113,11 +113,18 @@ export const createGetConnectionDisplayValue =
         if (connection.rateKnown === false) return '—'
         return `${prettyBytesHelper(connection.uploadSpeed)}/s`
       case CONNECTIONS_TABLE_ACCESSOR_KEY.Download:
-        return prettyBytesHelper(accessor.download(connection))
+        return connection.bytesUnavailable
+          ? '—'
+          : prettyBytesHelper(accessor.download(connection))
       case CONNECTIONS_TABLE_ACCESSOR_KEY.Upload:
-        return prettyBytesHelper(accessor.upload(connection))
+        return connection.bytesUnavailable
+          ? '—'
+          : prettyBytesHelper(accessor.upload(connection))
+      case CONNECTIONS_TABLE_ACCESSOR_KEY.Source:
+        return connection.kernel ? '内核' : 'fdae'
       case CONNECTIONS_TABLE_ACCESSOR_KEY.ConnectTime:
-        return fromNow(accessor.start(connection))
+        // conntrack does not expose a start time.
+        return connection.kernel ? '—' : fromNow(accessor.start(connection))
       case CONNECTIONS_TABLE_ACCESSOR_KEY.SourceIP:
         return connection.fdae
           ? accessor.sourceIP(connection)

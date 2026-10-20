@@ -63,6 +63,7 @@ const zh: LANG_MESSAGE = {
   collapseAllGroups: '折叠全部分组',
   rule: '规则',
   sourceIP: '源IP',
+  source: '转发方',
   activeConnections: '活跃',
   closedConnections: '已关闭',
   allConnections: '全部',

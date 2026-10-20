@@ -63,6 +63,7 @@ const zhTW: LANG_MESSAGE = {
   collapseAllGroups: '摺疊全部分組',
   rule: '規則',
   sourceIP: '源IP',
+  source: '轉發方',
   activeConnections: '活躍',
   closedConnections: '已關閉',
   allConnections: '全部',
