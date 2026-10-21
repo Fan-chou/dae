@@ -59,7 +59,19 @@ func runBpfProgram(prog *ebpf.Program, data, ctx []byte) (statusCode uint32, dat
 	return ret, opts.DataOut, ctxOut, err
 }
 
+// egressProofTestMark must match EGRESS_PROOF_TEST_MARK in bpf_test.c.
+const egressProofTestMark uint32 = 0x40000000
+
+// egressProofProgsetPrefix marks program sets that only make sense when
+// PARAM.direct_proof_mark is set; Test() and TestBpfBugsVerification run with
+// it unset and skip them.
+const egressProofProgsetPrefix = "EgressProof"
+
 func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, err error) {
+	return collectProgramsWithProofMark(t, 0)
+}
+
+func collectProgramsWithProofMark(t *testing.T, directProofMark uint32) (obj *bpftestObjects, progset []programSet, err error) {
 	obj = &bpftestObjects{}
 	spec, err := loadBpftest()
 	if err != nil {
@@ -79,8 +91,10 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 		hasBpfGetCurrentTask uint8
 		datapathGeneration   uint16
 		daeSocketMark        uint32
+		directProofMark      uint32
 	}{
 		datapathGeneration: 41,
+		directProofMark:    directProofMark,
 	}
 	if err = spec.Variables["PARAM"].Set(param); err != nil {
 		return nil, nil, err
@@ -176,7 +190,11 @@ func markAllOutboundsAlive(t *testing.T, obj *bpftestObjects) {
 }
 
 func runProgramSetByID(t *testing.T, id string) {
-	obj, progsets, err := collectPrograms(t)
+	runProgramSetByIDWithProofMark(t, id, 0)
+}
+
+func runProgramSetByIDWithProofMark(t *testing.T, id string, directProofMark uint32) {
+	obj, progsets, err := collectProgramsWithProofMark(t, directProofMark)
 	if err != nil {
 		t.Fatalf("error while collecting programs: %s", err)
 	}
@@ -298,6 +316,9 @@ func TestBpfBugsVerification(t *testing.T) {
 	bugResults := make(map[string]bool)
 
 	for _, progset := range progsets {
+		if strings.HasPrefix(progset.id, egressProofProgsetPrefix) {
+			continue
+		}
 		// Only run bug verification tests
 		if !strings.HasPrefix(strings.ToLower(progset.id), "bug_") &&
 			!strings.HasPrefix(strings.ToLower(progset.id), "bugcombined") {
@@ -414,6 +435,9 @@ func Test(t *testing.T) {
 	var zeroEntry []byte
 
 	for _, progset := range progsets {
+		if strings.HasPrefix(progset.id, egressProofProgsetPrefix) {
+			continue
+		}
 		if err = obj.RoutingMetaMap.Update(key, activeRulesLen, ebpf.UpdateAny); err != nil {
 			t.Fatalf("failed to initialize routing_meta_map: %v", err)
 		}
@@ -543,4 +567,20 @@ func TestSipAndDomainAmbiguous(t *testing.T) {
 
 func TestNotDomainAmbiguousFalsePositive(t *testing.T) {
 	runProgramSetByID(t, "NotDomainAmbiguousFalsePositive")
+}
+
+func TestEgressProofMark(t *testing.T) {
+	for _, id := range []string{
+		"EgressProofTcpNewDirect",
+		"EgressProofTcpCachedDirectKeepsRouteMark",
+		"EgressProofUdpNewDirect",
+		"EgressProofUdpWanIngressReplay",
+		"EgressProofTcpProxyNoProof",
+		"EgressProofTcpStatelessPassthroughNoProof",
+		"EgressProofStaleBitClearedOnPassthrough",
+	} {
+		t.Run(id, func(t *testing.T) {
+			runProgramSetByIDWithProofMark(t, id, egressProofTestMark)
+		})
+	}
 }

@@ -40,6 +40,7 @@ func loadABRegressionObjects(t *testing.T) *bpftestObjects {
 		hasBpfGetCurrentTask uint8
 		datapathGeneration   uint16
 		daeSocketMark        uint32
+		directProofMark      uint32
 	}{
 		datapathGeneration: 41,
 		daeSocketMark:      0x200,

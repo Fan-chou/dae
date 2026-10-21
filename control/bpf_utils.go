@@ -492,6 +492,7 @@ func fullLoadBpfObjects(
 	bpf *bpfObjects,
 	opts *loadBpfOptions,
 	soMarkFromDae uint32,
+	directProofMark uint32,
 ) (err error) {
 	// incompatibleMapRetries caps how many pinned-map rejections may trigger a
 	// reload attempt. Each retry removes one incompatible pinned map, so more
@@ -560,6 +561,7 @@ retryLoadBpf:
 			hasBpfGetCurrentTask uint8
 			datapathGeneration   uint16
 			daeSocketMark        uint32
+			directProofMark      uint32
 		}{
 			tproxyPort:           opts.BigEndianTproxyPort,
 			controlPlanePid:      uint32(os.Getpid()),
@@ -571,6 +573,7 @@ retryLoadBpf:
 			hasBpfGetCurrentTask: hasBpfGetCurrentTask,
 			datapathGeneration:   opts.DatapathGeneration,
 			daeSocketMark:        soMarkFromDae,
+			directProofMark:      directProofMark,
 		},
 	}
 	var dataplane bpfDataplane

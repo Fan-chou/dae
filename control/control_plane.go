@@ -423,7 +423,7 @@ func NewControlPlaneWithContextOptions(
 			CollectionOptions:      collectionOpts,
 			ConnStateMapMaxEntries: connStateMapMaxEntries,
 			DatapathGeneration:     datapathGeneration,
-		}, global.SoMarkFromDae); err != nil {
+		}, global.SoMarkFromDae, global.EgressGuardProofMark); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)
 			}

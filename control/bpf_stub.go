@@ -39,6 +39,7 @@ type bpfDaeParam struct {
 	HasBpfGetCurrentTask uint8
 	DatapathGeneration   uint16
 	DaeSocketMark        uint32 // mark set on dae's own sockets to identify them in eBPF
+	DirectProofMark      uint32 // fwmark bit OR'd into skb->mark on final-direct LAN packets (0=off)
 }
 
 type bpfDomainRouting struct {
@@ -459,6 +460,7 @@ func fullLoadBpfObjects(
 	bpf *bpfObjects,
 	opts *loadBpfOptions,
 	soMarkFromDae uint32,
+	directProofMark uint32,
 ) error {
 	return errBpfObjectsUnavailable
 }

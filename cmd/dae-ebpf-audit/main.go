@@ -31,6 +31,7 @@ type daeParam struct {
 	Padding1        uint8
 	Padding2        uint16
 	DaeSocketMark   uint32
+	DirectProofMark uint32
 }
 
 func main() {

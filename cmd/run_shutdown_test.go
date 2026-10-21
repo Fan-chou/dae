@@ -907,6 +907,12 @@ func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
 				conf.Global.SoMarkFromDae++
 			},
 		},
+		{
+			name: "egress guard proof mark",
+			mutate: func(conf *config.Config) {
+				conf.Global.EgressGuardProofMark = 0x40000000
+			},
+		},
 	}
 
 	for _, tt := range tests {

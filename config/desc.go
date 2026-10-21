@@ -58,6 +58,7 @@ var GlobalDesc = Desc{
 	"tproxy_port":                  "tproxy port to listen on. It is NOT a HTTP/SOCKS port, and is just used by eBPF program.\nIn normal case, you do not need to use it.",
 	"tproxy_port_protect":          "Set it true to protect tproxy port from unsolicited traffic. Set it false to allow users to use self-managed iptables tproxy rules.",
 	"so_mark_from_dae":             "Socket mark for dae-originated traffic. If omitted, dae auto-selects an internal mark to prevent UDP self-capture. Set a non-zero value to override that mark. Set 0 explicitly to keep the internal protection mark without the unset warning.",
+	"egress_guard_proof_mark":      "Optional single fwmark bit (e.g. 0x40000000) that LAN ingress sets on packets whose final routing decision is direct, so egress-guard can tell dae-approved direct traffic from unrouted traffic. 0 (default) disables it. Must match egress-guard's proof_mark, must not overlap 0x0fffff00 or so_mark_from_dae. Changes require a BPF reload.",
 	"log_level":                    "Log level: error, warn, info, debug, trace.",
 	"tcp_check_url":                "Node connectivity check.\nHost of URL should have both IPv4 and IPv6 if you have double stack in local.\nConsidering traffic consumption, it is recommended to choose a site with anycast IP and less response.",
 	"tcp_check_http_method":        "The HTTP request method to `tcp_check_url`. Use 'HEAD' by default because some server implementations bypass accounting for this kind of traffic.",

@@ -46,6 +46,9 @@ type Global struct {
 	TproxyPortProtect bool   `mapstructure:"tproxy_port_protect" default:"true"`
 	SoMarkFromDae     uint32 `mapstructure:"so_mark_from_dae"`
 	SoMarkFromDaeSet  bool   `mapstructure:"so_mark_from_dae_set"`
+	// EgressGuardProofMark is the fwmark bit set on LAN packets whose final
+	// routing decision is direct, for egress-guard's prerouting hook. 0 = off.
+	EgressGuardProofMark uint32 `mapstructure:"egress_guard_proof_mark" default:"0"`
 	LogLevel          string `mapstructure:"log_level" default:"info"`
 	// We use DirectTcpCheckUrl to check (tcp)*(ipv4/ipv6) connectivity for direct.
 	// DirectTcpCheckUrl string `mapstructure:"direct_tcp_check_url" default:"http://www.qualcomm.cn/generate_204"`

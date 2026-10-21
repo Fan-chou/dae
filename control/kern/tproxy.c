@@ -287,12 +287,29 @@ struct dae_param {
 	// When bpf_sk_lookup_* finds a socket, we check this mark to skip dae's own sockets.
 	// This prevents false positives in NAT loopback detection for transparent proxying.
 	__u32 dae_socket_mark;
+	// direct_proof_mark is the single fwmark bit that LAN ingress ORs into
+	// skb->mark for packets whose final routing decision is OUTBOUND_DIRECT
+	// (see direct_proof_skb_mark). 0 disables it. It lets an external
+	// egress guard (e.g. egress-guard's nft prerouting hook) tell packets that
+	// dae itself decided to forward directly from packets dae never routed.
+	__u32 direct_proof_mark;
 };
 
 /* Use const volatile for cilium/ebpf v0.20.0 compatibility.
  * This ensures the variable is placed in .rodata section and
  * can be rewritten from userspace via RewriteConstants. */
 const volatile struct dae_param PARAM = {};
+
+/* direct_proof_skb_mark returns the skb->mark to use for a packet that dae has
+ * just decided (or replayed from cache) to forward directly: the routing mark
+ * plus the optional direct-proof bit. Only call it on paths where the final
+ * outbound is OUTBOUND_DIRECT and the destination is not FakeIP; passthrough
+ * paths that never ran routing must NOT use it.
+ */
+static __always_inline __u32 direct_proof_skb_mark(__u32 mark)
+{
+	return mark | PARAM.direct_proof_mark;
+}
 
 /* dae_ifindex_map holds the runtime-updatable ifindex of the dae0 device.
  * Unlike PARAM.dae0_ifindex (frozen in .rodata at load time), this ARRAY map
@@ -2956,6 +2973,11 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	if (!pkt)
 		return TC_ACT_SHOT;
 
+	/* A direct-proof bit is only ever granted by the direct branches below.
+	 * Drop any stale copy so passthrough paths cannot carry one. */
+	if (PARAM.direct_proof_mark)
+		skb->mark &= ~PARAM.direct_proof_mark;
+
 	/* Ensure scratch bytes are initialized even if verifier can't precisely
 	 * track writes done through callee pointer arguments. */
 	__builtin_memset(pkt, 0, sizeof(*pkt));
@@ -3039,7 +3061,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		mark = tcp_state->meta.data.mark;
 
 		if (outbound == OUTBOUND_DIRECT && !dest_is_fakeip) {
-			skb->mark = mark;
+			skb->mark = direct_proof_skb_mark(mark);
 			return TC_ACT_OK;
 		}
 		if (dest_is_fakeip)
@@ -3077,6 +3099,7 @@ lan_new_flow_route:;
 			if (udp_state && udp_state->is_wan_ingress_direction &&
 			    !dest_is_fakeip) {
 				// Replay (outbound) of an inbound flow => direct.
+				skb->mark |= PARAM.direct_proof_mark;
 				return TC_ACT_OK;
 			}
 
@@ -3088,7 +3111,7 @@ lan_new_flow_route:;
 				__u32 mark = udp_state->meta.data.mark;
 
 				if (outbound == OUTBOUND_DIRECT) {
-					skb->mark = mark;
+					skb->mark = direct_proof_skb_mark(mark);
 					goto direct;
 				} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 					goto block;
@@ -3219,7 +3242,7 @@ lan_new_flow_route:;
 	// did not insert an entry.
 	if (pkt->l4proto == IPPROTO_TCP && !tcp_state && !dest_is_fakeip) {
 		if (outbound == OUTBOUND_DIRECT && mark == 0) {
-			skb->mark = mark;
+			skb->mark = direct_proof_skb_mark(mark);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("tcp(lan): GO OUTBOUND_DIRECT (MAP FULL)");
 #endif
@@ -3247,7 +3270,7 @@ lan_new_flow_route:;
 #endif
 
 	if (outbound == OUTBOUND_DIRECT) {
-		skb->mark = mark;
+		skb->mark = direct_proof_skb_mark(mark);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("GO OUTBOUND DIRECT");
 #endif

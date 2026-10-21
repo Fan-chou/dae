@@ -531,6 +531,10 @@ func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 		oldConf.Global.SoMarkFromDaeSet != newConf.Global.SoMarkFromDaeSet {
 		return true
 	}
+	// egress_guard_proof_mark is also a BPF program constant.
+	if oldConf.Global.EgressGuardProofMark != newConf.Global.EgressGuardProofMark {
+		return true
+	}
 	return false
 }
 

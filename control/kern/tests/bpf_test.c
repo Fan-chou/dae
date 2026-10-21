@@ -3104,3 +3104,205 @@ int testcheck_conntrack_refresh_bypass(struct __sk_buff *skb)
 {
 	return check_status_and_mark(skb, TC_ACT_OK, 0);
 }
+
+/*
+ * egress_proof_* tests exercise PARAM.direct_proof_mark. They only run in
+ * TestEgressProofMark*, which loads the collection with
+ * directProofMark == EGRESS_PROOF_TEST_MARK; the generic Test() skips them
+ * because every other test expects a zero proof mark.
+ */
+#define EGRESS_PROOF_TEST_MARK 0x40000000
+
+static __always_inline int
+setup_udp_wan_ingress_direction_state(__u32 saddr, __u32 daddr,
+				      __u16 sport, __u16 dport)
+{
+	struct tuples_key key = {};
+	struct conn_state *conn_state =
+		bpf_map_lookup_elem(&test_conn_state_scratch_map, &zero_key);
+
+	if (!conn_state)
+		return TC_ACT_SHOT;
+
+	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[3] = bpf_htonl(saddr);
+	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[3] = bpf_htonl(daddr);
+	key.sport = bpf_htons(sport);
+	key.dport = bpf_htons(dport);
+	key.l4proto = IPPROTO_UDP;
+
+	__builtin_memset(conn_state, 0, sizeof(*conn_state));
+	conn_state->is_wan_ingress_direction = true;
+	conn_state->state = TCP_STATE_ACTIVE;
+	conn_state->last_seen_ns = bpf_ktime_get_ns();
+	conn_state->datapath_generation = PARAM.datapath_generation;
+
+	return bpf_map_update_elem(&conn_state_map, &key, conn_state, BPF_ANY);
+}
+
+SEC("tc/pktgen/egress_proof_tcp_new_direct")
+int testpktgen_egress_proof_tcp_new_direct(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(1,1,1,1), 19233, 443);
+}
+
+SEC("tc/setup/egress_proof_tcp_new_direct")
+int testsetup_egress_proof_tcp_new_direct(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/egress_proof_tcp_new_direct")
+int testcheck_egress_proof_tcp_new_direct(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, EGRESS_PROOF_TEST_MARK);
+}
+
+SEC("tc/pktgen/egress_proof_tcp_cached_direct_keeps_route_mark")
+int testpktgen_egress_proof_tcp_cached_direct_keeps_route_mark(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,0,1), IPV4(1,1,1,1),
+				       19233, 80,
+				       false, true, true);
+}
+
+SEC("tc/setup/egress_proof_tcp_cached_direct_keeps_route_mark")
+int testsetup_egress_proof_tcp_cached_direct_keeps_route_mark(
+	struct __sk_buff *skb)
+{
+	/* A cached direct flow with a non-zero routing mark keeps that mark. */
+	if (setup_cached_routing_result(IPV4(192,168,0,1), IPV4(1,1,1,1),
+					19233, 80, OUTBOUND_DIRECT, 0x1234))
+		return TC_ACT_SHOT;
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/egress_proof_tcp_cached_direct_keeps_route_mark")
+int testcheck_egress_proof_tcp_cached_direct_keeps_route_mark(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK,
+				     0x1234 | EGRESS_PROOF_TEST_MARK);
+}
+
+SEC("tc/pktgen/egress_proof_udp_new_direct")
+int testpktgen_egress_proof_udp_new_direct(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,9), IPV4(10,20,0,9), 41008, 8443, 0);
+}
+
+SEC("tc/setup/egress_proof_udp_new_direct")
+int testsetup_egress_proof_udp_new_direct(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/egress_proof_udp_new_direct")
+int testcheck_egress_proof_udp_new_direct(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, EGRESS_PROOF_TEST_MARK);
+}
+
+SEC("tc/pktgen/egress_proof_udp_wan_ingress_replay")
+int testpktgen_egress_proof_udp_wan_ingress_replay(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,9), IPV4(10,20,0,9), 41008, 8443, 0);
+}
+
+SEC("tc/setup/egress_proof_udp_wan_ingress_replay")
+int testsetup_egress_proof_udp_wan_ingress_replay(struct __sk_buff *skb)
+{
+	/* The fallback must not matter: the replay shortcut returns first. */
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	if (setup_udp_wan_ingress_direction_state(IPV4(192,168,20,9),
+						  IPV4(10,20,0,9),
+						  41008, 8443))
+		return TC_ACT_SHOT;
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/egress_proof_udp_wan_ingress_replay")
+int testcheck_egress_proof_udp_wan_ingress_replay(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, EGRESS_PROOF_TEST_MARK);
+}
+
+SEC("tc/pktgen/egress_proof_tcp_proxy_no_proof")
+int testpktgen_egress_proof_tcp_proxy_no_proof(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(8,8,8,8), 23456, 443);
+}
+
+SEC("tc/setup/egress_proof_tcp_proxy_no_proof")
+int testsetup_egress_proof_tcp_proxy_no_proof(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/egress_proof_tcp_proxy_no_proof")
+int testcheck_egress_proof_tcp_proxy_no_proof(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_REDIRECT, 0);
+}
+
+SEC("tc/pktgen/egress_proof_tcp_stateless_passthrough_no_proof")
+int testpktgen_egress_proof_tcp_stateless_passthrough_no_proof(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,0,1), IPV4(8,8,4,4),
+				       23456, 443,
+				       false, true, true);
+}
+
+SEC("tc/setup/egress_proof_tcp_stateless_passthrough_no_proof")
+int testsetup_egress_proof_tcp_stateless_passthrough_no_proof(
+	struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/egress_proof_tcp_stateless_passthrough_no_proof")
+int testcheck_egress_proof_tcp_stateless_passthrough_no_proof(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
+SEC("tc/pktgen/egress_proof_stale_bit_cleared_on_passthrough")
+int testpktgen_egress_proof_stale_bit_cleared_on_passthrough(
+	struct __sk_buff *skb)
+{
+	int ret = set_ipv4_tcp_with_flags(skb,
+					  IPV4(192,168,0,1), IPV4(8,8,4,4),
+					  23456, 443,
+					  false, true, true);
+
+	/* A forged/stale proof bit must not survive a passthrough path. */
+	skb->mark = EGRESS_PROOF_TEST_MARK;
+	return ret;
+}
+
+SEC("tc/setup/egress_proof_stale_bit_cleared_on_passthrough")
+int testsetup_egress_proof_stale_bit_cleared_on_passthrough(
+	struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_DIRECT, true);
+	return do_tproxy_lan_ingress(skb, 14);
+}
+
+SEC("tc/check/egress_proof_stale_bit_cleared_on_passthrough")
+int testcheck_egress_proof_stale_bit_cleared_on_passthrough(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}

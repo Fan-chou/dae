@@ -46,6 +46,11 @@ global {
     # Set 0 explicitly to keep the internal protection mark without the unset warning.
     so_mark_from_dae: 0
 
+    # Optional single fwmark bit set on LAN packets whose final routing decision is direct.
+    # Used by egress-guard (proof_mark) to tell dae-approved direct traffic apart; 0 disables it.
+    # Must not overlap 0x0fffff00 or so_mark_from_dae. Changing it requires a BPF reload.
+    egress_guard_proof_mark: 0
+
     # Log level: error, warn, info, debug, trace.
     log_level: info
 

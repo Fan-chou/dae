@@ -60,7 +60,7 @@ func decodeGlobalSection(conf *Config, section *config_parser.Section) error {
 		return err
 	}
 	conf.Global.SoMarkFromDaeSet = sectionHasParam(section, "so_mark_from_dae")
-	return nil
+	return conf.Global.ValidateEgressGuardProofMark()
 }
 
 func decodeSubscriptionSection(conf *Config, section *config_parser.Section) error {
