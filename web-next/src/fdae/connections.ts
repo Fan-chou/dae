@@ -53,7 +53,7 @@ export function mapConnection(row: AdminConnection, scope: string): Connection {
       dscp: 0,
       host: dst.host,
       inboundIP: '',
-      inboundName: '',
+      inboundName: row.inbound || '',
       inboundPort: '',
       inboundUser: '',
       network: row.network.startsWith('tcp') ? 'tcp' : 'udp',
@@ -92,11 +92,14 @@ export function subscribeConnections() {
     if (source) query.set('src', source)
     if (state.filter.outbound) query.set('outbound', state.filter.outbound)
     if (state.filter.mac) query.set('mac', state.filter.mac)
+    if (state.filter.inbound) query.set('inbound', state.filter.inbound)
     const context = query.toString()
-    // Kernel flows are all "direct", so any other outbound filter excludes
-    // them; the source and MAC filters are applied by the server.
+    // Kernel flows are all "direct" and never come in through an inbound, so
+    // any other outbound filter or an inbound filter excludes them; the source
+    // and MAC filters are applied by the server.
     const wantKernel =
       includeKernel.value &&
+      !state.filter.inbound &&
       (!state.filter.outbound || state.filter.outbound === 'direct')
     const kernelQuery = new URLSearchParams({
       limit: String(state.filter.limit),
@@ -124,6 +127,7 @@ export function subscribeConnections() {
         source !== currentSource ||
         query.get('outbound') !== (state.filter.outbound || null) ||
         query.get('mac') !== (state.filter.mac || null) ||
+        query.get('inbound') !== (state.filter.inbound || null) ||
         query.get('limit') !== String(state.filter.limit)
       )
         throw new Error('筛选条件已更新，等待下一次快照')
@@ -163,7 +167,11 @@ export function subscribeConnections() {
       previousAt = now
       previousContext = nextContext
       // Preserve discovered pairs while narrowing the list, but never cross runtime scopes.
-      const unfiltered = !source && !query.has('mac') && !query.has('outbound')
+      const unfiltered =
+        !source &&
+        !query.has('mac') &&
+        !query.has('outbound') &&
+        !query.has('inbound')
       const pairs = new Map<string, { ip: string; mac: string }>()
       if (!unfiltered && scope === state.scope) {
         for (const pair of state.devicePairs)

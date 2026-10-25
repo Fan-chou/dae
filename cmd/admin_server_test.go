@@ -74,7 +74,7 @@ func (s *stubAdminPlane) AdminKernelConnections(limit int, src, mac string) cont
 	}
 }
 
-func (s *stubAdminPlane) AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot {
+func (s *stubAdminPlane) AdminConnections(limit int, outbound, src, mac, inbound string) control.AdminConnectionsSnapshot {
 	s.connLimit = limit
 	s.connOutbound = outbound
 	s.connSrc = src

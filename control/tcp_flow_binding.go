@@ -41,6 +41,9 @@ type TcpFlowBinding struct {
 	Route  TcpRouteBinding
 	Egress TcpEgressBinding
 	Mac    [6]uint8
+	// Inbound names the user-space inbound that accepted the flow; empty for
+	// transparent traffic.
+	Inbound string
 }
 
 func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult, mac [6]uint8) TcpFlowBinding {

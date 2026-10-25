@@ -8,6 +8,8 @@ import type {
   AdminConnectionsSnapshot,
   AdminKernelConnectionsSnapshot,
   AdminConfig,
+  AdminInbounds,
+  AdminInboundInput,
   EffectiveConfig,
 } from './types'
 
@@ -35,7 +37,7 @@ export const state = reactive({
   truncated: false,
   scope: '',
   devicePairs: [] as { ip: string; mac: string }[],
-  filter: { outbound: '', mac: '', limit: 1024 },
+  filter: { outbound: '', mac: '', inbound: '', limit: 1024 },
   groups: [] as AdminGroup[],
   displayNames: {} as Record<string, string>,
   groupsAt: 0,
@@ -167,11 +169,7 @@ export async function fetchGroups() {
   const body = await request<{
     groups: AdminGroup[]
     display_names?: Record<string, string>
-  }>(
-    '/groups',
-    {},
-    backend,
-  ).catch((error) => {
+  }>('/groups', {}, backend).catch((error) => {
     if (revision === stateRevision) state.groupsError = String(error.message)
     throw error
   })
@@ -194,6 +192,13 @@ export const fetchKernelConnections = (
     {},
     backend,
   )
+export const fetchInbounds = (backend?: Backend) =>
+  request<AdminInbounds>('/inbounds', {}, backend)
+export const saveInbounds = (inbounds: AdminInboundInput[]) =>
+  request<{ queued: boolean }>('/inbounds', {
+    method: 'PUT',
+    body: JSON.stringify({ inbounds }),
+  })
 export const fetchConfig = () => request<AdminConfig>('/config')
 export const fetchEffective = () =>
   request<EffectiveConfig>('/config/effective')

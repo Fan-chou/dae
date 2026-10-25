@@ -6,6 +6,7 @@ const zh: LANG_MESSAGE = {
   overview: '概览',
   proxies: '代理',
   rules: '规则',
+  inbounds: '入站',
   connections: '连接',
   logs: '日志',
 
@@ -83,7 +84,7 @@ const zh: LANG_MESSAGE = {
   geoipASNDatabaseURL: 'GeoIP ASN 库地址',
   geoipDatabaseURLTip:
     '用于本地解析连接 IP 的归属信息(国家 / ASN),从该地址加载 mmdb 并缓存在浏览器中。留空则使用默认地址。',
-  inboundUser: '入站用户',
+  inboundUser: '入站',
   basic: '基本',
   traffic: '流量',
   sourceAndDestination: '来源与目的',

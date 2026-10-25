@@ -23,12 +23,15 @@ const (
 
 // AdminConnection is one tproxy-captured live flow for GET /v1/connections.
 type AdminConnection struct {
-	ID       string `json:"id"`
-	Network  string `json:"network"`
-	Src      string `json:"src"`
-	Dst      string `json:"dst"`
-	Domain   string `json:"domain,omitempty"`
-	Mac      string `json:"mac,omitempty"`
+	ID      string `json:"id"`
+	Network string `json:"network"`
+	Src     string `json:"src"`
+	Dst     string `json:"dst"`
+	Domain  string `json:"domain,omitempty"`
+	Mac     string `json:"mac,omitempty"`
+	// Inbound is the user-space inbound the flow came in through; empty for
+	// transparent traffic.
+	Inbound  string `json:"inbound,omitempty"`
 	Outbound string `json:"outbound"`
 	Dialer   string `json:"dialer,omitempty"`
 	Policy   string `json:"policy,omitempty"`
@@ -58,6 +61,7 @@ type adminConnectionFilter struct {
 	outbound string
 	src      string
 	mac      string
+	inbound  string
 }
 
 func clampAdminConnectionLimit(limit int) int {
@@ -70,7 +74,7 @@ func clampAdminConnectionLimit(limit int) int {
 	return limit
 }
 
-func (c *ControlPlane) AdminConnections(limit int, outbound, src, mac string) AdminConnectionsSnapshot {
+func (c *ControlPlane) AdminConnections(limit int, outbound, src, mac, inbound string) AdminConnectionsSnapshot {
 	if c == nil {
 		return AdminConnectionsSnapshot{Connections: []AdminConnection{}}
 	}
@@ -78,11 +82,15 @@ func (c *ControlPlane) AdminConnections(limit int, outbound, src, mac string) Ad
 	if manager == nil {
 		return AdminConnectionsSnapshot{Connections: []AdminConnection{}}
 	}
-	snap := manager.adminConnectionsSnapshot(clampAdminConnectionLimit(limit), adminConnectionFilter{
+	limit = clampAdminConnectionLimit(limit)
+	filter := adminConnectionFilter{
 		outbound: strings.TrimSpace(outbound),
 		src:      strings.TrimSpace(src),
 		mac:      strings.ToLower(strings.TrimSpace(mac)),
-	})
+		inbound:  strings.TrimSpace(inbound),
+	}
+	snap := manager.adminConnectionsSnapshot(limit, filter)
+	snap = mergeInboundUDPConnections(snap, activeInboundManager.Load().udpConnections(), filter, limit)
 	store := c.runtimeStatsStore()
 	snap.UploadTotal = store.uploadTotal.Load()
 	snap.DownloadTotal = store.downloadTotal.Load()
@@ -106,18 +114,7 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 	for _, flow := range udp {
 		appendFiltered(adminConnectionFromUDP(flow))
 	}
-	// Heaviest flows first so that truncation drops the idle ones, not the
-	// ones a monitor exists to show. Ties fall back to the numeric id order,
-	// which keeps the bounded list stable between polls.
-	sort.Slice(out, func(i, j int) bool {
-		if bi, bj := out[i].Upload+out[i].Download, out[j].Upload+out[j].Download; bi != bj {
-			return bi > bj
-		}
-		if len(out[i].ID) != len(out[j].ID) {
-			return len(out[i].ID) < len(out[j].ID)
-		}
-		return out[i].ID < out[j].ID
-	})
+	sortAdminConnections(out)
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -131,6 +128,21 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter adminConnect
 		Connections:  out,
 		SnapshotAtMs: time.Now().UnixMilli(),
 	}
+}
+
+// sortAdminConnections puts the heaviest flows first so that truncation drops
+// the idle ones, not the ones a monitor exists to show. Ties fall back to the
+// numeric id order, which keeps the bounded list stable between polls.
+func sortAdminConnections(out []AdminConnection) {
+	sort.Slice(out, func(i, j int) bool {
+		if bi, bj := out[i].Upload+out[i].Download, out[j].Upload+out[j].Download; bi != bj {
+			return bi > bj
+		}
+		if len(out[i].ID) != len(out[j].ID) {
+			return len(out[i].ID) < len(out[j].ID)
+		}
+		return out[i].ID < out[j].ID
+	})
 }
 
 func (m *SessionManager) snapshotFlowRuntimes() (tcp []*FlowRuntime, udp []*UDPFlowRuntime) {
@@ -152,6 +164,7 @@ func adminConnectionFromTCP(flow *FlowRuntime) AdminConnection {
 		Src:      formatAddrPort(flow.src),
 		Dst:      formatAddrPort(flow.dst),
 		Mac:      macString(flow.mac),
+		Inbound:  flow.binding.Inbound,
 		Upload:   flow.uploadBytes.Load(),
 		Download: flow.downloadBytes.Load(),
 		Start:    formatFlowStart(flow.startUnixNano),
@@ -313,6 +326,9 @@ func (item AdminConnection) matches(filter adminConnectionFilter) bool {
 		return false
 	}
 	if filter.mac != "" && !strings.Contains(strings.ToLower(item.Mac), filter.mac) {
+		return false
+	}
+	if filter.inbound != "" && item.Inbound != filter.inbound {
 		return false
 	}
 	return true

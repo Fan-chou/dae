@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/component/inbound/socks5"
@@ -43,11 +44,15 @@ type InboundManager struct {
 	mu      sync.Mutex
 	servers map[string]*inboundServer
 	closed  bool
+	// desired is the last configuration applied, and failed the bind error of
+	// each inbound that is in it but not running.
+	desired []config.Inbound
+	failed  map[string]string
 }
 
 // NewInboundManager creates an empty manager.
 func NewInboundManager(log *logrus.Logger) *InboundManager {
-	return &InboundManager{log: log, servers: make(map[string]*inboundServer)}
+	return &InboundManager{log: log, servers: make(map[string]*inboundServer), failed: make(map[string]string)}
 }
 
 // Apply reconciles the running listeners with inbounds: new ones are started,
@@ -63,6 +68,8 @@ func (m *InboundManager) Apply(inbounds []config.Inbound) {
 	if m.closed {
 		return
 	}
+	m.desired = append([]config.Inbound(nil), inbounds...)
+	m.failed = make(map[string]string)
 	desired := make(map[string]config.Inbound, len(inbounds))
 	for _, in := range inbounds {
 		desired[in.Name] = in
@@ -82,6 +89,7 @@ func (m *InboundManager) Apply(inbounds []config.Inbound) {
 		}
 		s, err := startInboundServer(m.log, in)
 		if err != nil {
+			m.failed[in.Name] = err.Error()
 			m.log.Errorf("SOCKS5 inbound %q failed to start (other inbounds and tproxy continue): %v", in.Name, err)
 			continue
 		}
@@ -116,8 +124,12 @@ type inboundServer struct {
 	assocs      *inboundBudget
 	udpSessions *inboundBudget
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	accepted atomic.Uint64
+	started  time.Time
+
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	relays map[*InboundUDPRelay]struct{}
 }
 
 func startInboundServer(log *logrus.Logger, cfg config.Inbound) (*inboundServer, error) {
@@ -131,13 +143,15 @@ func startInboundServer(log *logrus.Logger, cfg config.Inbound) (*inboundServer,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &inboundServer{
-		log:    log,
-		cfg:    cfg,
-		ln:     ln,
-		ctx:    ctx,
-		cancel: cancel,
-		slots:  make(chan struct{}, inboundMaxConns),
-		conns:  make(map[net.Conn]struct{}),
+		log:     log,
+		cfg:     cfg,
+		ln:      ln,
+		ctx:     ctx,
+		cancel:  cancel,
+		slots:   make(chan struct{}, inboundMaxConns),
+		conns:   make(map[net.Conn]struct{}),
+		relays:  make(map[*InboundUDPRelay]struct{}),
+		started: time.Now(),
 
 		assocs:      newInboundBudget(inboundMaxAssociations),
 		udpSessions: newInboundBudget(inboundMaxUDPSessions),
@@ -197,6 +211,7 @@ func (s *inboundServer) acceptLoop() {
 			_ = conn.Close()
 			return
 		}
+		s.accepted.Add(1)
 		go func() {
 			defer func() { <-s.slots }()
 			s.serveConn(conn)
@@ -394,6 +409,8 @@ func (s *inboundServer) handleAssociate(conn net.Conn, req socks5.Addr) {
 			}
 			relay = NewInboundUDPRelay(ctx, s.cfg.Name, netip.AddrPortFrom(from.Addr().Unmap(), from.Port()), s.udpSessions, sink)
 			relay.deferResolve = s.cfg.DeferResolve()
+			s.addRelay(relay)
+			defer s.removeRelay(relay)
 		} else if from != client {
 			continue
 		}

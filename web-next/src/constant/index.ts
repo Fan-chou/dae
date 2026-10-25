@@ -1,4 +1,5 @@
 import {
+  ArrowDownOnSquareStackIcon,
   ArrowsRightLeftIcon,
   Cog6ToothIcon,
   CubeTransparentIcon,
@@ -78,6 +79,7 @@ export const CONNECTION_GROUPABLE_KEYS = [
   CONNECTIONS_TABLE_ACCESSOR_KEY.Dialer,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Destination,
   CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationType,
+  CONNECTIONS_TABLE_ACCESSOR_KEY.InboundUser,
 ] as const
 
 export type ConnectionGroupableKey = (typeof CONNECTION_GROUPABLE_KEYS)[number]
@@ -265,6 +267,7 @@ export enum ROUTE_NAME {
   connections = 'connections',
   logs = 'logs',
   rules = 'rules',
+  inbounds = 'inbounds',
   settings = 'settings',
   setup = 'setup',
 }
@@ -274,6 +277,7 @@ export const ROUTE_ICON_MAP = {
   [ROUTE_NAME.proxies]: GlobeAltIcon,
   [ROUTE_NAME.connections]: ArrowsRightLeftIcon,
   [ROUTE_NAME.rules]: SwatchIcon,
+  [ROUTE_NAME.inbounds]: ArrowDownOnSquareStackIcon,
   [ROUTE_NAME.logs]: DocumentTextIcon,
   [ROUTE_NAME.settings]: Cog6ToothIcon,
   [ROUTE_NAME.setup]: CubeTransparentIcon,

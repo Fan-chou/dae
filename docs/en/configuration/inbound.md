@@ -129,7 +129,26 @@ like any other option.
   is set: an IPv6 FakeIP target is mapped back to its name like an IPv4 one.
 - In `routing`, write IPv6 literals in quotes, e.g. `dip('fd00::/8')`.
 
-## Admin API
+## Admin API, panel and LuCI
 
-Inbound sections are not served by the admin API's `/v1/config`. A `password` line in `routing.dae` is redacted
-there, and writing that redacted value back is refused.
+- `GET /v1/inbounds` lists every inbound dae knows, wherever it is defined, with its state (`listening`, `pending` when
+  the saved definition is not running yet, or `failed` with the bind error), open connections, UDP sessions, and its
+  `origin`: `config` (the `inbound` section of `config.dae`), `routing` (`routing.dae`) or `managed` (any other
+  included file, e.g. the `local.dae` that the OpenWrt LuCI page generates). Passwords are never returned.
+- `PUT /v1/inbounds` replaces the `inbound` section of `config.dae` with the list it is given; inbounds defined
+  elsewhere are not touched and cannot be edited this way. A password left out keeps the saved one for that name, an
+  empty one removes it. The whole configuration is checked before anything is kept (a name that clashes with an inbound
+  in another file, a removed inbound that a rule still uses, an open proxy, a port that is taken by the transparent
+  proxy), and the old file is put back when the check fails. Comments inside the replaced section are not kept.
+  On success a reload is queued; a port that cannot be bound then shows as `failed` without affecting the others.
+- `GET /v1/connections?inbound=NAME` lists only the flows of one inbound; every flow of an inbound carries
+  `"inbound": "NAME"`, UDP sessions included.
+- `routing.dae` is still served as text. An `inbound` section there has its `password` lines redacted, and saving the
+  text back keeps the passwords of inbounds that already existed; a redacted password for a new or renamed inbound is
+  refused.
+- `dae inbound status -c config.dae` prints `GET /v1/inbounds` as JSON.
+- The panel has an **Inbounds** page (state, connections, add / edit / delete for the `config.dae` ones) and an inbound
+  column and filter on the connections page.
+- On OpenWrt, Services → fdae → Settings has an **Inbounds** table that is rendered into `local.dae`, and shows the
+  state of all inbounds. The panel shows those read-only, and the LuCI page does not touch the ones in `config.dae`, so
+  the two never overwrite each other. Do not use the same name in both.

@@ -49,6 +49,9 @@ export type AdminConnection = {
   dst: string
   domain?: string
   mac?: string
+  // The user-space inbound the flow came in through; absent for transparent
+  // traffic.
+  inbound?: string
   outbound: string
   dialer?: string
   policy?: string
@@ -73,7 +76,48 @@ export type ConnectionFilter = {
   outbound?: string
   src?: string
   mac?: string
+  inbound?: string
   limit?: number
+}
+
+// Where an inbound is defined. Only 'config' ones can be edited here.
+export type InboundOrigin = 'config' | 'routing' | 'managed'
+export type InboundState = 'listening' | 'pending' | 'failed'
+export type AdminInbound = {
+  name: string
+  protocol: string
+  listen: string
+  username?: string
+  has_password: boolean
+  udp: boolean
+  udp_advertise?: string
+  sniff: string
+  resolve: string
+  state: InboundState | string
+  error?: string
+  conns: number
+  associations: number
+  udp_sessions: number
+  accepted: number
+  since?: string
+  origin: InboundOrigin | string
+  editable: boolean
+}
+export type AdminInbounds = {
+  inbounds: AdminInbound[]
+  editable: boolean
+}
+// What is sent to save one inbound. Leaving password out keeps the saved one;
+// an empty string removes it.
+export type AdminInboundInput = {
+  name: string
+  listen: string
+  username: string
+  password?: string
+  udp: boolean
+  udp_advertise: string
+  sniff: string
+  resolve: string
 }
 
 export type AdminConfig = {

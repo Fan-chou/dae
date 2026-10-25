@@ -41,6 +41,20 @@ function loadMihomo() {
 	});
 }
 
+// The inbounds dae knows, with where each comes from and whether it listens;
+// null while dae is down.
+function loadInbounds() {
+	return L.resolveDefault(fs.exec(DAE, ['inbound', 'status', '-c', CONFIG]), null).then(function (res) {
+		if (!res || res.code || !res.stdout)
+			return null;
+		try {
+			return JSON.parse(res.stdout);
+		} catch (e) {
+			return null;
+		}
+	});
+}
+
 function notify(res, okMsg) {
 	const text = [res.stdout, res.stderr].filter(Boolean).join('\n').trim();
 	// A failed call that printed nothing is almost always a dropped connection
@@ -122,9 +136,71 @@ function sourceBlock(st) {
 	return E('div', {}, kids);
 }
 
+const LISTEN_RE = /^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9A-Fa-f:.]+)\]):(\d{1,5})$/;
+
+function validListen(v) {
+	const m = LISTEN_RE.exec(String(v || '').trim());
+	if (!m)
+		return _('写成 IP:端口，IPv6 写成 [地址]:端口');
+	const port = parseInt(m[3], 10);
+	if (port < 1 || port > 65535)
+		return _('端口范围 1–65535');
+	if (m[1] && m[1].split('.').some(function (o) { return parseInt(o, 10) > 255; }))
+		return _('不是有效的 IPv4 地址');
+	return true;
+}
+
+// Names of the inbounds that this page owns (the UCI sections).
+function uciInboundNames() {
+	const names = {};
+	(uci.sections('dae', 'inbound') || []).forEach(function (sec) {
+		if (sec.name)
+			names[sec.name] = true;
+	});
+	return names;
+}
+
+function inboundBlock(st) {
+	if (!st)
+		return E('em', {}, _('dae 未运行，或管理接口不可用。运行后这里显示各入站的状态。'));
+	const list = st.inbounds || [];
+	if (!list.length)
+		return E('em', {}, _('没有入站。'));
+	const mine = uciInboundNames();
+	const origins = { config: 'config.dae', routing: 'routing.dae', managed: _('其它文件') };
+	const state = {
+		listening: [ _('监听中'), 'green' ],
+		pending: [ _('已保存，等待重载'), '#c80' ],
+		failed: [ _('启动失败'), 'red' ]
+	};
+	const rows = list.map(function (ib) {
+		const s = state[ib.state] || [ ib.state, '' ];
+		const auth = ib.username ? ib.username + (ib.has_password ? ' / ••••' : '') : _('无');
+		const origin = mine[ib.name] ? _('本页') : (origins[ib.origin] || ib.origin);
+		const cells = [
+			E('td', { class: 'td' }, E('strong', {}, ib.name)),
+			E('td', { class: 'td' }, E('code', {}, ib.listen)),
+			E('td', { class: 'td' }, auth),
+			E('td', { class: 'td' }, [ ib.udp ? 'TCP+UDP' : 'TCP', ' · ', ib.sniff, ' · ', ib.resolve ]),
+			E('td', { class: 'td' }, E('strong', { style: 'color:' + s[1] }, s[0])),
+			E('td', { class: 'td' }, _('%d 连接 / %d UDP').format(ib.conns || 0, ib.udp_sessions || 0)),
+			E('td', { class: 'td' }, origin)
+		];
+		const tr = E('tr', { class: 'tr' }, cells);
+		if (ib.error)
+			return [ tr, E('tr', { class: 'tr' }, E('td', { class: 'td', colspan: 7, style: 'color:red;word-break:break-all' }, ib.error)) ];
+		return [ tr ];
+	}).reduce(function (a, b) { return a.concat(b); }, []);
+	return E('table', { class: 'table' }, [
+		E('tr', { class: 'tr table-titles' }, [ _('名称'), _('监听'), _('认证'), _('协议 · 嗅探 · 解析'), _('状态'), _('当前'), _('来源') ].map(function (t) {
+			return E('th', { class: 'th' }, t);
+		}))
+	].concat(rows));
+}
+
 return view.extend({
 	load() {
-		return Promise.all([uci.load('dae'), loadMihomo()]);
+		return Promise.all([uci.load('dae'), loadMihomo(), loadInbounds()]);
 	},
 
 	render(data) {
@@ -266,6 +342,93 @@ return view.extend({
 		o.value('routing', _('完整配置'));
 		o.value('nodes', _('仅节点'));
 		o.default = 'routing';
+
+		s = m.section(form.TypedSection);
+		s.anonymous = true;
+		s.render = function () {
+			const box = E('div', { id: 'fdae-inbound-status' }, inboundBlock(data[2]));
+			poll.add(function () {
+				return loadInbounds().then(function (st) {
+					box.replaceChildren(inboundBlock(st));
+				});
+			});
+			return E('div', { class: 'cbi-section' }, [
+				E('h3', {}, _('入站状态')),
+				E('div', { class: 'cbi-section-descr' },
+					_('包含所有来源的入站（本页、config.dae、routing.dae）。要让流量走某个入站的规则，在“配置”页写 inbound(名称)。')),
+				box
+			]);
+		};
+
+		s = m.section(form.GridSection, 'inbound', _('入站'),
+			_('SOCKS5 监听（TCP CONNECT 与 UDP ASSOCIATE）。保存并应用后生效。监听 0.0.0.0、[::] 或公网地址时必须设置用户名和密码。'));
+		s.anonymous = true;
+		s.addremove = true;
+		s.sortable = true;
+		s.nodescriptions = true;
+		s.addbtntitle = _('添加入站');
+		s.modaltitle = _('入站');
+
+		o = s.option(form.Flag, 'enabled', _('启用'));
+		o.default = o.enabled;
+		o.editable = true;
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'name', _('名称'), _('规则里写 inbound(名称)；1–32 位字母、数字、_ 或 -'));
+		o.rmempty = false;
+		o.placeholder = 's1';
+		o.validate = function (section_id, value) {
+			if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$/.test(value || ''))
+				return _('1–32 位字母、数字、_ 或 -');
+			let dup = false;
+			(uci.sections('dae', 'inbound') || []).forEach(function (sec) {
+				if (sec['.name'] !== section_id && sec.name === value)
+					dup = true;
+			});
+			return dup ? _('名称已被使用') : true;
+		};
+
+		o = s.option(form.Value, 'listen', _('监听地址'), _('IP:端口，IPv6 写成 [地址]:端口'));
+		o.rmempty = false;
+		o.placeholder = '127.0.0.1:1080';
+		o.validate = function (section_id, value) { return validListen(value); };
+
+		o = s.option(form.Value, 'username', _('用户名'), _('与密码同时填写才启用认证'));
+		o.modalonly = false;
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'password', _('密码'));
+		o.password = true;
+		o.modalonly = true;
+		o.rmempty = true;
+		o.validate = function (section_id, value) {
+			const user = this.section.formvalue(section_id, 'username');
+			if ((user ? true : false) !== (value ? true : false))
+				return _('用户名和密码要同时填写');
+			return true;
+		};
+
+		o = s.option(form.Flag, 'udp', _('UDP'), _('允许 UDP ASSOCIATE'));
+		o.default = o.enabled;
+		o.rmempty = false;
+		o.modalonly = true;
+
+		o = s.option(form.ListValue, 'sniff', _('嗅探'), _('自动：对 IP 目标先应答再嗅探 TLS SNI / HTTP Host；关闭：先拨号，SOCKS5 错误码更精确'));
+		o.value('auto', _('自动'));
+		o.value('off', _('关闭'));
+		o.default = 'auto';
+		o.modalonly = true;
+
+		o = s.option(form.ListValue, 'resolve', _('域名解析'), _('本地：先解析再路由；延后：先按域名路由，走代理的域名由节点解析，dae 不查询'));
+		o.value('local', _('本地'));
+		o.value('deferred', _('延后'));
+		o.default = 'local';
+		o.modalonly = true;
+
+		o = s.option(form.Value, 'udp_advertise', _('UDP 中继地址'), _('dae 在 NAT 或端口转发之后时，告诉客户端的 UDP 地址；留空自动'));
+		o.datatype = 'ipaddr';
+		o.modalonly = true;
+		o.rmempty = true;
 
 		s = m.section(form.NamedSection, 'config', 'dae', _('地理数据'),
 			_('geoip() 与 geosite 规则用的数据文件。填写链接后由 dae 自己下载、校验并定期更新，失败时保留旧文件。'));

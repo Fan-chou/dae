@@ -19,7 +19,7 @@ and merged by dae in-process.
 openwrt/
   build.sh                 ipk + apk for fdae and luci-app-fdae
   fdae/files/              init script, UCI defaults, default config.dae, apply/write-local/recover scripts
-  fdae/tests/              shell tests (apply_test.sh)
+  fdae/tests/              shell tests (apply_test.sh, write_local_test.sh)
   luci-app-fdae/           LuCI views, menu, ACL
 ```
 
@@ -27,6 +27,13 @@ Settings live in UCI (`/etc/config/dae`). `write-local.sh` renders them to
 `/etc/dae/local.dae`; `apply.sh` writes, validates (`dae validate`,
 `dae mihomo preview`) and only then asks a running dae to reload. A failed
 check leaves the running service alone.
+
+SOCKS5 inbounds (`config inbound` sections, edited in Services → fdae → Settings → Inbounds)
+are rendered into `local.dae` as well, and the same page shows the state of every
+inbound dae runs, wherever it is defined (`dae inbound status -c /etc/dae/config.dae`
+prints it as JSON). The rules that use them, `inbound(name)`, go in `config.dae`.
+The panel (`/fdae-ui/`) edits only the inbounds defined in `config.dae`; the ones
+this page owns are shown there read-only, so the two never overwrite each other.
 
 ## Updating
 
@@ -71,4 +78,5 @@ builds the binaries, packages and, for `v*` tags, a release.
 
 ```sh
 sh openwrt/fdae/tests/apply_test.sh
+sh openwrt/fdae/tests/write_local_test.sh
 ```

@@ -6,6 +6,9 @@
 #   mihomo {}        the one complete Mihomo YAML: a role=routing subscription
 #                    or dae.config.mihomo_config. dae fetches, converts and
 #                    merges it itself on every start and reload.
+#   inbound {}       the SOCKS5 listeners from the `inbound` UCI sections.
+#                    Rules that use them (inbound(name)) are written in
+#                    config.dae.
 #
 # config.dae should include { local.dae }.
 
@@ -48,6 +51,86 @@ quote_dae() {
 
 sanitize_tag() {
 	printf '%s' "$1" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'
+}
+
+# Same rule as dae's inbound names: usable bare in inbound(name).
+sanitize_inbound_name() {
+	printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$'
+}
+
+# A value that is written on one line of local.dae must not carry a line break.
+single_line() {
+	case $1 in
+	*"
+"*)
+		echo "value cannot contain a line break: $2" >&2
+		return 1
+		;;
+	esac
+}
+
+uci_true() {
+	case $1 in
+	0|no|off|false|disabled) return 1 ;;
+	esac
+	return 0
+}
+
+# One `name { ... }` entry of the inbound section from the UCI section at
+# index $1. Prints nothing for a disabled or empty section.
+render_inbound() {
+	_i=$1
+	_name=$(uci -q get "dae.@inbound[$_i].name" || true)
+	_listen=$(uci -q get "dae.@inbound[$_i].listen" || true)
+	_enabled=$(uci -q get "dae.@inbound[$_i].enabled" || echo 1)
+	_user=$(uci -q get "dae.@inbound[$_i].username" || true)
+	_pass=$(uci -q get "dae.@inbound[$_i].password" || true)
+	_udp=$(uci -q get "dae.@inbound[$_i].udp" || echo 1)
+	_adv=$(uci -q get "dae.@inbound[$_i].udp_advertise" || true)
+	_sniff=$(uci -q get "dae.@inbound[$_i].sniff" || true)
+	_resolve=$(uci -q get "dae.@inbound[$_i].resolve" || true)
+	uci_true "$_enabled" || return 0
+	[ -n "$_name" ] || [ -n "$_listen" ] || return 0
+	if ! sanitize_inbound_name "$_name"; then
+		echo "invalid inbound name: '$_name' (1-32 letters, digits, _ or -)" >&2
+		return 1
+	fi
+	if [ -z "$_listen" ]; then
+		echo "inbound $_name: listen is empty" >&2
+		return 1
+	fi
+	for _v in "$_listen" "$_user" "$_pass" "$_adv"; do
+		single_line "$_v" "inbound $_name" || return 1
+	done
+	case $_sniff in
+	""|auto|off) ;;
+	*) echo "inbound $_name: invalid sniff '$_sniff'" >&2; return 1 ;;
+	esac
+	case $_resolve in
+	""|local|deferred) ;;
+	*) echo "inbound $_name: invalid resolve '$_resolve'" >&2; return 1 ;;
+	esac
+	# Quote first: a failure inside echo "$(...)" would be swallowed.
+	_q_listen=$(quote_dae "$_listen") || return 1
+	_q_user="" _q_pass="" _q_adv=""
+	if [ -n "$_user" ] || [ -n "$_pass" ]; then
+		_q_user=$(quote_dae "$_user") || return 1
+		_q_pass=$(quote_dae "$_pass") || return 1
+	fi
+	if [ -n "$_adv" ]; then
+		_q_adv=$(quote_dae "$_adv") || return 1
+	fi
+	echo "    ${_name} {"
+	echo "        listen: ${_q_listen}"
+	if [ -n "$_q_user" ]; then
+		echo "        username: ${_q_user}"
+		echo "        password: ${_q_pass}"
+	fi
+	uci_true "$_udp" || echo "        udp: false"
+	[ -z "$_q_adv" ] || echo "        udp_advertise: ${_q_adv}"
+	[ -z "$_sniff" ] || [ "$_sniff" = auto ] || echo "        sniff: ${_sniff}"
+	[ -z "$_resolve" ] || [ "$_resolve" = local ] || echo "        resolve: ${_resolve}"
+	echo "    }"
 }
 
 # A node subscription is kept on disk, so a start without a network still has
@@ -189,6 +272,23 @@ umask 077
 		if [ "$dns_open" -eq 1 ]; then
 			echo "    }"
 		fi
+		echo "}"
+	fi
+
+	# User-space SOCKS5 listeners. Each is rendered on its own first so that a
+	# bad section stops the whole write instead of leaving half a block.
+	index=0
+	body=""
+	while uci -q get "dae.@inbound[$index]" >/dev/null 2>&1; do
+		entry=$(render_inbound "$index") || exit 1
+		index=$((index + 1))
+		[ -z "$entry" ] || body="${body:+$body
+}$entry"
+	done
+	if [ -n "$body" ]; then
+		echo
+		echo "inbound {"
+		printf '%s\n' "$body"
 		echo "}"
 	fi
 

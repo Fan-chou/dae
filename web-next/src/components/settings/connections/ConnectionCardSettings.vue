@@ -131,7 +131,7 @@ const setRestOfColumns = () => {
   restOfColumns.value = Object.values(CONNECTIONS_TABLE_ACCESSOR_KEY)
     .filter(
       (key) =>
-        !['close', 'process', 'geoip', 'remoteAddress', 'inboundUser'].includes(
+        !['close', 'process', 'geoip', 'remoteAddress'].includes(
           key,
         ),
     )

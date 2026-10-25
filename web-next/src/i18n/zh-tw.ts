@@ -6,6 +6,7 @@ const zhTW: LANG_MESSAGE = {
   overview: '概覽',
   proxies: '代理',
   rules: '規則',
+  inbounds: '入站',
   connections: '連接',
   logs: '日誌',
 
@@ -83,7 +84,7 @@ const zhTW: LANG_MESSAGE = {
   geoipASNDatabaseURL: 'GeoIP ASN 庫地址',
   geoipDatabaseURLTip:
     '用於本地解析連線 IP 的歸屬資訊(國家 / ASN),從該地址載入 mmdb 並快取在瀏覽器中。留空則使用預設地址。',
-  inboundUser: '入站用戶',
+  inboundUser: '入站',
   basic: '基本',
   traffic: '流量',
   sourceAndDestination: '來源與目的',

@@ -454,6 +454,8 @@ func (r *Runner) Run() (err error) {
 	// whenever a generation is published.
 	inboundManager := control.NewInboundManager(log)
 	inboundManager.Apply(conf.Inbound)
+	inboundManager.SetActive()
+	adminHTTP.setInbounds(inboundManager.Snapshot)
 	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
 	var ruleProviderLifecycleCancel context.CancelFunc
 	var ruleProviderLifecycleDone <-chan struct{}

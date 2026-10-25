@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -237,4 +238,24 @@ func patchInbound(params *Config) error {
 		return err
 	}
 	return ValidateInboundReferences(params.Routing.Rules, params.Inbound)
+}
+
+// ParseInbounds decodes every inbound section found in src, which holds
+// configuration text of its own (one file, or one extracted section). Defaults
+// are applied; nothing else is checked, use ValidateInbounds for that.
+func ParseInbounds(src string) ([]Inbound, error) {
+	sections, err := config_parser.Parse(src)
+	if err != nil {
+		return nil, err
+	}
+	var conf Config
+	for _, section := range sections {
+		if section.Name != "inbound" {
+			continue
+		}
+		if err := SectionParser(reflect.ValueOf(&conf.Inbound), section); err != nil {
+			return nil, err
+		}
+	}
+	return conf.Inbound, nil
 }

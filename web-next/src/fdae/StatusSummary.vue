@@ -20,6 +20,11 @@
         >LAN {{ state.status?.lan_interface?.join(', ') || '—' }} · WAN
         {{ state.status?.wan_interface?.join(', ') || '—' }}</span
       >
+      <span
+        v-if="inboundState.at && inboundState.list.length"
+        :class="inboundClass"
+        >入站 {{ inboundSummary }}</span
+      >
       <span v-if="mihomo?.enabled" :class="mihomoClass"
         >Mihomo 源 · {{ mihomoText }}</span
       >
@@ -41,10 +46,37 @@
   </div>
 </template>
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { useNow } from '@vueuse/core'
 import { state } from './client'
+import { inboundState, refreshInbounds } from './inbounds'
 const now = useNow({ interval: 1000 })
+const inboundSummary = computed(() => {
+  const list = inboundState.list
+  const failed = list.filter((i) => i.state === 'failed').length
+  const pending = list.filter((i) => i.state === 'pending').length
+  const listening = list.filter((i) => i.state === 'listening').length
+  return (
+    `${listening}/${list.length} 监听中` +
+    (pending ? ` · ${pending} 待重载` : '') +
+    (failed ? ` · ${failed} 启动失败` : '')
+  )
+})
+const inboundClass = computed(() =>
+  inboundState.list.some((i) => i.state === 'failed')
+    ? 'text-error'
+    : inboundState.list.some((i) => i.state === 'pending')
+      ? 'text-warning'
+      : '',
+)
+let inboundTimer: ReturnType<typeof setInterval> | undefined
+onMounted(() => {
+  void refreshInbounds()
+  inboundTimer = setInterval(() => {
+    if (document.visibilityState !== 'hidden') void refreshInbounds()
+  }, 5000)
+})
+onBeforeUnmount(() => clearInterval(inboundTimer))
 const mihomo = computed(() => state.status?.mihomo)
 const mihomoText = computed(() => {
   const m = mihomo.value

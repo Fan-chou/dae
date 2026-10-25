@@ -74,6 +74,12 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
   SOCKS5 error codes), FakeIP targets are mapped back to their names, and
   `resolve: deferred` routes domain targets by name before resolving them (a
   proxied name is then sent to the proxy without a lookup by dae).
+  Inbounds can be managed from the admin API (`GET`/`PUT /v1/inbounds`, state
+  and bind errors included; `/v1/connections` carries and filters by
+  `inbound`), the panel (new Inbounds page, inbound column and filter),
+  `dae inbound status`, and the OpenWrt LuCI settings page (`config inbound`
+  UCI sections rendered into `local.dae`). Saving `routing.dae` from the panel
+  no longer fails once an inbound there has a password.
   Details: [`docs/en/configuration/inbound.md`](docs/en/configuration/inbound.md).
 
 #### Behavior changes / Upgrade notes

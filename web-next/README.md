@@ -18,6 +18,7 @@ OpenWrt 打包默认使用此目录；可通过 FDAE_UI_DIR 指向旧 web/ 构�
 - 全局流量、TCP/UDP 数量、RSS 使用状态接口；代理组按已加载连接的实际 outbound 归账。分类汇总不是全量，界面明确范围。
 - 连接上限 256/512/1024，源 IP、MAC、出站后端筛选；保留原生多列分组、排序、虚拟表格、卡片和详情。切换筛选或运行 scope 时清理比较基线，截断不推断结束。
 - 配置 API 仅编辑 global/routing 和独立 routing 文件；保存排队不表示重载已完成。
+- 入站：`/v1/inbounds` 读取状态并编辑 config.dae 里的 inbound 配置段（其他文件的入站只读）；连接带 `inbound` 字段，可按入站筛选。
 - 旧版 kdae-ui-settings 的 API 地址与密钥可在本地迁移，原记录保留。
 
 ## 界面约定

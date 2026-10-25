@@ -54,6 +54,30 @@
         <option value="block">block</option>
       </select>
       <select
+        v-if="inboundState.list.length || state.filter.inbound"
+        v-model="state.filter.inbound"
+        class="select select-sm w-full min-w-0 md:w-32"
+        aria-label="入站筛选"
+      >
+        <option value="">全部入站</option>
+        <option
+          v-for="inbound in inboundState.list"
+          :key="inbound.name"
+          :value="inbound.name"
+        >
+          {{ inbound.name }}
+        </option>
+        <option
+          v-if="
+            state.filter.inbound &&
+            !inboundState.list.some((i) => i.name === state.filter.inbound)
+          "
+          :value="state.filter.inbound"
+        >
+          {{ state.filter.inbound }}
+        </option>
+      </select>
+      <select
         v-model.number="state.filter.limit"
         class="select select-sm w-full min-w-0 md:w-25"
         aria-label="加载上限"
@@ -106,7 +130,7 @@
         {{ renderConnections.length }}</span
       >
       <span v-if="state.truncated" class="text-warning"
-        >列表已截断，可按源 IP、MAC 或出站缩小范围</span
+        >列表已截断，可按源 IP、MAC、入站或出站缩小范围</span
       >
       <span v-if="state.connectionsError || stale" class="text-warning"
         >{{ state.connectionsError || '快照已过期' }} · 保留上次数据</span
@@ -155,7 +179,7 @@
 <script setup lang="ts">
 import { displayName } from '@/fdae/client'
 import TextInput from '@/components/common/TextInput.vue'
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useNow } from '@vueuse/core'
 import {
   CONNECTION_GROUPABLE_KEYS,
@@ -173,6 +197,7 @@ import { isConnectionCard } from '@/store/settings'
 import { useStorage } from '@/helper/storage'
 import { state } from './client'
 import { includeKernel, kernelState } from './kernelConnections'
+import { inboundState, refreshInbounds } from './inbounds'
 const sourceMacs = computed(() => {
   const result = new Map<string, string[]>()
   for (const { ip, mac } of state.devicePairs) {
@@ -216,6 +241,7 @@ const groupKey = computed({
     tableGroups.value = value ? [value] : []
   },
 })
+onMounted(() => void refreshInbounds())
 const now = useNow({ interval: 1000 })
 const stale = computed(
   () =>
@@ -225,6 +251,7 @@ function clear() {
   source.value = ''
   state.filter.mac = ''
   state.filter.outbound = ''
+  state.filter.inbound = ''
   connectionFilter.value = ''
   quickFilterEnabled.value = false
 }

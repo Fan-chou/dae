@@ -6,6 +6,7 @@ const ru: LANG_MESSAGE = {
   overview: 'Обзор',
   proxies: 'Прокси',
   rules: 'Правила',
+  inbounds: 'Входящие',
   connections: 'Подключения',
   logs: 'Журнал',
 
@@ -83,7 +84,7 @@ const ru: LANG_MESSAGE = {
   geoipASNDatabaseURL: 'URL базы ASN GeoIP',
   geoipDatabaseURLTip:
     'Используется для локального определения информации GeoIP (страна / ASN) для IP-адресов соединений. Файл mmdb загружается по этому адресу и кэшируется в браузере. Оставьте пустым для значения по умолчанию.',
-  inboundUser: 'Входящий пользователь',
+  inboundUser: 'Входящий',
   basic: 'Основное',
   traffic: 'Трафик',
   sourceAndDestination: 'Источник и назначение',

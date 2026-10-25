@@ -258,6 +258,7 @@ func (c *ControlPlane) ServeInboundTCP(ctx context.Context, inbound string, lCon
 	}
 
 	binding := newTcpFlowBinding(c.PolicyEpoch(), res, [6]uint8{})
+	binding.Inbound = inbound
 	flow, err := c.adoptTCPFlow(ctx, lease, lConn, rConn, binding, src, dst)
 	if err != nil {
 		// Adoption failed locally; the node was never exercised.
@@ -410,6 +411,16 @@ type inboundUDPSession struct {
 	ready      bool
 	closed     bool
 
+	// Shown in the connection list once the session is established.
+	id            uint64
+	startUnixNano int64
+	outbound      string
+	dialer        string
+	policy        string
+	domain        string
+	upload        atomic.Uint64
+	download      atomic.Uint64
+
 	lastActive atomic.Int64
 }
 
@@ -438,7 +449,7 @@ func (r *InboundUDPRelay) Send(target InboundTarget, payload []byte) {
 			r.mu.Unlock()
 			return
 		}
-		s = &inboundUDPSession{relay: r, key: key, target: target, idle: inboundUDPIdleTimeout(target.Port)}
+		s = &inboundUDPSession{relay: r, key: key, target: target, idle: inboundUDPIdleTimeout(target.Port), id: inboundUDPSessionSeq.Add(1)}
 		s.touch()
 		r.sessions[key] = s
 		r.mu.Unlock()
@@ -486,6 +497,7 @@ func (s *inboundUDPSession) write(conn netproxy.Conn, dialTarget string, payload
 		s.close()
 		return
 	}
+	s.upload.Add(uint64(len(payload)))
 	RecordUploadTraffic(int64(len(payload)))
 }
 
@@ -534,6 +546,15 @@ func (s *inboundUDPSession) dial() {
 		return
 	}
 	s.conn, s.dialTarget, s.ready = conn, res.DialTarget, true
+	s.startUnixNano = time.Now().UnixNano()
+	s.domain = domain
+	if res.Outbound != nil {
+		s.outbound = res.Outbound.Name
+		s.policy = string(res.Outbound.GetSelectionPolicy())
+	}
+	if res.Dialer != nil && res.Dialer.Property() != nil {
+		s.dialer = res.Dialer.Property().Name
+	}
 	queued := s.pending
 	s.pending = nil
 	s.mu.Unlock()
@@ -576,6 +597,7 @@ func (s *inboundUDPSession) readLoop(conn netproxy.Conn) {
 			// May have been truncated; never forward a damaged datagram.
 			continue
 		}
+		s.download.Add(uint64(n))
 		RecordDownloadTraffic(int64(n))
 		s.relay.sink(s.target, buf[:n])
 	}

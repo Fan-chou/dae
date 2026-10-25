@@ -9,6 +9,7 @@ import LogsPage from '@/views/LogsPage.vue'
 import OverviewPage from '@/views/OverviewPage.vue'
 import ProxiesPage from '@/views/ProxiesPage.vue'
 import RulesPage from '@/fdae/ConfigPage.vue'
+import InboundsPage from '@/fdae/InboundsPage.vue'
 import SettingsPage from '@/views/SettingsPage.vue'
 import SetupPage from '@/views/SetupPage.vue'
 import { useTitle } from '@vueuse/core'
@@ -40,6 +41,11 @@ const childrenRouter = [
     path: 'rules',
     name: ROUTE_NAME.rules,
     component: RulesPage,
+  },
+  {
+    path: 'inbounds',
+    name: ROUTE_NAME.inbounds,
+    component: InboundsPage,
   },
   {
     path: 'settings',

@@ -525,6 +525,7 @@ export const connectionTableColumns = useStorage<
   CONNECTIONS_TABLE_ACCESSOR_KEY.DestinationPort,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Host,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Source,
+  CONNECTIONS_TABLE_ACCESSOR_KEY.InboundUser,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Type,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Rule,
   CONNECTIONS_TABLE_ACCESSOR_KEY.Chains,
@@ -591,6 +592,26 @@ if (sourceColumnVersion.value < 1) {
     )
   }
   sourceColumnVersion.value = 1
+}
+
+// Existing browser layouts get the "inbound" column once, next to "forwarded
+// by", so flows that came in through a SOCKS5 inbound are recognisable.
+const inboundColumnVersion = useStorage('config/fdae-inbound-column-version', 0)
+if (inboundColumnVersion.value < 1) {
+  const key = CONNECTIONS_TABLE_ACCESSOR_KEY.InboundUser
+  const after = CONNECTIONS_TABLE_ACCESSOR_KEY.Source
+  if (!connectionTableColumns.value.includes(key)) {
+    const at = connectionTableColumns.value.indexOf(after)
+    connectionTableColumns.value =
+      at < 0
+        ? [...connectionTableColumns.value, key]
+        : [
+            ...connectionTableColumns.value.slice(0, at + 1),
+            key,
+            ...connectionTableColumns.value.slice(at + 1),
+          ]
+  }
+  inboundColumnVersion.value = 1
 }
 
 export const sourceIPLabelList = useStorage<SourceIPLabel[]>(

@@ -4,6 +4,7 @@ const en = {
   overview: 'Overview',
   proxies: 'Proxies',
   rules: 'Rules',
+  inbounds: 'Inbounds',
   connections: 'Connections',
   logs: 'Logs',
 
@@ -81,7 +82,7 @@ const en = {
   geoipASNDatabaseURL: 'GeoIP ASN database URL',
   geoipDatabaseURLTip:
     'Used to resolve the GeoIP info (country / ASN) of connection IPs locally. The mmdb is loaded from this URL and cached in the browser. Leave empty to use the default.',
-  inboundUser: 'Inbound user',
+  inboundUser: 'Inbound',
   basic: 'Basic',
   traffic: 'Traffic',
   sourceAndDestination: 'Source & destination',

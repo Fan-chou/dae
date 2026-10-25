@@ -134,10 +134,14 @@ func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminRe
 	}
 	mergedRouting := string(diskRouting)
 	if incoming.Routing != nil {
-		if err := rejectDisallowedAdminConfig(*incoming.Routing, true); err != nil {
+		restored, err := restoreRoutingInboundPasswords(*incoming.Routing, string(diskRouting))
+		if err != nil {
 			return false, err
 		}
-		mergedRouting = *incoming.Routing
+		if err := rejectDisallowedAdminConfig(restored, true); err != nil {
+			return false, err
+		}
+		mergedRouting = restored
 	}
 
 	configBak := configPath + ".admin-bak"

@@ -44,7 +44,7 @@ type adminPlane interface {
 	AdminStatusSnapshot(version string) control.AdminStatus
 	SetGroupSelection(groupName, memberName string) error
 	TriggerLatencyChecksForGroup(groupName string) error
-	AdminConnections(limit int, outbound, src, mac string) control.AdminConnectionsSnapshot
+	AdminConnections(limit int, outbound, src, mac, inbound string) control.AdminConnectionsSnapshot
 	AdminKernelConnections(limit int, src, mac string) control.AdminKernelConnectionsSnapshot
 }
 
@@ -62,6 +62,9 @@ type adminServer struct {
 	log       *logrus.Logger
 	plane     adminPlaneProvider
 	reload    adminReloadFunc
+	// inbounds reports the user-space inbounds that are running; nil before
+	// the manager exists.
+	inbounds func() []control.InboundStatus
 }
 
 type adminGroupPutBody struct {
@@ -98,6 +101,16 @@ func newAdminServer(log *logrus.Logger, logFile, configDir string, plane adminPl
 		plane:     plane,
 		reload:    reload,
 	}
+}
+
+// setInbounds tells the server where to read the state of the inbounds from.
+func (s *adminServer) setInbounds(provider func() []control.InboundStatus) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.inbounds = provider
+	s.mu.Unlock()
 }
 
 func (s *adminServer) refresh(listen, secret string) {
@@ -139,6 +152,7 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/kernel-connections", s.withAdminAuth(s.handleKernelConnections))
 	mux.HandleFunc("/v1/config", s.withAdminAuth(s.handleConfig))
 	mux.HandleFunc("/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
+	mux.HandleFunc("/v1/inbounds", s.withAdminAuth(s.handleInbounds))
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
 	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
 	registerAdminUI(mux)
@@ -305,7 +319,7 @@ func (s *adminServer) handleConnections(w http.ResponseWriter, r *http.Request) 
 		}
 		limit = parsed
 	}
-	snap := plane.AdminConnections(limit, r.URL.Query().Get("outbound"), r.URL.Query().Get("src"), r.URL.Query().Get("mac"))
+	snap := plane.AdminConnections(limit, r.URL.Query().Get("outbound"), r.URL.Query().Get("src"), r.URL.Query().Get("mac"), r.URL.Query().Get("inbound"))
 	writeAdminJSON(w, http.StatusOK, snap)
 }
 
