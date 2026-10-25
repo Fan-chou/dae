@@ -79,6 +79,12 @@ pname(curl) -> direct
 ### DSCP rule (match DSCP; is useful for BT bypass). See https://github.com/daeuniverse/dae/discussions/295
 dscp(0x4) -> direct
 
+### Inbound rule (match the user-space inbound a flow entered through). See inbound.md
+# Transparent traffic never matches an inbound() rule.
+inbound(s1) -> my_group
+inbound(s1, s2) && domain(geosite:cn) -> direct
+!inbound(s1) && dport(443) -> block
+
 ### Multiple domains rule
 domain(keyword: google, suffix: www.twitter.com, suffix: v2raya.org) -> my_group
 ### Multiple IP rule

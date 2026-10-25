@@ -33,6 +33,13 @@ type proxyDialParam struct {
 	Mark         uint32
 	Network      string         // e.g. "tcp", "udp"
 	Excluded     *dialer.Dialer // Dialer to exclude in selection
+	// Inbound is the consts.InboundID of the user-space inbound the flow
+	// entered through; 0 for transparent traffic.
+	Inbound uint32
+	// NameOnly marks a flow routed by Domain alone: Dest holds the placeholder
+	// address and the real one is resolved only if routing or a direct dial
+	// needs it. See inbound_nameonly.go.
+	NameOnly bool
 	// IdentifiedQuic is set by the UDP GetDialOption path. TCP leaves it false.
 	IdentifiedQuic     bool
 	ResolveDNSRecovery *resolveDNSRecovery
@@ -150,7 +157,14 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		return nil, err
 	}
 
-	fakeDest := c.destIsFakeIP(dst.Addr())
+	nameOnly := p.nameOnlyPending(dst)
+	// A name-only flow is routed like a FakeIP one: by name, resolving the
+	// real address only on demand.
+	fakeDest := c.destIsFakeIP(dst.Addr()) || nameOnly
+	realIPFor := c.realIPForFakeIPRoute
+	if nameOnly {
+		realIPFor = c.realIPForNameOnly
+	}
 	stickySite := stickySelectHost(domain, dst.Addr(), fakeDest)
 	if fakeDest {
 		// Kernel tproxy always marks FakeIP as 0xFD, but a stale conn_state
@@ -179,11 +193,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			proto = consts.L4ProtoType_UDP
 		}
 		if fakeDest {
-			outboundIndex, newMark, must, realIP, err = c.routeFakeIP(ctx, src, dst, domain, proto, routingResult)
+			outboundIndex, newMark, must, realIP, err = c.routeFakeIPInbound(ctx, p.Inbound, src, dst, domain, proto, routingResult, realIPFor)
 			if err != nil {
 				return nil, err
 			}
-		} else if outboundIndex, newMark, must, err = c.Route(
+		} else if outboundIndex, newMark, must, err = c.RouteInbound(
+			p.Inbound,
 			src,
 			dst,
 			domain,
@@ -193,8 +208,13 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			return nil, err
 		}
 		mark = newMark
-		// Reset dialTarget.
-		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
+		// Reset dialTarget. A name-only flow dials by name unless the address
+		// is pinned below; ChooseDialTarget would probe DNS for an unknown name.
+		if nameOnly {
+			dialTarget, dialIp = nameOnlyDialTarget(domain, dst.Port()), false
+		} else {
+			dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
+		}
 		if fakeDest && realIP.IsValid() && c.fakeIPShouldPinRealDest(outboundIndex) {
 			dst = netip.AddrPortFrom(realIP, dst.Port())
 			dialTarget = dst.String()
@@ -319,8 +339,8 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	// Routing uses the name; a selected direct leaf uses the actual destination.
 	// Explicit resolve_dns keeps its existing override semantics.
 	if isDirectResolveDNSDial(res) && !res.Dialer.ResolveDNS().IsValid() {
-		if c.destIsFakeIP(dst.Addr()) {
-			real, err := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+		if c.destIsFakeIP(dst.Addr()) || p.nameOnlyPending(dst) {
+			real, err := realIPFor(ctx, domain, dst.Addr())
 			if err != nil {
 				return res, err
 			}
@@ -344,9 +364,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 	if p.Network == "tcp" && p.Dest.Port() == 443 && res.Dialer != nil && res.Dialer.ResolveDNS().IsValid() {
 		preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName, c.destIsFakeIP(p.Dest.Addr()))
+		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName, c.destIsFakeIP(p.Dest.Addr()) || p.nameOnlyPending(p.Dest))
 	}
 	if err := c.ensureUdpDialTargetIP(ctx, p, res); err != nil {
+		return res, err
+	}
+	if err := guardNameOnlyDialTarget(p, res); err != nil {
 		return res, err
 	}
 	return res, nil

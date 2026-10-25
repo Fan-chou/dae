@@ -62,6 +62,20 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
   selection semantics. User-facing notes:
   [`docs/zh/quality-urltest-fallback.md`](docs/zh/quality-urltest-fallback.md).
 
+- New `inbound` section: named SOCKS5 listeners (TCP `CONNECT` and UDP
+  `ASSOCIATE`) with configurable `listen` address and optional RFC 1929
+  username/password. Their flows follow the ordinary `routing` section and are
+  matched with the new `inbound(name)` function, e.g. `inbound(s1) -> my_group`
+  or `!inbound(s1) && dport(443) -> block`. Binding an unspecified or public
+  address requires credentials. The function is evaluated in user space only
+  (the kernel treats it as constant false), so no eBPF change is involved.
+  A `CONNECT` to an IP address is sniffed for a TLS SNI / HTTP Host like
+  transparent traffic (`sniff: auto`, the default; `sniff: off` keeps precise
+  SOCKS5 error codes), FakeIP targets are mapped back to their names, and
+  `resolve: deferred` routes domain targets by name before resolving them (a
+  proxied name is then sent to the proxy without a lookup by dae).
+  Details: [`docs/en/configuration/inbound.md`](docs/en/configuration/inbound.md).
+
 #### Behavior changes / Upgrade notes
 
 Existing config files keep parsing, but the following defaults and semantics

@@ -28,6 +28,7 @@ var configSectionSpecs = []configSectionSpec{
 	{name: "geodata", decode: decodeGeodataSection},
 	{name: "node", decode: decodeNodeSection},
 	{name: "group", decode: decodeGroupSection},
+	{name: "inbound", decode: decodeInboundSection},
 	{name: "routing", required: true, decode: decodeRoutingSection},
 	{name: "dns", decode: decodeDnsSection},
 }
@@ -87,6 +88,10 @@ func decodeGeodataSection(conf *Config, section *config_parser.Section) error {
 
 func decodeNodeSection(conf *Config, section *config_parser.Section) error {
 	return SectionParser(reflect.ValueOf(&conf.Node), section)
+}
+
+func decodeInboundSection(conf *Config, section *config_parser.Section) error {
+	return SectionParser(reflect.ValueOf(&conf.Inbound), section)
 }
 
 func decodeGroupSection(conf *Config, section *config_parser.Section) error {

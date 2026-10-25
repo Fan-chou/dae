@@ -23,6 +23,25 @@ const (
 var nodeURIScheme = regexp.MustCompile(`(?i)(hy2|hysteria2?|ssr?|vmess|vless|trojan|tuic|juicity|anytls|socks5?)://`)
 var adminSecretAssign = regexp.MustCompile(`(?m)^([ \t]*admin_secret[ \t]*:[ \t]*)('[^']*'|"[^"]*"|[^\s#]+)`)
 
+// inboundPasswordAssign matches an inbound section's password line. routing.dae
+// is served whole, so an inbound section placed there must not leak it.
+var inboundPasswordAssign = regexp.MustCompile(`(?m)^([ \t]*password[ \t]*:[ \t]*)('[^']*'|"[^"]*"|[^\s#]+)`)
+
+func redactInboundPasswords(src string) string {
+	return inboundPasswordAssign.ReplaceAllString(src, "${1}'"+adminSecretPlaceholder+"'")
+}
+
+// hasRedactedInboundPassword reports whether src still carries the placeholder
+// that redactInboundPasswords wrote, i.e. a client echoed back a redacted read.
+func hasRedactedInboundPassword(src string) bool {
+	for _, m := range inboundPasswordAssign.FindAllStringSubmatch(src, -1) {
+		if unquoteAdminScalar(m[2]) == adminSecretPlaceholder {
+			return true
+		}
+	}
+	return false
+}
+
 type adminConfigBody struct {
 	Config  *string `json:"config"`
 	Routing *string `json:"routing"`
@@ -64,7 +83,7 @@ func loadAdminConfig(configDir string) (adminConfigResponse, error) {
 	extracted = stripNodeURILines(rewriteAdminSecret(extracted, adminSecretPlaceholder))
 	routing := ""
 	if body, readErr := os.ReadFile(routingPath); readErr == nil {
-		routing = stripNodeURILines(string(body))
+		routing = stripNodeURILines(redactInboundPasswords(string(body)))
 	} else if !os.IsNotExist(readErr) {
 		return adminConfigResponse{}, readErr
 	}
@@ -187,6 +206,9 @@ func rejectDisallowedAdminConfig(src string, routingFile bool) error {
 	}
 	if routingFile && strings.Contains(src, "://") {
 		return fmt.Errorf("URIs are not allowed in routing.dae")
+	}
+	if routingFile && hasRedactedInboundPassword(src) {
+		return fmt.Errorf("an inbound password is redacted in this view; edit it in the file instead")
 	}
 	return nil
 }

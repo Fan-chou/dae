@@ -260,6 +260,7 @@ type Config struct {
 	Geodata      Geodata         `mapstructure:"geodata"`
 	Node         []KeyableString `mapstructure:"node"`
 	Group        []Group         `mapstructure:"group" desc:"GroupDesc"`
+	Inbound      []Inbound       `mapstructure:"inbound" desc:"InboundDesc"`
 	Routing      Routing         `mapstructure:"routing" required:""`
 	Dns          Dns             `mapstructure:"dns" desc:"DnsDesc"`
 }

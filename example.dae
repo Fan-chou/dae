@@ -328,6 +328,27 @@ dns {
 #    }
 }
 
+# User-space proxy listeners (SOCKS5, TCP CONNECT and UDP ASSOCIATE). Traffic accepted here is routed by the
+# routing section below, like transparent traffic, and can be told apart with inbound(name). Each named
+# sub-section is one listener; add as many as you need.
+# Binding an unspecified (0.0.0.0, [::]) or public address requires username and password.
+#inbound {
+#    s1 {
+#        listen: '127.0.0.1:1080'
+#    }
+#    lan {
+#        listen: '192.168.1.1:1081'
+#        username: 'alice'
+#        password: 'change-me'
+#        # udp: false
+#        # sniff: off   # keep precise SOCKS5 error codes for IP targets (default: auto)
+#        # resolve: deferred   # route domain targets by name first; resolve only when needed (default: local)
+#        # Address announced as the UDP relay address when dae is behind NAT or port forwarding.
+#        # udp_advertise: '203.0.113.7'
+#    }
+#}
+# Then, in routing: inbound(s1) -> my_group
+
 # Node group (outbound).
 group {
     my_group {
@@ -401,6 +422,10 @@ routing {
     dip(geoip:private) -> direct
 
     ### Write your rules below.
+
+    # Match traffic that entered through a user-space inbound (section "inbound"). Transparent traffic never matches.
+    # inbound(s1) -> my_group
+    # inbound(lan) && domain(geosite:cn) -> direct
 
     # Optional extra hammer: silently drop ALL UDP/443 in kernel, including
     # datagram nodes. global.block_quic already REJECT-NO-DROP identified QUIC

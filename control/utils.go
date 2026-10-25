@@ -26,6 +26,12 @@ import (
 // means no domain is known for this invocation. A nil routingResult is treated
 // as an empty identity (internal DNS lookups have no client 5-tuple).
 func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	return c.RouteInbound(0, src, dst, domain, l4proto, routingResult)
+}
+
+// RouteInbound is Route for a flow that entered through the inbound with the
+// given consts.InboundID (0 for transparent traffic).
+func (c *ControlPlane) RouteInbound(inbound uint32, src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
 	if c == nil || c.routingMatcher == nil {
 		return 0, 0, false, fmt.Errorf("nil routing matcher")
 	}
@@ -42,7 +48,8 @@ func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto con
 	copy(mac16[10:], routingResult.Mac[:])
 	bSrc := src.Addr().As16()
 	bDst := dst.Addr().As16()
-	outboundIndex, mark, must, err = c.routingMatcher.Match(
+	outboundIndex, mark, must, err = c.routingMatcher.MatchInbound(
+		inbound,
 		bSrc,
 		bDst,
 		src.Port(),

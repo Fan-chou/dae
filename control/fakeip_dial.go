@@ -65,6 +65,20 @@ func (c *ControlPlane) routeFakeIP(
 	l4proto consts.L4ProtoType,
 	routingResult *bpfRoutingResult,
 ) (outboundIndex consts.OutboundIndex, mark uint32, must bool, realIP netip.Addr, err error) {
+	return c.routeFakeIPInbound(ctx, 0, src, dst, domain, l4proto, routingResult, c.realIPForFakeIPRoute)
+}
+
+// routeFakeIPInbound is routeFakeIP for a flow that entered through the
+// inbound with the given consts.InboundID (0 for transparent traffic).
+func (c *ControlPlane) routeFakeIPInbound(
+	ctx context.Context,
+	inbound uint32,
+	src, dst netip.AddrPort,
+	domain string,
+	l4proto consts.L4ProtoType,
+	routingResult *bpfRoutingResult,
+	realIPFor func(context.Context, string, netip.Addr) (netip.Addr, error),
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, realIP netip.Addr, err error) {
 	if c == nil || c.routingMatcher == nil {
 		return 0, 0, false, netip.Addr{}, fmt.Errorf("nil routing matcher")
 	}
@@ -87,13 +101,14 @@ func (c *ControlPlane) routeFakeIP(
 		if factErr != nil {
 			return 0, 0, false, netip.Addr{}, factErr
 		}
+		facts.inbound = inbound
 		attempted := false
 		var resolved netip.Addr
 		var resolveErr error
 		lookup := func() (netip.Addr, error) {
 			if !attempted {
 				attempted = true
-				resolved, resolveErr = c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+				resolved, resolveErr = realIPFor(ctx, domain, dst.Addr())
 			}
 			return resolved, resolveErr
 		}
@@ -106,7 +121,8 @@ func (c *ControlPlane) routeFakeIP(
 		}
 		return out, routeMark, routeMust, real, routeErr
 	}
-	outboundIndex, mark, must, needsDestIP, err := c.routingMatcher.MatchDeferringDestIP(
+	outboundIndex, mark, must, needsDestIP, err := c.routingMatcher.MatchDeferringDestIPInbound(
+		inbound,
 		bSrc,
 		bDst,
 		src.Port(),
@@ -124,11 +140,11 @@ func (c *ControlPlane) routeFakeIP(
 	if !needsDestIP && fakeIPDialSkipResolve(c.routingMatcher, outboundIndex) {
 		return outboundIndex, mark, must, netip.Addr{}, nil
 	}
-	realIP, realErr := c.realIPForFakeIPRoute(ctx, domain, dst.Addr())
+	realIP, realErr := realIPFor(ctx, domain, dst.Addr())
 	if realErr != nil {
 		return 0, 0, false, netip.Addr{}, realErr
 	}
-	outboundIndex, mark, must, err = c.Route(src, netip.AddrPortFrom(realIP, dst.Port()), domain, l4proto, routingResult)
+	outboundIndex, mark, must, err = c.RouteInbound(inbound, src, netip.AddrPortFrom(realIP, dst.Port()), domain, l4proto, routingResult)
 	return outboundIndex, mark, must, realIP, err
 }
 
@@ -284,7 +300,7 @@ func (c *ControlPlane) ensureUdpDialTargetIP(ctx context.Context, p *proxyDialPa
 		return nil
 	}
 	dest := p.Dest.Addr()
-	fake := dest.IsValid() && c.destIsFakeIP(dest)
+	fake := dest.IsValid() && (c.destIsFakeIP(dest) || p.NameOnly && dest.IsUnspecified())
 	domain := udpDialDomain(res)
 	// FakeIP direct pin: keep the resolved real IP. Rewriting to domain:port
 	// would let a direct leaf resolve via the system and bounce into 28.x.

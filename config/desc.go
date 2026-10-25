@@ -15,10 +15,11 @@ var SectionSummaryDesc = Desc{
 	"node":          "Nodes defined here will be merged as a part of the global node pool.\nOptional link query resolve_dns=8.8.8.8 (IP, optional :port) pins UDP dest IP via DNS through this node. Default is to pass the domain. DNS uses UDP; tcp:// is unsupported. Known-domain UDP sessions keep the chosen target across bounded transport recovery; TCP/DNS may prewarm HTTP/3 candidates.",
 	"dns":           "See more at https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/dns.md.",
 	"group":         "Node group. Groups defined here can be used as outbounds in section \"routing\".",
+	"inbound":       "User-space proxy listeners. Each named sub-section opens a SOCKS5 server (TCP CONNECT and UDP ASSOCIATE). Traffic accepted here follows section \"routing\" and can be matched with inbound(name).",
 	"routing": `Traffic follows this routing. See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.
 Notice: domain traffic split will fail if DNS traffic is not taken over by dae.
 Built-in outbound: direct, must_direct, block.
-Available functions: domain, sip, dip, sport, dport, ipversion, l4proto, pname, mac.
+Available functions: domain, sip, dip, sport, dport, ipversion, l4proto, pname, mac, inbound.
 Available keys in domain function: suffix, keyword, regex, full. No key indicates suffix.
 domain: Match domain.
 sip: Match source IP. CIDR format is also supported.
@@ -28,13 +29,26 @@ dport: Match dest port. Range like 8000-9000 is also supported.
 ipversion: Match IP version. Available values: 4, 6.
 l4proto: Match level 4 protocol. Available values: tcp, udp.
 pname: Match process name. It only works on WAN mode and for localhost programs.
-mac: Match source MAC address. It works on LAN mode.`,
+mac: Match source MAC address. It works on LAN mode.
+inbound: Match the user-space inbound (section "inbound") the flow entered through, e.g. inbound(s1). Transparent traffic never matches.`,
 }
 
 var SectionDescription = map[string]Desc{
-	"GlobalDesc": GlobalDesc,
-	"DnsDesc":    DnsDesc,
-	"GroupDesc":  GroupDesc,
+	"GlobalDesc":  GlobalDesc,
+	"DnsDesc":     DnsDesc,
+	"GroupDesc":   GroupDesc,
+	"InboundDesc": InboundDesc,
+}
+
+var InboundDesc = Desc{
+	"protocol":      "Inbound protocol. Only socks5 is supported.",
+	"listen":        "Address to listen on, as ip:port (IPv6 as [::1]:1080). Binding an unspecified or public address requires username/password.",
+	"username":      "RFC 1929 username. Set together with password to require authentication.",
+	"password":      "RFC 1929 password. Redacted from the admin API.",
+	"udp":           "Allow UDP ASSOCIATE. Default true.",
+	"resolve":       "How a domain target is handled: local (default) resolves it through dae's DNS first and routes with the real IP; deferred routes by the name first and resolves only when a rule needs the address (dip, geoip, ipversion) or the outbound is direct. A proxied name is then sent to the proxy as host:port without any lookup by dae, so dns-section rewrites and rejects do not apply to it.",
+	"sniff":         "TCP sniffing for CONNECT requests to an IP address: auto (default) answers CONNECT before dialing and sniffs the TLS SNI / HTTP Host so domain() rules and domain dialing work; off dials first and reports failures as precise SOCKS5 error codes. Requests that carry a domain name are never sniffed.",
+	"udp_advertise": "IP address announced to clients as the UDP relay address. Empty uses the local address of the client's TCP connection; set it when dae is behind NAT or port forwarding.",
 }
 
 var GlobalDesc = Desc{

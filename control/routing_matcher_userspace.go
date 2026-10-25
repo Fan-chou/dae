@@ -84,6 +84,9 @@ type routingMatcherFacts struct {
 	pname      [16]uint8
 	dscp       uint8
 	mac        [16]uint8
+	// inbound is consts.InboundID of the user-space inbound the flow entered
+	// through; 0 for transparent traffic, which no inbound() match satisfies.
+	inbound uint32
 
 	ipSetBin       string
 	sourceIPSetBin string
@@ -112,6 +115,7 @@ type compiledRoutingMatch struct {
 	mask      uint8
 	pname     [16]uint8
 	dscp      uint8
+	inboundID uint32
 }
 
 func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
@@ -135,6 +139,8 @@ func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
 		compiled.pname = match.Value
 	case consts.MatchType_Dscp:
 		compiled.dscp = match.Value[0]
+	case consts.MatchType_Inbound:
+		compiled.inboundID = nativeBpfABI.uint32(match.Value[:4])
 	case consts.MatchType_DomainSet, consts.MatchType_Fallback:
 		// No extra decode fields.
 	default:
@@ -257,6 +263,8 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 		return facts.pname[0] != 0 && match.pname == facts.pname, nil
 	case consts.MatchType_Dscp:
 		return facts.dscp == match.dscp, nil
+	case consts.MatchType_Inbound:
+		return facts.inbound != 0 && facts.inbound == match.inboundID, nil
 	case consts.MatchType_Fallback:
 		return true, nil
 	default:
@@ -264,8 +272,26 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 	}
 }
 
-// Match is modified from kern/tproxy.c; please keep sync.
+// Match is MatchInbound for traffic that did not enter through an inbound.
 func (m *RoutingMatcher) Match(
+	sourceAddr [16]uint8,
+	destAddr [16]uint8,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	dscp uint8,
+	mac [16]uint8,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	return m.MatchInbound(0, sourceAddr, destAddr, sourcePort, destPort, ipVersion, l4proto, domain, processName, dscp, mac)
+}
+
+// MatchInbound is modified from kern/tproxy.c; please keep sync. inbound is
+// the consts.InboundID of the inbound the flow entered through, or 0.
+func (m *RoutingMatcher) MatchInbound(
+	inbound uint32,
 	sourceAddr [16]uint8,
 	destAddr [16]uint8,
 	sourcePort uint16,
@@ -292,12 +318,31 @@ func (m *RoutingMatcher) Match(
 	if err != nil {
 		return 0, 0, false, err
 	}
+	facts.inbound = inbound
 	outbound, mark, must, _, err := m.matchFacts(facts)
 	return outbound, mark, must, err
 }
 
 // MatchDeferringDestIP is Match with dest ip()/geoip left UNKNOWN.
 func (m *RoutingMatcher) MatchDeferringDestIP(
+	sourceAddr [16]uint8,
+	destAddr [16]uint8,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	dscp uint8,
+	mac [16]uint8,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, err error) {
+	return m.MatchDeferringDestIPInbound(0, sourceAddr, destAddr, sourcePort, destPort, ipVersion, l4proto, domain, processName, dscp, mac)
+}
+
+// MatchDeferringDestIPInbound is MatchDeferringDestIP for a flow that entered
+// through the inbound with the given consts.InboundID (0 for none).
+func (m *RoutingMatcher) MatchDeferringDestIPInbound(
+	inbound uint32,
 	sourceAddr [16]uint8,
 	destAddr [16]uint8,
 	sourcePort uint16,
@@ -324,6 +369,7 @@ func (m *RoutingMatcher) MatchDeferringDestIP(
 	if err != nil {
 		return 0, 0, false, false, err
 	}
+	facts.inbound = inbound
 	return m.matchFactsDeferringDestIP(facts)
 }
 
@@ -333,7 +379,7 @@ func identityRoutingMatch(matchType consts.MatchType) bool {
 	switch matchType {
 	case consts.MatchType_Mac, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac,
 		consts.MatchType_Port, consts.MatchType_SourcePort, consts.MatchType_ProcessName,
-		consts.MatchType_Dscp, consts.MatchType_L4Proto:
+		consts.MatchType_Dscp, consts.MatchType_L4Proto, consts.MatchType_Inbound:
 		return true
 	default:
 		return false

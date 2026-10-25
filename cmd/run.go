@@ -449,6 +449,11 @@ func (r *Runner) Run() (err error) {
 	}
 	publishEffectiveConfig(conf)
 	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
+	// User-space inbounds live outside any control plane generation: they keep
+	// their sockets across reloads and are reconciled with the active config
+	// whenever a generation is published.
+	inboundManager := control.NewInboundManager(log)
+	inboundManager.Apply(conf.Inbound)
 	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
 	var ruleProviderLifecycleCancel context.CancelFunc
 	var ruleProviderLifecycleDone <-chan struct{}
@@ -563,6 +568,7 @@ loop:
 						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 					}
 					w.log.Warnln("[Reload] Finished")
+					inboundManager.Apply(w.conf.Inbound)
 					reloadManager.finishReloadSuccess()
 					continue
 				}
@@ -840,6 +846,7 @@ loop:
 					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 				}
 				w.log.Warnln("[Reload] Finished")
+				inboundManager.Apply(w.conf.Inbound)
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")
@@ -867,6 +874,10 @@ loop:
 		ruleProviderLifecycleCancel()
 		<-ruleProviderLifecycleDone
 	}
+
+	// User-space inbounds are ingress too: close them (and their connections)
+	// before the control plane they dispatch to is torn down.
+	inboundManager.Close()
 
 	// Stop accepting new ingress immediately so shutdown does not continue to
 	// create fresh UDP/TCP work while the control plane is being torn down.

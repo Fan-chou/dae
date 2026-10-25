@@ -176,6 +176,7 @@ func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.Rul
 	b.registerProgramParser(rulesBuilder, consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
 	b.registerProgramParser(rulesBuilder, consts.Function_Dscp, routing.UintParserFactory(b.addDscp))
 	b.registerProgramParser(rulesBuilder, consts.Function_IpVersion, routing.IpVersionParserFactory(b.addIpVersion))
+	b.registerProgramParser(rulesBuilder, consts.Function_Inbound, routing.EmptyKeyPlainParserFactory(b.addInbound))
 }
 
 func (b *RoutingMatcherBuilder) registerProgramParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser) {
@@ -574,6 +575,41 @@ func (b *RoutingMatcherBuilder) addDscp(f *config_parser.Function, values []uint
 	return nil
 }
 
+// addInbound compiles inbound(name, ...). The match is user-space only: the
+// kernel never sees traffic that entered through an inbound, so
+// rewriteKernRulesWithRingLpmIndex projects it as a constant FALSE.
+func (b *RoutingMatcherBuilder) addInbound(f *config_parser.Function, names []string, outbound *routing.Outbound) (err error) {
+	if len(names) == 0 {
+		return fmt.Errorf("%v requires at least one inbound name", consts.Function_Inbound)
+	}
+	for i, name := range names {
+		if err := config.ValidateInboundName(name); err != nil {
+			return err
+		}
+		outboundName := consts.OutboundLogicalOr.String()
+		if i == len(names)-1 {
+			outboundName = outbound.Name
+		}
+		outboundId, err := b.outboundToId(outboundName)
+		if err != nil {
+			return err
+		}
+		id := consts.InboundID(name)
+		set := bpfMatchSet{
+			Type:     uint8(consts.MatchType_Inbound),
+			Not:      bpfBool(f.Not),
+			Outbound: outboundId,
+			Mark:     outbound.Mark,
+			Must:     bpfBool(outbound.Must),
+		}
+		nativeBpfABI.putUint32(set.Value[:4], id)
+		compiled := newCompiledRoutingBase(consts.MatchType_Inbound, f.Not, outboundId, outbound.Mark, outbound.Must)
+		compiled.inboundID = id
+		b.appendRule(set, compiled)
+	}
+	return nil
+}
+
 func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrString) (err error) {
 	fallbackFunc, err := config.ParseFunctionOrString(fallbackOutbound)
 	if err != nil {
@@ -655,6 +691,14 @@ func rewriteKernRulesWithRingLpmIndex(rules []bpfMatchSet, allocStartIdx uint32,
 	for i, rule := range kernRules {
 		matchType := consts.MatchType(rule.Type)
 		switch matchType {
+		case consts.MatchType_Inbound:
+			// The kernel only sees transparent traffic, which never entered
+			// through an inbound. Project the match as a constant FALSE with
+			// an l4proto mask of 0 (value & mask is never non-zero); Not,
+			// Outbound, Mark and Must keep their meaning, so !inbound(x) is
+			// constant TRUE as it should be.
+			kernRules[i].Type = uint8(consts.MatchType_L4Proto)
+			kernRules[i].Value = [16]byte{}
 		case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_SourceIpSetMatchMac, consts.MatchType_Mac:
 			oldLpmIndex := nativeBpfABI.uint32(rule.Value[:4])
 			if oldLpmIndex >= lpmCount {

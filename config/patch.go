@@ -26,6 +26,7 @@ var patches = []patch{
 	patchTcpCheckHttpMethod,
 	patchEmptyDns,
 	patchMustOutbound,
+	patchInbound,
 }
 
 func patchBootstrapResolver(params *Config) error {
