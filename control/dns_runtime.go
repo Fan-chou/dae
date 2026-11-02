@@ -227,8 +227,25 @@ func (r *controlPlaneDNSRuntime) startPreparedDNSListener(ctx context.Context, l
 	return r.startPreparedDNSListenerWithWarmupTimeout(ctx, log, deferFuncs, stop, preparedDNSWarmupTimeout)
 }
 
+// clearPreparedDNSHooks drops the hooks installed for a staged reload. They
+// close over the reload handoff, and through it the previous generation and its
+// configuration, so a hook that outlives its use keeps every earlier generation
+// reachable: each new generation would hold the one before it.
+func (r *controlPlaneDNSRuntime) clearPreparedDNSHooks() {
+	if r == nil {
+		return
+	}
+	r.preparedDNSReuseHook = nil
+	r.preparedDNSStartHook = nil
+}
+
 func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx context.Context, log *logrus.Logger, deferFuncs *[]func() error, stop func() error, warmupTimeout time.Duration) error {
-	if r == nil || !r.delayDNSListenerStart {
+	if r == nil {
+		return nil
+	}
+	if !r.delayDNSListenerStart {
+		// Nothing is deferred, so the hooks will never run.
+		r.clearPreparedDNSHooks()
 		return nil
 	}
 	if err := r.waitDNSUpstreamAvailable(ctx, warmupTimeout); err != nil {
@@ -240,6 +257,9 @@ func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx c
 		}
 		r.preparedDNSReuseHook = nil
 		if !r.delayDNSListenerStart {
+			// The listener was reused, so the start hook is skipped. Drop it
+			// as well: it still references the previous generation.
+			r.preparedDNSStartHook = nil
 			return nil
 		}
 	}
