@@ -2581,7 +2581,11 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// inside RouteDialTcp and is not reduced by sniffing time.
 				src := common.ConvergeAddrPort(lconn.RemoteAddr().(*net.TCPAddr).AddrPort())
 				dst := common.ConvergeAddrPort(lconn.LocalAddr().(*net.TCPAddr).AddrPort())
-				if err := c.handleConn(c.ctx, lconn, ownership); err != nil {
+				task, err := c.handleConn(c.ctx, lconn, ownership)
+				if task != nil {
+					go runEstablishedTCPTask(task)
+				}
+				if err != nil {
 					if stderrors.Is(err, ErrUnnamedFakeIP) {
 						c.logUnnamedFakeIP("tcp", src, dst, err)
 					} else {
@@ -3111,11 +3115,10 @@ func (c *ControlPlane) closeTail() error {
 //
 // It deliberately does not nil out routingMatcher, outbounds, dnsController,
 // core, egressRuntime, sessionManager or the UDP dispatchers. SessionManager
-// lets established flows outlive the generation that created them, and those
-// flow goroutines keep reading exactly those fields. Clearing them races with
-// live readers and turns a reload into a nil dereference. Dropping the fields
-// buys nothing either: once the generation itself is unreachable, everything it
-// points at is collected with it.
+// lets established flows outlive the generation that created them. Transparent
+// TCP relays now detach into establishedTCPTask; other execution paths may still
+// read generation state. Retirement must not clear shared fields under live
+// readers. Once the generation is unreachable, its policy state is collected.
 func (c *ControlPlane) releaseRetainedState() {
 	if c == nil {
 		return

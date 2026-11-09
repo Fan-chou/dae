@@ -128,8 +128,12 @@ func retryRetrieveRoutingResult(ctx context.Context, retrieve func() (*bpfRoutin
 	return nil, lastErr
 }
 
-func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership *incomingConnectionLease) (err error) {
-	defer func() { _ = lConn.Close() }()
+func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership *incomingConnectionLease) (task *establishedTCPTask, err error) {
+	defer func() {
+		if task == nil {
+			_ = lConn.Close()
+		}
+	}()
 
 	// Get tuples and outbound first so we can decide whether sniffing is needed.
 	// Converge IPv4-mapped IPv6 addresses before looking up eBPF routing tuples.
@@ -153,28 +157,28 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership
 				}).WithError(err).Debug("Routing tuple missing; fallback to userspace routing")
 			}
 		} else {
-			return fmt.Errorf("failed to retrieve target info %v: %w", dst.String(), err)
+			return nil, fmt.Errorf("failed to retrieve target info %v: %w", dst.String(), err)
 		}
 	}
 	owner, ownerErr := c.routingEpochExecutionOwner(routingResult)
 	if ownerErr != nil {
-		return fmt.Errorf("select TCP routing epoch owner: %w", ownerErr)
+		return nil, fmt.Errorf("select TCP routing epoch owner: %w", ownerErr)
 	}
 	if owner != c {
 		if ownership != nil {
 			if !ownership.transferRoutingEpoch(owner, routingResult) {
-				return fmt.Errorf("transfer TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
+				return nil, fmt.Errorf("transfer TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
 			}
 		} else {
 			release, ok := owner.acquireRoutingEpochExecutionLeaseFor(routingResult)
 			if !ok {
-				return fmt.Errorf("acquire TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
+				return nil, fmt.Errorf("acquire TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
 			}
 			defer release()
 		}
-		return owner.handleConnWithRoutingResultOwned(owner.ctx, lConn, src, dst, routingResult, ownership)
+		return owner.prepareConnWithRoutingResultOwned(owner.ctx, lConn, src, dst, routingResult, ownership)
 	}
-	return c.handleConnWithRoutingResultOwned(ctx, lConn, src, dst, routingResult, ownership)
+	return c.prepareConnWithRoutingResultOwned(ctx, lConn, src, dst, routingResult, ownership)
 }
 
 func (c *ControlPlane) handleConnWithRoutingResultOwned(
@@ -185,6 +189,21 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	routingResult *bpfRoutingResult,
 	ownership *incomingConnectionLease,
 ) (err error) {
+	task, err := c.prepareConnWithRoutingResultOwned(ctx, lConn, src, dst, routingResult, ownership)
+	if task != nil {
+		return task.run()
+	}
+	return err
+}
+
+func (c *ControlPlane) prepareConnWithRoutingResultOwned(
+	ctx context.Context,
+	lConn net.Conn,
+	src netip.AddrPort,
+	dst netip.AddrPort,
+	routingResult *bpfRoutingResult,
+	ownership *incomingConnectionLease,
+) (task *establishedTCPTask, err error) {
 	// Keep the accepted connection for lifecycle indexing even when DNS probing
 	// or sniffing wraps the relay-side reader below.
 	ingressConn := lConn
@@ -199,10 +218,10 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// allowing proper fallback if this isn't DNS traffic.
 	if dst.Port() == 53 && dnsFastPathPermitted(routingResult) {
 		bufReader := bufio.NewReader(lConn)
-		handled, dnsErr := c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, ownership)
+		dnsTask, handled, dnsErr := c.prepareTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, ownership)
 		if handled {
 			// Connection was handled as DNS - any errors are already logged
-			return dnsErr
+			return dnsTask, dnsErr
 		}
 		// Not DNS traffic (or failed to read as DNS) - fall through to normal TCP handling
 		// Wrap the connection to include buffered data that was peeked but not consumed
@@ -226,7 +245,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		} else {
 			probeConn, prefetched, ready, probeErr := prefetchForTcpSniff(lConn, c.sniffingTimeout, tcpSniffPrefetchBytes)
 			if probeErr != nil {
-				return probeErr
+				return nil, probeErr
 			}
 			switch {
 			case !ready:
@@ -240,7 +259,11 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 			default:
 				// ConnSniffer should be used later, so we cannot close it now.
 				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
-				defer func() { _ = sniffer.Close() }()
+				defer func() {
+					if task == nil {
+						_ = sniffer.Close()
+					}
+				}()
 				lRelayConn = sniffer
 
 				domain, err = sniffer.SniffTcp()
@@ -250,7 +273,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 					// 2) Ignorable connection errors (EOF/reset/timeout) should not break relay.
 					// 3) Other unexpected errors should fail fast instead of being silently hidden.
 					if !sniffing.IsSniffingError(err) && !daerrors.IsIgnorableConnectionError(err) {
-						return err
+						return nil, err
 					}
 					if !sniffing.IsSniffingError(err) {
 						if c.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -284,7 +307,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	c.captureRoute(res, domain, captureDialStart, ctx, err)
 	if err != nil {
 		if c.destIsFakeIP(dst.Addr()) {
-			return fmt.Errorf("failed to dial FakeIP %v sniffed=%q: %w", dst, domain, err)
+			return nil, fmt.Errorf("failed to dial FakeIP %v sniffed=%q: %w", dst, domain, err)
 		}
 		if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 			res.Outbound.HandleNoAliveDialer(
@@ -295,12 +318,12 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 				domain,
 				res.IsDialIp,
 			)
-			return nil
+			return nil, nil
 		}
 		if daerrors.IsIgnorableConnectionError(err) {
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("failed to dial %v: %w", dst, err)
+		return nil, fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
 	if ownership != nil {
 		ownership.storePendingEgress(rConn)
@@ -310,6 +333,24 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	if dialParam.captureTrace != nil {
 		captureAdoptStart = time.Now()
 	}
+	// Snapshot every generation-owned dependency before adoption releases the
+	// drain ticket. Retirement may close the plane immediately after adoption.
+	prepared := &establishedTCPTask{ingress: ingressConn, left: lRelayConn, right: rConn,
+		log: c.log, src: src, dst: dst, target: res.DialTarget,
+		trace: dialParam.captureTrace, offload: c.prepareTCPRelayOffload()}
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		prepared.logFields = buildTCPLinkLogFields(res, dialParam, dst, domain, false, false, "")
+	}
+	if prepared.trace != nil {
+		prepared.scope, prepared.captureAllowed = c.captureScope(res, domain)
+		prepared.captured = c.startCaptureLinked(res, domain, prepared.trace, true)
+	}
+	defer func() {
+		if task == nil {
+			prepared.offload.close()
+			prepared.captured.Finish("adopt_abandoned")
+		}
+	}()
 	flow, err := c.adoptTCPFlow(ctx, ownership, ingressConn, rConn, binding, src, dst)
 	if err != nil {
 		if dialParam.captureTrace != nil {
@@ -325,87 +366,13 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		res.Quality.Abandon()
 		res.SelectPath.RecoveryAbandon()
 		if stderrors.Is(err, ErrSessionManagerClosed) || stderrors.Is(err, errRoutingEpochOwnerUnavailable) {
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("adopt TCP flow runtime: %w", err)
+		return nil, fmt.Errorf("adopt TCP flow runtime: %w", err)
 	}
-	defer closeEstablishedTCPFlow(rConn, flow)
-	var captured *observation.Flow
-	var captureOutcome string
-	var captureError *observation.ErrorFacts
-	if dialParam.captureTrace != nil {
-		captured = c.startCaptureLinked(res, domain, dialParam.captureTrace, true)
-		flow.capture.Store(captured)
-		captureRelayStart := time.Now()
-		captureOutcome = "relay_ended"
-		captureError = &observation.ErrorFacts{Class: "none", Stage: "relay"}
-		if scope, ok := c.captureScope(res, domain); ok {
-			outcome := "success"
-			if captured == nil {
-				outcome = "unmeasured"
-			}
-			dialParam.captureTrace.Stage(scope, res.DialTarget, src.Addr().String(), "flow_link", captureRelayStart, outcome, captured.EpisodeID())
-		}
-		defer func() {
-			if ctx.Err() != nil {
-				captureOutcome = "canceled"
-			}
-			captured.Finish(captureOutcome)
-			if scope, ok := c.captureScope(res, domain); ok {
-				dialParam.captureTrace.StageError(scope, res.DialTarget, src.Addr().String(), "relay_end", captureRelayStart, captureOutcome, captured.EpisodeID(), captureError)
-			}
-		}()
-	}
-
-	offloaded := false
-	offloadReason := ""
-	annotateOffload := false
-
-	// Attempt kernel-side splice via fast_sock/sk_skb before falling back to
-	// the user-space relay. A registered offload session blocks until both
-	// sockets close; any pre-registration failure falls through silently.
-	var offloadErr error
-	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, flow.recordDownload, flow.recordUpload, flow.offloadLiveAccounting())
-	if offloadErr != nil {
-		captureOutcome = "offload_error"
-		if captureError != nil {
-			captureError.Class = observation.ErrorClass(offloadErr)
-			captureError.Stage = "offload"
-		}
-		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
-	}
-	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
-	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
-		logOffloadSkipRateLimited(c.log, offloadReason)
-	}
-
-	// Per-flow routing traces are Debug: at Info they dominate CPU/allocs
-	// under high connection rates. Raise log_level to debug to restore them.
-	if c.log.IsLevelEnabled(logrus.DebugLevel) {
-		c.log.WithFields(buildTCPLinkLogFields(res, dialParam, dst, domain, annotateOffload, offloaded, offloadReason)).Debugf("%v <-> %v", RefineSourceToShow(src, dst.Addr()), res.DialTarget)
-	}
-
-	if offloaded {
-		if captureError != nil {
-			captureError.Stage = "offload"
-		}
-		captured.Offloaded()
-		return nil
-	}
-
-	captured.Userspace()
-	relayErr := relayEstablishedTCPFlow(flow, lRelayConn, rConn, c.log, src, dst)
-	if captureError != nil {
-		captureError.Class = observation.ErrorClass(relayErr)
-		captureError.Stage = "relay"
-	}
-	if relayErr != nil {
-		captureOutcome = "relay_error"
-	}
-	if flow.Context().Err() != nil {
-		captureOutcome = "canceled"
-	}
-	return relayErr
+	prepared.flow = flow
+	task = prepared
+	return task, nil
 }
 
 func closeEstablishedTCPFlow(egress netproxy.Conn, flow *FlowRuntime) {
@@ -828,6 +795,21 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 	routingResult *bpfRoutingResult,
 	ownership *incomingConnectionLease,
 ) (handled bool, err error) {
+	task, handled, err := c.prepareTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, ownership)
+	if task != nil {
+		err = task.run()
+	}
+	return handled, err
+}
+
+func (c *ControlPlane) prepareTCPDnsFastPathOwned(
+	ctx context.Context,
+	lConn net.Conn,
+	bufReader *bufio.Reader,
+	src, dst netip.AddrPort,
+	routingResult *bpfRoutingResult,
+	ownership *incomingConnectionLease,
+) (task *establishedTCPTask, handled bool, err error) {
 	// Try to read the first DNS query to verify this is actually DNS traffic
 	msg, frameLen, err := readDnsMsgFromBufio(bufReader, TCPDNSFirstReadTimeout, lConn, false)
 	if err != nil {
@@ -842,9 +824,9 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 		// clear its deadline is unusable, so report it handled to stop the
 		// caller from relaying on it.
 		if clearErr := lConn.SetReadDeadline(time.Time{}); clearErr != nil {
-			return true, clearErr
+			return nil, true, clearErr
 		}
-		return false, nil
+		return nil, false, nil
 	}
 
 	// Verify it's a query, not a response
@@ -857,7 +839,7 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 				"dst": dst.String(),
 			}).Debug("TCP DNS fast path consumed a response-shaped frame on port 53; closing the flow")
 		}
-		return true, nil
+		return nil, true, nil
 	}
 	// This is DNS-over-TCP traffic - handle all queries on this connection
 	flowRoutingResult := new(bpfRoutingResult)
@@ -876,23 +858,32 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 			Must:        flowRoutingResult.Must != 0,
 		},
 	}
-	flow, err := c.adoptTCPFlow(ctx, ownership, lConn, nil, binding, src, dst)
-	if err != nil {
-		return true, fmt.Errorf("adopt TCP DNS flow runtime: %w", err)
-	}
-	defer flow.finish()
-
 	// Standalone callers have no active publication and use their private
 	// control plane. Each DNS message is a new logical request, so a persistent
 	// DNS-over-TCP transport uses the active DNS policy without changing its
 	// immutable transport binding. Process-owned sessions never fall back to a
 	// retired plane.
+	c.sessionManagerForFlow(ctx)
 	fallback := c
 	if _, managerOwned := c.controlPlaneSessionManager(); !managerOwned {
 		fallback = nil
 	}
 	log := c.log
 
+	prepared := &establishedTCPTask{ingress: lConn, left: lConn, log: log, src: src, dst: dst,
+		dns: &establishedTCPDNS{reader: bufReader, first: msg, frameLen: frameLen, routing: flowRoutingResult, fallback: fallback}}
+	flow, err := c.adoptTCPFlow(ctx, ownership, lConn, nil, binding, src, dst)
+	if err != nil {
+		return nil, true, fmt.Errorf("adopt TCP DNS flow runtime: %w", err)
+	}
+
+	prepared.flow = flow
+	return prepared, true, nil
+}
+
+func (d *establishedTCPDNS) run(t *establishedTCPTask) error {
+	lConn, bufReader, msg, frameLen := t.ingress, d.reader, d.first, d.frameLen
+	src, dst, flowRoutingResult, fallback, flow, log := t.src, t.dst, d.routing, d.fallback, t.flow, t.log
 	writer := &tcpDnsResponseWriter{conn: lConn, record: RecordDownloadTraffic}
 	req := &udpRequest{
 		realSrc:        src,
@@ -919,7 +910,7 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 				errMsg := new(dnsmessage.Msg)
 				errMsg.SetRcode(msg, dnsmessage.RcodeServerFailure)
 				if writeErr := writer.WriteMsg(errMsg); writeErr != nil {
-					return true, nil
+					return nil
 				}
 				if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 					log.WithError(err).Debug("TCP DNS fast path failed; SERVFAIL sent")
@@ -932,13 +923,13 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 		if err != nil {
 			// Connection closed or timeout - normal termination
 			if daerrors.IsIgnorableConnectionError(err) || err == io.EOF {
-				return true, nil
+				return nil
 			}
 			// Other errors - log and close
 			if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 				log.WithError(err).Debug("TCP DNS connection read error")
 			}
-			return true, nil
+			return nil
 		}
 		if frameLen > 0 {
 			RecordUploadTraffic(int64(frameLen))
@@ -946,7 +937,7 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 
 		if msg.Response {
 			// Client sent a response - unexpected, close connection
-			return true, nil
+			return nil
 		}
 	}
 }

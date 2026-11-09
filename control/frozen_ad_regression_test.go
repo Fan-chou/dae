@@ -448,7 +448,7 @@ func TestHandleConnDoesNotDoubleCloseFailedAdoption(t *testing.T) {
 		t.Fatal("handleConn adoptTCPFlow call missing")
 	}
 	window := text[idx:]
-	end := strings.Index(window, "defer closeEstablishedTCPFlow")
+	end := strings.Index(window, "prepared.flow = flow")
 	if end < 0 {
 		t.Fatal("successful adoption ownership boundary missing")
 	}

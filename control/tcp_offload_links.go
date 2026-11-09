@@ -6,8 +6,11 @@
 package control
 
 import (
+	"fmt"
 	"io"
 	"sync"
+
+	"github.com/cilium/ebpf"
 )
 
 // tcpOffloadLinks owns the sk_skb stream-verdict link on fast_sock and the
@@ -21,7 +24,7 @@ import (
 // silently disabling the offload on every other generation (repro: SIGUSR1
 // reload with DAE_ALLOW_TCP_SOCKMAP=1). Reference-counting the links by the
 // shared *bpfObjects keeps exactly one attach alive across reloads and
-// closes it when the last plane referencing the objects goes away.
+// closes it when the last plane or established-flow lease goes away.
 type tcpOffloadLinks struct {
 	verdict io.Closer // sk_skb stream verdict on fast_sock
 	account io.Closer // skb_send_sock fentry/kprobe; nil when accounting is disabled
@@ -30,6 +33,7 @@ type tcpOffloadLinks struct {
 type tcpOffloadLinkEntry struct {
 	refs int
 	l    tcpOffloadLinks
+	maps [3]*ebpf.Map
 }
 
 var (
@@ -77,10 +81,53 @@ func releaseTCPOffloadLinks(bpf *bpfObjects) {
 	}
 	closeQuietly(l.verdict)
 	closeQuietly(l.account)
+	for _, m := range entry.maps {
+		if m != nil {
+			_ = m.Close()
+		}
+	}
 }
 
 func closeQuietly(c io.Closer) {
 	if c != nil {
 		_ = c.Close()
 	}
+}
+
+// acquireTCPOffloadRuntime retains the links and one shared set of independent
+// map handles. The caller holds core.mu, excluding Close during first clone.
+// Flow leases keep only BPF resources, never a generation's core or matcher.
+func acquireTCPOffloadRuntime(bpf *bpfObjects) (*tcpRelayOffloadRuntime, error) {
+	tcpOffloadLinkMu.Lock()
+	defer tcpOffloadLinkMu.Unlock()
+	entry := tcpOffloadLinkRegistry[bpf]
+	if entry == nil {
+		return nil, fmt.Errorf("offload links unavailable")
+	}
+	if entry.maps[0] == nil {
+		var cloned [3]*ebpf.Map
+		for i, m := range [3]*ebpf.Map{bpf.FastSock, bpf.TcpOffloadPause, bpf.TcpOffloadSent} {
+			if m == nil {
+				for _, c := range cloned {
+					if c != nil {
+						_ = c.Close()
+					}
+				}
+				return nil, fmt.Errorf("offload map unavailable")
+			}
+			var err error
+			cloned[i], err = m.Clone()
+			if err != nil {
+				for _, c := range cloned {
+					if c != nil {
+						_ = c.Close()
+					}
+				}
+				return nil, err
+			}
+		}
+		entry.maps = cloned
+	}
+	entry.refs++
+	return &tcpRelayOffloadRuntime{maps: entry.maps, release: func() { releaseTCPOffloadLinks(bpf) }}, nil
 }

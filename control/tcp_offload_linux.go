@@ -162,18 +162,38 @@ func (s *tcpRelayOffloadSession) recordFinal(leftRx, rightRx int64, leftRecord, 
 	}
 }
 
-func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64), live *tcpOffloadLiveAccounting) (offloaded bool, reason string, err error) {
-	if c == nil || c.core == nil {
-		return false, "", nil
+func (c *ControlPlane) prepareTCPRelayOffload() *tcpRelayOffloadRuntime {
+	if c == nil || c.core == nil || !c.core.tcpSockmapOffloadReady.Load() {
+		return nil
 	}
-	if !c.core.tcpSockmapOffloadReady.Load() {
+	core := c.core
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if !core.tcpSockmapOffloadReady.Load() {
+		return nil
+	}
+	bpf := core.bpf.Load()
+	if bpf == nil {
+		return nil
+	}
+	r, err := acquireTCPOffloadRuntime(bpf)
+	if err != nil {
+		return nil
+	}
+	r.log = c.log
+	return r
+}
+
+func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64), live *tcpOffloadLiveAccounting) (bool, string, error) {
+	r := c.prepareTCPRelayOffload()
+	defer r.close()
+	return r.run(ctx, left, right, leftRecord, rightRecord, live)
+}
+
+func (r *tcpRelayOffloadRuntime) run(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64), live *tcpOffloadLiveAccounting) (offloaded bool, reason string, err error) {
+	if r == nil {
 		return false, "offload disabled", nil
 	}
-	bpf := c.core.bpf.Load()
-	if bpf == nil || bpf.FastSock == nil || bpf.TcpOffloadPause == nil || bpf.TcpOffloadSent == nil {
-		return false, "fast_sock/pause/sent unavailable", nil
-	}
-
 	// Flush any userspace-buffered prefix (sniff leftovers) before registering,
 	// so the kernel receive queues are the only source of pending data.
 	// Direction note: bytes taken from left (client side) are written to right
@@ -188,7 +208,7 @@ func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netpr
 		rightRecord(int64(prefixN))
 	}
 
-	session, err := newTCPRelayOffloadSession(c.log, bpf.FastSock, bpf.TcpOffloadPause, bpf.TcpOffloadSent, left, right, leftRecord, rightRecord)
+	session, err := newTCPRelayOffloadSession(r.log, r.maps[0], r.maps[1], r.maps[2], left, right, leftRecord, rightRecord)
 	if err != nil {
 		if errors.Is(err, errTCPRelayOffloadUnavailable) {
 			return false, tcpRelayOffloadReason(err), nil
@@ -198,8 +218,8 @@ func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netpr
 	defer func() { _ = session.Close() }()
 	session.live = live
 
-	if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
-		c.log.Debugf("TCP relay eBPF offload: %v <-> %v", session.left.RemoteAddr(), session.right.RemoteAddr())
+	if r.log != nil && r.log.IsLevelEnabled(logrus.DebugLevel) {
+		r.log.Debugf("TCP relay eBPF offload: %v <-> %v", session.left.RemoteAddr(), session.right.RemoteAddr())
 	}
 
 	leftRx, rightRx, err := session.Run(ctx)
