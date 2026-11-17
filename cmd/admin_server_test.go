@@ -500,8 +500,8 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 
 	resolveCalls := 0
 	server.resolveListenFn = func(_ context.Context, listen string) (string, error) {
-		resolveCalls++
 		if listen == "router.lan:2025" {
+			resolveCalls++
 			// Verify TOCTOU resistance: even if a second call returned public IP,
 			// refresh must only resolve once and pass the validated IP listener to Serve.
 			if resolveCalls > 1 {
@@ -534,7 +534,10 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		t.Fatalf("srv1=%v bound1=%q addr1=%q resolveCalls=%d", srv1 != nil, bound1, addr1, resolveCalls)
 	}
 
-	client := &http.Client{Timeout: time.Second}
+	client := &http.Client{
+		Timeout:   time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 	doStatus := func(addr, secret string) (*http.Response, error) {
 		req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/status", nil)
 		if err != nil {
