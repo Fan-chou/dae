@@ -7,6 +7,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -252,7 +253,7 @@ func TestApplyAdminConfigKeepsRoutingInboundPassword(t *testing.T) {
 		t.Fatalf("GET leaked the password:\n%s", body.Routing)
 	}
 	edited := strings.Replace(body.Routing, "fallback: direct", "fallback: direct\n    dport(22) -> direct", 1)
-	if _, err := applyAdminConfig(dir, adminConfigBody{Routing: &edited}, nil); err != nil {
+	if _, err := applyAdminConfig(dir, adminConfigBody{Routing: &edited}, func() bool { return true }); err != nil {
 		t.Fatalf("saving the text that was read must work: %v", err)
 	}
 	saved, _ := os.ReadFile(filepath.Join(dir, "routing.dae"))
@@ -311,7 +312,7 @@ func TestLoadAdminInboundsOriginsAndPending(t *testing.T) {
 
 func TestHandleInboundsNeverReturnsPassword(t *testing.T) {
 	dir := inboundTestDir(t, "inbound {\n    lan {\n        listen: '192.168.1.1:11081'\n        username: 'alice'\n        password: 'topsecret'\n    }\n}\n")
-	s := &adminServer{configDir: dir, secret: "x"}
+	s := &adminServer{configDir: dir, secret: "x", reload: func() bool { return true }}
 	s.inbounds = func() []control.InboundStatus {
 		return []control.InboundStatus{{Name: "lan", Protocol: "socks5", Listen: "192.168.1.1:11081", Username: "alice", HasPassword: true, UDP: true, Sniff: "auto", Resolve: "local", State: "listening"}}
 	}
@@ -342,5 +343,40 @@ func TestHandleInboundsNeverReturnsPassword(t *testing.T) {
 	s.handleInbounds(rec, httptest.NewRequest(http.MethodDelete, "/v1/inbounds", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("DELETE status %d", rec.Code)
+	}
+}
+
+func TestApplyAdminInboundsRollsBackAndReturns409WhenQueueFull(t *testing.T) {
+	dir := inboundTestDir(t, "inbound {\n    s1 {\n        listen: '127.0.0.1:11080'\n    }\n}\n")
+	configPath := filepath.Join(dir, "config.dae")
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queued, err := applyAdminInbounds(dir, []adminInboundPut{{Name: "s1", Listen: "127.0.0.1:11099"}}, func() bool { return false })
+	if queued || !errors.Is(err, errAdminReloadQueueFull) {
+		t.Fatalf("applyAdminInbounds(full) = (%v, %v), want (false, errAdminReloadQueueFull)", queued, err)
+	}
+	after, _ := os.ReadFile(configPath)
+	if string(after) != string(before) {
+		t.Fatalf("config.dae not restored on queue full:\n%s", after)
+	}
+	if _, statErr := os.Stat(configPath + ".admin-bak"); !os.IsNotExist(statErr) {
+		t.Fatalf("backup left behind: %v", statErr)
+	}
+
+	s := newAdminServer(nil, "", dir, nil, func() bool { return false })
+	s.secret = "x"
+	req := httptest.NewRequest(http.MethodPut, "/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11099"}]}`))
+	req.Header.Set("Authorization", "Bearer x")
+	rec := httptest.NewRecorder()
+	s.withAdminAuth(s.handleInbounds)(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("PUT /v1/inbounds queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
+	}
+	after, _ = os.ReadFile(configPath)
+	if string(after) != string(before) {
+		t.Fatalf("config.dae mutated on 409:\n%s", after)
 	}
 }

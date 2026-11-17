@@ -56,6 +56,7 @@ type adminServer struct {
 	mu        sync.Mutex
 	http      *http.Server
 	listen    string
+	boundAddr string
 	secret    string
 	logFile   string
 	configDir string
@@ -65,6 +66,14 @@ type adminServer struct {
 	// inbounds reports the user-space inbounds that are running; nil before
 	// the manager exists.
 	inbounds func() []control.InboundStatus
+
+	reloadManager        *reloadManager
+	resolveListenFn      func(context.Context, string) (string, error)
+	activeSnapshot       *adminConfigSnapshot
+	pendingAdminDigest   string
+	lastReloadError      string
+	lastReloadRolledBack bool
+	suspended            bool
 }
 
 type adminGroupPutBody struct {
@@ -80,9 +89,13 @@ type adminStatusBody struct {
 	Generation string `json:"generation,omitempty"`
 	// SyncWarning is set when the Mihomo routing source is not being read
 	// fresh: the last attempt failed or the last good copy is in use.
-	SyncWarning string        `json:"sync_warning,omitempty"`
-	Mihomo      MihomoStatus  `json:"mihomo"`
-	Geodata     GeodataStatus `json:"geodata"`
+	SyncWarning          string        `json:"sync_warning,omitempty"`
+	ConfigInSync         bool          `json:"config_in_sync"`
+	LastReloadError      string        `json:"last_reload_error,omitempty"`
+	ReloadPending        bool          `json:"reload_pending,omitempty"`
+	LastReloadRolledBack bool          `json:"last_reload_rolled_back,omitempty"`
+	Mihomo               MihomoStatus  `json:"mihomo"`
+	Geodata              GeodataStatus `json:"geodata"`
 }
 
 type adminLogsBody struct {
@@ -113,6 +126,209 @@ func (s *adminServer) setInbounds(provider func() []control.InboundStatus) {
 	s.mu.Unlock()
 }
 
+func (s *adminServer) setReloadManager(m *reloadManager) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.reloadManager = m
+	s.mu.Unlock()
+}
+
+func (s *adminServer) currentInbounds() func() []control.InboundStatus {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inbounds
+}
+
+func (s *adminServer) currentSecret() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.secret
+}
+
+func (s *adminServer) captureActiveSnapshot() {
+	if s == nil {
+		return
+	}
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+
+	s.mu.Lock()
+	configDir := s.configDir
+	s.mu.Unlock()
+
+	snap, err := readAdminConfigSnapshot(configDir)
+	if err != nil {
+		return
+	}
+	writeAdminLastGoodSnapshot(configDir, snap)
+	s.mu.Lock()
+	s.activeSnapshot = &snap
+	s.mu.Unlock()
+}
+
+// recordPendingAdminWriteLocked records the digest of the configuration just
+// committed by an admin PUT so a subsequent async reload failure can safely
+// restore .admin-last-good only if no newer manual edit superseded it.
+// Caller must hold adminConfigWriteMu.
+func (s *adminServer) recordPendingAdminWriteLocked() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	configDir := s.configDir
+	hasActive := s.activeSnapshot != nil
+	s.mu.Unlock()
+
+	var digest string
+	if hasActive {
+		if snap, err := readAdminConfigSnapshot(configDir); err == nil {
+			digest = snap.digest
+		}
+	}
+	s.mu.Lock()
+	s.pendingAdminDigest = digest
+	s.lastReloadError = ""
+	s.lastReloadRolledBack = false
+	s.mu.Unlock()
+}
+
+func (s *adminServer) markReloadStarted() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lastReloadError = ""
+	s.lastReloadRolledBack = false
+	s.mu.Unlock()
+}
+
+func (s *adminServer) markReloadSucceeded() {
+	if s == nil {
+		return
+	}
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+
+	s.mu.Lock()
+	configDir := s.configDir
+	s.suspended = false
+	s.lastReloadError = ""
+	s.lastReloadRolledBack = false
+	s.pendingAdminDigest = ""
+	s.mu.Unlock()
+
+	if snap, err := readAdminConfigSnapshot(configDir); err == nil {
+		writeAdminLastGoodSnapshot(configDir, snap)
+		s.mu.Lock()
+		s.activeSnapshot = &snap
+		s.mu.Unlock()
+	}
+}
+
+func (s *adminServer) markSuspended() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.suspended = true
+	s.mu.Unlock()
+}
+
+func (s *adminServer) handleAsyncReloadFailure(errMsg string) {
+	if s == nil {
+		return
+	}
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+
+	sanitized := ""
+	if strings.TrimSpace(errMsg) != "" {
+		sanitized = sanitizeAdminError(errors.New(errMsg))
+	}
+
+	s.mu.Lock()
+	configDir := s.configDir
+	pendingDigest := s.pendingAdminDigest
+	activeSnap := s.activeSnapshot
+	s.lastReloadError = sanitized
+	s.pendingAdminDigest = ""
+	s.lastReloadRolledBack = false
+	s.mu.Unlock()
+
+	if pendingDigest == "" || activeSnap == nil {
+		return
+	}
+	curSnap, err := readAdminConfigSnapshot(configDir)
+	if err != nil || curSnap.digest != pendingDigest {
+		return
+	}
+	if rErr := restoreAdminConfigSnapshot(configDir, *activeSnap); rErr != nil {
+		s.warnf("admin config reload failed (%s) and rollback failed: %v", sanitized, rErr)
+		return
+	}
+	s.mu.Lock()
+	s.lastReloadRolledBack = true
+	s.mu.Unlock()
+	s.warnf("admin config reload failed (%s); restored last good configuration", sanitized)
+}
+
+type adminReloadStatusSnapshot struct {
+	configInSync         bool
+	lastReloadError      string
+	reloadPending        bool
+	lastReloadRolledBack bool
+}
+
+func (s *adminServer) reloadStatusSnapshot() adminReloadStatusSnapshot {
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+
+	s.mu.Lock()
+	rm := s.reloadManager
+	activeSnap := s.activeSnapshot
+	lastErr := s.lastReloadError
+	rolledBack := s.lastReloadRolledBack
+	suspended := s.suspended
+	configDir := s.configDir
+	s.mu.Unlock()
+
+	var reloadActive, reloading, reloadPending bool
+	if rm != nil {
+		reloadActive = rm.reloadActive.Load()
+		reloading = rm.reloading.Load()
+		reloadPending = rm.reloadPending.Load() || reloadActive || reloading
+		if err := rm.reloadError(); err != nil {
+			lastErr = sanitizeAdminError(err)
+		}
+	}
+
+	inSync := !suspended && !reloadActive && !reloading
+	if inSync && activeSnap != nil {
+		curSnap, err := readAdminConfigSnapshot(configDir)
+		if err != nil || curSnap.digest != activeSnap.digest {
+			inSync = false
+		}
+	}
+	if lastErr != "" && !rolledBack {
+		inSync = false
+	}
+
+	return adminReloadStatusSnapshot{
+		configInSync:         inSync,
+		lastReloadError:      lastErr,
+		reloadPending:        reloadPending,
+		lastReloadRolledBack: rolledBack,
+	}
+}
+
 func (s *adminServer) refresh(listen, secret string) {
 	if s == nil {
 		return
@@ -132,12 +348,22 @@ func (s *adminServer) refresh(listen, secret string) {
 	if listen == "" {
 		return
 	}
-	if err := config.ValidateAdminListen(listen); err != nil {
+	resolveFn := s.resolveListenFn
+	if resolveFn == nil {
+		resolveFn = config.ResolveAndValidateAdminListen
+	}
+	resolvedListen, err := resolveFn(context.Background(), listen)
+	if err != nil {
 		s.warnf("admin HTTP disabled: %v", err)
 		return
 	}
 	if secret == "" {
 		s.warnf("admin HTTP disabled: admin_secret is empty")
+		return
+	}
+	ln, err := net.Listen("tcp", resolvedListen)
+	if err != nil {
+		s.warnf("admin HTTP listen failed (tproxy continues): %v", err)
 		return
 	}
 	mux := http.NewServeMux()
@@ -156,19 +382,21 @@ func (s *adminServer) refresh(listen, secret string) {
 	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
 	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
 	registerAdminUI(mux)
+	boundAddr := ln.Addr().String()
 	server := &http.Server{
-		Addr:         listen,
+		Addr:         boundAddr,
 		Handler:      s.withAdminCORS(mux),
 		ReadTimeout:  adminReadTimeout,
 		WriteTimeout: adminWriteTimeout,
 	}
 	s.http = server
+	s.boundAddr = boundAddr
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.warnf("admin HTTP listen failed (tproxy continues): %v", err)
 		}
 	}()
-	s.infof("admin HTTP listening on %s", listen)
+	s.infof("admin HTTP listening on %s", boundAddr)
 }
 
 func (s *adminServer) shutdown() {
@@ -181,6 +409,7 @@ func (s *adminServer) shutdown() {
 }
 
 func (s *adminServer) stopLocked() {
+	s.boundAddr = ""
 	if s.http == nil {
 		return
 	}
@@ -208,7 +437,7 @@ func (s *adminServer) withAdminCORS(next http.Handler) http.Handler {
 
 func (s *adminServer) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !adminBearerOK(r.Header.Get("Authorization"), s.secret) {
+		if !adminBearerOK(r.Header.Get("Authorization"), s.currentSecret()) {
 			writeAdminError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -231,6 +460,11 @@ func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body.Mihomo = CurrentMihomoStatus()
 	body.Geodata = CurrentGeodataStatus()
 	body.SyncWarning = mihomoWarning(body.Mihomo)
+	syncStatus := s.reloadStatusSnapshot()
+	body.ConfigInSync = syncStatus.configInSync
+	body.LastReloadError = syncStatus.lastReloadError
+	body.ReloadPending = syncStatus.reloadPending
+	body.LastReloadRolledBack = syncStatus.lastReloadRolledBack
 	if view := CurrentEffectiveConfig(); view != nil {
 		body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
 	}
@@ -356,7 +590,9 @@ func (s *adminServer) handleKernelConnections(w http.ResponseWriter, r *http.Req
 func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		adminConfigWriteMu.Lock()
 		body, err := loadAdminConfig(s.configDir)
+		adminConfigWriteMu.Unlock()
 		if err != nil {
 			writeAdminError(w, http.StatusInternalServerError, sanitizeAdminError(err))
 			return
@@ -369,9 +605,18 @@ func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 			writeAdminError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		queued, err := applyAdminConfig(s.configDir, body, s.reload)
+		adminConfigWriteMu.Lock()
+		queued, err := applyAdminConfigLocked(s.configDir, body, s.reload)
+		if err == nil {
+			s.recordPendingAdminWriteLocked()
+		}
+		adminConfigWriteMu.Unlock()
 		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
+			status := http.StatusBadRequest
+			if errors.Is(err, errAdminReloadQueueFull) {
+				status = http.StatusConflict
+			}
+			writeAdminError(w, status, sanitizeAdminError(err))
 			return
 		}
 		writeAdminJSON(w, http.StatusOK, adminReloadBody{Queued: queued})
@@ -412,6 +657,8 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusServiceUnavailable, "reload is unavailable")
 		return
 	}
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
 	if err := validateLoadedAdminConfig(s.configDir); err != nil {
 		writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
 		return

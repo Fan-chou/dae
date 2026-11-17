@@ -7,12 +7,16 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func writeRestrictedDae(t *testing.T, path, body string) {
@@ -299,5 +303,170 @@ routing { fallback: direct }
 	}
 	if !reloaded {
 		t.Fatal("valid config should queue reload")
+	}
+}
+
+func TestApplyAdminConfigRollsBackWhenReloadQueueFullOrNil(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	routingPath := filepath.Join(dir, "routing.dae")
+	origConfig := "global {\n    log_level: info\n    admin_secret: 'keep-me'\n}\nrouting { fallback: direct }\n"
+	origRouting := "routing {\n    dip(1.1.1.1) -> direct\n}\n"
+	writeRestrictedDae(t, configPath, origConfig)
+	writeRestrictedDae(t, routingPath, origRouting)
+
+	newConfig := "global {\n    log_level: warn\n    admin_secret: '***'\n}\nrouting { fallback: direct }\n"
+	newRouting := "routing {\n    dip(8.8.8.8) -> direct\n}\n"
+
+	for name, reloadFn := range map[string]adminReloadFunc{
+		"queue full": func() bool { return false },
+		"nil reload": nil,
+	} {
+		queued, err := applyAdminConfig(dir, adminConfigBody{
+			Config:  strPtr(newConfig),
+			Routing: strPtr(newRouting),
+		}, reloadFn)
+		if queued || !errors.Is(err, errAdminReloadQueueFull) {
+			t.Fatalf("%s: got (queued=%v, err=%v), want (false, errAdminReloadQueueFull)", name, queued, err)
+		}
+		gotCfg, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotCfg) != origConfig {
+			t.Fatalf("%s: config.dae not restored:\n%s", name, gotCfg)
+		}
+		gotRouting, err := os.ReadFile(routingPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotRouting) != origRouting {
+			t.Fatalf("%s: routing.dae not restored:\n%s", name, gotRouting)
+		}
+		if _, err := os.Stat(configPath + ".admin-bak"); !os.IsNotExist(err) {
+			t.Fatalf("%s: config.dae.admin-bak left behind: %v", name, err)
+		}
+		if _, err := os.Stat(routingPath + ".admin-bak"); !os.IsNotExist(err) {
+			t.Fatalf("%s: routing.dae.admin-bak left behind: %v", name, err)
+		}
+	}
+}
+
+func TestApplyAdminConfigRemovesAbsentRoutingOnQueueFullRollback(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	routingPath := filepath.Join(dir, "routing.dae")
+	origConfig := "global {\n    log_level: info\n}\nrouting { fallback: direct }\n"
+	writeRestrictedDae(t, configPath, origConfig)
+
+	queued, err := applyAdminConfig(dir, adminConfigBody{
+		Routing: strPtr("routing {\n    dip(1.1.1.1) -> direct\n}\n"),
+	}, func() bool { return false })
+	if queued || !errors.Is(err, errAdminReloadQueueFull) {
+		t.Fatalf("got (%v, %v), want (false, errAdminReloadQueueFull)", queued, err)
+	}
+	if _, err := os.Stat(routingPath); !os.IsNotExist(err) {
+		t.Fatalf("newly created routing.dae was not removed on rollback: %v", err)
+	}
+	gotCfg, _ := os.ReadFile(configPath)
+	if string(gotCfg) != origConfig {
+		t.Fatalf("config.dae altered: %s", gotCfg)
+	}
+}
+
+func TestHandleConfigReturns409WhenReloadQueueFull(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	origConfig := "global {\n    log_level: info\n}\nrouting { fallback: direct }\n"
+	writeRestrictedDae(t, configPath, origConfig)
+
+	server := newAdminServer(nil, "", dir, nil, func() bool { return false })
+	server.secret = "test-token"
+
+	req := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n"}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleConfig)(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("PUT /v1/config queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
+	}
+	var errBody adminErrorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil || errBody.Error == "" {
+		t.Fatalf("expected JSON error body, got %s (%v)", rec.Body.String(), err)
+	}
+	gotCfg, _ := os.ReadFile(configPath)
+	if string(gotCfg) != origConfig {
+		t.Fatalf("config.dae mutated on 409: %s", gotCfg)
+	}
+}
+
+func TestAdminConfigWriteMuSerializesConfigAndInboundsWrites(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	writeRestrictedDae(t, configPath, "global {\n    tproxy_port: 12345\n    log_level: info\n    wan_interface: auto\n    lan_interface: lo\n}\nrouting {\n    fallback: direct\n}\n")
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	server := newAdminServer(nil, "", dir, nil, func() bool {
+		cur := inFlight.Add(1)
+		for {
+			prev := maxInFlight.Load()
+			if cur <= prev || maxInFlight.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+		inFlight.Add(-1)
+		return true
+	})
+	server.secret = "test-token"
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(iter int) {
+			defer wg.Done()
+			level := "info"
+			if iter%2 == 1 {
+				level = "warn"
+			}
+			body := `{"config":"global { tproxy_port: 12345\n log_level: ` + level + `\n wan_interface: auto\n lan_interface: lo }\nrouting { fallback: direct }\n"}`
+			req := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			server.withAdminAuth(server.handleConfig)(rec, req)
+			if rec.Code != http.StatusOK {
+				errs <- errors.New("config PUT status " + rec.Body.String())
+			}
+		}(i)
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPut, "/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11080"}]}`))
+			req.Header.Set("Authorization", "Bearer test-token")
+			rec := httptest.NewRecorder()
+			server.withAdminAuth(server.handleInbounds)(rec, req)
+			if rec.Code != http.StatusOK {
+				errs <- errors.New("inbounds PUT status " + rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if maxInFlight.Load() != 1 {
+		t.Fatalf("concurrent config/inbounds writers overlapped: maxInFlight=%d", maxInFlight.Load())
+	}
+	if err := validateLoadedAdminConfig(dir); err != nil {
+		t.Fatalf("final config invalid after concurrent writes: %v", err)
+	}
+	if _, err := os.Stat(configPath + ".admin-bak"); !os.IsNotExist(err) {
+		t.Fatalf("backup left behind: %v", err)
 	}
 }

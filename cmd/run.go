@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -195,7 +196,55 @@ func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnectio
 	}
 }
 
+var (
+	reloadProgressObserverMu sync.RWMutex
+	reloadProgressObserver   func(code byte, content string)
+)
+
+func registerReloadProgressObserver(fn func(code byte, content string)) func() {
+	reloadProgressObserverMu.Lock()
+	reloadProgressObserver = fn
+	reloadProgressObserverMu.Unlock()
+	return func() {
+		reloadProgressObserverMu.Lock()
+		reloadProgressObserver = nil
+		reloadProgressObserverMu.Unlock()
+	}
+}
+
+func hasPendingEffectiveConfig(conf *config.Config) bool {
+	if conf == nil {
+		return false
+	}
+	effectiveState.mu.Lock()
+	defer effectiveState.mu.Unlock()
+	for _, p := range effectiveState.pending {
+		if p.conf == conf {
+			return true
+		}
+	}
+	return false
+}
+
+func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, reloadErr error, isSuspend bool) {
+	if adminHTTP == nil || conf == nil || reloadErr != nil {
+		return
+	}
+	if isSuspend {
+		adminHTTP.markSuspended()
+		return
+	}
+	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
+	adminHTTP.markReloadSucceeded()
+}
+
 var setRunSignalProgress = func(code byte, content string) error {
+	reloadProgressObserverMu.RLock()
+	obs := reloadProgressObserver
+	reloadProgressObserverMu.RUnlock()
+	if obs != nil {
+		obs(code, content)
+	}
 	return writeSignalProgressFile(SignalProgressFilePath, code, content)
 }
 
@@ -441,13 +490,24 @@ func (r *Runner) Run() (err error) {
 	reloadManager := newReloadManager(reloadReqs, runStateChanges, sigs)
 	w.reloadManager = reloadManager
 	w.runStateChanges = runStateChanges
+	adminHTTP.setReloadManager(reloadManager)
 	adminHTTP.reload = func() bool {
 		return reloadManager.queueReloadRequest(log, reloadRequest{
 			requestedAt:     time.Now(),
 			requestedAtMono: monotonicNowNano(),
 		})
 	}
+	unregisterProgressObserver := registerReloadProgressObserver(func(code byte, content string) {
+		switch code {
+		case consts.ReloadProcessing:
+			adminHTTP.markReloadStarted()
+		case consts.ReloadError:
+			adminHTTP.handleAsyncReloadFailure(content)
+		}
+	})
+	defer unregisterProgressObserver()
 	publishEffectiveConfig(conf)
+	adminHTTP.captureActiveSnapshot()
 	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
 	// User-space inbounds live outside any control plane generation: they keep
 	// their sockets across reloads and are reconciled with the active config
@@ -708,6 +768,7 @@ loop:
 					continue
 				}
 				dnsHandoffActive := reloadManager.pendingDNSHandoffActive(serveControlPlane)
+				isLoadedConfig := false
 				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
 					var publishErr error
 					if !handoff.tcHookHandoffPrepared {
@@ -823,6 +884,7 @@ loop:
 					w.c = handoff.preparedGeneration.controlPlane
 					w.currCancel = handoff.preparedGeneration.cancel
 					w.conf = handoff.preparedGeneration.conf
+					isLoadedConfig = hasPendingEffectiveConfig(w.conf)
 					publishEffectiveConfig(w.conf)
 					if ruleProviderLifecycleHolder != nil {
 						ruleProviderLifecycleHolder.setConfig(w.conf)
@@ -849,6 +911,7 @@ loop:
 				}
 				w.log.Warnln("[Reload] Finished")
 				inboundManager.Apply(w.conf.Inbound)
+				applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), !isLoadedConfig)
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")

@@ -6,14 +6,19 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 )
 
@@ -383,5 +388,220 @@ func TestAdminQualityRequiresAuthAndIsReadOnly(t *testing.T) {
 		if rec.Code != tc.status {
 			t.Fatalf("%s => %d %s", tc.method, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func reserveTestLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	routingPath := filepath.Join(dir, "routing.dae")
+	origCfg := "global {\n    log_level: info\n}\nrouting { fallback: direct }\n"
+	origRouting := "routing {\n    dip(1.1.1.1) -> direct\n}\n"
+	writeRestrictedDae(t, configPath, origCfg)
+	writeRestrictedDae(t, routingPath, origRouting)
+
+	rm := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
+	server := newAdminServer(nil, "", dir, func() adminPlane {
+		return &stubAdminPlane{status: control.AdminStatus{Version: "test"}}
+	}, func() bool { return true })
+	server.secret = "test-token"
+	server.setReloadManager(rm)
+	server.captureActiveSnapshot()
+
+	getStatus := func() adminStatusBody {
+		req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		rec := httptest.NewRecorder()
+		server.withAdminAuth(server.handleStatus)(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d body %s", rec.Code, rec.Body.String())
+		}
+		var out adminStatusBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	st := getStatus()
+	if !st.ConfigInSync || st.LastReloadError != "" || st.ReloadPending {
+		t.Fatalf("initial status = %+v, want in sync with no error", st)
+	}
+	if _, err := os.Stat(configPath + ".admin-last-good"); err != nil {
+		t.Fatalf("expected .admin-last-good snapshot at startup: %v", err)
+	}
+
+	// Simulate PUT /v1/config writing a new config whose async reload fails.
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n","routing":"routing { dip(8.8.8.8) -> direct }\n"}`))
+	putReq.Header.Set("Authorization", "Bearer test-token")
+	putRec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleConfig)(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT /v1/config status = %d body %s", putRec.Code, putRec.Body.String())
+	}
+
+	// Before reload completes, disk differs from running state.
+	st = getStatus()
+	if st.ConfigInSync {
+		t.Fatalf("expected config_in_sync=false while disk has pending edit: %+v", st)
+	}
+
+	// Async reload failure restores .admin-last-good and surfaces sanitized last_reload_error.
+	rm.setReloadError(errors.New("dialer failed for hy2://secret@example.com"))
+	server.handleAsyncReloadFailure("dialer failed for hy2://secret@example.com")
+
+	gotCfg, _ := os.ReadFile(configPath)
+	gotRouting, _ := os.ReadFile(routingPath)
+	if string(gotCfg) != origCfg || string(gotRouting) != origRouting {
+		t.Fatalf("last-good rollback failed:\ncfg=%s\nrouting=%s", gotCfg, gotRouting)
+	}
+	st = getStatus()
+	if !st.ConfigInSync || !st.LastReloadRolledBack || st.LastReloadError == "" || strings.Contains(st.LastReloadError, "hy2://") {
+		t.Fatalf("post-rollback status = %+v", st)
+	}
+
+	// External disk edit is NOT overwritten by async reload failure and reports out-of-sync.
+	rm.setReloadError(nil)
+	server.markReloadSucceeded()
+	if err := os.WriteFile(configPath, []byte("global {\n    log_level: debug\n}\nrouting { fallback: direct }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rm.setReloadError(errors.New("prepare staged reload: invalid runtime"))
+	server.handleAsyncReloadFailure("prepare staged reload: invalid runtime")
+	st = getStatus()
+	if st.ConfigInSync || st.LastReloadRolledBack || st.LastReloadError != "prepare staged reload: invalid runtime" {
+		t.Fatalf("external-edit status = %+v", st)
+	}
+	gotCfg, _ = os.ReadFile(configPath)
+	if !strings.Contains(string(gotCfg), "log_level: debug") {
+		t.Fatalf("external edit was overwritten: %s", gotCfg)
+	}
+}
+
+func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T) {
+	addr1 := reserveTestLoopbackAddr(t)
+	addr2 := reserveTestLoopbackAddr(t)
+
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane {
+		return &stubAdminPlane{status: control.AdminStatus{Version: "test"}}
+	}, nil)
+	t.Cleanup(server.shutdown)
+
+	resolveCalls := 0
+	server.resolveListenFn = func(_ context.Context, listen string) (string, error) {
+		resolveCalls++
+		if listen == "router.lan:2025" {
+			// Verify TOCTOU resistance: even if a second call returned public IP,
+			// refresh must only resolve once and pass the validated IP listener to Serve.
+			if resolveCalls > 1 {
+				return "", errors.New("unexpected re-resolution")
+			}
+			return addr1, nil
+		}
+		if listen == "public.example.com:2025" {
+			return "", errors.New("admin_listen host \"public.example.com\" resolved to non-private address 8.8.8.8")
+		}
+		return config.ResolveAndValidateAdminListen(context.Background(), listen)
+	}
+
+	// Rejected public hostname does not start listener.
+	server.refresh("public.example.com:2025", "sec1")
+	server.mu.Lock()
+	if server.http != nil {
+		server.mu.Unlock()
+		t.Fatal("expected public hostname refresh to fail without starting HTTP server")
+	}
+	server.mu.Unlock()
+
+	// Private hostname resolves once and binds concrete IP:port directly.
+	server.refresh("router.lan:2025", "sec1")
+	server.mu.Lock()
+	bound1 := server.boundAddr
+	srv1 := server.http
+	server.mu.Unlock()
+	if srv1 == nil || bound1 != addr1 || resolveCalls != 1 {
+		t.Fatalf("srv1=%v bound1=%q addr1=%q resolveCalls=%d", srv1 != nil, bound1, addr1, resolveCalls)
+	}
+
+	client := &http.Client{Timeout: time.Second}
+	doStatus := func(addr, secret string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/status", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+secret)
+		return client.Do(req)
+	}
+
+	resp, err := doStatus(addr1, "sec1")
+	if err != nil {
+		t.Fatalf("GET on initial resolved listener failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial status code = %d, want 200", resp.StatusCode)
+	}
+
+	// Failed reload (even when isSuspend is false-positive on legacy rollback) does NOT refresh adminHTTP or mark suspended.
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, errors.New("reload failed"), true)
+	server.mu.Lock()
+	if server.boundAddr != addr1 || server.suspended {
+		suspended := server.suspended
+		bound := server.boundAddr
+		server.mu.Unlock()
+		t.Fatalf("failed reload must not rebind or suspend adminHTTP, bound=%q suspended=%v", bound, suspended)
+	}
+	server.mu.Unlock()
+
+	// Suspend reload does NOT refresh adminHTTP and marks suspended.
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, true)
+	server.mu.Lock()
+	if server.boundAddr != addr1 || !server.suspended {
+		suspended := server.suspended
+		bound := server.boundAddr
+		server.mu.Unlock()
+		t.Fatalf("suspend must mark suspended and not rebind adminHTTP, bound=%q suspended=%v", bound, suspended)
+	}
+	server.mu.Unlock()
+
+	// Successful hot reload switches both admin_listen and admin_secret.
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, false)
+	server.mu.Lock()
+	bound2 := server.boundAddr
+	server.mu.Unlock()
+	if bound2 != addr2 {
+		t.Fatalf("hot reload boundAddr = %q, want %q", bound2, addr2)
+	}
+
+	if respOld, err := doStatus(addr1, "sec1"); err == nil {
+		_ = respOld.Body.Close()
+		t.Fatalf("old listener %s still accepted connection after hot reload", addr1)
+	}
+	respWrongSecret, err := doStatus(addr2, "sec1")
+	if err != nil {
+		t.Fatalf("GET on new listener with old secret failed: %v", err)
+	}
+	_ = respWrongSecret.Body.Close()
+	if respWrongSecret.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old secret on new listener = %d, want 401", respWrongSecret.StatusCode)
+	}
+	respNew, err := doStatus(addr2, "sec2")
+	if err != nil {
+		t.Fatalf("GET on new listener with new secret failed: %v", err)
+	}
+	_ = respNew.Body.Close()
+	if respNew.StatusCode != http.StatusOK {
+		t.Fatalf("new listener status = %d, want 200", respNew.StatusCode)
 	}
 }

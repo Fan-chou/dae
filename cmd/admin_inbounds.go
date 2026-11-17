@@ -7,11 +7,11 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -32,9 +32,6 @@ const (
 )
 
 const adminMaxInboundBytes = 64 << 10
-
-// adminInboundsMu serializes edits of config.dae's inbound section.
-var adminInboundsMu sync.Mutex
 
 type adminInbound struct {
 	control.InboundStatus
@@ -337,11 +334,14 @@ func rewriteNamedSection(src, name, raw string) (string, error) {
 
 // applyAdminInbounds replaces the inbound section of config.dae with the
 // requested inbounds and checks the whole configuration. A file that does not
-// load is put back exactly as it was.
+// load or cannot queue a reload is put back exactly as it was.
 func applyAdminInbounds(configDir string, in []adminInboundPut, reload adminReloadFunc) (queued bool, err error) {
-	adminInboundsMu.Lock()
-	defer adminInboundsMu.Unlock()
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+	return applyAdminInboundsLocked(configDir, in, reload)
+}
 
+func applyAdminInboundsLocked(configDir string, in []adminInboundPut, reload adminReloadFunc) (queued bool, err error) {
 	configPath, _, err := adminConfigPaths(configDir)
 	if err != nil {
 		return false, err
@@ -382,7 +382,11 @@ func applyAdminInbounds(configDir string, in []adminInboundPut, reload adminRelo
 	if err := writeFileAtomic(bak, disk, adminConfigFileMode); err != nil {
 		return false, err
 	}
-	restore := func() { _ = os.Rename(bak, configPath) }
+	restore := func() {
+		if renameErr := os.Rename(bak, configPath); renameErr == nil {
+			_ = os.Remove(bak)
+		}
+	}
 	if err := writeFileAtomic(configPath, []byte(merged), adminConfigFileMode); err != nil {
 		restore()
 		return false, err
@@ -391,11 +395,12 @@ func applyAdminInbounds(configDir string, in []adminInboundPut, reload adminRelo
 		restore()
 		return false, fmt.Errorf("%s", sanitizeAdminError(err))
 	}
-	_ = os.Remove(bak)
-	if reload == nil {
-		return false, nil
+	if reload == nil || !reload() {
+		restore()
+		return false, errAdminReloadQueueFull
 	}
-	return reload(), nil
+	_ = os.Remove(bak)
+	return true, nil
 }
 
 func sameInbounds(a, b []config.Inbound) bool {
@@ -454,10 +459,12 @@ func (s *adminServer) handleInbounds(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var running []control.InboundStatus
-		if s.inbounds != nil {
-			running = s.inbounds()
+		if inbounds := s.currentInbounds(); inbounds != nil {
+			running = inbounds()
 		}
+		adminConfigWriteMu.Lock()
 		body, err := loadAdminInbounds(s.configDir, running)
+		adminConfigWriteMu.Unlock()
 		if err != nil {
 			writeAdminError(w, http.StatusInternalServerError, sanitizeAdminError(err))
 			return
@@ -470,9 +477,18 @@ func (s *adminServer) handleInbounds(w http.ResponseWriter, r *http.Request) {
 			writeAdminError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		queued, err := applyAdminInbounds(s.configDir, body.Inbounds, s.reload)
+		adminConfigWriteMu.Lock()
+		queued, err := applyAdminInboundsLocked(s.configDir, body.Inbounds, s.reload)
+		if err == nil {
+			s.recordPendingAdminWriteLocked()
+		}
+		adminConfigWriteMu.Unlock()
 		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
+			status := http.StatusBadRequest
+			if errors.Is(err, errAdminReloadQueueFull) {
+				status = http.StatusConflict
+			}
+			writeAdminError(w, status, sanitizeAdminError(err))
 			return
 		}
 		writeAdminJSON(w, http.StatusOK, adminReloadBody{Queued: queued})

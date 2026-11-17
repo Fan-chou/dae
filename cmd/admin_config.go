@@ -6,18 +6,34 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
+
+	"github.com/daeuniverse/dae/config"
 )
 
 const (
 	adminSecretPlaceholder = "***"
 	adminMaxConfigBytes    = 2 << 20
 	adminConfigFileMode    = 0o600
+)
+
+var (
+	// adminConfigWriteMu serializes admin configuration reads/edits,
+	// backup/restore, reload queuing, and snapshot recovery across config.dae
+	// and routing.dae.
+	adminConfigWriteMu sync.Mutex
+
+	errAdminReloadQueueFull = errors.New("reload queue is full or unavailable; configuration changes were rolled back")
 )
 
 var nodeURIScheme = regexp.MustCompile(`(?i)(hy2|hysteria2?|ssr?|vmess|vless|trojan|tuic|juicity|anytls|socks5?)://`)
@@ -95,11 +111,20 @@ func validateLoadedAdminConfig(configDir string) error {
 	if err != nil {
 		return err
 	}
-	_, _, err = readConfig(configPath)
-	return err
+	conf, _, err := readConfig(configPath)
+	if err != nil {
+		return err
+	}
+	return config.ValidateAdminListen(conf.Global.AdminListen)
 }
 
 func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminReloadFunc) (queued bool, err error) {
+	adminConfigWriteMu.Lock()
+	defer adminConfigWriteMu.Unlock()
+	return applyAdminConfigLocked(configDir, incoming, reload)
+}
+
+func applyAdminConfigLocked(configDir string, incoming adminConfigBody, reload adminReloadFunc) (queued bool, err error) {
 	configPath, routingPath, err := adminConfigPaths(configDir)
 	if err != nil {
 		return false, err
@@ -155,12 +180,21 @@ func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminRe
 			return false, err
 		}
 	}
+	cleanupBak := func() {
+		_ = os.Remove(configBak)
+		_ = os.Remove(routingBak)
+	}
 	restore := func() {
-		_ = os.Rename(configBak, configPath)
+		if renameErr := os.Rename(configBak, configPath); renameErr == nil {
+			_ = os.Remove(configBak)
+		}
 		if routingExists {
-			_ = os.Rename(routingBak, routingPath)
+			if renameErr := os.Rename(routingBak, routingPath); renameErr == nil {
+				_ = os.Remove(routingBak)
+			}
 		} else {
 			_ = os.Remove(routingPath)
+			_ = os.Remove(routingBak)
 		}
 	}
 
@@ -178,12 +212,96 @@ func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminRe
 		restore()
 		return false, fmt.Errorf("%s", sanitizeAdminError(err))
 	}
-	_ = os.Remove(configBak)
-	_ = os.Remove(routingBak)
-	if reload == nil {
-		return false, nil
+	if reload == nil || !reload() {
+		restore()
+		return false, errAdminReloadQueueFull
 	}
-	return reload(), nil
+	cleanupBak()
+	return true, nil
+}
+
+type adminConfigSnapshot struct {
+	digest        string
+	configBytes   []byte
+	routingExists bool
+	routingBytes  []byte
+}
+
+func adminSnapshotDigest(configBytes []byte, routingExists bool, routingBytes []byte) string {
+	h := sha256.New()
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(configBytes)))
+	h.Write(lenBuf[:])
+	h.Write(configBytes)
+	if routingExists {
+		h.Write([]byte{1})
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(routingBytes)))
+		h.Write(lenBuf[:])
+		h.Write(routingBytes)
+	} else {
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func readAdminConfigSnapshot(configDir string) (adminConfigSnapshot, error) {
+	configPath, routingPath, err := adminConfigPaths(configDir)
+	if err != nil {
+		return adminConfigSnapshot{}, err
+	}
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return adminConfigSnapshot{}, err
+	}
+	var routingBytes []byte
+	routingExists := true
+	if body, readErr := os.ReadFile(routingPath); readErr == nil {
+		routingBytes = body
+	} else if os.IsNotExist(readErr) {
+		routingExists = false
+	} else {
+		return adminConfigSnapshot{}, readErr
+	}
+	return adminConfigSnapshot{
+		digest:        adminSnapshotDigest(configBytes, routingExists, routingBytes),
+		configBytes:   configBytes,
+		routingExists: routingExists,
+		routingBytes:  routingBytes,
+	}, nil
+}
+
+func writeAdminLastGoodSnapshot(configDir string, snap adminConfigSnapshot) {
+	configPath, routingPath, err := adminConfigPaths(configDir)
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(configPath+".admin-last-good", snap.configBytes, adminConfigFileMode)
+	if snap.routingExists {
+		_ = writeFileAtomic(routingPath+".admin-last-good", snap.routingBytes, adminConfigFileMode)
+	} else {
+		_ = os.Remove(routingPath + ".admin-last-good")
+	}
+}
+
+func restoreAdminConfigSnapshot(configDir string, snap adminConfigSnapshot) error {
+	if snap.digest == "" {
+		return fmt.Errorf("no last-good snapshot recorded")
+	}
+	configPath, routingPath, err := adminConfigPaths(configDir)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(configPath, snap.configBytes, adminConfigFileMode); err != nil {
+		return err
+	}
+	if snap.routingExists {
+		if err := writeFileAtomic(routingPath, snap.routingBytes, adminConfigFileMode); err != nil {
+			return err
+		}
+	} else if err := os.Remove(routingPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func rejectDisallowedAdminConfig(src string, routingFile bool) error {
