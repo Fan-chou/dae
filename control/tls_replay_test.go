@@ -286,6 +286,7 @@ func TestTLSReplayTransparentFailoverOnEarlyEOFAndWriteReset(t *testing.T) {
 			t.Fatalf("%s active load count = %d, want 0 after finish", name, active)
 		}
 	}
+	runtime.KeepAlive(c)
 }
 
 func TestTLSReplaySkipsIneligiblePathsAndOversizedOrNonTLSPayloads(t *testing.T) {
@@ -480,6 +481,7 @@ func TestTLSReplayDoesNotReplayOnClientCloseOrFlowAbort(t *testing.T) {
 			if raw2.calls.Load() != 0 {
 				t.Fatalf("%s unexpectedly dialed backup p2 (%d times)", scenario, raw2.calls.Load())
 			}
+			runtime.KeepAlive(c)
 		})
 	}
 }

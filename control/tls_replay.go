@@ -235,8 +235,8 @@ func (r *tlsReplayConn) Write(p []byte) (int, error) {
 		return s.Write(p)
 	}
 
-	canBuffer := false
 	if len(p) > 0 {
+		canBuffer := false
 		switch len(r.sent) {
 		case 0:
 			canBuffer = mayStartTLSClientHello(p)
@@ -250,27 +250,26 @@ func (r *tlsReplayConn) Write(p []byte) (int, error) {
 			r.opMu.Unlock()
 			return s.Write(p)
 		}
+		// Record sent bytes and publish hasSent before s.Write(p) so a
+		// fast remote close/RST racing with s.Write return cannot observe
+		// hasSent == false in concurrent Read().
+		r.sent = append(r.sent, p...)
+		if len(r.sent) >= 2 {
+			r.hasSent.Store(true)
+		}
 	}
 
 	n, err := s.Write(p)
 	if err == nil {
-		if len(p) > 0 {
-			r.sent = append(r.sent, p...)
-			if len(r.sent) >= 2 {
-				r.hasSent.Store(true)
-			}
-		}
 		r.opMu.Unlock()
 		return n, nil
 	}
 
-	if len(p) > 0 && len(r.sent)+len(p) >= 2 &&
+	if len(p) > 0 && len(r.sent) >= 2 &&
 		!r.closed.Load() && !r.answered.Load() &&
 		r.flow != nil && r.flow.Context().Err() == nil &&
 		r.readDeadlineAllowsReplay() &&
 		!(isReplayTimeoutError(err) && r.writeDeadlineSet.Load()) {
-		r.sent = append(r.sent, p...)
-		r.hasSent.Store(true)
 		if r.replayLocked(s, err) {
 			r.opMu.Unlock()
 			return len(p), nil
