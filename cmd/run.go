@@ -213,7 +213,7 @@ func registerReloadProgressObserver(fn func(code byte, content string)) func() {
 	}
 }
 
-func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, reloadErr error, isSuspend bool) {
+func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, reloadErr error, isSuspend bool, snapshot *adminConfigSnapshot) {
 	if adminHTTP == nil || conf == nil || reloadErr != nil {
 		return
 	}
@@ -222,7 +222,7 @@ func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, relo
 		return
 	}
 	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
-	adminHTTP.markReloadSucceeded()
+	adminHTTP.markReloadSucceeded(snapshot)
 }
 
 var setRunSignalProgress = func(code byte, content string) error {
@@ -277,7 +277,7 @@ var (
 			}
 
 			// Read config from --config cfgFile.
-			conf, includes, err := readConfigAtStartup(cfgFile)
+			conf, includes, snapshot, err := readConfigWithAdminSnapshot(cfgFile, readColdStart)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{
 					"err": err,
@@ -300,7 +300,9 @@ var (
 			logger.SetLogger(logrus.StandardLogger(), conf.Global.LogLevel, disableTimestamp, logOpts)
 
 			log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
-			if err := Run(log, conf, []string{filepath.Dir(cfgFile)}); err != nil {
+			runner := newRunner(log, conf, []string{filepath.Dir(cfgFile)})
+			runner.adminSnapshot = snapshot
+			if err := runner.Run(); err != nil {
 				log.Fatalln(err)
 			}
 		},
@@ -327,10 +329,11 @@ func restorePreviousFreshDatapathGeneration(
 	}
 	w.listener = recoveredListener
 	if err := supervisor.replaceActive(&runtimeGeneration{
-		controlPlane: handoff.oldControlPlane,
-		listener:     recoveredListener,
-		cancel:       handoff.oldCancel,
-		conf:         handoff.oldConf,
+		controlPlane:  handoff.oldControlPlane,
+		listener:      recoveredListener,
+		cancel:        handoff.oldCancel,
+		conf:          handoff.oldConf,
+		adminSnapshot: w.adminSnapshot,
 	}); err != nil {
 		w.log.WithError(err).Errorf("[Reload] Failed to restore supervisor %s", step)
 		return fmt.Errorf("restore supervisor %s: %w", step, err)
@@ -387,9 +390,10 @@ func (r *Runner) Run() (err error) {
 		return fmt.Errorf("attach process session manager: %w", err)
 	}
 	runtimeSupervisor := newRuntimeSupervisor(&runtimeGeneration{
-		controlPlane: c,
-		cancel:       currCancel,
-		conf:         conf,
+		controlPlane:  c,
+		cancel:        currCancel,
+		conf:          conf,
+		adminSnapshot: r.adminSnapshot,
 	})
 
 	// Serve tproxy TCP/UDP server util signals.
@@ -400,10 +404,11 @@ func (r *Runner) Run() (err error) {
 		return listenErr
 	}
 	if supervisorErr := runtimeSupervisor.replaceActive(&runtimeGeneration{
-		controlPlane: c,
-		listener:     listener,
-		cancel:       currCancel,
-		conf:         conf,
+		controlPlane:  c,
+		listener:      listener,
+		cancel:        currCancel,
+		conf:          conf,
+		adminSnapshot: r.adminSnapshot,
 	}); supervisorErr != nil {
 		_ = listener.Close()
 		cancel()
@@ -420,6 +425,7 @@ func (r *Runner) Run() (err error) {
 		routingEpochHandoffEnabled: routingEpochHandoffEnabled,
 		log:                        log,
 		conf:                       conf,
+		adminSnapshot:              r.adminSnapshot,
 		c:                          c,
 		currCancel:                 currCancel,
 		listener:                   listener,
@@ -494,7 +500,7 @@ func (r *Runner) Run() (err error) {
 	})
 	defer unregisterProgressObserver()
 	publishEffectiveConfig(conf)
-	adminHTTP.captureActiveSnapshot()
+	adminHTTP.captureActiveSnapshot(r.adminSnapshot)
 	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
 	// User-space inbounds live outside any control plane generation: they keep
 	// their sockets across reloads and are reconciled with the active config
@@ -618,7 +624,7 @@ loop:
 					}
 					w.log.Warnln("[Reload] Finished")
 					inboundManager.Apply(w.conf.Inbound)
-					applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), false)
+					applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), false, w.adminSnapshot)
 					reloadManager.finishReloadSuccess()
 					continue
 				}
@@ -872,6 +878,7 @@ loop:
 					w.c = handoff.preparedGeneration.controlPlane
 					w.currCancel = handoff.preparedGeneration.cancel
 					w.conf = handoff.preparedGeneration.conf
+					w.adminSnapshot = handoff.preparedGeneration.adminSnapshot
 					isSuspend = handoff.isSuspend
 					publishEffectiveConfig(w.conf)
 					if ruleProviderLifecycleHolder != nil {
@@ -899,7 +906,7 @@ loop:
 				}
 				w.log.Warnln("[Reload] Finished")
 				inboundManager.Apply(w.conf.Inbound)
-				applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), isSuspend)
+				applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), isSuspend, w.adminSnapshot)
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")
@@ -935,10 +942,11 @@ loop:
 	// Stop accepting new ingress immediately so shutdown does not continue to
 	// create fresh UDP/TCP work while the control plane is being torn down.
 	shutdownHandoff := buildRunShutdownHandoff(reloadManager, runtimeSupervisor, &runtimeGeneration{
-		controlPlane: w.c,
-		listener:     w.listener,
-		cancel:       w.currCancel,
-		conf:         w.conf,
+		controlPlane:  w.c,
+		listener:      w.listener,
+		cancel:        w.currCancel,
+		conf:          w.conf,
+		adminSnapshot: w.adminSnapshot,
 	}, fastExit)
 	shutdownErr := shutdownAfterSignalWithHandoff(w.log, w.listener, w.c, control.GetDaeNetns(), fastExit, shutdownHandoff)
 	return errors.Join(fatalRunErr, shutdownErr)

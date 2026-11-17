@@ -242,10 +242,46 @@ func readConfigAtStartup(cfgFile string) (conf *config.Config, includes []string
 }
 
 func readConfigAt(cfgFile string, mode readMode) (conf *config.Config, includes []string, err error) {
+	return readConfigAtWithSnapshot(cfgFile, mode, nil)
+}
+
+// readConfigWithAdminSnapshot captures managed files at load time. Parsed
+// files replace the preliminary snapshot with the exact bytes the merger read,
+// so edits made during preparation cannot become the last-good configuration.
+func readConfigWithAdminSnapshot(cfgFile string, mode readMode) (*config.Config, []string, *adminConfigSnapshot, error) {
+	snap, snapshotErr := readAdminConfigSnapshot(filepath.Dir(cfgFile))
+	var captured *adminConfigSnapshot
+	configPath, _, _ := adminConfigPaths(filepath.Dir(cfgFile))
+	if snapshotErr == nil && filepath.Clean(cfgFile) == configPath {
+		captured = &snap
+	}
+	conf, includes, err := readConfigAtWithSnapshot(cfgFile, mode, captured)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return conf, includes, captured, nil
+}
+
+func readConfigAtWithSnapshot(cfgFile string, mode readMode, snapshot *adminConfigSnapshot) (conf *config.Config, includes []string, err error) {
 	merger := config.NewMerger(cfgFile)
+	if snapshot != nil {
+		configPath, routingPath, _ := adminConfigPaths(filepath.Dir(cfgFile))
+		merger.OnReadFile = func(path string, data []byte) {
+			switch filepath.Clean(path) {
+			case configPath:
+				snapshot.configBytes = data
+			case routingPath:
+				snapshot.routingExists = true
+				snapshot.routingBytes = data
+			}
+		}
+	}
 	sections, includes, err := merger.Merge()
 	if err != nil {
 		return nil, nil, err
+	}
+	if snapshot != nil {
+		snapshot.digest = adminSnapshotDigest(snapshot.configBytes, snapshot.routingExists, snapshot.routingBytes)
 	}
 	if conf, err = config.New(sections); err != nil {
 		return nil, nil, err

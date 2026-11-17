@@ -42,6 +42,7 @@ type tlsReplayConn struct {
 	createdAtNano int64
 
 	stream           atomic.Pointer[tlsReplayStreamBox]
+	pendingReplay    atomic.Pointer[tlsReplayStreamBox]
 	closed           atomic.Bool
 	answered         atomic.Bool
 	disabled         atomic.Bool
@@ -126,7 +127,13 @@ func (r *tlsReplayConn) loadStream() netproxy.Conn {
 func (r *tlsReplayConn) setDialCancel(cancel context.CancelFunc) {
 	r.dialCancelMu.Lock()
 	r.dialCancel = cancel
+	// Close or the relay's cancellation deadline can arrive just before the
+	// dial registers its cancel function. Do not miss that cancellation.
+	canceled := cancel != nil && (r.closed.Load() || !r.readDeadlineAllowsReplay())
 	r.dialCancelMu.Unlock()
+	if canceled {
+		cancel()
+	}
 }
 
 func (r *tlsReplayConn) cancelActiveDial() {
@@ -339,7 +346,12 @@ func (r *tlsReplayConn) replayLocked(failedStream netproxy.Conn, triggerErr erro
 			r.disableLocked()
 			return false
 		}
+		// Publish ownership before the first replay write so Close can interrupt
+		// it even though the flow is not rebound until replay succeeds.
+		pending := &tlsReplayStreamBox{conn: newConn}
+		r.pendingReplay.Store(pending)
 		if r.closed.Load() || r.flow.Context().Err() != nil || !r.readDeadlineAllowsReplay() {
+			r.pendingReplay.CompareAndSwap(pending, nil)
 			_ = newConn.Close()
 			newRes.Quality.Abandon()
 			newRes.SelectPath.RecoveryAbandon()
@@ -348,7 +360,14 @@ func (r *tlsReplayConn) replayLocked(failedStream netproxy.Conn, triggerErr erro
 		}
 
 		if writeErr := writeTLSReplayPayload(newConn, sentCopy, wasWriteClosed); writeErr != nil {
+			r.pendingReplay.CompareAndSwap(pending, nil)
 			_ = newConn.Close()
+			if r.closed.Load() || r.flow.Context().Err() != nil || !r.readDeadlineAllowsReplay() {
+				newRes.Quality.Abandon()
+				newRes.SelectPath.RecoveryAbandon()
+				r.disableLocked()
+				return false
+			}
 			if newRes.Dialer != nil {
 				r.excluded[newRes.Dialer] = struct{}{}
 			}
@@ -362,6 +381,7 @@ func (r *tlsReplayConn) replayLocked(failedStream netproxy.Conn, triggerErr erro
 		}
 
 		if !r.flow.rebindAfterEarlyReplay(c.PolicyEpoch(), expectedFlowStream, newConn, c.egressRuntime, newRes) {
+			r.pendingReplay.CompareAndSwap(pending, nil)
 			_ = newConn.Close()
 			newRes.Quality.Abandon()
 			newRes.SelectPath.RecoveryAbandon()
@@ -369,7 +389,8 @@ func (r *tlsReplayConn) replayLocked(failedStream netproxy.Conn, triggerErr erro
 			return false
 		}
 
-		r.storeStream(newConn)
+		r.stream.Store(pending)
+		r.pendingReplay.CompareAndSwap(pending, nil)
 		// Synchronize against concurrent Close() or SetReadDeadline(): if either
 		// arrived while swapping streams, propagate immediately so no handle leaks.
 		if dl := r.readDeadlineNano.Load(); dl != 0 {
@@ -446,8 +467,12 @@ func (r *tlsReplayConn) Close() error {
 	}
 	r.closed.Store(true)
 	r.cancelActiveDial()
-	if s := r.loadStream(); s != nil {
-		return s.Close()
+	pending := r.pendingReplay.Swap(nil)
+	if pending != nil {
+		_ = pending.conn.Close()
+	}
+	if current := r.stream.Load(); current != nil && current != pending {
+		return current.conn.Close()
 	}
 	return nil
 }
@@ -515,6 +540,9 @@ func (r *tlsReplayConn) storeReadDeadline(t time.Time) {
 	r.readDeadlineNano.Store(nano)
 	if nano != 0 && nano <= r.createdAtNano {
 		r.cancelActiveDial()
+		if pending := r.pendingReplay.Swap(nil); pending != nil {
+			_ = pending.conn.Close()
+		}
 	}
 }
 

@@ -22,6 +22,30 @@ func writeMergeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+func TestMergerReadObserverSeesParsedVersion(t *testing.T) {
+	dir := t.TempDir()
+	loaded := "global { log_level: info } routing { fallback: direct }"
+	path := writeMergeFile(t, dir, "config.dae", loaded)
+	merger := NewMerger(path)
+	var captured []byte
+	merger.OnReadFile = func(name string, data []byte) {
+		if name != path {
+			t.Fatalf("read unexpected file %s", name)
+		}
+		captured = data
+		// Replace the file immediately after it was read, before parsing.
+		writeMergeFile(t, dir, "config.dae", "this version does not parse")
+	}
+	sections, _, err := merger.Merge()
+	if err != nil {
+		t.Fatalf("merger parsed replacement instead of loaded bytes: %v", err)
+	}
+	conf, err := New(sections)
+	if err != nil || conf.Global.LogLevel != "info" || string(captured) != loaded {
+		t.Fatalf("parsed config and snapshot differ: config=%v, bytes=%q, error=%v", conf, captured, err)
+	}
+}
+
 // TestMergerAcceptsDiamondInclude pins that a shared file included by two
 // siblings is legal: the visited-set used to double as the merged-section
 // accumulator, so the second branch to reach the shared file was misreported

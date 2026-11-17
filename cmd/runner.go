@@ -15,6 +15,7 @@ import (
 type Runner struct {
 	log               *logrus.Logger
 	conf              *config.Config
+	adminSnapshot     *adminConfigSnapshot
 	externGeoDataDirs []string
 	configFile        string
 }

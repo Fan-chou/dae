@@ -27,10 +27,11 @@ var (
 // runtimeGeneration is one immutable runtime configuration and its resources.
 // The supervisor transfers ownership of these resources as a unit.
 type runtimeGeneration struct {
-	controlPlane *control.ControlPlane
-	listener     *control.Listener
-	cancel       context.CancelFunc
-	conf         *config.Config
+	controlPlane  *control.ControlPlane
+	listener      *control.Listener
+	cancel        context.CancelFunc
+	conf          *config.Config
+	adminSnapshot *adminConfigSnapshot
 
 	cleanupOnce sync.Once
 	cleanupErr  error

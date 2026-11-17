@@ -41,12 +41,13 @@ type reloadWorker struct {
 	// currCancel, and listener after publishing a candidate generation.
 	// Reload reconfigures log in place so Run-scoped closures that captured
 	// the original *logrus.Logger keep the current level.
-	log         *logrus.Logger
-	conf        *config.Config
-	c           *control.ControlPlane
-	currCancel  context.CancelFunc
-	listener    *control.Listener
-	pprofServer *http.Server
+	log           *logrus.Logger
+	conf          *config.Config
+	adminSnapshot *adminConfigSnapshot
+	c             *control.ControlPlane
+	currCancel    context.CancelFunc
+	listener      *control.Listener
+	pprofServer   *http.Server
 }
 
 // applyReloadLogLevel reconfigures the process logger in place so Run-scoped
@@ -102,6 +103,7 @@ func (w *reloadWorker) run() {
 		abortConnections := os.Remove(AbortFile) == nil
 		w.log.Warnln("[Reload] Load new config")
 		var newConf *config.Config
+		var loadedSnapshot *adminConfigSnapshot
 		if req.isSuspend {
 			newConf, err = emptyConfig()
 			if err != nil {
@@ -117,7 +119,7 @@ func (w *reloadWorker) run() {
 			newConf.Global.LogLevel = "warning"
 		} else {
 			var includes []string
-			newConf, includes, err = readConfig(cfgFile)
+			newConf, includes, loadedSnapshot, err = readConfigWithAdminSnapshot(cfgFile, readStrict)
 			if err != nil {
 				w.log.WithFields(logrus.Fields{
 					"err": err,
@@ -265,16 +267,18 @@ func (w *reloadWorker) run() {
 			hasOverlap := newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
-				controlPlane: oldC,
-				listener:     oldListener,
-				cancel:       oldCancel,
-				conf:         oldConf,
+				controlPlane:  oldC,
+				listener:      oldListener,
+				cancel:        oldCancel,
+				conf:          oldConf,
+				adminSnapshot: w.adminSnapshot,
 			}
 			candidateGeneration := &runtimeGeneration{
-				controlPlane: newC,
-				listener:     stagedListener,
-				cancel:       cancel,
-				conf:         newConf,
+				controlPlane:  newC,
+				listener:      stagedListener,
+				cancel:        cancel,
+				conf:          newConf,
+				adminSnapshot: loadedSnapshot,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
 				failSupervisorStep(err, "record active generation for staged reload", candidateGeneration, nil, nil)
@@ -335,16 +339,18 @@ func (w *reloadWorker) run() {
 			hasOverlap := newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
-				controlPlane: oldC,
-				listener:     oldListener,
-				cancel:       oldCancel,
-				conf:         oldConf,
+				controlPlane:  oldC,
+				listener:      oldListener,
+				cancel:        oldCancel,
+				conf:          oldConf,
+				adminSnapshot: w.adminSnapshot,
 			}
 			candidateGeneration := &runtimeGeneration{
-				controlPlane: newC,
-				listener:     stagedListener,
-				cancel:       cancel,
-				conf:         newConf,
+				controlPlane:  newC,
+				listener:      stagedListener,
+				cancel:        cancel,
+				conf:          newConf,
+				adminSnapshot: loadedSnapshot,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
 				failSupervisorStep(err, "record active generation for fresh datapath reload", candidateGeneration, nil, nil)
@@ -457,16 +463,18 @@ func (w *reloadWorker) run() {
 		hasOverlap := newC.InheritDialerHealthFrom(oldC)
 		configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 		activeGeneration := &runtimeGeneration{
-			controlPlane: oldC,
-			listener:     oldListener,
-			cancel:       oldCancel,
-			conf:         oldConf,
+			controlPlane:  oldC,
+			listener:      oldListener,
+			cancel:        oldCancel,
+			conf:          oldConf,
+			adminSnapshot: w.adminSnapshot,
 		}
 		candidateGeneration := &runtimeGeneration{
-			controlPlane: newC,
-			listener:     stagedListener,
-			cancel:       newCancel,
-			conf:         newConf,
+			controlPlane:  newC,
+			listener:      stagedListener,
+			cancel:        newCancel,
+			conf:          newConf,
+			adminSnapshot: loadedSnapshot,
 		}
 		// The legacy path moved its shared BPF object above; on supervisor
 		// failure the ownership must return before candidate teardown, and the

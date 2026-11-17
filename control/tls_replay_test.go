@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +40,98 @@ func (d *funcNetproxyDialer) DialContext(ctx context.Context, network, addr stri
 type writeFailConn struct {
 	netproxy.Conn
 	writeErr error
+}
+
+type replayWriteStartedConn struct {
+	net.Conn
+	once    sync.Once
+	started chan struct{}
+}
+
+func (c *replayWriteStartedConn) Write(p []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Write(p)
+}
+
+func TestTLSReplayCancellationInterruptsPendingWrite(t *testing.T) {
+	for _, action := range []string{"close", "read_deadline"} {
+		t.Run(action, func(t *testing.T) {
+			m := NewSessionManager(context.Background())
+			defer m.Close()
+			first, firstPeer := net.Pipe()
+			defer firstPeer.Close()
+			p1, _ := newNamedProxyTestDialer("p1", "198.51.100.41:443", func(context.Context, string, string) (netproxy.Conn, error) {
+				return &writeFailConn{Conn: first, writeErr: unix.ECONNRESET}, nil
+			})
+			defer p1.Close()
+			backup, backupPeer := net.Pipe()
+			defer backupPeer.Close()
+			defer backup.Close()
+			pending := &replayWriteStartedConn{Conn: backup, started: make(chan struct{})}
+			p2, raw2 := newNamedProxyTestDialer("p2", "198.51.100.42:443", func(context.Context, string, string) (netproxy.Conn, error) {
+				return pending, nil
+			})
+			defer p2.Close()
+			group := newFallbackProxyGroup(p1, p2)
+			defer group.Close()
+			c := newTLSReplayControlPlane(group, false)
+			if err := c.AttachSessionManager(m); err != nil {
+				t.Fatal(err)
+			}
+			client, ingress := net.Pipe()
+			defer client.Close()
+			defer ingress.Close()
+			task := prepareTLSReplayTask(t, m, c, ingress)
+			defer closeEstablishedTCPFlow(task.right, task.flow)
+			replay, ok := task.right.(*tlsReplayConn)
+			if !ok {
+				t.Fatalf("expected TLS replay wrapper, got %T", task.right)
+			}
+			writeDone := make(chan error, 1)
+			go func() { _, err := replay.Write(sampleTLSClientHello("cancel.example")); writeDone <- err }()
+			select {
+			case <-pending.started:
+			case <-time.After(time.Second):
+				t.Fatal("backup replay did not start")
+			}
+			if action == "close" {
+				_ = replay.Close()
+			} else {
+				_ = replay.SetReadDeadline(time.Unix(1, 0))
+			}
+			select {
+			case err := <-writeDone:
+				if err == nil {
+					t.Fatal("canceled replay unexpectedly succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("pending replay write did not stop on cancellation")
+			}
+			if raw2.calls.Load() != 1 || replay.pendingReplay.Load() != nil {
+				t.Fatal("cancellation retried or retained the pending connection")
+			}
+			runtime.KeepAlive(c)
+		})
+	}
+}
+
+func TestTLSReplayDialRegistrationAfterCancellation(t *testing.T) {
+	for _, action := range []string{"close", "read_deadline"} {
+		t.Run(action, func(t *testing.T) {
+			replay := &tlsReplayConn{createdAtNano: time.Now().UnixNano()}
+			if action == "close" {
+				_ = replay.Close()
+			} else {
+				_ = replay.SetReadDeadline(time.Unix(1, 0))
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			replay.setDialCancel(cancel)
+			if ctx.Err() == nil {
+				t.Fatal("dial registered after cancellation was not canceled")
+			}
+		})
+	}
 }
 
 func (c *writeFailConn) Write([]byte) (int, error) {

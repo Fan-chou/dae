@@ -21,6 +21,10 @@ var (
 )
 
 type Merger struct {
+	// OnReadFile observes the exact bytes passed to the parser. The callback
+	// must not modify data; it may retain it for a loaded-config snapshot.
+	OnReadFile func(path string, data []byte)
+
 	entry             string
 	entryDir          string
 	entryToSectionMap map[string]map[string][]*config_parser.Item
@@ -91,6 +95,9 @@ func (m *Merger) readEntry(entry string) (err error) {
 	b, err := io.ReadAll(f)
 	if err != nil {
 		return err
+	}
+	if m.OnReadFile != nil {
+		m.OnReadFile(entry, b)
 	}
 	entrySections, err := config_parser.Parse(string(b))
 	if err != nil {

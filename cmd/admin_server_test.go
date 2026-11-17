@@ -402,6 +402,59 @@ func reserveTestLoopbackAddr(t *testing.T) string {
 	return addr
 }
 
+func readTestAdminSnapshot(t *testing.T, dir string) *adminConfigSnapshot {
+	t.Helper()
+	snapshot, err := readAdminConfigSnapshot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &snapshot
+}
+
+func TestAdminReloadSnapshotKeepsLoadedFilesAfterManualEdit(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	routingPath := filepath.Join(dir, "routing.dae")
+	loadedConfig := "include { routing.dae }\nglobal { log_level: info }\n"
+	loadedRouting := "routing { fallback: direct }\n"
+	writeRestrictedDae(t, configPath, loadedConfig)
+	writeRestrictedDae(t, routingPath, loadedRouting)
+	conf, _, snapshot, err := readConfigWithAdminSnapshot(configPath, readValidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Edit both files after parsing but before the generation is published.
+	manualConfig := "include { routing.dae }\nglobal { log_level: debug }\n"
+	writeRestrictedDae(t, configPath, manualConfig)
+	writeRestrictedDae(t, routingPath, "routing { fallback: block }\n")
+	server := newAdminServer(nil, "", dir, nil, nil)
+	applyPublishedReloadAdmin(server, conf, nil, false, snapshot)
+	if server.reloadStatusSnapshot().configInSync {
+		t.Fatal("manual edit was mistaken for the loaded configuration")
+	}
+	for path, want := range map[string]string{configPath: loadedConfig, routingPath: loadedRouting} {
+		got, err := os.ReadFile(path + ".admin-last-good")
+		if err != nil || string(got) != want {
+			t.Fatalf("last-good %s = %q, error=%v; want loaded bytes %q", path, got, err, want)
+		}
+	}
+	if got, _ := os.ReadFile(configPath); string(got) != manualConfig {
+		t.Fatal("successful publication overwrote the manual edit")
+	}
+	// A subsequent failed admin reload must restore the loaded version, not B.
+	writeRestrictedDae(t, configPath, "global { log_level: warn }\nrouting { fallback: direct }\n")
+	adminConfigWriteMu.Lock()
+	server.recordPendingAdminWriteLocked()
+	adminConfigWriteMu.Unlock()
+	server.handleAsyncReloadFailure("prepare failed")
+	if got, _ := os.ReadFile(configPath); string(got) != loadedConfig {
+		t.Fatalf("rollback restored %q instead of loaded config", got)
+	}
+	if !server.reloadStatusSnapshot().configInSync {
+		t.Fatal("restored loaded snapshot should be in sync")
+	}
+}
+
 func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.dae")
@@ -417,7 +470,7 @@ func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 	}, func() bool { return true })
 	server.secret = "test-token"
 	server.setReloadManager(rm)
-	server.captureActiveSnapshot()
+	server.captureActiveSnapshot(readTestAdminSnapshot(t, dir))
 
 	getStatus := func() adminStatusBody {
 		req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
@@ -473,7 +526,7 @@ func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 
 	// External disk edit is NOT overwritten by async reload failure and reports out-of-sync.
 	rm.setReloadError(nil)
-	server.markReloadSucceeded()
+	server.markReloadSucceeded(readTestAdminSnapshot(t, dir))
 	if err := os.WriteFile(configPath, []byte("global {\n    log_level: debug\n}\nrouting { fallback: direct }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +610,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 
 	// Failed reload (even when isSuspend is false-positive on legacy rollback) does NOT refresh adminHTTP or mark suspended.
-	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, errors.New("reload failed"), true)
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, errors.New("reload failed"), true, nil)
 	server.mu.Lock()
 	if server.boundAddr != addr1 || server.suspended {
 		suspended := server.suspended
@@ -568,7 +621,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	server.mu.Unlock()
 
 	// Suspend reload does NOT refresh adminHTTP and marks suspended.
-	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, true)
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, true, nil)
 	server.mu.Lock()
 	if server.boundAddr != addr1 || !server.suspended {
 		suspended := server.suspended
@@ -583,7 +636,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	if handoff.isSuspend {
 		t.Fatal("default stagedReloadHandoff.isSuspend should be false")
 	}
-	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, handoff.isSuspend)
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, handoff.isSuspend, nil)
 	server.mu.Lock()
 	bound2 := server.boundAddr
 	stillSuspended := server.suspended

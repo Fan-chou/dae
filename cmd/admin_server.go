@@ -153,7 +153,7 @@ func (s *adminServer) currentSecret() string {
 	return s.secret
 }
 
-func (s *adminServer) captureActiveSnapshot() {
+func (s *adminServer) captureActiveSnapshot(snap *adminConfigSnapshot) {
 	if s == nil {
 		return
 	}
@@ -164,13 +164,11 @@ func (s *adminServer) captureActiveSnapshot() {
 	configDir := s.configDir
 	s.mu.Unlock()
 
-	snap, err := readAdminConfigSnapshot(configDir)
-	if err != nil {
-		return
+	if snap != nil {
+		writeAdminLastGoodSnapshot(configDir, *snap)
 	}
-	writeAdminLastGoodSnapshot(configDir, snap)
 	s.mu.Lock()
-	s.activeSnapshot = &snap
+	s.activeSnapshot = snap
 	s.mu.Unlock()
 }
 
@@ -210,7 +208,7 @@ func (s *adminServer) markReloadStarted() {
 	s.mu.Unlock()
 }
 
-func (s *adminServer) markReloadSucceeded() {
+func (s *adminServer) markReloadSucceeded(snap *adminConfigSnapshot) {
 	if s == nil {
 		return
 	}
@@ -225,12 +223,12 @@ func (s *adminServer) markReloadSucceeded() {
 	s.pendingAdminDigest = ""
 	s.mu.Unlock()
 
-	if snap, err := readAdminConfigSnapshot(configDir); err == nil {
-		writeAdminLastGoodSnapshot(configDir, snap)
-		s.mu.Lock()
-		s.activeSnapshot = &snap
-		s.mu.Unlock()
+	if snap != nil {
+		writeAdminLastGoodSnapshot(configDir, *snap)
 	}
+	s.mu.Lock()
+	s.activeSnapshot = snap
+	s.mu.Unlock()
 }
 
 func (s *adminServer) markSuspended() {
@@ -310,8 +308,8 @@ func (s *adminServer) reloadStatusSnapshot() adminReloadStatusSnapshot {
 		}
 	}
 
-	inSync := !suspended && !reloadActive && !reloading
-	if inSync && activeSnap != nil {
+	inSync := activeSnap != nil && !suspended && !reloadActive && !reloading
+	if inSync {
 		curSnap, err := readAdminConfigSnapshot(configDir)
 		if err != nil || curSnap.digest != activeSnap.digest {
 			inSync = false
