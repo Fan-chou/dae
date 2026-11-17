@@ -1694,7 +1694,9 @@ static __always_inline void mac_assoc_upsert_ip(struct mac_assoc_entry *entry,
 #pragma unroll
 	for (i = 0; i < MAC_ASSOC_IP_SLOTS; i++) {
 		if (ip16_equal(entry->ips[i].ip, ip)) {
-			entry->ips[i].last_seen_ns = now;
+			if (now > entry->ips[i].last_seen_ns &&
+			    now - entry->ips[i].last_seen_ns > 1000000000ULL)
+				entry->ips[i].last_seen_ns = now;
 			return;
 		}
 		if (empty < 0 && ip16_is_unspecified(entry->ips[i].ip))
@@ -1728,12 +1730,14 @@ static __always_inline void mac_assoc_learn(const __u8 *mac, const __u8 *ip)
 	__builtin_memcpy(ip_key.ip, ip, 16);
 
 	old_mac = bpf_map_lookup_elem(&ip_mac_assoc_map, &ip_key);
-	if (old_mac && __builtin_memcmp(old_mac->mac, mac, 6) != 0) {
-		entry = bpf_map_lookup_elem(&mac_assoc_map, old_mac);
-		if (entry)
-			mac_assoc_remove_ip(entry, ip);
+	if (!old_mac || __builtin_memcmp(old_mac->mac, mac, 6) != 0) {
+		if (old_mac) {
+			entry = bpf_map_lookup_elem(&mac_assoc_map, old_mac);
+			if (entry)
+				mac_assoc_remove_ip(entry, ip);
+		}
+		bpf_map_update_elem(&ip_mac_assoc_map, &ip_key, &key, BPF_ANY);
 	}
-	bpf_map_update_elem(&ip_mac_assoc_map, &ip_key, &key, BPF_ANY);
 
 	entry = bpf_map_lookup_elem(&mac_assoc_map, &key);
 	if (entry) {
@@ -2566,7 +2570,9 @@ udp_wan_egress_handoff_mandatory(const struct tuples *tuples,
 static __always_inline bool
 udp_conn_state_expired(const struct conn_state *state, __u64 now)
 {
-	return state && now - state->last_seen_ns > UDP_CONN_STATE_TIMEOUT_NS;
+	if (!state || now <= state->last_seen_ns)
+		return false;
+	return now - state->last_seen_ns > UDP_CONN_STATE_TIMEOUT_NS;
 }
 
 static __noinline struct conn_state *
@@ -2584,7 +2590,8 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 	if (state) {
 		// Fast path: lazy timestamp update (only if interval > 1 second)
-		if (now - state->last_seen_ns > UDP_CONN_STATE_UPDATE_INTERVAL_NS)
+		if (now > state->last_seen_ns &&
+		    now - state->last_seen_ns > UDP_CONN_STATE_UPDATE_INTERVAL_NS)
 			state->last_seen_ns = now;
 
 		// Update routing if provided (e.g., routing decision changed)
@@ -2682,7 +2689,7 @@ mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 static __always_inline bool
 tcp_conn_state_expired(const struct conn_state *state, __u64 now)
 {
-	if (!state)
+	if (!state || now <= state->last_seen_ns)
 		return false;
 	if (state->state == TCP_STATE_CLOSING)
 		return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
@@ -2726,17 +2733,21 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 	if (state) {
 		// Fast path: lazy timestamp update (only if interval > 1 second)
-		if (now - state->last_seen_ns > TCP_CONN_STATE_UPDATE_INTERVAL_NS)
+		if (now > state->last_seen_ns &&
+		    now - state->last_seen_ns > TCP_CONN_STATE_UPDATE_INTERVAL_NS)
 			state->last_seen_ns = now;
 
 		// Cilium seen_non_syn: any packet without SYN promotes SYN-only
 		// to established (bit 2 of tcp_flags).
-		if (tcp_flags & 4)
+		if ((tcp_flags & 4) && !state->seen_non_syn)
 			state->seen_non_syn = 1;
 
 		// Check for connection close signals (FIN or RST)
-		if (is_fin_rst)
+		if (is_fin_rst && state->state != TCP_STATE_CLOSING) {
 			state->state = TCP_STATE_CLOSING;
+			if (now > state->last_seen_ns)
+				state->last_seen_ns = now;
+		}
 
 		// Update routing if provided (rare: routing decision changed)
 		if (args && (args->flags & CT_ARGS_HAS_ROUTING)) {
@@ -3657,6 +3668,17 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	return redirect_to_control_plane_egress();
 }
 
+static __always_inline __u8 active_routing_epoch_slot_encoded(void)
+{
+	__u32 active_slot = 0;
+	__u32 *active_slot_ptr =
+		bpf_map_lookup_elem(&active_routing_epoch_map, &zero_key);
+
+	if (active_slot_ptr)
+		active_slot = *active_slot_ptr;
+	return routing_epoch_slot_encode(active_slot);
+}
+
 static __noinline int
 do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 			 struct tuples *tuples, struct ethhdr *ethh,
@@ -3699,17 +3721,39 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 			return DAE_TC_CONTINUE;
 
 		if (udp_conn_state && udp_conn_state->meta.data.has_routing) {
-			outbound = udp_conn_state->meta.data.outbound;
-			mark = udp_conn_state->meta.data.mark;
-			must = udp_conn_state->meta.data.must;
-			__builtin_memcpy(mac, udp_conn_state->mac, 6);
-			handoff_pname = (const char *)udp_conn_state->pname;
-			handoff_pid = udp_conn_state->pid;
-			routing_epoch_slot = routing_epoch_slot_sanitize(
-				udp_conn_state->routing_epoch_slot);
-			datapath_generation = udp_conn_state->datapath_generation;
-			cached_routing = true;
-			goto fast_path_skip_routing;
+			__u8 cached_outbound =
+				udp_conn_state->meta.data.outbound;
+			bool epoch_ok = true;
+
+			/* Direct/block flows have no userspace pin, so validate
+			 * against the active routing epoch slot to avoid using
+			 * stale direct decisions across hot reloads.
+			 */
+			if (cached_outbound == OUTBOUND_DIRECT ||
+			    cached_outbound == OUTBOUND_BLOCK) {
+				__u8 active_slot =
+					active_routing_epoch_slot_encoded();
+
+				epoch_ok = active_slot !=
+					   ROUTING_EPOCH_SLOT_UNKNOWN &&
+					   udp_conn_state->routing_epoch_slot ==
+					   active_slot;
+			}
+			if (epoch_ok) {
+				outbound = cached_outbound;
+				mark = udp_conn_state->meta.data.mark;
+				must = udp_conn_state->meta.data.must;
+				__builtin_memcpy(mac, udp_conn_state->mac, 6);
+				handoff_pname =
+					(const char *)udp_conn_state->pname;
+				handoff_pid = udp_conn_state->pid;
+				routing_epoch_slot = routing_epoch_slot_sanitize(
+					udp_conn_state->routing_epoch_slot);
+				datapath_generation =
+					udp_conn_state->datapath_generation;
+				cached_routing = true;
+				goto fast_path_skip_routing;
+			}
 		}
 	}
 
@@ -3753,14 +3797,18 @@ fast_path_skip_routing:
 	 * rewrite it here: that undoes the rate-limit and contends the
 	 * conn_state_map cacheline on high-PPS WAN flows.
 	 */
-	if (udp_conn_state && tuples->five.dport != bpf_htons(53) &&
-	    (outbound != OUTBOUND_DIRECT || mark != 0 || must)) {
+	if (!cached_routing && udp_conn_state &&
+	    tuples->five.dport != bpf_htons(53)) {
 		__builtin_memcpy(udp_conn_state->mac, mac, 6);
 		if (pid_pname) {
 			__builtin_memcpy(udp_conn_state->pname,
 					 pid_pname->pname,
 					 TASK_COMM_LEN);
 			udp_conn_state->pid = pid_pname->pid;
+		} else {
+			__builtin_memset(udp_conn_state->pname, 0,
+					 TASK_COMM_LEN);
+			udp_conn_state->pid = 0;
 		}
 		udp_conn_state->routing_epoch_slot = routing_epoch_slot;
 		udp_conn_state->datapath_generation = datapath_generation;

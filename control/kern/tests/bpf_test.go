@@ -569,6 +569,46 @@ func TestNotDomainAmbiguousFalsePositive(t *testing.T) {
 	runProgramSetByID(t, "NotDomainAmbiguousFalsePositive")
 }
 
+func TestWanEgressUdpDirectCachesRoutingAndEpoch(t *testing.T) {
+	runProgramSetByID(t, "WanEgressUdpDirectCachesRoutingAndEpoch")
+}
+
+func TestWanEgressUdpDirectCacheInvalidatesOnEpochReload(t *testing.T) {
+	runProgramSetByID(t, "WanEgressUdpDirectCacheInvalidatesOnEpochReload")
+}
+
+func TestWanEgressUdpCachedProxySkipsMetadataRewrite(t *testing.T) {
+	runProgramSetByID(t, "WanEgressUdpCachedProxySkipsMetadataRewrite")
+}
+
+func TestTcpSeenPreservesClosingAndEstablishedState(t *testing.T) {
+	runProgramSetByID(t, "TcpSeenPreservesClosingAndEstablishedState")
+}
+
+func TestMacAssocLearnThrottlesUnchangedUpdates(t *testing.T) {
+	runProgramSetByID(t, "MacAssocLearnThrottlesUnchangedUpdates")
+}
+
+func TestLanIngressTcpClosingProxyTailStaysRedirected(t *testing.T) {
+	runProgramSetByID(t, "LanIngressTcpClosingProxyTailStaysRedirected")
+}
+
+func TestWanEgressTcpClosingProxyTailStaysRedirected(t *testing.T) {
+	runProgramSetByID(t, "WanEgressTcpClosingProxyTailStaysRedirected")
+}
+
+func TestLanIngressTcpClosingSynReuseRebuilds(t *testing.T) {
+	runProgramSetByID(t, "LanIngressTcpClosingSynReuseRebuilds")
+}
+
+func TestWanEgressTcpClosingSynReuseRebuilds(t *testing.T) {
+	runProgramSetByID(t, "WanEgressTcpClosingSynReuseRebuilds")
+}
+
+func TestTcpClosingFutureLastSeenNotExpired(t *testing.T) {
+	runProgramSetByID(t, "TcpClosingFutureLastSeenNotExpired")
+}
+
 func TestEgressProofMark(t *testing.T) {
 	for _, id := range []string{
 		"EgressProofTcpNewDirect",
