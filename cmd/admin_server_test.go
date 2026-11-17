@@ -575,13 +575,18 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 	server.mu.Unlock()
 
-	// Successful hot reload switches both admin_listen and admin_secret.
-	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, false)
+	// Successful unsuspend / hot reload clears suspended and switches both admin_listen and admin_secret.
+	handoff := newStagedReloadHandoff(&runtimeGeneration{}, &runtimeGeneration{}, false, false)
+	if handoff.isSuspend {
+		t.Fatal("default stagedReloadHandoff.isSuspend should be false")
+	}
+	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, handoff.isSuspend)
 	server.mu.Lock()
 	bound2 := server.boundAddr
+	stillSuspended := server.suspended
 	server.mu.Unlock()
-	if bound2 != addr2 {
-		t.Fatalf("hot reload boundAddr = %q, want %q", bound2, addr2)
+	if bound2 != addr2 || stillSuspended {
+		t.Fatalf("hot reload boundAddr = %q (want %q), suspended = %v (want false)", bound2, addr2, stillSuspended)
 	}
 
 	if respOld, err := doStatus(addr1, "sec1"); err == nil {

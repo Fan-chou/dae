@@ -285,6 +285,7 @@ func (w *reloadWorker) run() {
 				continue
 			}
 			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff.isSuspend = req.isSuspend
 			handoff.preparedDNSHandoff = true
 			handoff.sharedBpfHandoff = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
@@ -354,6 +355,7 @@ func (w *reloadWorker) run() {
 				continue
 			}
 			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff.isSuspend = req.isSuspend
 			handoff.freshDatapath = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
@@ -491,6 +493,7 @@ func (w *reloadWorker) run() {
 			continue
 		}
 		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+		handoff.isSuspend = req.isSuspend
 		handoff.bpfTransferred = !freshDatapathReload
 		w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.clearPendingRetirement()

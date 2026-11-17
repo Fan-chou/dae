@@ -176,6 +176,7 @@ type stagedReloadHandoff struct {
 	tcHookSetAdopted      bool
 	hookFlipCommitted     bool
 	provisionalOwner      bool
+	isSuspend             bool
 }
 
 // newStagedReloadHandoff builds the base handoff from the two supervisor
@@ -210,20 +211,6 @@ func registerReloadProgressObserver(fn func(code byte, content string)) func() {
 		reloadProgressObserver = nil
 		reloadProgressObserverMu.Unlock()
 	}
-}
-
-func hasPendingEffectiveConfig(conf *config.Config) bool {
-	if conf == nil {
-		return false
-	}
-	effectiveState.mu.Lock()
-	defer effectiveState.mu.Unlock()
-	for _, p := range effectiveState.pending {
-		if p.conf == conf {
-			return true
-		}
-	}
-	return false
 }
 
 func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, reloadErr error, isSuspend bool) {
@@ -631,6 +618,7 @@ loop:
 					}
 					w.log.Warnln("[Reload] Finished")
 					inboundManager.Apply(w.conf.Inbound)
+					applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), false)
 					reloadManager.finishReloadSuccess()
 					continue
 				}
@@ -768,7 +756,7 @@ loop:
 					continue
 				}
 				dnsHandoffActive := reloadManager.pendingDNSHandoffActive(serveControlPlane)
-				isLoadedConfig := false
+				isSuspend := false
 				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
 					var publishErr error
 					if !handoff.tcHookHandoffPrepared {
@@ -884,7 +872,7 @@ loop:
 					w.c = handoff.preparedGeneration.controlPlane
 					w.currCancel = handoff.preparedGeneration.cancel
 					w.conf = handoff.preparedGeneration.conf
-					isLoadedConfig = hasPendingEffectiveConfig(w.conf)
+					isSuspend = handoff.isSuspend
 					publishEffectiveConfig(w.conf)
 					if ruleProviderLifecycleHolder != nil {
 						ruleProviderLifecycleHolder.setConfig(w.conf)
@@ -911,7 +899,7 @@ loop:
 				}
 				w.log.Warnln("[Reload] Finished")
 				inboundManager.Apply(w.conf.Inbound)
-				applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), !isLoadedConfig)
+				applyPublishedReloadAdmin(adminHTTP, w.conf, reloadManager.reloadError(), isSuspend)
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")
