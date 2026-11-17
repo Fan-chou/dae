@@ -4157,15 +4157,35 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	if (unlikely(ret < 0))
 		return ret;
 
-	u8 offset = ctx.l;
+	__u32 offset = ctx.l;
+
+	_Static_assert((MAX_ARG_LEN & (MAX_ARG_LEN - 1)) == 0,
+		       "MAX_ARG_LEN must be power of two");
+	if (offset >= MAX_ARG_LEN) {
+		pid_pname->pname[0] = '\0';
+		return 0;
+	}
 
 	for (u8 i = 0; i < TASK_COMM_LEN; i++) {
-		if (offset + i < MAX_ARG_LEN && arg_buf[offset + i] != '\0') {
-			pid_pname->pname[i] = arg_buf[offset + i];
-		} else {
+		__u32 idx = offset + i;
+
+		if (idx >= MAX_ARG_LEN) {
 			pid_pname->pname[i] = '\0';
 			break;
 		}
+		/* Keep bounds on the indexing register itself so clang cannot
+		 * hoist &arg_buf[offset] as an unbounded pointer before the
+		 * loop check.
+		 */
+		barrier_var(idx);
+		idx &= MAX_ARG_LEN - 1;
+		char ch = arg_buf[idx];
+
+		if (ch == '\0') {
+			pid_pname->pname[i] = '\0';
+			break;
+		}
+		pid_pname->pname[i] = ch;
 	}
 
 	return 0;

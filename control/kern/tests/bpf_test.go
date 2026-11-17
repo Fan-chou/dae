@@ -17,6 +17,8 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/vishvananda/netlink/nl"
 )
 
@@ -68,10 +70,14 @@ const egressProofTestMark uint32 = 0x40000000
 const egressProofProgsetPrefix = "EgressProof"
 
 func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, err error) {
-	return collectProgramsWithProofMark(t, 0)
+	return collectProgramsWithParam(t, 0, 0)
 }
 
 func collectProgramsWithProofMark(t *testing.T, directProofMark uint32) (obj *bpftestObjects, progset []programSet, err error) {
+	return collectProgramsWithParam(t, directProofMark, 0)
+}
+
+func collectProgramsWithParam(t *testing.T, directProofMark uint32, hasBpfGetCurrentTask uint8) (obj *bpftestObjects, progset []programSet, err error) {
 	obj = &bpftestObjects{}
 	spec, err := loadBpftest()
 	if err != nil {
@@ -93,8 +99,9 @@ func collectProgramsWithProofMark(t *testing.T, directProofMark uint32) (obj *bp
 		daeSocketMark        uint32
 		directProofMark      uint32
 	}{
-		datapathGeneration: 41,
-		directProofMark:    directProofMark,
+		hasBpfGetCurrentTask: hasBpfGetCurrentTask,
+		datapathGeneration:   41,
+		directProofMark:      directProofMark,
 	}
 	if err = spec.Variables["PARAM"].Set(param); err != nil {
 		return nil, nil, err
@@ -607,6 +614,17 @@ func TestWanEgressTcpClosingSynReuseRebuilds(t *testing.T) {
 
 func TestTcpClosingFutureLastSeenNotExpired(t *testing.T) {
 	runProgramSetByID(t, "TcpClosingFutureLastSeenNotExpired")
+}
+
+func TestCgroupProgramsLoadWithBpfGetCurrentTask(t *testing.T) {
+	if err := features.HaveProgramHelper(ebpf.CGroupSockAddr, asm.FnGetCurrentTask); err != nil {
+		t.Skipf("kernel lacks bpf_get_current_task in cgroup/sock_addr: %v", err)
+	}
+	obj, _, err := collectProgramsWithParam(t, 0, 1)
+	if err != nil {
+		t.Fatalf("collectProgramsWithParam(hasBpfGetCurrentTask=1): %v", err)
+	}
+	defer obj.Close()
 }
 
 func TestEgressProofMark(t *testing.T) {
