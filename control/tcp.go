@@ -229,8 +229,9 @@ func (c *ControlPlane) prepareConnWithRoutingResultOwned(
 	}
 
 	var (
-		domain     string
-		lRelayConn netproxy.Conn = lConn
+		domain            string
+		lRelayConn        netproxy.Conn = lConn
+		tlsPrecheckNonTLS bool
 	)
 	if c.shouldTryTcpSniff(dst, routingResult) {
 		cacheKey := newTcpSniffNegKey(dst, routingResult)
@@ -256,7 +257,13 @@ func (c *ControlPlane) prepareConnWithRoutingResultOwned(
 				// Fast reject for non HTTP/TLS prefixes.
 				c.noteTcpSniffFailure(cacheKey, now)
 				lRelayConn = probeConn
+				if len(prefetched) > 0 && !mayStartTLSClientHello(prefetched) {
+					tlsPrecheckNonTLS = true
+				}
 			default:
+				if len(prefetched) > 0 && !mayStartTLSClientHello(prefetched) {
+					tlsPrecheckNonTLS = true
+				}
 				// ConnSniffer should be used later, so we cannot close it now.
 				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
 				defer func() {
@@ -371,6 +378,7 @@ func (c *ControlPlane) prepareConnWithRoutingResultOwned(
 		return nil, fmt.Errorf("adopt TCP flow runtime: %w", err)
 	}
 	prepared.flow = flow
+	prepared.right = c.maybeWrapTLSReplay(flow, rConn, dialParam, res, tlsPrecheckNonTLS)
 	task = prepared
 	return task, nil
 }
@@ -393,8 +401,8 @@ func relayEstablishedTCPFlow(
 	dst netip.AddrPort,
 ) error {
 	var relayErr error
-	if q := flow.binding.Egress.Quality; q != nil {
-		relayErr = newRelayCore(ingress, egress, qualityRelayCopyEngine{ingress: ingress, flow: q}, flow.recordDownload, flow.recordUpload).run(flow.Context())
+	if q := flow.currentQuality(); q != nil {
+		relayErr = newRelayCore(ingress, egress, qualityRelayCopyEngine{ingress: ingress, flow: q, runtime: flow}, flow.recordDownload, flow.recordUpload).run(flow.Context())
 	} else {
 		relayErr = RelayTCPContextWithRecords(flow.Context(), ingress, egress, flow.recordDownload, flow.recordUpload)
 	}

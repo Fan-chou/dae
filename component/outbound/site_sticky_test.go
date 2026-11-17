@@ -7,6 +7,8 @@ package outbound
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1246,5 +1248,190 @@ func TestSiteStickyDeadAdmitEvictedBeforeLivePins(t *testing.T) {
 	}
 	if _, ok := table.entries[SiteKey("newest.com")]; !ok {
 		t.Fatal("newest pin should survive eviction")
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectFallbackPrimaryDirect(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	direct := newDirectDialer(option, false)
+	proxy := namedNoopDialer(option, "proxy")
+	defer direct.Close()
+	defer proxy.Close()
+
+	now := time.Unix(1_700_000_000, 0)
+	var pubMu sync.Mutex
+	pubCount := 0
+	var g *DialerGroup
+	g = NewDialerGroup(option, "fallback-direct-first", []*dialer.Dialer{direct, proxy}, newEmptyAnnotations(2), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(_ bool, nt *dialer.NetworkType, isInit bool) {
+		if isInit || g == nil || nt == nil || nt.L4Proto != consts.L4ProtoStr_TCP {
+			return
+		}
+		pubMu.Lock()
+		pubCount++
+		pubMu.Unlock()
+	})
+	defer g.Close()
+	g.nowFn = func() time.Time { return now }
+
+	if !g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fallback(direct, proxy) with no sticky overrides should enable kernel DIRECT")
+	}
+
+	// Pinning DIRECT itself must keep kernel DIRECT enabled.
+	g.PinSite("domestic.example", direct, false)
+	if !g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("site pin to DIRECT must not block kernel DIRECT")
+	}
+
+	// Pinning any site to non-DIRECT immediately republishes and disables kernel DIRECT.
+	pubMu.Lock()
+	beforePin := pubCount
+	pubMu.Unlock()
+	g.PinSite("blocked.example", proxy, false)
+	pubMu.Lock()
+	afterPin := pubCount
+	pubMu.Unlock()
+	if afterPin <= beforePin {
+		t.Fatalf("expected PinSite(proxy) to trigger republishKernelAlive immediately (before=%d after=%d)", beforePin, afterPin)
+	}
+	if g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("active non-DIRECT site pin must disable kernel DIRECT")
+	}
+
+	// UDP sticky table remains unaffected while only TCP siteSticky was pinned.
+	udpNT := &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: TestNetworkType.IpVersion}
+	if !g.KernelFastPathDirect(udpNT) {
+		t.Fatal("TCP site pin must not disable UDP kernel DIRECT")
+	}
+
+	// Expiry clears the blocking entry and re-allows kernel DIRECT.
+	now = now.Add(siteStickyTTL + time.Minute)
+	if !g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("expired non-DIRECT site pin must re-allow kernel DIRECT")
+	}
+
+	// Site-level hold-down on DIRECT immediately disables kernel DIRECT as well.
+	pubMu.Lock()
+	beforeFail := pubCount
+	pubMu.Unlock()
+	g.FailSite("timeout.example", direct)
+	pubMu.Lock()
+	afterFail := pubCount
+	pubMu.Unlock()
+	if afterFail <= beforeFail {
+		t.Fatalf("expected FailSite(direct) hold-down to trigger republishKernelAlive immediately (before=%d after=%d)", beforeFail, afterFail)
+	}
+	if g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("active hold-down on DIRECT must disable kernel DIRECT")
+	}
+	now = now.Add(siteStickyHoldDown + time.Second)
+	if !g.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("expired DIRECT hold-down must re-allow kernel DIRECT")
+	}
+}
+
+func TestDialerGroup_KernelFastPathDirectNestedFixedAndFirstAliveFallbackDirect(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	direct := newDirectDialer(option, false)
+	proxy := namedNoopDialer(option, "proxy")
+	proxy2 := namedNoopDialer(option, "proxy2")
+	defer direct.Close()
+	defer proxy.Close()
+	defer proxy2.Close()
+
+	child := NewDialerGroup(option, "fallback-child", []*dialer.Dialer{direct, proxy}, newEmptyAnnotations(2), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+	defer child.Close()
+	backupChild := NewDialerGroup(option, "proxy-backup", []*dialer.Dialer{proxy2}, newEmptyAnnotations(1), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {})
+	defer backupChild.Close()
+
+	var fixedPubCount atomic.Int32
+	parentFixed, err := NewNestedDialerGroup(option, "fixed-parent", []NestedDialerGroupMember{{Group: child}}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(_ bool, nt *dialer.NetworkType, isInit bool) {
+		if !isInit && nt != nil && nt.L4Proto == consts.L4ProtoStr_TCP {
+			fixedPubCount.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parentFixed: %v", err)
+	}
+	defer parentFixed.Close()
+
+	var firstAlivePubCount atomic.Int32
+	parentFirstAlive, err := NewNestedDialerGroup(option, "first-alive-parent", []NestedDialerGroupMember{
+		{Group: child},
+		{Group: backupChild},
+	}, DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_FirstAlive}, func(_ bool, nt *dialer.NetworkType, isInit bool) {
+		if !isInit && nt != nil && nt.L4Proto == consts.L4ProtoStr_TCP {
+			firstAlivePubCount.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatalf("parentFirstAlive: %v", err)
+	}
+	defer parentFirstAlive.Close()
+
+	if !parentFixed.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fixed(fallback(direct, proxy)) should allow kernel DIRECT when unpinned")
+	}
+	if !parentFirstAlive.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive(fallback(direct, proxy), proxy) should allow kernel DIRECT when unpinned")
+	}
+
+	child.PinSite("override.example", proxy, false)
+	if fixedPubCount.Load() == 0 {
+		t.Fatal("nested fixed parent should republish when child acquires non-DIRECT pin")
+	}
+	if firstAlivePubCount.Load() == 0 {
+		t.Fatal("nested first_alive parent should republish when child acquires non-DIRECT pin")
+	}
+	if parentFixed.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("fixed parent must disable kernel DIRECT when child has active non-DIRECT pin")
+	}
+	if parentFirstAlive.KernelFastPathDirect(TestNetworkType) {
+		t.Fatal("first_alive parent must disable kernel DIRECT when selected child has active non-DIRECT pin")
+	}
+}
+
+func TestDialerGroup_HasAlternativeDialerAndSkipQuality(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	p1 := namedNoopDialer(option, "p1")
+	p2 := namedNoopDialer(option, "p2")
+	p3 := namedNoopDialer(option, "p3")
+	defer p1.Close()
+	defer p2.Close()
+	defer p3.Close()
+
+	fixed := NewDialerGroup(option, "fixed", []*dialer.Dialer{p1, p2}, newEmptyAnnotations(2), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fixed, FixedIndex: 0}, func(bool, *dialer.NetworkType, bool) {})
+	defer fixed.Close()
+	if fixed.HasAlternativeDialer(p1, TestNetworkType) {
+		t.Fatal("fixed group must not claim an alternative dialer beyond its FixedIndex member")
+	}
+
+	fb := NewDialerGroup(option, "fallback", []*dialer.Dialer{p1, p2, p3}, newEmptyAnnotations(3), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+	defer fb.Close()
+	if !fb.HasAlternativeDialer(p1, TestNetworkType) {
+		t.Fatal("fallback group with live backups must report HasAlternativeDialer=true")
+	}
+	skip := map[*dialer.Dialer]struct{}{p1: {}, p2: {}}
+	d, _, _, _, _, err := fb.SelectWithSkipQuality(TestNetworkType, true, nil, skip, "tls.example")
+	if err != nil {
+		t.Fatalf("SelectWithSkipQuality error = %v", err)
+	}
+	if d != p3 {
+		t.Fatalf("SelectWithSkipQuality selected %v, want p3", d)
 	}
 }

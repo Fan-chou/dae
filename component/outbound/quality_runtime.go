@@ -6,6 +6,7 @@
 package outbound
 
 import (
+	"errors"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -356,7 +357,32 @@ func (q *qualityRuntime) commit(f *QualityFlow, now time.Time, reason string, ca
 // authority. Probe candidates are selected through that same nested graph,
 // never by flattening members or overriding a fixed child.
 func (g *DialerGroup) SelectWithQuality(nt *dialer.NetworkType, strict bool, excluded *dialer.Dialer, site string) (*dialer.Dialer, time.Duration, *dialer.NetworkType, SelectPath, *QualityFlow, error) {
-	d, lat, selected, path, err := g.SelectWithPath(nt, strict, excluded, site)
+	return g.SelectWithSkipQuality(nt, strict, excluded, nil, site)
+}
+
+// SelectWithSkipQuality behaves like SelectWithQuality while also excluding all
+// dialers in hardSkip (for multi-attempt handshake replay).
+func (g *DialerGroup) SelectWithSkipQuality(nt *dialer.NetworkType, strict bool, excluded *dialer.Dialer, hardSkip map[*dialer.Dialer]struct{}, site string) (*dialer.Dialer, time.Duration, *dialer.NetworkType, SelectPath, *QualityFlow, error) {
+	var (
+		d        *dialer.Dialer
+		lat      time.Duration
+		selected *dialer.NetworkType
+		path     SelectPath
+		err      error
+	)
+	if len(hardSkip) == 0 {
+		d, lat, selected, path, err = g.SelectWithPath(nt, strict, excluded, site)
+	} else {
+		var b selectPathBuilder
+		holdDown := g.siteHoldDownSet(site, nt)
+		skip := mergeSkipMaps(hardSkip, holdDown)
+		d, lat, selected, _, err = g.selectWithSkip(nt, strict, excluded, skip, true, site, false, true, &b)
+		if errors.Is(err, ErrNoAliveDialer) && len(holdDown) > 0 {
+			b = selectPathBuilder{}
+			d, lat, selected, _, err = g.selectWithSkip(nt, strict, excluded, hardSkip, true, site, false, false, &b)
+		}
+		path = internSelectPath(g, b)
+	}
 	if !g.hasQuality || err != nil || selected == nil || selected.L4Proto != consts.L4ProtoStr_TCP {
 		return d, lat, selected, path, nil, err
 	}
@@ -387,10 +413,10 @@ func (g *DialerGroup) SelectWithQuality(nt *dialer.NetworkType, strict bool, exc
 	// Recheck the pin through the original graph with every other leaf skipped.
 	// This also rejects pins excluded by an updated fixed child selection, and
 	// a stable leaf that a recent same-site failure placed under hold-down.
-	if q.options.Mode == "enforce" && e.stable != nil && e.stable != excluded {
+	if q.options.Mode == "enforce" && e.stable != nil && e.stable != excluded && !dialerSkipped(e.stable, hardSkip) {
 		stable, generation := e.stable, e.generation
 		q.unlock()
-		skip := owner.siteHoldDownSet(site)
+		skip := mergeSkipMaps(hardSkip, owner.siteHoldDownSet(site))
 		if skip == nil {
 			skip = make(map[*dialer.Dialer]struct{})
 		}
@@ -430,7 +456,7 @@ func (g *DialerGroup) SelectWithQuality(nt *dialer.NetworkType, strict bool, exc
 	}
 	q.serial++
 	f := &QualityFlow{runtime: q, key: key, record: e, generation: e.generation, id: q.serial, node: d, path: path, started: now, windowStart: now}
-	if q.options.Mode == "enforce" && excluded == nil && e.probe == nil && !now.Before(e.next) && q.budget(e, now) {
+	if q.options.Mode == "enforce" && excluded == nil && len(hardSkip) == 0 && e.probe == nil && !now.Before(e.next) && q.budget(e, now) {
 		rate := e.rates[e.stable]
 		bad := rate != nil && rate.severe && now.Sub(rate.at) < q.options.Policy.EvidenceTTL && !q.aggregateDeferred(e.stable, now)
 		// Skip the stable leaf for quality verification. Periodic recovery only

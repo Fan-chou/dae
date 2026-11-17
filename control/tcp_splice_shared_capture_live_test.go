@@ -76,7 +76,8 @@ func TestSpliceCaptureLiveSharedNodeAccounting(t *testing.T) {
 			t.Fatal("shared flow registration failed")
 		}
 		f.capture.Userspace()
-		f.flow = &FlowRuntime{binding: TcpFlowBinding{Egress: TcpEgressBinding{Dialer: d}}}
+		f.flow = &FlowRuntime{initialEgressState: tcpEgressRuntimeState{binding: TcpFlowBinding{Egress: TcpEgressBinding{Dialer: d}}}}
+		f.flow.egressState.Store(&f.flow.initialEgressState)
 		f.flow.capture.Store(f.capture)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)

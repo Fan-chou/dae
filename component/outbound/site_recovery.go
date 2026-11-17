@@ -166,12 +166,22 @@ func (r *stickyRecovery) finish(success bool, now time.Time) {
 }
 func (r *stickyRecovery) finishReason(success bool, now time.Time, reason string) {
 	t := r.table
+	var notify func()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
 	e := t.entries[r.key]
 	if t.detached || e != r.entry || e.recovery != r {
 		return
 	}
+	defer func() {
+		t.syncBlockingKeyLocked(r.key, t.entries[r.key], now)
+		notify = t.finishMutationLocked()
+	}()
 	if r.candidate.AdmissionState(&r.network) != dialer.AdmissionAlive {
 		success = false
 		reason = "candidate_not_healthy"

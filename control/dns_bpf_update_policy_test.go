@@ -8,6 +8,8 @@ package control
 import (
 	"testing"
 	"time"
+
+	dnsmessage "github.com/miekg/dns"
 )
 
 // TestNeedsBpfUpdateUnchangedHashSkipsUntilMaxInterval is the contract the
@@ -101,5 +103,90 @@ func TestNeedsBpfUpdateSteadyLANHitRate(t *testing.T) {
 	}
 	if writes == 0 {
 		t.Fatal("expected the 60s force to fire at least once in a 90s window")
+	}
+}
+
+func TestLookupDnsRespCacheInPlaceHitTriggersBpfUpdate(t *testing.T) {
+	updated := make(chan *DnsCache, 1)
+	ctrl := setTestDnsControllerRuntime(nil, func(rt *dnsControllerRuntimeState) {
+		rt.cacheAccessCallback = func(cache *DnsCache) error {
+			select {
+			case updated <- cache:
+			default:
+			}
+			return nil
+		}
+	})
+	defer ctrl.Close()
+
+	now := time.Now()
+	cache := domainRoutingACache("inplace.example.:1", "203.0.113.20", domainRoutingBitmap(0x1))
+	cache.Deadline = now.Add(time.Minute)
+	cache.OriginalDeadline = cache.Deadline
+	cache.MarkBpfUpdated(now.Add(-2 * MaxBpfUpdateInterval))
+	ctrl.dnsCache.Store(cache.RouteOwnerKey, cache)
+
+	req := new(dnsmessage.Msg)
+	req.SetQuestion("inplace.example.", dnsmessage.TypeA)
+	resp, needRefresh := ctrl.LookupDnsRespCache_(req, cache.RouteOwnerKey, false)
+	if resp == nil {
+		t.Fatal("expected non-nil response on in-place cache hit")
+	}
+	if needRefresh {
+		t.Fatal("expected needRefresh=false on fresh in-place cache hit")
+	}
+	select {
+	case got := <-updated:
+		if got != cache {
+			t.Fatalf("unexpected cache passed to BPF callback: got %v, want %v", got, cache)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected BPF update trigger on fillIntoWithTTLInPlace hit")
+	}
+}
+
+func TestLookupDnsRespCacheStaleHitTriggersBpfUpdate(t *testing.T) {
+	updated := make(chan *DnsCache, 1)
+	ctrl := setTestDnsControllerRuntime(nil, func(rt *dnsControllerRuntimeState) {
+		rt.optimisticCacheEnabled = true
+		rt.optimisticCacheTtl = 60
+		rt.cacheAccessCallback = func(cache *DnsCache) error {
+			select {
+			case updated <- cache:
+			default:
+			}
+			return nil
+		}
+	})
+	defer ctrl.Close()
+
+	now := time.Now()
+	cache := domainRoutingACache("stale.example.:1", "203.0.113.21", domainRoutingBitmap(0x1))
+	if err := cache.prepackResponseWithTTL("stale.example.", dnsmessage.TypeA, 30, now.Add(-35*time.Second)); err != nil {
+		t.Fatalf("prepackResponseWithTTL: %v", err)
+	}
+	expired := now.Add(-5 * time.Second)
+	cache.Deadline = expired
+	cache.OriginalDeadline = expired
+	cache.deadlineNano.Store(expired.UnixNano())
+	cache.MarkBpfUpdated(expired.Add(-2 * MaxBpfUpdateInterval))
+	ctrl.dnsCache.Store(cache.RouteOwnerKey, cache)
+
+	req := new(dnsmessage.Msg)
+	req.SetQuestion("stale.example.", dnsmessage.TypeA)
+	resp, needRefresh := ctrl.LookupDnsRespCache_(req, cache.RouteOwnerKey, false)
+	if resp == nil {
+		t.Fatal("expected non-nil response on RFC 8767 stale cache hit")
+	}
+	if !needRefresh {
+		t.Fatal("expected needRefresh=true on first stale cache hit")
+	}
+	select {
+	case got := <-updated:
+		if got != cache {
+			t.Fatalf("unexpected cache passed to BPF callback: got %v, want %v", got, cache)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected BPF update trigger on RFC 8767 GetStaleResponse hit")
 	}
 }

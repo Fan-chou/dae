@@ -158,20 +158,21 @@ func adminConnectionFromTCP(flow *FlowRuntime) AdminConnection {
 	if flow == nil {
 		return AdminConnection{}
 	}
+	binding := flow.Binding()
 	item := AdminConnection{
 		ID:       strconv.FormatUint(flow.id, 10),
 		Network:  flow.network,
 		Src:      formatAddrPort(flow.src),
 		Dst:      formatAddrPort(flow.dst),
 		Mac:      macString(flow.mac),
-		Inbound:  flow.binding.Inbound,
+		Inbound:  binding.Inbound,
 		Upload:   flow.uploadBytes.Load(),
 		Download: flow.downloadBytes.Load(),
 		Start:    formatFlowStart(flow.startUnixNano),
 	}
-	fillAdminConnectionEgress(&item, flow.binding.Egress.Outbound, flow.binding.Egress.Dialer, flow.binding.Egress.SniffedDomain, flow.binding.Egress.Target, flow.binding.Egress.IsDialIp)
+	fillAdminConnectionEgress(&item, binding.Egress.Outbound, binding.Egress.Dialer, binding.Egress.SniffedDomain, binding.Egress.Target, binding.Egress.IsDialIp)
 	if item.Dst == "" {
-		item.Dst = displayConnectionTarget(flow.binding.Egress.Target)
+		item.Dst = displayConnectionTarget(binding.Egress.Target)
 	}
 	return item
 }

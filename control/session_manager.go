@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/daeuniverse/dae/common/consts"
 	commonerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/component/outbound"
@@ -127,6 +128,13 @@ func (s *pinnedKeyShard) unpin(key bpfTuplesKey) (dropped bool) {
 	return dropped
 }
 
+func (s *pinnedKeyShard) has(key bpfTuplesKey) bool {
+	s.mu.Lock()
+	refs := s.keys[key]
+	s.mu.Unlock()
+	return refs > 0
+}
+
 func (s *redirectKeyShard) pin(key bpfRedirectTuple) {
 	s.mu.Lock()
 	s.keys[key]++
@@ -192,6 +200,56 @@ type SessionManager struct {
 	closeErr  error
 
 	nextFlowID atomic.Uint64
+
+	// Test-only seam (nil in production) for exercising conn_state closing
+	// transitions and monotonic clock timestamps without privileged BPF maps.
+	testConnStateOps func(*ebpf.Map) bpfConnStateStore
+	testMonotonicNow func() (uint64, error)
+}
+
+type bpfConnStateStore interface {
+	LookupConnState(key *bpfTuplesKey, out *bpfConnState) error
+	UpdateConnState(key *bpfTuplesKey, val *bpfConnState, flags ebpf.MapUpdateFlags) error
+	BatchDeleteConnState(keys []bpfTuplesKey) (int, error)
+}
+
+type ebpfConnStateStore struct {
+	m *ebpf.Map
+}
+
+func (s ebpfConnStateStore) LookupConnState(key *bpfTuplesKey, out *bpfConnState) error {
+	return s.m.Lookup(key, out)
+}
+
+func (s ebpfConnStateStore) UpdateConnState(key *bpfTuplesKey, val *bpfConnState, flags ebpf.MapUpdateFlags) error {
+	return s.m.Update(key, val, flags)
+}
+
+func (s ebpfConnStateStore) BatchDeleteConnState(keys []bpfTuplesKey) (int, error) {
+	return BpfMapBatchDelete(s.m, keys)
+}
+
+func (m *SessionManager) connStateStore(connMap *ebpf.Map) bpfConnStateStore {
+	if connMap == nil {
+		return nil
+	}
+	if m != nil && m.testConnStateOps != nil {
+		return m.testConnStateOps(connMap)
+	}
+	return ebpfConnStateStore{m: connMap}
+}
+
+func (m *SessionManager) connStateNowNs() (uint64, error) {
+	if m != nil && m.testMonotonicNow != nil {
+		return m.testMonotonicNow()
+	}
+	return monotonicNowNano()
+}
+
+type tcpEgressRuntimeState struct {
+	egress  netproxy.Conn
+	binding TcpFlowBinding
+	lease   *egressRuntimeLease
 }
 
 // FlowRuntime is the process-owned lifecycle capsule for one established TCP
@@ -201,24 +259,26 @@ type FlowRuntime struct {
 	capture atomic.Pointer[observation.Flow]
 	manager *SessionManager
 
-	id            uint64
-	startUnixNano int64
-	src           netip.AddrPort
-	dst           netip.AddrPort
-	mac           [6]uint8
-	network       string
-	uploadBytes   atomic.Uint64
-	downloadBytes atomic.Uint64
-	firstByte     atomic.Bool
+	id                  uint64
+	startUnixNano       int64
+	replayDialStartNano atomic.Int64
+	src                 netip.AddrPort
+	dst                 netip.AddrPort
+	mac                 [6]uint8
+	network             string
+	uploadBytes         atomic.Uint64
+	downloadBytes       atomic.Uint64
+	firstByte           atomic.Bool
 
-	ingress net.Conn
-	egress  netproxy.Conn
-	binding TcpFlowBinding
+	ingress            net.Conn
+	egressMu           sync.Mutex
+	egressClosed       atomic.Bool
+	initialEgressState tcpEgressRuntimeState
+	egressState        atomic.Pointer[tcpEgressRuntimeState]
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	egressLease    *egressRuntimeLease
 	pinKeys        [2]bpfTuplesKey
 	pinKeyCount    uint8
 	redirectKey    bpfRedirectTuple
@@ -470,21 +530,96 @@ func (f *FlowRuntime) Ingress() net.Conn {
 	return f.ingress
 }
 
-// Egress returns the concrete outbound connection selected at establishment.
-// It is nil for locally terminated flows such as transparent DNS-over-TCP.
+// Egress returns the concrete outbound connection selected at establishment
+// (or updated after early TLS ClientHello replay). It is nil for locally
+// terminated flows such as transparent DNS-over-TCP.
 func (f *FlowRuntime) Egress() netproxy.Conn {
 	if f == nil {
 		return nil
 	}
-	return f.egress
+	if state := f.egressState.Load(); state != nil {
+		return state.egress
+	}
+	return nil
 }
 
-// Binding returns the immutable route and concrete egress decision.
+// Binding returns the current route and concrete egress decision.
 func (f *FlowRuntime) Binding() TcpFlowBinding {
 	if f == nil {
 		return TcpFlowBinding{}
 	}
-	return f.binding
+	if state := f.egressState.Load(); state != nil {
+		return state.binding
+	}
+	return TcpFlowBinding{}
+}
+
+func (f *FlowRuntime) currentQuality() *outbound.QualityFlow {
+	return f.Binding().Egress.Quality
+}
+
+func (f *FlowRuntime) releaseCurrentLease() error {
+	if f == nil {
+		return nil
+	}
+	f.egressMu.Lock()
+	cur := f.egressState.Load()
+	if cur == nil || cur.lease == nil {
+		f.egressMu.Unlock()
+		return nil
+	}
+	lease := cur.lease
+	next := *cur
+	next.lease = nil
+	f.egressState.Store(&next)
+	f.egressMu.Unlock()
+	return lease.release()
+}
+
+func (f *FlowRuntime) rebindAfterEarlyReplay(
+	planeEpoch routing.PolicyEpoch,
+	expectedOld netproxy.Conn,
+	newConn netproxy.Conn,
+	runtime *egressRuntime,
+	res *proxyDialResult,
+) bool {
+	if f == nil || newConn == nil || res == nil {
+		return false
+	}
+	f.egressMu.Lock()
+	if f.egressClosed.Load() || f.Context().Err() != nil {
+		f.egressMu.Unlock()
+		return false
+	}
+	cur := f.egressState.Load()
+	if cur == nil || cur.egress != expectedOld || cur.binding.Route.PolicyEpoch != planeEpoch {
+		f.egressMu.Unlock()
+		return false
+	}
+	newLease, retainedOutbound, ok := runtime.acquireEgress(res.Dialer, res.Outbound, res.SelectPath)
+	if !ok {
+		f.egressMu.Unlock()
+		return false
+	}
+	nextBinding := newTcpFlowBinding(cur.binding.Route.PolicyEpoch, res, cur.binding.Mac)
+	nextBinding.Inbound = cur.binding.Inbound
+	nextBinding.Egress.Outbound = retainedOutbound
+
+	cur.binding.Egress.Dialer.LoadFinish()
+	nextBinding.Egress.Dialer.LoadStart()
+	f.replayDialStartNano.Store(time.Now().UnixNano())
+	f.egressState.Store(&tcpEgressRuntimeState{
+		egress:  newConn,
+		binding: nextBinding,
+		lease:   newLease,
+	})
+	oldLease := cur.lease
+	f.egressMu.Unlock()
+
+	if oldLease != nil {
+		_ = oldLease.release()
+	}
+	return true
 }
 
 func (f *FlowRuntime) recordUpload(n int64) {
@@ -492,7 +627,7 @@ func (f *FlowRuntime) recordUpload(n int64) {
 	if f == nil || n <= 0 {
 		return
 	}
-	f.binding.Egress.Dialer.LoadBytes(uint64(n), 0)
+	f.Binding().Egress.Dialer.LoadBytes(uint64(n), 0)
 	f.uploadBytes.Add(uint64(n))
 	f.capture.Load().Add(uint64(n), 0)
 }
@@ -519,7 +654,7 @@ func (f *FlowRuntime) recordDownloadLive(n int64) {
 }
 
 func (f *FlowRuntime) addDownloadBytes(n uint64) {
-	f.binding.Egress.Dialer.LoadBytes(0, n)
+	f.Binding().Egress.Dialer.LoadBytes(0, n)
 	f.downloadBytes.Add(n)
 	f.capture.Load().Add(0, n)
 }
@@ -543,17 +678,22 @@ func (f *FlowRuntime) reportFirstByte(measured bool) {
 	if f == nil {
 		return
 	}
-	if f.firstByte.CompareAndSwap(false, true) && f.binding.Egress.Dialer != nil && f.binding.Egress.NetworkType.L4Proto != "" {
+	binding := f.Binding()
+	if f.firstByte.CompareAndSwap(false, true) && binding.Egress.Dialer != nil && binding.Egress.NetworkType.L4Proto != "" {
 		slow := false
 		if measured {
-			ttfb := time.Duration(time.Now().UnixNano() - f.startUnixNano)
-			nt := f.binding.Egress.NetworkType
-			slow = f.binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
+			dialStart := f.replayDialStartNano.Load()
+			if dialStart == 0 {
+				dialStart = f.startUnixNano
+			}
+			ttfb := time.Duration(time.Now().UnixNano() - dialStart)
+			nt := binding.Egress.NetworkType
+			slow = binding.Egress.Dialer.ObserveTTFB(&nt, ttfb)
 		}
-		f.binding.Egress.Quality.FirstByte(slow)
-		recoveryHandled := f.binding.Egress.SelectPath.RecoveryFirstByte(slow)
-		if g := f.binding.Egress.Outbound; g != nil && !recoveryHandled && !f.binding.Egress.Quality.ControlsPin() {
-			g.PinSite(pinSiteSubject(f.binding.Egress.StickySite, f.binding.Egress.SniffedDomain), f.binding.Egress.Dialer, slow)
+		binding.Egress.Quality.FirstByte(slow)
+		recoveryHandled := binding.Egress.SelectPath.RecoveryFirstByte(slow)
+		if g := binding.Egress.Outbound; g != nil && !recoveryHandled && !binding.Egress.Quality.ControlsPin() {
+			g.PinSite(pinSiteSubject(binding.Egress.StickySite, binding.Egress.SniffedDomain), binding.Egress.Dialer, slow)
 		}
 	}
 }
@@ -627,12 +767,15 @@ func (m *SessionManager) adoptTCP(
 		mac:           binding.Mac,
 		network:       flowNetworkName(false, src.Addr()),
 		ingress:       ingress,
-		egress:        egress,
-		binding:       binding,
 		ctx:           ctx,
 		cancel:        cancel,
-		egressLease:   lease,
+		initialEgressState: tcpEgressRuntimeState{
+			egress:  egress,
+			binding: binding,
+			lease:   lease,
+		},
 	}
+	flow.egressState.Store(&flow.initialEgressState)
 	if len(pinKeys) > len(flow.pinKeys) {
 		pinKeys = pinKeys[:len(flow.pinKeys)]
 	}
@@ -677,12 +820,21 @@ func (f *FlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
-		f.binding.Egress.Dialer.LoadFinish()
-		f.binding.Egress.Quality.Finish()
-		f.binding.Egress.SelectPath.RecoveryFinish()
-		if d := f.binding.Egress.Dialer; d != nil && f.binding.Egress.NetworkType.L4Proto != "" {
+		f.egressMu.Lock()
+		f.egressClosed.Store(true)
+		state := f.egressState.Load()
+		f.egressMu.Unlock()
+
+		var binding TcpFlowBinding
+		if state != nil {
+			binding = state.binding
+		}
+		binding.Egress.Dialer.LoadFinish()
+		binding.Egress.Quality.Finish()
+		binding.Egress.SelectPath.RecoveryFinish()
+		if d := binding.Egress.Dialer; d != nil && binding.Egress.NetworkType.L4Proto != "" {
 			elapsed := time.Duration(time.Now().UnixNano() - f.startUnixNano)
-			nt := f.binding.Egress.NetworkType
+			nt := binding.Egress.NetworkType
 			upload, download := f.uploadBytes.Load(), f.downloadBytes.Load()
 			d.ObserveConnFinished(&nt, elapsed, upload, download)
 		}
@@ -693,7 +845,7 @@ func (f *FlowRuntime) finish() {
 		if f.cancel != nil {
 			f.cancel()
 		}
-		_ = f.egressLease.release()
+		_ = f.releaseCurrentLease()
 	})
 }
 
@@ -703,6 +855,7 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 	}
 	deleteKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
 	migratedMaps := []*bpfObjects(nil)
+	flowEpoch := flow.Binding().Route.PolicyEpoch
 
 	m.generationsMu.Lock()
 	current, loaded := m.flows.LoadAndDelete(flow.ingress)
@@ -721,7 +874,7 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 		}
 
 		m.tcpCount.Add(-1)
-		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
+		m.releaseGenerationLocked(flowEpoch)
 
 		for i := range int(flow.pinKeyCount) {
 			key := flow.pinKeys[i]
@@ -735,32 +888,110 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 			refShard.unpin(flow.redirectKey)
 		}
 		migratedMaps = flow.migratedBpf
+		flow.migratedBpf = nil
 	}
 	m.generationsMu.Unlock()
 
 	if len(deleteKeys) > 0 {
+		var seenPtrs map[*ebpf.Map]struct{}
+		var seenIDs map[ebpf.MapID]struct{}
+		var primaryMap *ebpf.Map
+		var primaryID ebpf.MapID
+		var primaryHasID bool
+
 		m.udpStateMu.RLock()
 		if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
-			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
+			primaryMap = bpf.ConnStateMap
+			primaryID, primaryHasID = connStateMapID(primaryMap)
+			m.markConnStateClosingOrDelete(primaryMap, deleteKeys)
 		}
 		m.udpStateMu.RUnlock()
-	}
-	// Also scrub every map this flow was migrated into. The refcounts
-	// for these keys were already unwound above, so we only need to
-	// physically remove the entries from the migrated maps.
-	for _, bpf := range migratedMaps {
-		if bpf != nil && bpf.ConnStateMap != nil {
-			migrateKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
-			for i := range int(flow.pinKeyCount) {
-				migrateKeys = append(migrateKeys, flow.pinKeys[i])
+
+		// Also scrub or cool down any distinct conn_state_map this flow was
+		// migrated into. Always use deleteKeys (unpinned refcounts only) and
+		// skip maps aliasing primaryMap (e.g. FreshDatapathState shared-map reload)
+		// so a proxied closing entry is never prematurely deleted.
+		for _, bpf := range migratedMaps {
+			if bpf == nil || bpf.ConnStateMap == nil {
+				continue
 			}
-			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, migrateKeys)
+			cm := bpf.ConnStateMap
+			if cm == primaryMap {
+				continue
+			}
+			cmID, hasID := connStateMapID(cm)
+			if primaryHasID && hasID && cmID == primaryID {
+				continue
+			}
+			if seenPtrs == nil {
+				seenPtrs = make(map[*ebpf.Map]struct{}, len(migratedMaps))
+				seenIDs = make(map[ebpf.MapID]struct{}, len(migratedMaps))
+			}
+			if _, ok := seenPtrs[cm]; ok {
+				continue
+			}
+			if hasID {
+				if _, ok := seenIDs[cmID]; ok {
+					continue
+				}
+				seenIDs[cmID] = struct{}{}
+			}
+			seenPtrs[cm] = struct{}{}
+			m.markConnStateClosingOrDelete(cm, deleteKeys)
 		}
 	}
 	if flow.cancel != nil {
 		flow.cancel()
 	}
-	_ = flow.egressLease.release()
+	_ = flow.releaseCurrentLease()
+}
+
+func connStateMapID(m *ebpf.Map) (ebpf.MapID, bool) {
+	if m == nil {
+		return 0, false
+	}
+	info, err := m.Info()
+	if err != nil || info == nil {
+		return 0, false
+	}
+	return info.ID()
+}
+
+// markConnStateClosingOrDelete transitions non-direct proxied TCP entries into
+// TCP_STATE_CLOSING with a refreshed monotonic timestamp so conn_state_janitor
+// retires them after tcpConnStateTimeoutClosing, preventing trailing ACK/FIN/RST
+// packets sent immediately after relay teardown from leaking to WAN (dae#1165).
+// Unrouted or OUTBOUND_DIRECT entries are deleted immediately to save map space.
+func (m *SessionManager) markConnStateClosingOrDelete(connMap *ebpf.Map, keys []bpfTuplesKey) {
+	store := m.connStateStore(connMap)
+	if store == nil || len(keys) == 0 {
+		return
+	}
+	nowNs, err := m.connStateNowNs()
+	hasNow := err == nil
+
+	var directDeleteKeys []bpfTuplesKey
+	for _, key := range keys {
+		if m.pinnedShards[tuplesShardIndex(&key)].has(key) {
+			continue
+		}
+		var state bpfConnState
+		if err := store.LookupConnState(&key, &state); err != nil {
+			continue
+		}
+		if state.Meta.Data.HasRouting != 0 && state.Meta.Data.Outbound != uint8(consts.OutboundDirect) {
+			state.State = tcpConnStateClosing
+			if hasNow && nowNs > state.LastSeenNs {
+				state.LastSeenNs = nowNs
+			}
+			_ = store.UpdateConnState(&key, &state, ebpf.UpdateExist)
+			continue
+		}
+		directDeleteKeys = append(directDeleteKeys, key)
+	}
+	if len(directDeleteKeys) > 0 {
+		_, _ = store.BatchDeleteConnState(directDeleteKeys)
+	}
 }
 
 func (m *SessionManager) retainGenerationLocked(epoch routing.PolicyEpoch) {
@@ -1068,8 +1299,8 @@ func (f *FlowRuntime) abort() error {
 				errs = append(errs, closeErr)
 			}
 		}
-		if f.egress != nil {
-			if closeErr := f.egress.Close(); closeErr != nil && !commonerrors.IsClosedConnection(closeErr) {
+		if egress := f.Egress(); egress != nil {
+			if closeErr := egress.Close(); closeErr != nil && !commonerrors.IsClosedConnection(closeErr) {
 				errs = append(errs, closeErr)
 			}
 		}
@@ -1079,25 +1310,38 @@ func (f *FlowRuntime) abort() error {
 	return err
 }
 
-// migrate transfers a TCP flow from its current generation to a new one
-// without closing the underlying sockets. It re-pins BPF conn_state_map
-// entries, swaps the egress lease, and updates the generation tracking so
-// that the flow survives a same-port reload. On failure the flow is left
-// untouched so the caller can fall back to abort.
-//
-// The migration is transactional: if re-pinning fails the flow keeps its
-// original lease and epoch, and the new bpfObjects does not retain stale
-// entries. Once the generation tracking has moved to the new epoch the
-// migration has committed and the old lease is released.
-func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *egressRuntimeLease, newOutbound *outbound.DialerGroup, newEpoch routing.PolicyEpoch) error {
+// migrateWithRuntime transfers a TCP flow from its current generation to a new
+// one without closing the underlying kernel sockets. Holding egressMu
+// serializes the transfer against early TLS replay so the new lease always
+// matches the flow's live dialer.
+func (f *FlowRuntime) migrateWithRuntime(
+	m *SessionManager,
+	oldEpoch, newEpoch routing.PolicyEpoch,
+	newBpf *bpfObjects,
+	newRuntime *egressRuntime,
+) (migrated bool, leaseUnavailable bool) {
 	if f == nil {
-		return nil
+		return false, false
 	}
-	var err error
-	f.migrateOnce.Do(func() {
-		oldEpoch := f.binding.Route.PolicyEpoch
-		oldLease := f.egressLease
+	f.egressMu.Lock()
+	if f.egressClosed.Load() {
+		f.egressMu.Unlock()
+		return false, false
+	}
+	cur := f.egressState.Load()
+	if cur == nil || cur.binding.Route.PolicyEpoch != oldEpoch {
+		f.egressMu.Unlock()
+		return false, false
+	}
+	newLease, retainedGroup := newRuntime.transferLease(cur.lease)
+	if newLease == nil {
+		f.egressMu.Unlock()
+		return false, true
+	}
 
+	var didMigrate bool
+	f.migrateOnce.Do(func() {
+		didMigrate = true
 		// Step 1: BPF re-pin. Failures here are non-fatal — the flow can
 		// still relay via userspace — so we proceed even if no entries
 		// were copied. Successful pins are tracked for cleanup on finish.
@@ -1107,9 +1351,10 @@ func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *e
 
 		// Step 2: Bind the new lease before releasing the old one. This
 		// keeps the dialer reference count monotonic across the swap.
-		f.egressLease = newLease
-		if newOutbound != nil {
-			f.binding.Egress.Outbound = newOutbound
+		next := *cur
+		next.lease = newLease
+		if retainedGroup != nil {
+			next.binding.Egress.Outbound = retainedGroup
 		}
 
 		// Step 3: Move the flow from the old generation to the new one.
@@ -1120,18 +1365,21 @@ func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *e
 		// MigrateGeneration epoch filters and the counter table.
 		m.generationsMu.Lock()
 		m.releaseGenerationLocked(oldEpoch)
-		f.binding.Route.PolicyEpoch = newEpoch
+		next.binding.Route.PolicyEpoch = newEpoch
 		m.retainGenerationLocked(newEpoch)
+		f.egressState.Store(&next)
 		m.generationsMu.Unlock()
-
-		// Commit complete: drop the old lease now that the new one is
-		// bound and the flow is tracked by the new generation.
-		if oldLease != nil {
-			_ = oldLease.release()
-		}
-		err = nil
 	})
-	return err
+	f.egressMu.Unlock()
+
+	if didMigrate {
+		if cur.lease != nil {
+			_ = cur.lease.release()
+		}
+		return true, false
+	}
+	_ = newLease.release()
+	return false, true
 }
 
 // repinConnStateMapsForRollback is the rollback-aware variant of
@@ -1190,7 +1438,7 @@ func (m *SessionManager) AbortGeneration(epoch routing.PolicyEpoch) error {
 	m.generationsMu.Lock()
 	m.flows.Range(func(_, v any) bool {
 		flow := v.(*FlowRuntime)
-		if flow.binding.Route.PolicyEpoch == epoch {
+		if flow.Binding().Route.PolicyEpoch == epoch {
 			flows = append(flows, flow)
 		}
 		return true
@@ -1242,7 +1490,7 @@ func (m *SessionManager) MigrateGeneration(
 	var flows []*FlowRuntime
 	m.flows.Range(func(_, v any) bool {
 		flow := v.(*FlowRuntime)
-		if flow.binding.Route.PolicyEpoch == oldEpoch {
+		if flow.Binding().Route.PolicyEpoch == oldEpoch {
 			flows = append(flows, flow)
 		}
 		return true
@@ -1250,23 +1498,12 @@ func (m *SessionManager) MigrateGeneration(
 	m.generationsMu.Unlock()
 
 	for _, flow := range flows {
-		// Try to acquire an equivalent lease from the new runtime so the
-		// flow's dialer reference does not keep the old generation alive.
-		newLease, retainedGroup := newRuntime.transferLease(flow.egressLease)
-		if newLease == nil {
+		ok, leaseMiss := flow.migrateWithRuntime(m, oldEpoch, newEpoch, newBpf, newRuntime)
+		if ok {
+			migrated++
+		} else if leaseMiss {
 			remaining++
-			continue
 		}
-		if err := flow.migrate(m, newBpf, newLease, retainedGroup, newEpoch); err != nil {
-			// Migration failed: put back the lease and leave the flow
-			// untouched. The caller may drain/abort it separately.
-			if newLease != nil {
-				_ = newLease.release()
-			}
-			remaining++
-			continue
-		}
-		migrated++
 	}
 	return migrated, remaining
 }

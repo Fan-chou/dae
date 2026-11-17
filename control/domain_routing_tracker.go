@@ -111,22 +111,43 @@ func orDomainRoutingBitmap(dst *bpfDomainRouting, src bpfDomainRouting) {
 func mergeDomainRoutingIPOwners(owners map[string]domainRoutingIPOwner) bpfDomainRouting {
 	var merged bpfDomainRouting
 	var seen domainRoutingFingerprint
+	var firstBitmap [len(merged.Bitmap)]uint32
+	seenBitmap := false
+	bitmapsMatch := true
 	seenValid := false
 	ambiguous := false
+	anyIdentitySensitive := false
+	validCount := 0
 	for _, owner := range owners {
 		orDomainRoutingBitmap(&merged, owner.bitmap)
+		if !seenBitmap {
+			firstBitmap = owner.bitmap.Bitmap
+			seenBitmap = true
+		} else if owner.bitmap.Bitmap != firstBitmap {
+			bitmapsMatch = false
+		}
 		if !owner.fingerprint.valid {
 			continue
+		}
+		validCount++
+		if owner.fingerprint.identitySensitive {
+			anyIdentitySensitive = true
 		}
 		if !seenValid {
 			seen = owner.fingerprint
 			seenValid = true
 			continue
 		}
-		if owner.fingerprint != seen ||
-			seen.identitySensitive || owner.fingerprint.identitySensitive {
+		if owner.fingerprint != seen {
 			ambiguous = true
 		}
+	}
+	// Multiple owners sharing an IP only diverge under identity-sensitive rules
+	// when their compiled routing bitmaps differ; identical bitmaps with equal
+	// dest-only fingerprints select the exact same eBPF route() branch regardless
+	// of port, L4 protocol, or source identity.
+	if validCount > 1 && anyIdentitySensitive && !bitmapsMatch {
+		ambiguous = true
 	}
 	if ambiguous {
 		merged.Ambiguous = 1

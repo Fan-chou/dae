@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
@@ -239,6 +240,14 @@ func NewDialerGroupWithRuntimeOptions(
 		siteSticky:         newSiteStickyTable(),
 		siteStickyUDP:      newSiteStickyTable(),
 	}
+	groupWeak := weak.Make(group)
+	notifyKernelDirect := func() {
+		if owner := groupWeak.Value(); owner != nil {
+			owner.republishKernelAlive()
+		}
+	}
+	group.siteSticky.setKernelDirectChangeCallback(notifyKernelDirect)
+	group.siteStickyUDP.setKernelDirectChangeCallback(notifyKernelDirect)
 	group.initStickyRecoveryLog()
 	group.quality = newQualityRuntime(name, runtimeOptions.Quality, log)
 	group.hasQuality = group.quality != nil
@@ -768,12 +777,6 @@ func (g *DialerGroup) KernelFastPathDirect(networkType *dialer.NetworkType) bool
 	if g == nil || networkType == nil {
 		return false
 	}
-	// Per-site stickiness lives in userspace Select. If a non-DIRECT member is
-	// still admitted (Alive or Degraded), new connections must reach userspace
-	// so a congested proxy is not bypassed by a group-level DIRECT win.
-	if g.usesSiteSticky() && g.hasAdmittedNonDirectLeaf(networkType) {
-		return false
-	}
 	d, _, _, stable, err := g.selectWithExclusionResult(networkType, true, nil, false, "", nil)
 	if err != nil || !stable || !isBuiltinDirectDialer(d) {
 		return false
@@ -788,15 +791,113 @@ func (g *DialerGroup) stickySubtreeBlocksKernelDirect(selected *dialer.Dialer, n
 	if g == nil || networkType == nil {
 		return false
 	}
-	// Any sticky subtree with an admitted proxy can change the parent
-	// competition once a site pin is applied. Do not require the current
-	// group-level DIRECT leaf to be a member of that subtree: a sibling
-	// fallback/url_test pin can still beat DIRECT in userspace Select.
 	if g.usesSiteSticky() && g.hasAdmittedNonDirectLeaf(networkType) {
-		return true
+		if g.GetSelectionPolicy() != consts.DialerSelectionPolicy_Fallback {
+			return true
+		}
+		if g.quality != nil && g.quality.options.Mode == "enforce" && networkType.L4Proto == consts.L4ProtoStr_TCP {
+			return true
+		}
+		if !g.fallbackDirectIsUnconditionalPrimary(selected, networkType) {
+			return true
+		}
+		if g.stickyTable(networkType).hasBlockingKernelDirectEntry(g.now()) {
+			return true
+		}
 	}
 	for _, member := range g.nestedMembersAffectingKernelDirect(selected, networkType) {
 		if member.group != nil && member.group.stickySubtreeBlocksKernelDirect(selected, networkType) {
+			return true
+		}
+	}
+	return false
+}
+
+// fallbackDirectIsUnconditionalPrimary reports whether DIRECT is the rank-0
+// alive primary of a Policy_Fallback group ahead of every admitted proxy leaf.
+// When DIRECT only won because a higher-ranked proxy was degraded, userspace
+// site-sticky must still govern connections so KernelFastPathDirect stays false.
+func (g *DialerGroup) fallbackDirectIsUnconditionalPrimary(selected *dialer.Dialer, networkType *dialer.NetworkType) bool {
+	if g == nil || networkType == nil || selected == nil || !isBuiltinDirectDialer(selected) {
+		return false
+	}
+	if g.GetSelectionPolicy() != consts.DialerSelectionPolicy_Fallback {
+		return false
+	}
+	if selected.FallbackAdmission(networkType) != dialer.AdmissionAlive {
+		return false
+	}
+	if len(g.nestedMembers) > 0 {
+		for _, member := range g.nestedMembers {
+			d, _, _, stable, err := g.selectNestedMember(networkType, consts.DialerSelectionPolicy_Fallback, member, nil, false, false, "", false, nil)
+			if err != nil || d == nil {
+				continue
+			}
+			if !stable || !isBuiltinDirectDialer(d) || d.FallbackAdmission(networkType) != dialer.AdmissionAlive {
+				return false
+			}
+			return member.group == nil || !member.group.stickySubtreeBlocksKernelDirect(d, networkType)
+		}
+		return false
+	}
+	for _, d := range g.Dialers {
+		if d == nil || !g.leafSelectable(d, networkType) {
+			continue
+		}
+		if isBuiltinDirectDialer(d) {
+			return d.FallbackAdmission(networkType) == dialer.AdmissionAlive
+		}
+		return false
+	}
+	return false
+}
+
+// HasAlternativeDialer reports whether this group can currently select an
+// admitted leaf other than excluded for the given networkType without forcing
+// a fixed group off its selected member.
+func (g *DialerGroup) HasAlternativeDialer(excluded *dialer.Dialer, nt *dialer.NetworkType) bool {
+	if g == nil || excluded == nil || nt == nil {
+		return false
+	}
+	return g.selectableContainsOtherThan(excluded, nt)
+}
+
+func (g *DialerGroup) selectableContainsOtherThan(excluded *dialer.Dialer, nt *dialer.NetworkType) bool {
+	if g == nil || nt == nil {
+		return false
+	}
+	if len(g.nestedMembers) > 0 {
+		if g.CurrentSelectionPolicy().Policy == consts.DialerSelectionPolicy_Fixed {
+			idx := g.CurrentSelectionPolicy().FixedIndex
+			if idx < 0 || idx >= len(g.nestedMembers) {
+				return false
+			}
+			member := g.nestedMembers[idx]
+			if member.group != nil {
+				return member.group.selectableContainsOtherThan(excluded, nt)
+			}
+			return member.dialer != nil && member.dialer != excluded && g.leafSelectable(member.dialer, nt)
+		}
+		for _, member := range g.nestedMembers {
+			if member.group != nil && member.group.selectableContainsOtherThan(excluded, nt) {
+				return true
+			}
+			if member.dialer != nil && member.dialer != excluded && g.leafSelectable(member.dialer, nt) {
+				return true
+			}
+		}
+		return false
+	}
+	if g.CurrentSelectionPolicy().Policy == consts.DialerSelectionPolicy_Fixed {
+		idx := g.CurrentSelectionPolicy().FixedIndex
+		if idx < 0 || idx >= len(g.Dialers) {
+			return false
+		}
+		d := g.Dialers[idx]
+		return d != nil && d != excluded && g.leafSelectable(d, nt)
+	}
+	for _, d := range g.Dialers {
+		if d != nil && d != excluded && g.leafSelectable(d, nt) {
 			return true
 		}
 	}

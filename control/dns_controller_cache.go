@@ -786,6 +786,7 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 		// to mutate it in place, so this avoids the extra request copy on the
 		// remaining TTL-aware cache-hit fallback.
 		if resp = cache.fillIntoWithTTLInPlace(msg, now); resp != nil {
+			c.triggerBpfUpdateIfNeeded(cache, now)
 			return resp, false
 		}
 		return nil, false
@@ -802,6 +803,7 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 			if cache.refreshing.CompareAndSwap(false, true) {
 				needRefresh = true
 			}
+			c.triggerBpfUpdateIfNeeded(cache, now)
 			return resp, needRefresh
 		}
 	}

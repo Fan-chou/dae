@@ -19,18 +19,30 @@ import (
 // write through this method. Kernel offload is attempted before wrapping.
 type qualityWriteConn struct {
 	netproxy.Conn
-	flow *outbound.QualityFlow
+	flow    *outbound.QualityFlow
+	runtime *FlowRuntime
+}
+
+func (c *qualityWriteConn) activeQualityFlow() *outbound.QualityFlow {
+	if c.runtime != nil {
+		return c.runtime.currentQuality()
+	}
+	return c.flow
 }
 
 func (c *qualityWriteConn) Write(p []byte) (int, error) {
-	if !c.flow.MeasureWrites() {
+	q := c.activeQualityFlow()
+	if q == nil {
+		return c.Conn.Write(p)
+	}
+	if !q.MeasureWrites() {
 		n, err := c.Conn.Write(p)
-		c.flow.ObserveWrite(n, 0)
+		q.ObserveWrite(n, 0)
 		return n, err
 	}
 	start := time.Now()
 	n, err := c.Conn.Write(p)
-	c.flow.ObserveWrite(n, time.Since(start))
+	q.ObserveWrite(n, time.Since(start))
 	return n, err
 }
 func (c *qualityWriteConn) CloseWrite() error { closeWriteRelayConn(c.Conn); return nil }
@@ -55,11 +67,12 @@ func localQualityOptions(g config.Group, w *quality.ModelWorker) outbound.Qualit
 type qualityRelayCopyEngine struct {
 	ingress netproxy.Conn
 	flow    *outbound.QualityFlow
+	runtime *FlowRuntime
 }
 
 func (e qualityRelayCopyEngine) Copy(ctx context.Context, dst, src netproxy.Conn, record, onActive func(int64)) (int64, error) {
 	if dst == e.ingress && !shouldUseRelayFastPath(dst, src) {
-		dst = &qualityWriteConn{Conn: dst, flow: e.flow}
+		dst = &qualityWriteConn{Conn: dst, flow: e.flow, runtime: e.runtime}
 	}
 	return (defaultRelayCopyEngine{}).Copy(ctx, dst, src, record, onActive)
 }

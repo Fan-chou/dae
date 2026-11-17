@@ -31,8 +31,9 @@ type proxyDialParam struct {
 	Src          netip.AddrPort
 	Dest         netip.AddrPort
 	Mark         uint32
-	Network      string         // e.g. "tcp", "udp"
-	Excluded     *dialer.Dialer // Dialer to exclude in selection
+	Network      string                      // e.g. "tcp", "udp"
+	Excluded     *dialer.Dialer              // Dialer to exclude in selection
+	ExcludedSet  map[*dialer.Dialer]struct{} // Additional dialers excluded during TLS handshake replay
 	// Inbound is the consts.InboundID of the user-space inbound the flow
 	// entered through; 0 for transparent traffic.
 	Inbound uint32
@@ -272,12 +273,12 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	strictIpVersion := dialIp
-	d, _, admissionNetworkType, selectPath, qualityFlow, err := outbound.SelectWithQuality(selectionNetworkType, strictIpVersion, p.Excluded, stickySite)
+	d, _, admissionNetworkType, selectPath, qualityFlow, err := outbound.SelectWithSkipQuality(selectionNetworkType, strictIpVersion, p.Excluded, p.ExcludedSet, stickySite)
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
-		d, _, admissionNetworkType, selectPath, qualityFlow, err = outbound.SelectWithQuality(altType, false, p.Excluded, stickySite)
+		d, _, admissionNetworkType, selectPath, qualityFlow, err = outbound.SelectWithSkipQuality(altType, false, p.Excluded, p.ExcludedSet, stickySite)
 		if err == nil {
 			selectionNetworkType = altType
 		}

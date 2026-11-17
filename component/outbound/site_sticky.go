@@ -61,16 +61,32 @@ type siteStickyTable struct {
 	mu                                      sync.Mutex
 	detached                                bool
 	entries                                 map[string]*siteStickyEntry
+	blockingKeys                            map[string]struct{}
+	kernelDirectBlocked                     bool
+	onKernelDirectChange                    func()
 	liveLRU                                 *list.List
 	deadLRU                                 *list.List
 }
 
 func newSiteStickyTable() *siteStickyTable {
 	return &siteStickyTable{
-		entries: make(map[string]*siteStickyEntry),
-		liveLRU: list.New(),
-		deadLRU: list.New(),
+		entries:      make(map[string]*siteStickyEntry),
+		blockingKeys: make(map[string]struct{}),
+		liveLRU:      list.New(),
+		deadLRU:      list.New(),
 	}
+}
+
+func (t *siteStickyTable) setKernelDirectChangeCallback(cb func()) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.detached {
+		return
+	}
+	t.onKernelDirectChange = cb
 }
 
 func (t *siteStickyTable) detach() {
@@ -81,6 +97,9 @@ func (t *siteStickyTable) detach() {
 	defer t.mu.Unlock()
 	t.detached = true
 	t.entries = nil
+	t.blockingKeys = nil
+	t.kernelDirectBlocked = false
+	t.onKernelDirectChange = nil
 	t.liveLRU = nil
 	t.deadLRU = nil
 }
@@ -593,11 +612,21 @@ func (t *siteStickyTable) pin(site string, d *dialer.Dialer, now time.Time, slow
 	if key == "" || d == nil {
 		return
 	}
+	var notify func()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
 	if t.detached {
 		return
 	}
+	defer func() {
+		t.syncBlockingKeyLocked(key, t.entries[key], now)
+		notify = t.finishMutationLocked()
+	}()
 	entry := t.lookupLocked(key, now)
 	if entry == nil {
 		t.evictLocked(now)
@@ -650,11 +679,21 @@ func (t *siteStickyTable) fail(site string, d *dialer.Dialer, now time.Time) {
 	if key == "" || d == nil {
 		return
 	}
+	var notify func()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
 	if t.detached {
 		return
 	}
+	defer func() {
+		t.syncBlockingKeyLocked(key, t.entries[key], now)
+		notify = t.finishMutationLocked()
+	}()
 	entry := t.lookupLocked(key, now)
 	if entry == nil {
 		t.evictLocked(now)
@@ -711,6 +750,74 @@ func (e *siteStickyEntry) hasActiveHoldDown(now time.Time) bool {
 	return false
 }
 
+// blocksKernelDirect reports whether a site entry currently overrides a
+// DIRECT primary leaf—either via an active non-DIRECT pin or an active
+// hold-down against builtin DIRECT.
+func (e *siteStickyEntry) blocksKernelDirect(now time.Time) bool {
+	if e == nil {
+		return false
+	}
+	if e.leaf != nil && !isBuiltinDirectDialer(e.leaf) {
+		return true
+	}
+	for d, until := range e.holdDownUntil {
+		if now.Before(until) && isBuiltinDirectDialer(d) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *siteStickyTable) syncBlockingKeyLocked(key string, entry *siteStickyEntry, now time.Time) {
+	if t == nil || t.detached || key == "" {
+		return
+	}
+	if entry != nil && entry.blocksKernelDirect(now) {
+		if t.blockingKeys == nil {
+			t.blockingKeys = make(map[string]struct{})
+		}
+		t.blockingKeys[key] = struct{}{}
+		return
+	}
+	delete(t.blockingKeys, key)
+}
+
+func (t *siteStickyTable) finishMutationLocked() func() {
+	if t == nil || t.detached {
+		return nil
+	}
+	nowBlocked := len(t.blockingKeys) > 0
+	if nowBlocked == t.kernelDirectBlocked {
+		return nil
+	}
+	t.kernelDirectBlocked = nowBlocked
+	return t.onKernelDirectChange
+}
+
+func (t *siteStickyTable) hasBlockingKernelDirectEntry(now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	if t.detached || len(t.blockingKeys) == 0 {
+		t.kernelDirectBlocked = false
+		t.mu.Unlock()
+		return false
+	}
+	for key := range t.blockingKeys {
+		entry := t.lookupLocked(key, now)
+		if entry != nil && entry.blocksKernelDirect(now) {
+			t.kernelDirectBlocked = true
+			t.mu.Unlock()
+			return true
+		}
+		delete(t.blockingKeys, key)
+	}
+	t.kernelDirectBlocked = false
+	t.mu.Unlock()
+	return false
+}
+
 func (t *siteStickyTable) lookupLocked(key string, now time.Time) *siteStickyEntry {
 	if t == nil || t.detached || t.entries == nil || key == "" {
 		return nil
@@ -758,6 +865,7 @@ func (t *siteStickyTable) removeLocked(key string) {
 		t.unlinkLocked(entry)
 	}
 	delete(t.entries, key)
+	delete(t.blockingKeys, key)
 }
 
 func (t *siteStickyTable) touchLocked(key string, entry *siteStickyEntry) {
@@ -830,11 +938,21 @@ func (t *siteStickyTable) reclaim(site string, d *dialer.Dialer, now time.Time) 
 	if key == "" {
 		return
 	}
+	var notify func()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
 	if t.detached {
 		return
 	}
+	defer func() {
+		t.syncBlockingKeyLocked(key, t.entries[key], now)
+		notify = t.finishMutationLocked()
+	}()
 	entry := t.lookupLocked(key, now)
 	if entry == nil {
 		return
@@ -859,8 +977,21 @@ func (t *siteStickyTable) hit(site string, excluded *dialer.Dialer, now time.Tim
 	if key == "" {
 		return nil, nil, false
 	}
+	var notify func()
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer func() {
+		t.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
+	if t.detached {
+		return nil, nil, false
+	}
+	defer func() {
+		t.syncBlockingKeyLocked(key, t.entries[key], now)
+		notify = t.finishMutationLocked()
+	}()
 	entry := t.lookupLocked(key, now)
 	if entry == nil || entry.leaf == nil {
 		return nil, t.holdDownExcludeLocked(entry, excluded, now), false

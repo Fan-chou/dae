@@ -81,7 +81,8 @@ func testSpliceCaptureLiveAccounting(t *testing.T, upload bool) {
 		t.Fatal("isolated flow registration failed")
 	}
 	captured.Userspace()
-	f := &FlowRuntime{binding: TcpFlowBinding{Egress: TcpEgressBinding{Dialer: d}}}
+	f := &FlowRuntime{initialEgressState: tcpEgressRuntimeState{binding: TcpFlowBinding{Egress: TcpEgressBinding{Dialer: d}}}}
+	f.egressState.Store(&f.initialEgressState)
 	f.capture.Store(captured)
 	const chunk = 256 << 10
 	const chunks = 80

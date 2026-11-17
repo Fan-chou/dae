@@ -158,6 +158,32 @@ func TestDomainRoutingTrackerIdentitySensitiveMarksAmbiguous(t *testing.T) {
 	}
 }
 
+func TestDomainRoutingTrackerIdentitySensitiveSameBitmapNotAmbiguous(t *testing.T) {
+	tracker := newDomainRoutingTracker()
+	sharedBitmap := domainRoutingBitmap(0x5)
+	cacheA := domainRoutingACache("a.example.:1", "203.0.113.78", sharedBitmap)
+	cacheB := domainRoutingACache("b.example.:1", "203.0.113.78", sharedBitmap)
+	sameSensitive := domainRoutingFingerprint{
+		outbound:          consts.OutboundDirect,
+		identitySensitive: true,
+		valid:             true,
+	}
+
+	if err := projectDomainRoutingWithFingerprint(tracker, 0, cacheA, sameSensitive); err != nil {
+		t.Fatalf("project A: %v", err)
+	}
+	if err := projectDomainRoutingWithFingerprint(tracker, 0, cacheB, sameSensitive); err != nil {
+		t.Fatalf("project B: %v", err)
+	}
+	merged := requireTrackerMerged(t, tracker, cacheA)
+	if merged.Bitmap[0] != 0x5 {
+		t.Fatalf("merged bitmap = %#x, want 0x5", merged.Bitmap[0])
+	}
+	if merged.Ambiguous != 0 {
+		t.Fatalf("ambiguous = %d, want 0 when owners share identical bitmap and dest-only fingerprint", merged.Ambiguous)
+	}
+}
+
 func TestDomainRoutingTrackerIdentitySensitiveAttachedFromMatcher(t *testing.T) {
 	matcher := l4SplitConflictMatcher()
 	core := &controlPlaneCore{}
