@@ -332,10 +332,12 @@ func TestTLSReplaySkipsIneligiblePathsAndOversizedOrNonTLSPayloads(t *testing.T)
 	}
 
 	// 3) Pre-sniffed HTTP prefix must skip wrapping completely.
+	httpPayload := []byte("GET / HTTP/1.1\r\nHost: plain.example\r\n\r\n")
 	p1HTTP, _ := newNamedProxyTestDialer("p1-http", "198.51.100.1:443", func(context.Context, string, string) (netproxy.Conn, error) {
 		e, s := net.Pipe()
 		go func() {
-			_, _ = io.ReadAll(s)
+			buf := make([]byte, len(httpPayload))
+			_, _ = io.ReadFull(s, buf)
 			_ = s.Close()
 		}()
 		return e, nil
@@ -349,13 +351,29 @@ func TestTLSReplaySkipsIneligiblePathsAndOversizedOrNonTLSPayloads(t *testing.T)
 	}
 	clientHTTP, ingressHTTP := net.Pipe()
 	defer clientHTTP.Close()
-	go func() { _, _ = clientHTTP.Write([]byte("GET / HTTP/1.1\r\nHost: plain.example\r\n\r\n")) }()
+	httpWriteDone := make(chan error, 1)
+	go func() {
+		_, writeErr := clientHTTP.Write(httpPayload)
+		httpWriteDone <- writeErr
+	}()
 	taskHTTP := prepareTLSReplayTask(t, m, cHTTP, ingressHTTP)
 	if _, isWrapped := taskHTTP.right.(*tlsReplayConn); isWrapped {
 		t.Fatal("pre-sniffed plain HTTP flow must not be wrapped by tlsReplayConn")
 	}
+	if writeErr := <-httpWriteDone; writeErr != nil {
+		t.Fatalf("write plain HTTP request: %v", writeErr)
+	}
 	_ = clientHTTP.Close()
-	_ = taskHTTP.run()
+	doneHTTP := make(chan error, 1)
+	go func() { doneHTTP <- taskHTTP.run() }()
+	select {
+	case err := <-doneHTTP:
+		if err != nil {
+			t.Fatalf("plain HTTP relay returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("plain HTTP test relay did not exit")
+	}
 	if raw2.calls.Load() != 0 {
 		t.Fatalf("p2 called %d times for plain HTTP, want 0", raw2.calls.Load())
 	}
