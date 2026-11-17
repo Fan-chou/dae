@@ -275,6 +275,113 @@ func TestReleaseFlowRespectsSharedPinAndMigratedMaps(t *testing.T) {
 	}
 }
 
+func TestReleaseFlowDeduplicatesMigratedMapAliasByMapID(t *testing.T) {
+	const nowNs uint64 = 90_000_000_000
+	primaryMap := &ebpf.Map{}
+	aliasedPrimaryMap := &ebpf.Map{}
+	distinctMigratedMap := &ebpf.Map{}
+	aliasedDistinctMap := &ebpf.Map{}
+
+	primaryStore := newFakeConnStateStore()
+	distinctStore := newFakeConnStateStore()
+	var opsCalls struct {
+		mu     sync.Mutex
+		counts map[*ebpf.Map]int
+	}
+	opsCalls.counts = make(map[*ebpf.Map]int)
+
+	manager := NewSessionManager(context.Background())
+	defer manager.Close()
+	primaryBPF := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: primaryMap}}
+	aliasedPrimaryBPF := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: aliasedPrimaryMap}}
+	distinctBPF := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: distinctMigratedMap}}
+	aliasedDistinctBPF := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: aliasedDistinctMap}}
+
+	manager.udpBPF.Store(primaryBPF)
+	manager.testConnStateMapID = func(m *ebpf.Map) (ebpf.MapID, bool) {
+		switch m {
+		case primaryMap, aliasedPrimaryMap:
+			return ebpf.MapID(42), true
+		case distinctMigratedMap, aliasedDistinctMap:
+			return ebpf.MapID(99), true
+		default:
+			return 0, false
+		}
+	}
+	manager.testConnStateOps = func(m *ebpf.Map) bpfConnStateStore {
+		opsCalls.mu.Lock()
+		opsCalls.counts[m]++
+		opsCalls.mu.Unlock()
+		switch m {
+		case primaryMap, aliasedPrimaryMap:
+			return primaryStore
+		case distinctMigratedMap, aliasedDistinctMap:
+			return distinctStore
+		default:
+			return nil
+		}
+	}
+	manager.testMonotonicNow = func() (uint64, error) {
+		return nowNs, nil
+	}
+
+	runtime := newEgressRuntime(nil, nil)
+	defer runtime.releaseOwner()
+
+	src := netip.MustParseAddrPort("192.0.2.12:42010")
+	dst := netip.MustParseAddrPort("198.51.100.12:443")
+	key := bpfTuplesKeyFromAddrPorts(src, dst, unix.IPPROTO_TCP)
+
+	var proxiedVal bpfConnState
+	proxiedVal.LastSeenNs = 3_000_000_000
+	proxiedVal.SeenNonSyn = 1
+	proxiedVal.Meta.Data.HasRouting = 1
+	proxiedVal.Meta.Data.Outbound = uint8(consts.OutboundUserDefinedMin)
+	primaryStore.entries[key] = proxiedVal
+	distinctStore.entries[key] = proxiedVal
+
+	flow, err := manager.adoptTCP(&memoryLayoutConn{id: 250}, nil, TcpFlowBinding{}, runtime, []bpfTuplesKey{key}, src, dst)
+	if err != nil {
+		t.Fatalf("adoptTCP: %v", err)
+	}
+	flow.repinConnStateMapsForRollback(aliasedPrimaryBPF)
+	flow.repinConnStateMapsForRollback(distinctBPF)
+	flow.repinConnStateMapsForRollback(aliasedDistinctBPF)
+
+	opsCalls.mu.Lock()
+	clear(opsCalls.counts)
+	opsCalls.mu.Unlock()
+
+	flow.finish()
+
+	opsCalls.mu.Lock()
+	primaryCalls := opsCalls.counts[primaryMap]
+	aliasedPrimaryCalls := opsCalls.counts[aliasedPrimaryMap]
+	distinctCalls := opsCalls.counts[distinctMigratedMap]
+	aliasedDistinctCalls := opsCalls.counts[aliasedDistinctMap]
+	opsCalls.mu.Unlock()
+
+	if primaryCalls != 1 {
+		t.Fatalf("primaryMap ops calls = %d, want 1", primaryCalls)
+	}
+	if aliasedPrimaryCalls != 0 {
+		t.Fatalf("aliasedPrimaryMap ops calls = %d, want 0 (must skip MapID matching primary)", aliasedPrimaryCalls)
+	}
+	if distinctCalls != 1 || aliasedDistinctCalls != 0 {
+		t.Fatalf("distinct ops calls = (%d, alias=%d), want (1, 0)", distinctCalls, aliasedDistinctCalls)
+	}
+
+	for name, store := range map[string]*fakeConnStateStore{
+		"primary":  primaryStore,
+		"distinct": distinctStore,
+	} {
+		got, ok := store.get(key)
+		if !ok || got.State != tcpConnStateClosing || got.LastSeenNs != nowNs {
+			t.Fatalf("%s store state = %+v (exists=%v), want TCP_STATE_CLOSING at %d", name, got, ok, nowNs)
+		}
+	}
+}
+
 func TestReleaseFlowRealConnStateClosingAndJanitorExpire(t *testing.T) {
 	f := newReloadRetirementCleanupFixture(t)
 	f.manager.udpBPF.Store(f.plane.core.bpf.Load())

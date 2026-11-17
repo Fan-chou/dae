@@ -202,9 +202,10 @@ type SessionManager struct {
 	nextFlowID atomic.Uint64
 
 	// Test-only seam (nil in production) for exercising conn_state closing
-	// transitions and monotonic clock timestamps without privileged BPF maps.
-	testConnStateOps func(*ebpf.Map) bpfConnStateStore
-	testMonotonicNow func() (uint64, error)
+	// transitions, map-ID aliasing, and monotonic clock timestamps without privileged BPF maps.
+	testConnStateOps   func(*ebpf.Map) bpfConnStateStore
+	testConnStateMapID func(*ebpf.Map) (ebpf.MapID, bool)
+	testMonotonicNow   func() (uint64, error)
 }
 
 type bpfConnStateStore interface {
@@ -902,7 +903,6 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 		m.udpStateMu.RLock()
 		if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
 			primaryMap = bpf.ConnStateMap
-			primaryID, primaryHasID = connStateMapID(primaryMap)
 			m.markConnStateClosingOrDelete(primaryMap, deleteKeys)
 		}
 		m.udpStateMu.RUnlock()
@@ -911,6 +911,7 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 		// migrated into. Always use deleteKeys (unpinned refcounts only) and
 		// skip maps aliasing primaryMap (e.g. FreshDatapathState shared-map reload)
 		// so a proxied closing entry is never prematurely deleted.
+		primaryIDResolved := false
 		for _, bpf := range migratedMaps {
 			if bpf == nil || bpf.ConnStateMap == nil {
 				continue
@@ -919,7 +920,11 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 			if cm == primaryMap {
 				continue
 			}
-			cmID, hasID := connStateMapID(cm)
+			if !primaryIDResolved {
+				primaryID, primaryHasID = m.connStateMapID(primaryMap)
+				primaryIDResolved = true
+			}
+			cmID, hasID := m.connStateMapID(cm)
 			if primaryHasID && hasID && cmID == primaryID {
 				continue
 			}
@@ -946,11 +951,19 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 	_ = flow.releaseCurrentLease()
 }
 
-func connStateMapID(m *ebpf.Map) (ebpf.MapID, bool) {
-	if m == nil {
+func (m *SessionManager) connStateMapID(connMap *ebpf.Map) (ebpf.MapID, bool) {
+	if connMap == nil {
 		return 0, false
 	}
-	info, err := m.Info()
+	if m != nil {
+		if m.testConnStateMapID != nil {
+			return m.testConnStateMapID(connMap)
+		}
+		if m.testConnStateOps != nil {
+			return 0, false
+		}
+	}
+	info, err := connMap.Info()
 	if err != nil || info == nil {
 		return 0, false
 	}
@@ -1393,14 +1406,19 @@ func (f *FlowRuntime) repinConnStateMapsForRollback(newBpf *bpfObjects) []bpfTup
 	if oldBpf == nil || oldBpf.ConnStateMap == nil {
 		return nil
 	}
+	oldStore := f.manager.connStateStore(oldBpf.ConnStateMap)
+	newStore := f.manager.connStateStore(newBpf.ConnStateMap)
+	if oldStore == nil || newStore == nil {
+		return nil
+	}
 
 	var rePinned []bpfTuplesKey
 	for i := range int(f.pinKeyCount) {
 		var value bpfConnState
-		if err := oldBpf.ConnStateMap.Lookup(&f.pinKeys[i], &value); err != nil {
+		if err := oldStore.LookupConnState(&f.pinKeys[i], &value); err != nil {
 			continue
 		}
-		if err := newBpf.ConnStateMap.Update(&f.pinKeys[i], &value, ebpf.UpdateAny); err != nil {
+		if err := newStore.UpdateConnState(&f.pinKeys[i], &value, ebpf.UpdateAny); err != nil {
 			break
 		}
 		rePinned = append(rePinned, f.pinKeys[i])
