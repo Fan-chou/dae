@@ -113,7 +113,7 @@ require (
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
 // Published fork includes cancellable DATAGRAMs, queue observations and MTU-safe Initial packets.
-replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20261010024030-18f87d1c8c58
+replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-20261117013931-85c44dfd15e2
 
 //replace github.com/cilium/ebpf v0.22.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /path/to/antlrProjects/dae-config/build/go/dae_config
@@ -129,4 +129,4 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026101
 // the SS2022 UDP replay-window shift fix, the hysteria2 FastOpen deadline
 // handling, the VMess request padding fill (pool residue used to be sent) and
 // the REALITY spiderX parse-error handling.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261020142427-17ab089ea888
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261117062026-9ae19d9e4423
