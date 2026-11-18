@@ -1936,7 +1936,7 @@ func TestLoadRejects304GenerationDriftAgainstCachedSnapshot(t *testing.T) {
 	}
 }
 
-func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) {
+func TestMultiProviderLoadAllowsUnversionedMixedFreshAndLastGoodFallback(t *testing.T) {
 	const (
 		aOldBody = "payload:\n  - a-old.example\n"
 		aNewBody = "payload:\n  - a-new.example\n"
@@ -1987,20 +1987,13 @@ func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) 
 	if _, err := loadWithOptions(context.Background(), []config.RuleProvider{providerB}, dir, http.DefaultClient, options); err != nil {
 		t.Fatalf("initial B-old load error = %v", err)
 	}
-	newRegistry, err := loadWithOptions(context.Background(), []config.RuleProvider{providerA}, dir, http.DefaultClient, options)
-	if err != nil {
-		t.Fatalf("independent A-new load error = %v", err)
-	}
-	if newRegistry[providerA.Name].Functions[0].Params[0].Val != "a-new.example" {
-		t.Fatalf("independent A-new registry = %#v, want A-new", newRegistry)
-	}
 
 	providers := []config.RuleProvider{providerA, providerB}
 	descriptorA := testCacheDescriptor(t, providerA, dir)
 	descriptorB := testCacheDescriptor(t, providerB, dir)
 	initialA, err := readCacheSnapshot(descriptorA)
 	if err != nil {
-		t.Fatalf("read A-new snapshot error = %v", err)
+		t.Fatalf("read A-old snapshot error = %v", err)
 	}
 	initialB, err := readCacheSnapshot(descriptorB)
 	if err != nil {
@@ -2008,34 +2001,22 @@ func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) 
 	}
 	initialAState, err := readCurrentState(descriptorA.root)
 	if err != nil {
-		t.Fatalf("read A-new current state error = %v", err)
+		t.Fatalf("read A-old current state error = %v", err)
 	}
 	initialBState, err := readCurrentState(descriptorB.root)
 	if err != nil {
 		t.Fatalf("read B-old current state error = %v", err)
 	}
-	if string(initialA.body) != aNewBody || string(initialB.body) != bOldBody || initialA.metadata.Generation != "" || initialB.metadata.Generation != "" {
-		t.Fatalf("last-good setup snapshots = A:%#v B:%#v, want unversioned A-new/B-old", initialA, initialB)
+	if string(initialA.body) != aOldBody || string(initialB.body) != bOldBody || initialA.metadata.Generation != "" || initialB.metadata.Generation != "" {
+		t.Fatalf("setup snapshots = A:%#v B:%#v, want unversioned A-old/B-old", initialA, initialB)
 	}
 
 	registry, loadErr := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options)
-	if loadErr == nil {
-		aValue, bValue := "<missing>", "<missing>"
-		if rules, ok := registry["a"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
-			aValue = rules.Functions[0].Params[0].Val
-		}
-		if rules, ok := registry["b"]; ok && len(rules.Functions) > 0 && len(rules.Functions[0].Params) > 0 {
-			bValue = rules.Functions[0].Params[0].Val
-		}
-		t.Fatalf("unversioned mixed last-good batch was accepted: a=%q b=%q registry=%#v", aValue, bValue, registry)
+	if loadErr != nil {
+		t.Fatalf("unversioned fresh + last-good batch failed: %v", loadErr)
 	}
-	if registry != nil {
-		t.Fatalf("unversioned mixed last-good batch returned registry with error: err=%v registry=%#v", loadErr, registry)
-	}
-	message := strings.ToLower(loadErr.Error())
-	if !strings.Contains(message, "batch") ||
-		(!strings.Contains(message, "consisten") && !strings.Contains(message, "fence") && !strings.Contains(message, "freshness") && !strings.Contains(message, "generation")) {
-		t.Fatalf("unversioned mixed last-good batch error = %v, want explicit batch consistency/fence error", loadErr)
+	if aGot, bGot := registry["a"].Functions[0].Params[0].Val, registry["b"].Functions[0].Params[0].Val; aGot != "a-new.example" || bGot != "b-old.example" {
+		t.Fatalf("registry = a:%q b:%q, want a-new.example and b-old.example", aGot, bGot)
 	}
 
 	afterA, err := readCacheSnapshot(descriptorA)
@@ -2054,11 +2035,11 @@ func TestMultiProviderLoadRejectsUnversionedMixedLastGoodFallback(t *testing.T) 
 	if err != nil {
 		t.Fatalf("read final B current state error = %v", err)
 	}
-	if !reflect.DeepEqual(afterA, initialA) || !reflect.DeepEqual(afterAState, initialAState) {
-		t.Fatalf("rejected unversioned mixed last-good batch changed A current/cache: initial=%#v/%#v after=%#v/%#v", initialAState, initialA, afterAState, afterA)
+	if string(afterA.body) != aNewBody || afterAState.target == initialAState.target {
+		t.Fatalf("A was not updated on disk: body=%q state=%#v (initial=%#v)", afterA.body, afterAState, initialAState)
 	}
 	if !reflect.DeepEqual(afterB, initialB) || !reflect.DeepEqual(afterBState, initialBState) {
-		t.Fatalf("rejected unversioned mixed last-good batch changed B current/cache: initial=%#v/%#v after=%#v/%#v", initialBState, initialB, afterBState, afterB)
+		t.Fatalf("unversioned mixed batch changed B last-good current/cache: initial=%#v/%#v after=%#v/%#v", initialBState, initialB, afterBState, afterB)
 	}
 }
 
@@ -3678,9 +3659,9 @@ func TestMultiProviderLoadPublishesPartialUnversionedUpdateAsOneBatch(t *testing
 	}
 }
 
-// A source that cannot be fetched is not a consistent member of the batch: the
-// last-good copy must never be published alongside fresh siblings.
-func TestMultiProviderLoadStillRejectsPartialUpdateWhenAProviderFellBackToLastGood(t *testing.T) {
+// An unversioned healthy sibling still publishes its update even when another
+// independent provider fails and keeps its last-good cache snapshot.
+func TestMultiProviderLoadUpdatesHealthyProviderWhenUnversionedSiblingUsesLastGood(t *testing.T) {
 	var mu sync.Mutex
 	bDown := false
 	version := 1
@@ -3708,16 +3689,38 @@ func TestMultiProviderLoadStillRejectsPartialUpdateWhenAProviderFellBackToLastGo
 		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
 		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
 	}
+	conf := stage4ARefreshConfigForProviders(providers...)
 	dir := t.TempDir()
-	options := loadOptions{allowPrivate: true}
-	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err != nil {
-		t.Fatalf("initial load error = %v", err)
+	opts := loadOptions{allowPrivate: true, reuseFresh: true, refreshGrace: true}
+	if _, _, err := refreshWithOptions(context.Background(), conf, dir, http.DefaultClient, opts); err != nil {
+		t.Fatalf("initial refresh error = %v", err)
 	}
 	mu.Lock()
 	bDown, version = true, 2
 	mu.Unlock()
-	if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, options); err == nil {
-		t.Fatal("a fresh provider was published next to a last-good fallback")
+	refreshReport, loadReport, err := refreshWithOptions(context.Background(), conf, dir, http.DefaultClient, opts)
+	if err != nil {
+		t.Fatalf("refresh with failing unversioned sibling = %v", err)
+	}
+	if !refreshReport.Changed || !refreshReport.UsedLastGood || !loadReport.UsedLastGood {
+		t.Fatalf("reports = %#v / %#v, want Changed=true and UsedLastGood=true", refreshReport, loadReport)
+	}
+	if loadReport.Warning == nil || !strings.Contains(loadReport.Warning.Error(), `"b"`) {
+		t.Fatalf("warning = %v, want provider b named", loadReport.Warning)
+	}
+	snapA, err := readCacheSnapshot(testCacheDescriptor(t, providers[0], dir))
+	if err != nil {
+		t.Fatalf("read snapshot A = %v", err)
+	}
+	snapB, err := readCacheSnapshot(testCacheDescriptor(t, providers[1], dir))
+	if err != nil {
+		t.Fatalf("read snapshot B = %v", err)
+	}
+	if string(snapA.body) != "payload:\n  - a2.example\n" {
+		t.Fatalf("snapshot A = %q, want a2.example", snapA.body)
+	}
+	if string(snapB.body) != "payload:\n  - b1.example\n" {
+		t.Fatalf("snapshot B = %q, want preserved b1.example", snapB.body)
 	}
 }
 
@@ -3814,6 +3817,168 @@ func TestPartialUnversionedPublishReportsOnlyContentChangesAndKeepsVersionsBound
 		}
 		if len(entries) > maxCacheVersions {
 			t.Fatalf("provider %s keeps %d versions after repeated publishes, want at most %d", provider.Name, len(entries), maxCacheVersions)
+		}
+	}
+}
+
+func TestBatchConsistencyAndWarningsNameAllFallbackProviders(t *testing.T) {
+	t.Run("unversioned-updates-healthy-and-names-all-fallback-providers", func(t *testing.T) {
+		var down atomic.Bool
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/a":
+				if down.Load() {
+					_, _ = fmt.Fprint(w, "payload:\n  - a2.example\n")
+					return
+				}
+				_, _ = fmt.Fprint(w, "payload:\n  - a1.example\n")
+			case "/b":
+				if down.Load() {
+					http.Error(w, "b down", http.StatusInternalServerError)
+					return
+				}
+				_, _ = fmt.Fprint(w, "payload:\n  - b1.example\n")
+			case "/c":
+				if down.Load() {
+					http.Error(w, "c down", http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = fmt.Fprint(w, "payload:\n  - c1.example\n")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		providers := []config.RuleProvider{
+			{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+			{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+			{Name: "c", Type: "http", URL: server.URL + "/c", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		}
+		dir := t.TempDir()
+		opts := loadOptions{allowPrivate: true}
+		conf := stage4ARefreshConfigForProviders(providers...)
+		if _, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, opts); err != nil {
+			t.Fatalf("initial load = %v", err)
+		}
+
+		down.Store(true)
+		conf = stage4ARefreshConfigForProviders(providers...)
+		report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, opts)
+		if err != nil {
+			t.Fatalf("unversioned mixed update error = %v, want healthy provider updated", err)
+		}
+		if !report.UsedLastGood || report.Warning == nil {
+			t.Fatalf("report = %#v, want UsedLastGood=true and Warning!=nil", report)
+		}
+		msg := report.Warning.Error()
+		for _, want := range []string{`"b"`, `"c"`, "500", "503"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("warning %q missing %s", msg, want)
+			}
+		}
+		snapA, err := readCacheSnapshot(testCacheDescriptor(t, providers[0], dir))
+		if err != nil || string(snapA.body) != "payload:\n  - a2.example\n" {
+			t.Fatalf("provider a snapshot = %q err=%v, want a2.example", snapA.body, err)
+		}
+		snapB, err := readCacheSnapshot(testCacheDescriptor(t, providers[1], dir))
+		if err != nil || string(snapB.body) != "payload:\n  - b1.example\n" {
+			t.Fatalf("provider b snapshot = %q err=%v, want b1.example", snapB.body, err)
+		}
+		snapC, err := readCacheSnapshot(testCacheDescriptor(t, providers[2], dir))
+		if err != nil || string(snapC.body) != "payload:\n  - c1.example\n" {
+			t.Fatalf("provider c snapshot = %q err=%v, want c1.example", snapC.body, err)
+		}
+	})
+
+	t.Run("versioned-generation-mismatch-names-all-fallback-providers", func(t *testing.T) {
+		var gen atomic.Bool
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/a":
+				if gen.Load() {
+					w.Header().Set(providerGenerationHeader, "G2")
+					_, _ = fmt.Fprint(w, "payload:\n  - a2.example\n")
+					return
+				}
+				w.Header().Set(providerGenerationHeader, "G1")
+				_, _ = fmt.Fprint(w, "payload:\n  - a1.example\n")
+			case "/b":
+				if gen.Load() {
+					http.Error(w, "b down", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set(providerGenerationHeader, "G1")
+				_, _ = fmt.Fprint(w, "payload:\n  - b1.example\n")
+			case "/c":
+				if gen.Load() {
+					http.Error(w, "c down", http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set(providerGenerationHeader, "G1")
+				_, _ = fmt.Fprint(w, "payload:\n  - c1.example\n")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		providers := []config.RuleProvider{
+			{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+			{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+			{Name: "c", Type: "http", URL: server.URL + "/c", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		}
+		dir := t.TempDir()
+		opts := loadOptions{allowPrivate: true}
+		if _, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, opts); err != nil {
+			t.Fatalf("initial versioned load = %v", err)
+		}
+
+		gen.Store(true)
+		_, err := loadWithOptions(context.Background(), providers, dir, http.DefaultClient, opts)
+		if err == nil {
+			t.Fatal("versioned generation mismatch returned nil error")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "generation mismatch") {
+			t.Fatalf("unexpected generation mismatch message: %q", msg)
+		}
+		for _, want := range []string{`"b"`, `"c"`, "500", "503"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("generation mismatch error %q missing %s", msg, want)
+			}
+		}
+	})
+}
+
+func TestPrepareProviderBatchReportsAllFailingProvidersInRound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/a":
+			_, _ = fmt.Fprint(w, "payload:\n  - a.example\n")
+		case "/b":
+			http.Error(w, "b failed", http.StatusInternalServerError)
+		case "/c":
+			http.Error(w, "c failed", http.StatusBadGateway)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	providers := []config.RuleProvider{
+		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+		{Name: "c", Type: "http", URL: server.URL + "/c", Behavior: "domain", Format: "yaml", MaxSize: 1024},
+	}
+	_, err := loadWithOptions(context.Background(), providers, t.TempDir(), http.DefaultClient, loadOptions{allowPrivate: true})
+	if err == nil {
+		t.Fatal("expected error for failing batch")
+	}
+	msg := err.Error()
+	for _, want := range []string{`rule provider "b"`, `rule provider "c"`, "500", "502"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("batch error %q missing %s", msg, want)
 		}
 	}
 }

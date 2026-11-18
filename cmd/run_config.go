@@ -23,6 +23,7 @@ import (
 	"github.com/daeuniverse/dae/component/ruleprovider"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/sirupsen/logrus"
 )
 
 func monotonicNowNano() uint64 {
@@ -290,14 +291,36 @@ func readConfigAtWithSnapshot(cfgFile string, mode readMode, snapshot *adminConf
 	if err != nil {
 		return nil, nil, err
 	}
+	coldStart := mode.tolerateMihomo && mode.cache == ruleprovider.CacheReuseFresh
 	if mode.cache != ruleprovider.CacheOnly {
-		loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), mode.fetchGeodata, mode.cache == ruleprovider.CacheReuseFresh)
+		loadGeodata(context.Background(), conf, filepath.Dir(cfgFile), mode.fetchGeodata, mode.cache == ruleprovider.CacheReuseFresh, coldStart)
 	}
 	// Taken before rule sets are expanded: after that there is one rule per
 	// entry, which is no longer something to read.
 	rememberEffectiveConfig(conf, buildEffectiveConfig(conf, merge))
-	if err := ruleprovider.LoadAndExpandCached(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, mode.cache); err != nil {
+	providerCacheMode := mode.cache
+	if coldStart {
+		providerCacheMode = ruleprovider.CacheColdStart
+	}
+	report, err := ruleprovider.LoadAndExpandCachedWithReport(context.Background(), conf, filepath.Dir(cfgFile), http.DefaultClient, providerCacheMode)
+	if mode.cache != ruleprovider.CacheOnly {
+		status := RuleProviderStatus{
+			CheckedAt:    time.Now(),
+			UsedLastGood: report.UsedLastGood,
+			Degraded:     report.Degraded,
+		}
+		if err != nil {
+			status.Error = err.Error()
+		} else if report.Warning != nil {
+			status.Error = report.Warning.Error()
+		}
+		setRuleProviderStatus(status)
+	}
+	if err != nil {
 		return nil, nil, fmt.Errorf("load native rule providers: %w", err)
+	}
+	if report.Warning != nil {
+		logrus.WithField("error", report.Warning.Error()).Warnln("[RuleProvider] Upstream rule provider issue; using cached/available rules and retrying")
 	}
 	return conf, includes, nil
 }
@@ -314,9 +337,10 @@ func emptyConfig() (conf *config.Config, err error) {
 }
 
 // loadGeodata makes the dat files named by the geodata section available. A
-// cold start fetches them; a reload only fills in what is missing, since the
-// refresh schedule keeps them current and a reload should not wait on it.
-func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll, reuseFresh bool) {
+// cold start fetches missing files without blocking on already-present copies;
+// a reload only fills in what is missing, since the refresh schedule keeps
+// them current once dae is running.
+func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll, reuseFresh, coldStart bool) {
 	if !conf.Geodata.Enabled() {
 		setGeodataStatus(GeodataStatus{})
 		return
@@ -324,10 +348,11 @@ func loadGeodata(ctx context.Context, conf *config.Config, dir string, fetchAll,
 	if reuseFresh && geodataFresh(conf.Geodata, dir) {
 		return
 	}
-	if !fetchAll {
+	if !fetchAll || coldStart {
 		missing := false
 		for name, url := range map[string]string{"geoip.dat": conf.Geodata.GeoIP, "geosite.dat": conf.Geodata.GeoSite} {
-			if _, err := os.Stat(filepath.Join(dir, name)); url != "" && err != nil {
+			info, err := os.Stat(filepath.Join(dir, name))
+			if url != "" && (err != nil || info.Size() == 0) {
 				missing = true
 			}
 		}

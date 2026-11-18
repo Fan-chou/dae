@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/component/ruleprovider"
@@ -17,13 +18,40 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// RuleProviderStatus describes the last attempt to load or refresh native rule providers.
+type RuleProviderStatus struct {
+	CheckedAt    time.Time `json:"checked_at,omitempty"`
+	UsedLastGood bool      `json:"used_last_good,omitempty"`
+	Degraded     bool      `json:"degraded,omitempty"`
+	Error        string    `json:"error,omitempty"`
+}
+
+var ruleProviderState struct {
+	mu     sync.RWMutex
+	status RuleProviderStatus
+}
+
+func setRuleProviderStatus(status RuleProviderStatus) {
+	ruleProviderState.mu.Lock()
+	ruleProviderState.status = status
+	ruleProviderState.mu.Unlock()
+}
+
+// CurrentRuleProviderStatus returns the status of the last rule provider load or refresh.
+func CurrentRuleProviderStatus() RuleProviderStatus {
+	ruleProviderState.mu.RLock()
+	defer ruleProviderState.mu.RUnlock()
+	return ruleProviderState.status
+}
+
 type ruleProviderLifecycleHolder struct {
 	mu      sync.RWMutex
 	conf    *config.Config
 	baseDir string
 
-	reloadManager *reloadManager
-	log           *logrus.Logger
+	reloadManager     *reloadManager
+	log               *logrus.Logger
+	lastRefreshFailed atomic.Bool
 }
 
 func newRuleProviderLifecycleHolder(conf *config.Config, baseDir string, interval time.Duration, reloadManager *reloadManager, log *logrus.Logger) (*ruleProviderLifecycleHolder, *ruleprovider.RefreshLifecycle, error) {
@@ -43,7 +71,7 @@ func newRuleProviderLifecycleHolder(conf *config.Config, baseDir string, interva
 	lifecycle, err := ruleprovider.NewRefreshLifecycle(ruleprovider.RefreshLifecycleConfig{
 		Interval: interval,
 		NextInterval: func() time.Duration {
-			if CurrentMihomoStatus().Degraded {
+			if CurrentMihomoStatus().Degraded || CurrentRuleProviderStatus().Degraded || holder.lastRefreshFailed.Load() {
 				return min(interval, mihomoDegradedRetry)
 			}
 			return interval
@@ -70,14 +98,33 @@ func (h *ruleProviderLifecycleHolder) initialWait(interval time.Duration) func()
 		if interval <= 0 || CurrentMihomoStatus().Degraded {
 			return 0
 		}
+		if rpStatus := CurrentRuleProviderStatus(); rpStatus.Degraded || rpStatus.UsedLastGood {
+			return min(initialRefreshFloor, interval)
+		}
 		h.mu.RLock()
 		conf, baseDir := h.conf, h.baseDir
 		h.mu.RUnlock()
+		if conf.Geodata.Enabled() && conf.Geodata.Interval > 0 && !geodataFresh(conf.Geodata, baseDir) {
+			return min(initialRefreshFloor, interval)
+		}
 		var documents []config.RuleProvider
 		if conf.Mihomo.Enabled() && conf.Mihomo.RoutingSubscription != "" {
 			spec := mihomoDocumentSpec(conf.Mihomo)
 			spec.Interval = conf.Mihomo.Interval
 			documents = append(documents, spec)
+		}
+		if conf.Geodata.Enabled() {
+			for name, url := range map[string]string{"geodata-geoip": conf.Geodata.GeoIP, "geodata-geosite": conf.Geodata.GeoSite} {
+				if url != "" {
+					documents = append(documents, config.RuleProvider{
+						Name:     name,
+						Type:     "http",
+						URL:      url,
+						MaxSize:  conf.Geodata.MaxSize,
+						Interval: conf.Geodata.Interval,
+					})
+				}
+			}
 		}
 		oldest, ok := ruleprovider.OldestCheck(conf.RuleProvider, documents, baseDir)
 		if !ok {
@@ -97,7 +144,31 @@ func (h *ruleProviderLifecycleHolder) refresh(ctx context.Context) (ruleprovider
 	baseDir := h.baseDir
 	h.mu.RUnlock()
 
-	report, err := ruleprovider.Refresh(ctx, conf, baseDir, http.DefaultClient)
+	wasDegraded := CurrentRuleProviderStatus().Degraded
+	report, loadReport, err := ruleprovider.RefreshWithReport(ctx, conf, baseDir, http.DefaultClient)
+	rpStatus := RuleProviderStatus{
+		CheckedAt:    time.Now(),
+		UsedLastGood: report.UsedLastGood || loadReport.UsedLastGood,
+	}
+	if err != nil {
+		rpStatus.Degraded = wasDegraded
+		rpStatus.Error = err.Error()
+		setRuleProviderStatus(rpStatus)
+	} else {
+		if rpStatus.UsedLastGood && wasDegraded {
+			rpStatus.Degraded = true
+		}
+		if loadReport.Warning != nil {
+			rpStatus.Error = loadReport.Warning.Error()
+			if h.log != nil {
+				h.log.WithError(loadReport.Warning).Warnln("[RuleProvider] Refresh used last-good cache for some rule providers")
+			}
+		}
+		setRuleProviderStatus(rpStatus)
+		if wasDegraded && !rpStatus.UsedLastGood {
+			report.Changed = true
+		}
+	}
 	// The Mihomo source is refreshed on the same schedule; either changing
 	// is a reason to reload.
 	mihomoReport, mihomoErr := refreshMihomoSource(ctx, conf, baseDir, http.DefaultClient)
@@ -106,6 +177,8 @@ func (h *ruleProviderLifecycleHolder) refresh(ctx context.Context) (ruleprovider
 	// The dat files are read when routing is built, so a new one needs a reload.
 	geodataChanged, geodataErr := syncGeodata(ctx, conf.Geodata, baseDir, http.DefaultClient)
 	report.Changed = report.Changed || geodataChanged
+
+	h.lastRefreshFailed.Store(err != nil || mihomoErr != nil || geodataErr != nil || rpStatus.UsedLastGood || mihomoReport.UsedLastGood)
 	return report, errors.Join(err, mihomoErr, geodataErr)
 }
 
@@ -123,6 +196,7 @@ func (h *ruleProviderLifecycleHolder) queueReload(ctx context.Context) error {
 	}
 	if !h.reloadManager.queueReloadRequest(h.log, reloadRequest{
 		isSuspend:       false,
+		fromRefresh:     true,
 		requestedAt:     time.Now(),
 		requestedAtMono: monotonicNowNano(),
 	}) {
@@ -158,8 +232,9 @@ func ruleProviderRefreshInterval(conf *config.Config) time.Duration {
 			interval = provider.Interval
 		}
 	}
-	if interval == 0 && conf.Mihomo.Enabled() && CurrentMihomoStatus().Degraded {
-		// Nothing is scheduled, but the source is missing: keep trying.
+	if interval == 0 && ((conf.Mihomo.Enabled() && CurrentMihomoStatus().Degraded) ||
+		(len(conf.RuleProvider) > 0 && (CurrentRuleProviderStatus().Degraded || CurrentRuleProviderStatus().UsedLastGood))) {
+		// Nothing is scheduled, but the source is missing or degraded: keep trying.
 		interval = time.Hour
 	}
 	return interval

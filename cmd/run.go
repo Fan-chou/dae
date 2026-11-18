@@ -116,6 +116,7 @@ type signalShutdownStagedHandoff struct {
 
 type reloadRequest struct {
 	isSuspend       bool
+	fromRefresh     bool
 	requestedAt     time.Time
 	requestedAtMono uint64
 }

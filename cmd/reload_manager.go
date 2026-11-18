@@ -102,7 +102,9 @@ coalesce:
 	for {
 		select {
 		case nextReq := <-m.reloadReqs:
+			fromRefresh := req.fromRefresh && nextReq.fromRefresh
 			req = nextReq
+			req.fromRefresh = fromRefresh
 			if req.requestedAt.IsZero() {
 				req.requestedAt = time.Now()
 			}

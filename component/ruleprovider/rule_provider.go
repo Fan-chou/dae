@@ -60,6 +60,9 @@ var providerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 type ProviderRules struct {
 	Functions []*config_parser.Function
+	// Degraded is true when a cold-start load tolerated an HTTP provider that
+	// could neither be fetched nor answered from cache.
+	Degraded bool
 }
 
 type Registry map[string]ProviderRules
@@ -69,6 +72,14 @@ type Registry map[string]ProviderRules
 type RefreshReport struct {
 	Changed      bool
 	UsedLastGood bool
+}
+
+// LoadReport summarizes how a rule provider batch was prepared and expanded.
+type LoadReport struct {
+	ReusedCache  bool
+	UsedLastGood bool
+	Degraded     bool
+	Warning      error
 }
 
 // ErrProductionRuntimeDisabled is kept for source compatibility with callers
@@ -91,10 +102,21 @@ type loadOptions struct {
 	// provider with no cache counts as empty, and nothing is recovered or
 	// published.
 	validateOnly bool
-	// reuseFresh answers from the cache, without asking the network, when every
-	// http provider's copy is younger than its interval and they were
-	// published together; otherwise it behaves as usual.
+	// reuseFresh answers from the cache, without asking the network, when an
+	// unversioned http provider's copy is younger than its interval; otherwise
+	// it fetches only the stale/failing providers.
 	reuseFresh bool
+	// refreshGrace subtracts a bounded grace window from Interval when
+	// checking freshness so scheduled refresh ticks near an interval boundary
+	// still fetch.
+	refreshGrace bool
+	// reuseUsable answers from the cache, without asking the network, when every
+	// http provider has a valid matching cached copy (and shared generation when
+	// versioned), regardless of whether its interval has elapsed.
+	reuseUsable bool
+	// tolerateDegraded lets cold start survive upstream failures without
+	// failing startup or persisting partial caches.
+	tolerateDegraded bool
 }
 
 // CacheMode says how much a load may rely on what is already cached.
@@ -109,6 +131,13 @@ const (
 	// CacheOnly never asks the network and never writes: it checks what is
 	// already there.
 	CacheOnly
+	// CacheReuseBatch skips the network when every HTTP provider has a valid
+	// matching cached copy from one consistent batch.
+	CacheReuseBatch
+	// CacheColdStart reuses any consistent valid cached batch (even if its
+	// refresh interval elapsed) and degrades gracefully on cold start when
+	// uncached or partial upstream fetches fail.
+	CacheColdStart
 )
 
 func (m CacheMode) options() loadOptions {
@@ -117,6 +146,10 @@ func (m CacheMode) options() loadOptions {
 		return loadOptions{reuseFresh: true}
 	case CacheOnly:
 		return loadOptions{noNetwork: true, validateOnly: true}
+	case CacheReuseBatch:
+		return loadOptions{reuseUsable: true}
+	case CacheColdStart:
+		return loadOptions{reuseUsable: true, tolerateDegraded: true}
 	}
 	return loadOptions{}
 }
@@ -133,11 +166,14 @@ func (o loadOptions) parseBody(body []byte, provider config.RuleProvider) (Provi
 type preparedProvider struct {
 	// uncached marks a provider a cache-only check had nothing to check against.
 	uncached      bool
+	degraded      bool
+	reusedFresh   bool
 	name          string
 	rules         ProviderRules
 	generation    string
 	batchIdentity string
 	usedLastGood  bool
+	fallbackErr   error
 	descriptor    cacheDescriptor
 	candidate     *cacheCandidate
 	// rebind is the unchanged current content as a candidate. It is used only
@@ -404,7 +440,15 @@ func LoadAndExpand(ctx context.Context, conf *config.Config, baseDir string, cli
 
 // LoadAndExpandCached is LoadAndExpand with a cache mode.
 func LoadAndExpandCached(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, mode CacheMode) error {
-	return loadAndExpandWithOptions(ctx, conf, baseDir, client, mode.options())
+	_, err := LoadAndExpandCachedWithReport(ctx, conf, baseDir, client, mode)
+	return err
+}
+
+// LoadAndExpandCachedWithReport is LoadAndExpandCached that also reports
+// whether cache reuse, last-good fallback, or degraded cold-start survival
+// occurred.
+func LoadAndExpandCachedWithReport(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, mode CacheMode) (LoadReport, error) {
+	return loadAndExpandWithOptionsAndReport(ctx, conf, baseDir, client, mode.options())
 }
 
 // Refresh prepares a complete provider snapshot, validates that the current
@@ -412,36 +456,48 @@ func LoadAndExpandCached(ctx context.Context, conf *config.Config, baseDir strin
 // It intentionally leaves conf.Routing.Rules unchanged so callers can retain
 // ruleset() declarations for subsequent refreshes.
 func Refresh(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) (RefreshReport, error) {
+	report, _, err := RefreshWithReport(ctx, conf, baseDir, client)
+	return report, err
+}
+
+// RefreshWithReport is Refresh that also returns a LoadReport carrying any
+// per-provider fallback diagnostics (for example when a single provider fell
+// back to its cached last-good snapshot).
+func RefreshWithReport(ctx context.Context, conf *config.Config, baseDir string, client *http.Client) (RefreshReport, LoadReport, error) {
+	return refreshWithOptions(ctx, conf, baseDir, client, loadOptions{reuseFresh: true, refreshGrace: true})
+}
+
+func refreshWithOptions(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, options loadOptions) (RefreshReport, LoadReport, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return RefreshReport{}, err
+			return RefreshReport{}, LoadReport{}, err
 		}
 	}
 	if conf == nil {
-		return RefreshReport{}, nil
+		return RefreshReport{}, LoadReport{}, nil
 	}
 	if len(conf.RuleProvider) == 0 {
 		if _, err := ExpandRoutingRules(conf.Routing.Rules, Registry{}); err != nil {
-			return RefreshReport{}, err
+			return RefreshReport{}, LoadReport{}, err
 		}
-		return RefreshReport{}, nil
+		return RefreshReport{}, LoadReport{}, nil
 	}
 	if baseDir != "" {
 		if err := recoverPendingPublish(baseDir); err != nil {
-			return RefreshReport{}, err
+			return RefreshReport{}, LoadReport{}, err
 		}
 	}
-	registry, prepared, err := prepareProviders(ctx, conf.RuleProvider, baseDir, client, loadOptions{})
+	registry, prepared, loadReport, err := prepareProvidersWithReport(ctx, conf.RuleProvider, baseDir, client, options)
 	if err != nil {
-		return RefreshReport{}, err
+		return RefreshReport{}, loadReport, err
 	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return RefreshReport{}, err
+			return RefreshReport{}, LoadReport{}, err
 		}
 	}
 	if _, err := ExpandRoutingRules(conf.Routing.Rules, registry); err != nil {
-		return RefreshReport{}, err
+		return RefreshReport{}, LoadReport{}, err
 	}
 
 	hasCandidate := false
@@ -455,83 +511,102 @@ func Refresh(ctx context.Context, conf *config.Config, baseDir string, client *h
 		}
 	}
 	if !hasCandidate {
-		return RefreshReport{UsedLastGood: usedLastGood}, nil
+		return RefreshReport{UsedLastGood: usedLastGood}, loadReport, nil
 	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return RefreshReport{}, err
+			return RefreshReport{}, LoadReport{}, err
 		}
 	}
 	published, err := publishPreparedWithContext(ctx, prepared)
 	if err != nil {
-		return RefreshReport{}, err
+		return RefreshReport{}, LoadReport{}, err
 	}
-	return RefreshReport{Changed: published, UsedLastGood: usedLastGood}, nil
+	return RefreshReport{Changed: published, UsedLastGood: usedLastGood}, loadReport, nil
 }
 
 func loadAndExpandWithOptions(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, options loadOptions) error {
+	_, err := loadAndExpandWithOptionsAndReport(ctx, conf, baseDir, client, options)
+	return err
+}
+
+func loadAndExpandWithOptionsAndReport(ctx context.Context, conf *config.Config, baseDir string, client *http.Client, options loadOptions) (LoadReport, error) {
 	if conf == nil {
-		return nil
+		return LoadReport{}, nil
 	}
 	if len(conf.RuleProvider) == 0 {
 		rules, err := ExpandRoutingRules(conf.Routing.Rules, Registry{})
 		if err != nil {
-			return err
+			return LoadReport{}, err
 		}
 		conf.Routing.Rules = rules
-		return nil
+		return LoadReport{}, nil
 	}
 	if baseDir != "" && !options.validateOnly {
 		if err := recoverPendingPublish(baseDir); err != nil {
-			return err
+			return LoadReport{}, err
 		}
 	}
-	registry, prepared, err := prepareProviders(ctx, conf.RuleProvider, baseDir, client, options)
+	registry, prepared, report, err := prepareProvidersWithReport(ctx, conf.RuleProvider, baseDir, client, options)
 	if err != nil {
-		return err
+		return report, err
 	}
 	if options.validateOnly {
 		for _, provider := range prepared {
 			if provider.uncached {
 				// A rule may name a provider that has never been fetched; there
 				// is nothing to expand it against until the first real start.
-				return nil
+				return report, nil
 			}
 		}
 	}
 	rules, err := ExpandRoutingRules(conf.Routing.Rules, registry)
 	if err != nil {
-		return err
+		return report, err
 	}
 	if !options.validateOnly {
-		if err := publishPrepared(prepared); err != nil {
-			return err
+		hasCandidate := false
+		for _, provider := range prepared {
+			if provider.candidate != nil {
+				hasCandidate = true
+				break
+			}
+		}
+		if hasCandidate {
+			if err := publishPrepared(prepared); err != nil {
+				return report, err
+			}
 		}
 	}
 	conf.Routing.Rules = rules
-	return nil
+	return report, nil
 }
 
 func prepareProviders(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) (Registry, []preparedProvider, error) {
+	registry, prepared, _, err := prepareProvidersWithReport(ctx, providers, baseDir, client, options)
+	return registry, prepared, err
+}
+
+func prepareProvidersWithReport(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) (Registry, []preparedProvider, LoadReport, error) {
 	if baseDir == "" {
-		return nil, nil, fmt.Errorf("rule provider base directory is empty")
+		return nil, nil, LoadReport{}, fmt.Errorf("rule provider base directory is empty")
 	}
 	var err error
 	baseDir, err = filepath.Abs(baseDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve rule provider base directory: %w", err)
+		return nil, nil, LoadReport{}, fmt.Errorf("resolve rule provider base directory: %w", err)
 	}
 	if len(providers) != 0 {
 		baseInfo, err := os.Lstat(baseDir)
 		if err != nil {
-			return nil, nil, fmt.Errorf("inspect rule provider base directory: %w", err)
+			return nil, nil, LoadReport{}, fmt.Errorf("inspect rule provider base directory: %w", err)
 		}
 		if baseInfo.Mode()&os.ModeSymlink != 0 || !baseInfo.IsDir() {
-			return nil, nil, errors.New("rule provider base directory is not a directory")
+			return nil, nil, LoadReport{}, errors.New("rule provider base directory is not a directory")
 		}
 		resolvedBase, err := filepath.EvalSymlinks(baseDir)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolve rule provider base directory: %w", err)
+			return nil, nil, LoadReport{}, fmt.Errorf("resolve rule provider base directory: %w", err)
 		}
 		baseDir = resolvedBase
 	}
@@ -546,7 +621,7 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 	for i, provider := range providers {
 		normalized[i] = normalizeProvider(provider)
 		if err := validateProviderDefinition(normalized[i], baseDir, options.allowPrivate, options.document); err != nil {
-			return nil, nil, err
+			return nil, nil, LoadReport{}, err
 		}
 	}
 	if !options.allowPrivate {
@@ -561,7 +636,7 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 			}
 		}
 		if err := config.ValidateRuleProviders(forValidation, baseDir); err != nil {
-			return nil, nil, err
+			return nil, nil, LoadReport{}, err
 		}
 	}
 
@@ -569,82 +644,144 @@ func prepareProviders(ctx context.Context, providers []config.RuleProvider, base
 	seen := make(map[string]struct{}, len(providers))
 	for _, provider := range normalized {
 		if _, ok := seen[provider.Name]; ok {
-			return nil, nil, fmt.Errorf("duplicate rule provider %q", provider.Name)
+			return nil, nil, LoadReport{}, fmt.Errorf("duplicate rule provider %q", provider.Name)
 		}
 		seen[provider.Name] = struct{}{}
 	}
+	if len(normalized) == 0 {
+		return registry, nil, LoadReport{}, nil
+	}
 
+	var report LoadReport
 	var prepared []preparedProvider
-	if options.reuseFresh && cachesAreFresh(normalized, baseDir, options) {
+	canReuseCache := !options.noNetwork &&
+		((options.reuseFresh && cachesAreFresh(normalized, baseDir, options)) ||
+			(options.reuseUsable && cachesAreUsable(normalized, baseDir, options, false)))
+	if canReuseCache {
 		cached := options
-		cached.reuseFresh, cached.noNetwork = false, true
+		cached.reuseFresh = false
+		cached.reuseUsable = false
+		cached.tolerateDegraded = false
+		cached.noNetwork = true
 		// A cache that no longer converts or no longer forms one batch is not
 		// worth failing a start over: fall back to asking the network.
-		prepared, _ = prepareStableProviderBatch(ctx, normalized, baseDir, client, cached)
+		if cachedPrepared, _, cachedErr := prepareStableProviderBatchDetailed(ctx, normalized, baseDir, client, cached); cachedErr == nil {
+			prepared = cachedPrepared
+			report.ReusedCache = true
+		}
 	}
 	if prepared == nil {
-		options.reuseFresh = false
-		prepared, err = prepareStableProviderBatch(ctx, normalized, baseDir, client, options)
+		netOpts := options
+		netOpts.reuseUsable = false
+		var partial []preparedProvider
+		prepared, partial, err = prepareStableProviderBatchDetailed(ctx, normalized, baseDir, client, netOpts)
 		if err != nil {
-			return nil, nil, err
-		}
-		if !options.noNetwork {
-			markChecked(prepared, time.Now().UTC())
+			if !options.reuseFresh && !options.reuseUsable && !options.tolerateDegraded {
+				return nil, nil, LoadReport{}, err
+			}
+			// 1. Try whole-batch fallback to a complete, consistent on-disk cached
+			// batch so a failing versioned/uncached round never blocks startup or
+			// overwrites intact caches with partial results.
+			if cachesAreUsable(normalized, baseDir, options, false) {
+				cached := netOpts
+				cached.reuseFresh = false
+				cached.refreshGrace = false
+				cached.noNetwork = true
+				cached.tolerateDegraded = false
+				if cachedPrepared, _, cachedErr := prepareStableProviderBatchDetailed(ctx, normalized, baseDir, client, cached); cachedErr == nil {
+					for i := range cachedPrepared {
+						cachedPrepared[i].usedLastGood = true
+					}
+					report.UsedLastGood = true
+					report.ReusedCache = true
+					report.Warning = err
+					prepared = cachedPrepared
+					err = nil
+				}
+			}
+			// 2. On cold start (tolerateDegraded), if no consistent on-disk batch
+			// exists (e.g. uncached provider or mismatched generations on disk),
+			// fall back to the per-provider prepared rules from this round
+			// without persisting any partial batch to disk.
+			if err != nil && options.tolerateDegraded && !options.document && partial != nil && !isSecurityError(err) {
+				for i := range partial {
+					partial[i].candidate = nil
+					partial[i].rebind = nil
+					if partial[i].degraded {
+						report.Degraded = true
+					}
+					if partial[i].usedLastGood {
+						report.UsedLastGood = true
+					}
+				}
+				report.Degraded = true
+				report.UsedLastGood = true
+				report.Warning = err
+				prepared = partial
+				err = nil
+			}
+			if err != nil {
+				return nil, nil, LoadReport{}, err
+			}
+		} else {
+			for i := range prepared {
+				if prepared[i].degraded {
+					report.Degraded = true
+				}
+				if prepared[i].usedLastGood {
+					report.UsedLastGood = true
+				}
+			}
+			if report.Degraded {
+				report.UsedLastGood = true
+				for i := range prepared {
+					prepared[i].candidate = nil
+					prepared[i].rebind = nil
+				}
+			}
+			if warn := joinFallbackErrors(prepared); warn != nil {
+				report.Warning = warn
+			}
+			if !options.noNetwork && !report.Degraded {
+				markChecked(prepared, time.Now().UTC())
+			}
 		}
 	}
 	for index, provider := range normalized {
 		registry[provider.Name] = prepared[index].rules
 	}
-	return registry, prepared, nil
+	return registry, prepared, report, nil
 }
 
 func prepareStableProviderBatch(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) ([]preparedProvider, error) {
+	prepared, _, err := prepareStableProviderBatchDetailed(ctx, providers, baseDir, client, options)
+	return prepared, err
+}
+
+func prepareStableProviderBatchDetailed(ctx context.Context, providers []config.RuleProvider, baseDir string, client *http.Client, options loadOptions) ([]preparedProvider, []preparedProvider, error) {
 	prepared, err := prepareProviderBatch(ctx, providers, baseDir, client, options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if options.validateOnly {
 		// Checking what is cached: there is no remote generation to agree on.
-		return prepared, nil
+		return prepared, nil, nil
 	}
 	if err := validateBatchGeneration(prepared); err != nil {
-		return nil, err
-	}
-	if requiresUnversionedBatchIdentity(prepared) && !options.noNetwork {
-		// Retain the existing second fetch as an update probe. It does not prove
-		// that independent providers share a remote generation; acceptance below
-		// still requires either fresh candidates for every provider or a durable
-		// common cache batch identity.
-		prepared, err = prepareProviderBatch(ctx, providers, baseDir, client, options)
-		if err != nil {
-			return nil, err
-		}
-		if err := validateBatchGeneration(prepared); err != nil {
-			return nil, err
-		}
+		return nil, prepared, err
 	}
 	if !options.noNetwork {
 		rebindUnchangedIntoPartialBatch(prepared)
 	}
 	if err := validateUnversionedBatchConsistency(prepared); err != nil {
-		return nil, err
+		return nil, prepared, err
 	}
-	return prepared, nil
+	return prepared, nil, nil
 }
 
-// rebindUnchangedIntoPartialBatch lets a partial upstream update through.
-// Independent HTTP sources have no common generation, so a round in which only
-// some of them changed used to be rejected outright, and since a rejected
-// round leaves the cache as it was, every later round saw the same difference:
-// one rotated ETag or one updated rule set blocked the whole set indefinitely.
-//
-// The unchanged providers are republished with their cached content under the
-// batch identity of this publish, so the result is the same single atomic
-// transaction a fully changed batch gets and the caches keep sharing one
-// identity. This is only done when every unchanged provider was actually
-// confirmed by the source in this round; a provider that fell back to its
-// last-good copy is not a member of a consistent batch, and such a round is
-// still rejected by the consistency check.
+// rebindUnchangedIntoPartialBatch republishes confirmed-unchanged or skipped-fresh
+// unversioned siblings alongside updated ones so healthy providers publish together
+// under one batch identity while any sibling that fell back to last-good stays untouched.
 func rebindUnchangedIntoPartialBatch(prepared []preparedProvider) {
 	if !requiresUnversionedBatchIdentity(prepared) {
 		return
@@ -658,14 +795,10 @@ func rebindUnchangedIntoPartialBatch(prepared []preparedProvider) {
 	if fresh == 0 || fresh == len(prepared) {
 		return
 	}
-	for _, provider := range prepared {
-		if provider.candidate == nil && (provider.usedLastGood || provider.rebind == nil) {
-			return
-		}
-	}
 	for index := range prepared {
-		if prepared[index].candidate == nil {
-			prepared[index].candidate = prepared[index].rebind
+		provider := prepared[index]
+		if provider.candidate == nil && !provider.usedLastGood && !provider.degraded && provider.rebind != nil {
+			prepared[index].candidate = provider.rebind
 		}
 	}
 }
@@ -700,10 +833,14 @@ func prepareProviderBatch(ctx context.Context, providers []config.RuleProvider, 
 	}
 	close(next)
 	wg.Wait()
+	var errs []error
 	for index, provider := range providers {
 		if err := preparationErrors[index]; err != nil {
-			return nil, fmt.Errorf("rule provider %q: %w", provider.Name, err)
+			errs = append(errs, fmt.Errorf("rule provider %q: %w", provider.Name, err))
 		}
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
 	}
 	return prepared, nil
 }
@@ -728,36 +865,39 @@ func requiresUnversionedBatchIdentity(prepared []preparedProvider) bool {
 	return hasHTTP
 }
 
-func validateUnversionedBatchConsistency(prepared []preparedProvider) error {
-	if !requiresUnversionedBatchIdentity(prepared) {
-		return nil
-	}
-
-	candidates := 0
+func joinFallbackErrors(prepared []preparedProvider) error {
+	var errs []error
 	for _, provider := range prepared {
-		if provider.candidate != nil {
-			candidates++
+		if provider.fallbackErr != nil {
+			errs = append(errs, provider.fallbackErr)
 		}
 	}
-	if candidates == len(prepared) {
-		// Every provider has a fresh candidate. publishPrepared binds all of
-		// them to one transaction-generated identity before any current pointer
-		// is replaced, so this is a safe initial or complete batch update.
-		return nil
-	}
-	if candidates != 0 {
-		return errors.New("rule provider batch consistency fence rejects mixed fresh and cached results without a generation token")
-	}
+	return errors.Join(errs...)
+}
 
-	batchIdentity := prepared[0].batchIdentity
-	if batchIdentity == "" {
-		return errors.New("rule provider batch consistency fence rejects cached results without a shared batch identity")
-	}
-	for _, provider := range prepared[1:] {
-		if provider.batchIdentity != batchIdentity {
-			return errors.New("rule provider batch consistency fence rejects cached results from different batches")
+func formatFallbackDetails(prepared []preparedProvider) string {
+	var parts []string
+	for _, provider := range prepared {
+		if provider.fallbackErr != nil {
+			parts = append(parts, provider.fallbackErr.Error())
 		}
 	}
+	return strings.Join(parts, "; ")
+}
+
+func withFallbackDetails(base string, prepared []preparedProvider) error {
+	details := formatFallbackDetails(prepared)
+	if details == "" {
+		return errors.New(base)
+	}
+	return fmt.Errorf("%s (%s)", base, details)
+}
+
+func validateUnversionedBatchConsistency(prepared []preparedProvider) error {
+	// Independent HTTP providers without an X-Dae-Rule-Provider-Generation token
+	// do not share an upstream release generation and are validated individually
+	// in prepareProvider. A failing sibling keeping its last-good cache must not
+	// block healthy independent providers from updating or starting.
 	return nil
 }
 
@@ -863,7 +1003,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 	if expectedCurrentErr != nil {
 		return preparedProvider{}, fmt.Errorf("inspect provider cache %q: %w", provider.Name, expectedCurrentErr)
 	}
-	makePrepared := func(rules ProviderRules, generation, batchIdentity string, candidate *cacheCandidate, usedLastGood bool) preparedProvider {
+	makePrepared := func(rules ProviderRules, generation, batchIdentity string, candidate *cacheCandidate, usedLastGood bool, fallbackErr error) preparedProvider {
 		if candidate != nil {
 			candidate.expectedCurrent = expectedCurrent
 			candidate.expectedCurrentKnown = true
@@ -874,6 +1014,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			generation:           generation,
 			batchIdentity:        batchIdentity,
 			usedLastGood:         usedLastGood,
+			fallbackErr:          fallbackErr,
 			descriptor:           descriptor,
 			candidate:            candidate,
 			expectedCurrent:      expectedCurrent,
@@ -887,14 +1028,16 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 		body, readErr := readProviderFile(baseDir, provider.Path, provider.MaxSize)
 		if readErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
+				fallback := fmt.Errorf("rule provider %q (%s): read provider file: %w", provider.Name, descriptor.source, readErr)
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true, fallback), nil
 			}
 			return preparedProvider{}, fmt.Errorf("read provider file: %v; cache failed: %w", readErr, cachedRulesErr)
 		}
 		rules, parseErr := options.parseBody(body, provider)
 		if parseErr != nil {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
+				fallback := fmt.Errorf("rule provider %q (%s): validate file provider body: %w", provider.Name, descriptor.source, parseErr)
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true, fallback), nil
 			}
 			return preparedProvider{}, fmt.Errorf("validate file provider body: %w", parseErr)
 		}
@@ -916,7 +1059,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		prepared := makePrepared(rules, "", batchIdentity, candidate, false)
+		prepared := makePrepared(rules, "", batchIdentity, candidate, false, nil)
 		if candidate == nil {
 			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
 		}
@@ -926,53 +1069,94 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 		cachedRules, cachedRulesErr := parseCachedRules(cached, cacheErr, provider, options)
 		if options.noNetwork {
 			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, false), nil
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, false, nil), nil
 			}
 			if options.validateOnly {
 				// Nothing to check against yet; the first real start fetches it.
-				p := makePrepared(ProviderRules{}, "", "", nil, false)
+				p := makePrepared(ProviderRules{}, "", "", nil, false, nil)
 				p.uncached = true
 				return p, nil
 			}
 			return preparedProvider{}, fmt.Errorf("no usable cache: %w", cachedRulesErr)
 		}
+		if options.reuseFresh &&
+			cachedRulesErr == nil &&
+			cacheMetadataMatches(cached.metadata, descriptor) &&
+			cacheSnapshotGeneration(cached) == "" &&
+			providerFresh(descriptor, cached, provider.Interval, preparedAt, options.refreshGrace) {
+			prepared := makePrepared(cachedRules, "", cacheSnapshotBatchIdentity(cached), nil, false, nil)
+			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
+			prepared.reusedFresh = true
+			return prepared, nil
+		}
+		httpFailureFallback := func(cause, hardErr error) (preparedProvider, error) {
+			if cachedRulesErr == nil {
+				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true, cause), nil
+			}
+			if options.tolerateDegraded && !options.document {
+				degradedErr := fmt.Errorf("%v; cache failed: %w", cause, cachedRulesErr)
+				p := makePrepared(ProviderRules{Degraded: true}, "", "", nil, true, degradedErr)
+				p.degraded = true
+				return p, nil
+			}
+			return preparedProvider{}, hardErr
+		}
 		fetched, fetchErr := fetchHTTP(ctx, provider.URL, provider.MaxSize, client, options.allowPrivate, cached)
 		if fetchErr != nil {
-			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
-			}
+			redacted := redactProviderFetchError(fetchErr)
+			cause := fmt.Errorf("rule provider %q (%s): fetch failed: %w", provider.Name, descriptor.source, redacted)
 			if isSecurityError(fetchErr) {
+				if cachedRulesErr == nil {
+					return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true, cause), nil
+				}
 				return preparedProvider{}, fmt.Errorf("fetch rejected by provider security policy: %w", fetchErr)
 			}
-			return preparedProvider{}, fmt.Errorf("fetch failed: %v; cache failed: %w", redactProviderError(fetchErr), cachedRulesErr)
+			return httpFailureFallback(cause, fmt.Errorf("fetch failed: %v; cache failed: %w", redacted, cachedRulesErr))
 		}
 		cachedGeneration := cacheSnapshotGeneration(cached)
 		if !fetched.notModified && cachedRulesErr == nil && cachedGeneration != "" && fetched.generation == "" {
-			return preparedProvider{}, fmt.Errorf("fresh provider response omitted generation token while cached generation %q is available", cachedGeneration)
+			genErr := fmt.Errorf("fresh provider response omitted generation token while cached generation %q is available", cachedGeneration)
+			if options.tolerateDegraded && !options.document {
+				cause := fmt.Errorf("rule provider %q (%s): %w", provider.Name, descriptor.source, genErr)
+				return makePrepared(cachedRules, cachedGeneration, cacheSnapshotBatchIdentity(cached), nil, true, cause), nil
+			}
+			return preparedProvider{}, genErr
 		}
 		if fetched.notModified {
 			if cachedRulesErr != nil {
-				return preparedProvider{}, fmt.Errorf("provider returned 304 without usable cache: %w", cachedRulesErr)
+				notModErr := fmt.Errorf("provider returned 304 without usable cache: %w", cachedRulesErr)
+				if options.tolerateDegraded && !options.document {
+					cause := fmt.Errorf("rule provider %q (%s): %w", provider.Name, descriptor.source, notModErr)
+					p := makePrepared(ProviderRules{Degraded: true}, "", "", nil, true, cause)
+					p.degraded = true
+					return p, nil
+				}
+				return preparedProvider{}, notModErr
 			}
 			generation := cachedGeneration
 			if fetched.generation != "" {
+				var genErr error
 				if generation == "" {
-					return preparedProvider{}, fmt.Errorf("provider returned 304 generation %q but cached snapshot has no generation", fetched.generation)
+					genErr = fmt.Errorf("provider returned 304 generation %q but cached snapshot has no generation", fetched.generation)
+				} else if fetched.generation != generation {
+					genErr = fmt.Errorf("provider returned 304 generation %q inconsistent with cached generation %q", fetched.generation, generation)
 				}
-				if fetched.generation != generation {
-					return preparedProvider{}, fmt.Errorf("provider returned 304 generation %q inconsistent with cached generation %q", fetched.generation, generation)
+				if genErr != nil {
+					if options.tolerateDegraded && !options.document {
+						cause := fmt.Errorf("rule provider %q (%s): %w", provider.Name, descriptor.source, genErr)
+						return makePrepared(cachedRules, cachedGeneration, cacheSnapshotBatchIdentity(cached), nil, true, cause), nil
+					}
+					return preparedProvider{}, genErr
 				}
 			}
-			prepared := makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false)
+			prepared := makePrepared(cachedRules, generation, cacheSnapshotBatchIdentity(cached), nil, false, nil)
 			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
 			return prepared, nil
 		}
 		rules, parseErr := options.parseBody(fetched.body, provider)
 		if parseErr != nil {
-			if cachedRulesErr == nil {
-				return makePrepared(cachedRules, cacheSnapshotGeneration(cached), cacheSnapshotBatchIdentity(cached), nil, true), nil
-			}
-			return preparedProvider{}, fmt.Errorf("validate fresh provider body: %w", parseErr)
+			cause := fmt.Errorf("rule provider %q (%s): validate fresh provider body: %w", provider.Name, descriptor.source, parseErr)
+			return httpFailureFallback(cause, fmt.Errorf("validate fresh provider body: %w", parseErr))
 		}
 		candidate := &cacheCandidate{
 			descriptor:           descriptor,
@@ -997,7 +1181,7 @@ func prepareProvider(ctx context.Context, provider config.RuleProvider, baseDir 
 			candidate = nil
 			batchIdentity = cacheSnapshotBatchIdentity(cached)
 		}
-		prepared := makePrepared(rules, fetched.generation, batchIdentity, candidate, false)
+		prepared := makePrepared(rules, fetched.generation, batchIdentity, candidate, false, nil)
 		if candidate == nil {
 			prepared.rebind = unchangedRebind(descriptor, cached, preparedAt, expectedCurrent)
 		}
@@ -1064,7 +1248,7 @@ func validateBatchGeneration(prepared []preparedProvider) error {
 			continue
 		}
 		if provider.generation != firstGeneration {
-			return fmt.Errorf("rule provider generation mismatch in batch: provider %q differs from provider %q", provider.name, firstProvider)
+			return withFallbackDetails(fmt.Sprintf("rule provider generation mismatch in batch: provider %q differs from provider %q", provider.name, firstProvider), prepared)
 		}
 	}
 	if firstGeneration == "" {
@@ -1072,7 +1256,7 @@ func validateBatchGeneration(prepared []preparedProvider) error {
 	}
 	for _, provider := range prepared {
 		if provider.generation == "" {
-			return fmt.Errorf("rule provider generation mismatch in batch: provider %q did not provide a generation token", provider.name)
+			return withFallbackDetails(fmt.Sprintf("rule provider generation mismatch in batch: provider %q did not provide a generation token", provider.name), prepared)
 		}
 	}
 	return nil
@@ -1716,7 +1900,9 @@ func publishPreparedWithContext(ctx context.Context, prepared []preparedProvider
 	if requiresUnversionedBatchIdentity(prepared) {
 		batchIdentity = transactionID
 		for index := range prepared {
-			prepared[index].candidate.batchIdentity = batchIdentity
+			if prepared[index].candidate != nil {
+				prepared[index].candidate.batchIdentity = batchIdentity
+			}
 		}
 	}
 
@@ -2262,7 +2448,7 @@ func transactionCurrentsMatch(transactionRoot string, entries map[string]cacheTr
 		if !state.exists || state.target != entry.NewCurrent {
 			return false
 		}
-		if batchIdentity != "" && !currentCacheHasBatchIdentity(state, batchIdentity) {
+		if batchIdentity != "" && entry.NewCurrent != entry.OldCurrent && !currentCacheHasBatchIdentity(state, batchIdentity) {
 			return false
 		}
 	}
@@ -3734,9 +3920,18 @@ func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_p
 			}
 			e, err = expandOrderedExpr(e, registry, false)
 			if err != nil {
+				if errors.Is(err, errDegradedProviderSkip) {
+					return nil, nil
+				}
 				return nil, err
 			}
+			if e == nil {
+				return nil, nil
+			}
 			root.Children = append(root.Children, e)
+		}
+		if len(root.Children) == 0 {
+			return nil, nil
 		}
 		f, err := routing.EncodeOrderedExpr(root)
 		if err != nil {
@@ -3763,6 +3958,9 @@ func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_p
 			return nil, fmt.Errorf("routing rule references unknown rule provider %q", function.Params[0].Val)
 		}
 		if len(provider.Functions) == 0 {
+			if provider.Degraded {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("routing rule references empty rule provider %q", function.Params[0].Val)
 		}
 		for _, replacement := range provider.Functions {
@@ -3917,12 +4115,30 @@ func redactProviderFetchError(err error) error {
 // published together. A reuse that failed the second condition would only be
 // rejected later by the batch fence.
 func cachesAreFresh(providers []config.RuleProvider, baseDir string, options loadOptions) bool {
+	return cachesAreUsable(providers, baseDir, options, true)
+}
+
+func providerFresh(descriptor cacheDescriptor, snapshot cacheSnapshot, interval time.Duration, now time.Time, withGrace bool) bool {
+	if interval <= 0 {
+		return false
+	}
+	grace := time.Duration(0)
+	if withGrace {
+		grace = min(interval/10, 30*time.Second)
+	}
+	return now.Sub(lastChecked(descriptor, snapshot))+grace < interval
+}
+
+func cachesAreUsable(providers []config.RuleProvider, baseDir string, options loadOptions, requireFreshInterval bool) bool {
 	now := time.Now().UTC()
-	batch := ""
+	generation := ""
+	httpCount := 0
+	withGeneration := 0
 	for _, provider := range providers {
 		if provider.Type != "http" {
 			continue
 		}
+		httpCount++
 		descriptor, err := newCacheDescriptor(provider, baseDir)
 		if err != nil {
 			return false
@@ -3931,19 +4147,27 @@ func cachesAreFresh(providers []config.RuleProvider, baseDir string, options loa
 		if err != nil || !cacheMetadataMatches(snapshot.metadata, descriptor) {
 			return false
 		}
-		if provider.Interval <= 0 || now.Sub(lastChecked(descriptor, snapshot)) >= provider.Interval {
+		if requireFreshInterval && !providerFresh(descriptor, snapshot, provider.Interval, now, options.refreshGrace) {
 			return false
 		}
 		if _, err := options.parseBody(snapshot.body, provider); err != nil {
 			return false
 		}
 		if len(providers) > 1 {
-			identity := cacheSnapshotBatchIdentity(snapshot)
-			if identity == "" || (batch != "" && identity != batch) {
-				return false
+			if gen := cacheSnapshotGeneration(snapshot); gen != "" {
+				if generation != "" && gen != generation {
+					return false
+				}
+				generation = gen
+				withGeneration++
 			}
-			batch = identity
 		}
+	}
+	if httpCount == 0 {
+		return false
+	}
+	if len(providers) > 1 && withGeneration > 0 {
+		return withGeneration == httpCount
 	}
 	return true
 }
@@ -3957,8 +4181,8 @@ const checkedFile = "checked"
 
 func markChecked(prepared []preparedProvider, at time.Time) {
 	for _, provider := range prepared {
-		// A provider answered from its last good copy was not checked.
-		if provider.descriptor.sourceType != "http" || provider.usedLastGood || provider.uncached {
+		// A provider answered from last-good or reused locally within its interval was not asked upstream.
+		if provider.descriptor.sourceType != "http" || provider.usedLastGood || provider.degraded || provider.uncached || provider.reusedFresh {
 			continue
 		}
 		root := provider.descriptor.root

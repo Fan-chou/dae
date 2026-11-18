@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/ruleprovider"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/logger"
@@ -119,7 +120,14 @@ func (w *reloadWorker) run() {
 			newConf.Global.LogLevel = "warning"
 		} else {
 			var includes []string
-			newConf, includes, loadedSnapshot, err = readConfigWithAdminSnapshot(cfgFile, readStrict)
+			mode := readStrict
+			if req.fromRefresh {
+				mode = readMode{cache: ruleprovider.CacheReuseBatch}
+			}
+			newConf, includes, loadedSnapshot, err = readConfigWithAdminSnapshot(cfgFile, mode)
+			if err != nil && req.fromRefresh {
+				newConf, includes, loadedSnapshot, err = readConfigWithAdminSnapshot(cfgFile, readStrict)
+			}
 			if err != nil {
 				w.log.WithFields(logrus.Fields{
 					"err": err,

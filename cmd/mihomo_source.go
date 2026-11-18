@@ -190,7 +190,11 @@ func applyMihomoSource(ctx context.Context, conf *config.Config, baseDir string,
 		}
 	}
 
-	result, fetched, err := fetchMihomo(ctx, m, baseDir, client, cache)
+	fetchCache := cache
+	if startup && fetchCache == ruleprovider.CacheReuseFresh {
+		fetchCache = ruleprovider.CacheColdStart
+	}
+	result, fetched, err := fetchMihomo(ctx, m, baseDir, client, fetchCache)
 	if err != nil {
 		if startup && m.RoutingSubscription != "" {
 			status.Error = m.ScrubSecrets(err.Error())

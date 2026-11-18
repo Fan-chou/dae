@@ -14,12 +14,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/daeuniverse/dae/component/routing"
 )
 
 type countingProvider struct {
@@ -278,4 +281,248 @@ func TestOldestCheckFollowsChecksNotContentAge(t *testing.T) {
 	if fresh, ok := OldestCheck(conf.RuleProvider, nil, dir); !ok || time.Since(fresh) > time.Minute {
 		t.Fatalf("OldestCheck after a successful check = %v ok=%v, want about now", fresh, ok)
 	}
+}
+
+func TestColdStartReusesConsistentStaleCacheWithoutNetwork(t *testing.T) {
+	a, b := newCountingProvider(t, "a.example\n"), newCountingProvider(t, "b.example\n")
+	dir := t.TempDir()
+	primeCache(t, dir, a, b)
+	ageContent(t, dir, 3*time.Hour)
+
+	a.hits.Store(0)
+	b.hits.Store(0)
+	conf := cacheModeConfig(t, time.Hour, a, b)
+	report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, cacheModeOptions(CacheColdStart))
+	if err != nil {
+		t.Fatalf("CacheColdStart load = %v", err)
+	}
+	if a.hits.Load()+b.hits.Load() != 0 {
+		t.Fatalf("CacheColdStart asked network for consistent cached batch: a=%d b=%d", a.hits.Load(), b.hits.Load())
+	}
+	if !report.ReusedCache || report.Degraded || report.UsedLastGood || report.Warning != nil {
+		t.Fatalf("CacheColdStart report = %#v, want ReusedCache=true only", report)
+	}
+	if len(conf.Routing.Rules) == 0 {
+		t.Fatal("expected expanded routing rules from cached batch")
+	}
+	oldest, ok := OldestCheck(conf.RuleProvider, nil, dir)
+	if !ok || time.Since(oldest) < 2*time.Hour {
+		t.Fatalf("OldestCheck = %v ok=%v, want stale check preserved so background refresh runs promptly", oldest, ok)
+	}
+}
+
+func TestReuseFreshUpdatesHealthyAndRetriesOnlyFailedProvider(t *testing.T) {
+	var mu sync.Mutex
+	aBody := "a1.example\n"
+	bBody := "b1.example\n"
+	bDown := false
+	a := newCountingProvider(t, "")
+	b := newCountingProvider(t, "")
+	a.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.hits.Add(1)
+		mu.Lock()
+		body := aBody
+		mu.Unlock()
+		_, _ = fmt.Fprint(w, body)
+	})
+	b.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.hits.Add(1)
+		mu.Lock()
+		down, body := bDown, bBody
+		mu.Unlock()
+		if down {
+			http.Error(w, "upstream timeout", http.StatusGatewayTimeout)
+			return
+		}
+		_, _ = fmt.Fprint(w, body)
+	})
+
+	dir := t.TempDir()
+	primeCache(t, dir, a, b)
+	descA := testCacheDescriptor(t, config.RuleProvider{Name: "a", Type: "http", URL: a.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20}, dir)
+	descB := testCacheDescriptor(t, config.RuleProvider{Name: "b", Type: "http", URL: b.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20}, dir)
+
+	ageContent(t, dir, 3*time.Hour)
+	mu.Lock()
+	aBody = "a2.example\n"
+	bDown = true
+	mu.Unlock()
+	a.hits.Store(0)
+	b.hits.Store(0)
+
+	conf := cacheModeConfig(t, time.Hour, a, b)
+	report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, cacheModeOptions(CacheReuseFresh))
+	if err != nil {
+		t.Fatalf("CacheReuseFresh load with failing sibling b = %v", err)
+	}
+	if !report.UsedLastGood || report.ReusedCache || report.Warning == nil {
+		t.Fatalf("CacheReuseFresh report = %#v, want UsedLastGood=true ReusedCache=false Warning!=nil", report)
+	}
+	if !strings.Contains(report.Warning.Error(), `"b"`) {
+		t.Fatalf("warning %q does not identify failing provider b", report.Warning)
+	}
+	if a.hits.Load() != 1 || b.hits.Load() != 1 {
+		t.Fatalf("fetch counts = a:%d b:%d, want single fetch per provider", a.hits.Load(), b.hits.Load())
+	}
+	snapAAfter, _ := readCacheSnapshot(descA)
+	snapBAfter, _ := readCacheSnapshot(descB)
+	if string(snapAAfter.body) != "a2.example\n" || string(snapBAfter.body) != "b1.example\n" {
+		t.Fatalf("disk cache after mixed round = a:%q b:%q, want a2.example and b1.example", snapAAfter.body, snapBAfter.body)
+	}
+
+	// Fast retry while a's 1h interval is fresh and b recovered: skips a, fetches only b.
+	a.hits.Store(0)
+	b.hits.Store(0)
+	mu.Lock()
+	bBody = "b2.example\n"
+	bDown = false
+	mu.Unlock()
+	retryConf := cacheModeConfig(t, time.Hour, a, b)
+	refreshReport, retryLoadReport, err := refreshWithOptions(context.Background(), retryConf, dir, http.DefaultClient, loadOptions{allowPrivate: true, reuseFresh: true, refreshGrace: true})
+	if err != nil {
+		t.Fatalf("subsequent refreshWithOptions error = %v", err)
+	}
+	if a.hits.Load() != 0 || b.hits.Load() != 1 {
+		t.Fatalf("retry fetch counts = a:%d b:%d, want a=0 (fresh skipped) and b=1 (failed provider retried)", a.hits.Load(), b.hits.Load())
+	}
+	if !refreshReport.Changed || refreshReport.UsedLastGood || retryLoadReport.UsedLastGood || retryLoadReport.Warning != nil {
+		t.Fatalf("retry reports = %#v / %#v, want Changed=true UsedLastGood=false", refreshReport, retryLoadReport)
+	}
+	snapARetry, _ := readCacheSnapshot(descA)
+	snapBRetry, _ := readCacheSnapshot(descB)
+	if string(snapARetry.body) != "a2.example\n" || string(snapBRetry.body) != "b2.example\n" {
+		t.Fatalf("disk cache after retry = a:%q b:%q, want a2.example and b2.example", snapARetry.body, snapBRetry.body)
+	}
+}
+
+func TestColdStartSurvivesUncachedTimeoutAndMixedBatchesInDegradedMode(t *testing.T) {
+	t.Run("uncached-timeout-skips-only-degraded-rules", func(t *testing.T) {
+		a := newCountingProvider(t, "a1.example\n")
+		b := newCountingProvider(t, "b1.example\n")
+		b.server.Close()
+
+		sections, err := config_parser.Parse(`routing {
+  ruleset(a) -> proxy
+  ruleset(b) -> proxy
+  ruleset_no_resolve(b) -> proxy
+  ruleset(a) && ruleset_no_resolve(b) -> proxy
+  !ruleset_no_resolve(b) -> direct
+  fallback: direct
+}`)
+		if err != nil {
+			t.Fatalf("Parse() error = %v", err)
+		}
+		var r config.Routing
+		if err := config.SectionParser(reflect.ValueOf(&r), sections[0]); err != nil {
+			t.Fatalf("SectionParser() error = %v", err)
+		}
+		conf := &config.Config{
+			RuleProvider: []config.RuleProvider{
+				{Name: "a", Type: "http", URL: a.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20, Interval: time.Hour},
+				{Name: "b", Type: "http", URL: b.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20, Interval: time.Hour},
+			},
+			Routing: r,
+		}
+		dir := t.TempDir()
+		report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, cacheModeOptions(CacheColdStart))
+		if err != nil {
+			t.Fatalf("CacheColdStart degraded load error = %v", err)
+		}
+		if !report.Degraded || !report.UsedLastGood || report.Warning == nil {
+			t.Fatalf("degraded report = %#v, want Degraded=true UsedLastGood=true Warning!=nil", report)
+		}
+		if !strings.Contains(report.Warning.Error(), `"b"`) {
+			t.Fatalf("degraded warning %q should name failing provider b", report.Warning)
+		}
+		if len(conf.Routing.Rules) != 1 || conf.Routing.Rules[0].AndFunctions[0].Params[0].Val != "a1.example" {
+			t.Fatalf("expanded routing rules = %#v, want only a1.example rule", conf.Routing.Rules)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "persist.d", "rule-providers", "a", "current")); !os.IsNotExist(statErr) {
+			t.Fatalf("partial batch persisted cache for a: %v", statErr)
+		}
+
+		// Also verify direct OrderedExpr negation & or/and behavior on degraded provider.
+		reg := Registry{
+			"a": {Functions: []*config_parser.Function{{Name: "domain", Params: []*config_parser.Param{{Key: "suffix", Val: "a1.example"}}}}},
+			"b": {Degraded: true},
+		}
+		negExpr, _ := routing.EncodeOrderedExpr(&routing.OrderedExpr{
+			Op:   "not",
+			Children: []*routing.OrderedExpr{{Op: "atom", Atom: &config_parser.Function{Name: "ruleset_no_resolve", Params: []*config_parser.Param{{Val: "b"}}}}},
+		})
+		out, err := ExpandRoutingRules([]*config_parser.RoutingRule{
+			{AndFunctions: []*config_parser.Function{negExpr}, Outbound: config_parser.Function{Name: "direct"}},
+		}, reg)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("negated degraded OrderedExpr = out=%#v err=%v, want skipped without error", out, err)
+		}
+	})
+
+	t.Run("mismatched-disk-batches-tolerate-mixed-cold-start", func(t *testing.T) {
+		aBody := "a1.example\n"
+		bDown := atomic.Bool{}
+		var aMu sync.Mutex
+		a := newCountingProvider(t, "")
+		a.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			a.hits.Add(1)
+			aMu.Lock()
+			body := aBody
+			aMu.Unlock()
+			_, _ = fmt.Fprint(w, body)
+		})
+		b := newCountingProvider(t, "")
+		b.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b.hits.Add(1)
+			if bDown.Load() {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = fmt.Fprint(w, "b1.example\n")
+		})
+		dir := t.TempDir()
+		// Prime A and B separately so their on-disk caches have different batch identities.
+		if _, err := loadWithOptions(context.Background(), []config.RuleProvider{{Name: "a", Type: "http", URL: a.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20}}, dir, http.DefaultClient, cacheModeOptions(CacheNever)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadWithOptions(context.Background(), []config.RuleProvider{{Name: "b", Type: "http", URL: b.server.URL, Behavior: "domain", Format: "text", MaxSize: 1 << 20}}, dir, http.DefaultClient, cacheModeOptions(CacheNever)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Cold start reuses independent valid unversioned caches directly without network requests.
+		a.hits.Store(0)
+		b.hits.Store(0)
+		bDown.Store(true)
+		conf := cacheModeConfig(t, time.Hour, a, b)
+		report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, cacheModeOptions(CacheColdStart))
+		if err != nil {
+			t.Fatalf("CacheColdStart with independent disk batches = %v", err)
+		}
+		if a.hits.Load()+b.hits.Load() != 0 {
+			t.Fatalf("CacheColdStart asked network: a=%d b=%d", a.hits.Load(), b.hits.Load())
+		}
+		if !report.ReusedCache || report.Degraded || report.UsedLastGood || report.Warning != nil {
+			t.Fatalf("cold-start report = %#v, want ReusedCache=true only", report)
+		}
+		if len(conf.Routing.Rules) == 0 {
+			t.Fatal("expected cached rules to expand on cold start")
+		}
+
+		// Strict load while b is down still updates a and keeps b's last-good cache.
+		aMu.Lock()
+		aBody = "a2.example\n"
+		aMu.Unlock()
+		conf2 := cacheModeConfig(t, time.Hour, a, b)
+		report2, err := loadAndExpandWithOptionsAndReport(context.Background(), conf2, dir, http.DefaultClient, cacheModeOptions(CacheNever))
+		if err != nil {
+			t.Fatalf("CacheNever mixed load with mismatched disk batches = %v", err)
+		}
+		if !report2.UsedLastGood || report2.Warning == nil || !strings.Contains(report2.Warning.Error(), `"b"`) {
+			t.Fatalf("report2 = %#v, want UsedLastGood=true and Warning naming b", report2)
+		}
+		snapA, _ := readCacheSnapshot(testCacheDescriptor(t, conf2.RuleProvider[0], dir))
+		snapB, _ := readCacheSnapshot(testCacheDescriptor(t, conf2.RuleProvider[1], dir))
+		if string(snapA.body) != "a2.example\n" || string(snapB.body) != "b1.example\n" {
+			t.Fatalf("caches after CacheNever mixed load = a:%q b:%q, want a2.example and b1.example", snapA.body, snapB.body)
+		}
+	})
 }
