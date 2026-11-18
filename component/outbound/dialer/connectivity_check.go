@@ -1047,20 +1047,29 @@ func (d *Dialer) UnregisterAliveDialerSet(a *AliveDialerSet) {
 	}
 }
 
+func formatUnavailableError(network *NetworkType, err error) error {
+	if err == nil {
+		return nil
+	}
+	// Use common/errors package for type-safe error checking
+	// instead of string matching for better reliability.
+	if commonerrors.IsNetworkUnreachable(err) {
+		return fmt.Errorf("network is unreachable")
+	}
+	if commonerrors.IsAddressNotSuitable(err) {
+		// EADDRNOTAVAIL means no usable source address of this family on
+		// the host, not that the family is unsupported per se.
+		return fmt.Errorf("no usable IPv%v source address", network.IpVersion)
+	}
+	return err
+}
+
 func (d *Dialer) logUnavailable(
 	network *NetworkType,
 	err error,
 ) {
 	if err != nil {
-		// Use common/errors package for type-safe error checking
-		// instead of string matching for better reliability.
-		if commonerrors.IsNetworkUnreachable(err) {
-			err = fmt.Errorf("network is unreachable")
-		} else if commonerrors.IsAddressNotSuitable(err) {
-			// EADDRNOTAVAIL means no usable source address of this family on
-			// the host, not that the family is unsupported per se.
-			err = fmt.Errorf("no usable IPv%v source address", network.IpVersion)
-		}
+		err = formatUnavailableError(network, err)
 		d.Log.WithFields(logrus.Fields{
 			"network": network.String(),
 			"node":    d.property.Name,
@@ -1390,12 +1399,13 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		d.collectionFineMu.Unlock()
 		return false, nil
 	case err != nil && !d.isLifecycleTeardownError(err) && !stderrors.Is(err, errCheckOptionUnavailable):
+		normalizedErr := formatUnavailableError(opts.networkType, err)
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
 			CheckedAt: checkedAt,
 			Alive:     false,
-			Message:   err.Error(),
+			Message:   normalizedErr.Error(),
 		}
 		d.collectionFineMu.Unlock()
 
@@ -1403,7 +1413,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		// errors racing dialer retirement and probe-infrastructure failures
 		// carry no evidence about node health and must not poison dialer
 		// state or the process-global proxy failure tracker.
-		d.logUnavailable(opts.networkType, err)
+		d.logUnavailable(opts.networkType, normalizedErr)
 		d.informDialerGroupUpdate(d.markUnavailable(opts.networkType))
 
 		if cycle != nil {

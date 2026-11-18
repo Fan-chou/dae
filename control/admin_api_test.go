@@ -395,3 +395,82 @@ func TestAdminGroupsParentHealthRetryKeepsNestedChildAlive(t *testing.T) {
 		t.Fatalf("nested child shown dead after parent retry should admit second leaf: %#v", stream)
 	}
 }
+
+func TestAdminGroupsIPv4OnlyNodeRemainsAliveWithLatencyWhenIPv6Fails(t *testing.T) {
+	t.Parallel()
+	d := newNamedTestEndpointDialer("hk-v4-only")
+	t.Cleanup(func() { _ = d.Close() })
+
+	tcp4 := &componentdialer.NetworkType{
+		L4Proto:   consts.L4ProtoStr_TCP,
+		IpVersion: consts.IpVersionStr_4,
+	}
+	now := time.Now()
+	snap := d.HealthSnapshot()
+	snap.Collections[componentdialer.IdxTcp4].Alive = true
+	snap.Collections[componentdialer.IdxTcp4].MovingAverage = 42 * time.Millisecond
+	snap.Collections[componentdialer.IdxTcp4].LastProbe = componentdialer.DialerProbeObservationSnapshot{
+		CheckedAt:  now,
+		Alive:      true,
+		Latency:    42 * time.Millisecond,
+		HasLatency: true,
+	}
+	snap.Collections[componentdialer.IdxTcp6].Alive = false
+	snap.Collections[componentdialer.IdxTcp6].LastProbe = componentdialer.DialerProbeObservationSnapshot{
+		CheckedAt: now,
+		Alive:     false,
+		Message:   "timeout",
+	}
+	d.RestoreHealthSnapshot(snap)
+
+	group := newTestOutboundGroup(outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, d)
+	t.Cleanup(func() { group.Close() })
+	c := &ControlPlane{
+		controlPlaneGenerationState: controlPlaneGenerationState{
+			outbounds: []*outbound.DialerGroup{group},
+			groupSelectionMembers: map[string][]string{
+				group.Name: {"hk-v4-only"},
+			},
+		},
+	}
+
+	checkMember := func() AdminGroupMember {
+		t.Helper()
+		groups := c.AdminGroups()
+		if len(groups) != 1 || len(groups[0].Members) != 1 {
+			t.Fatalf("groups = %#v, want 1 group with 1 member", groups)
+		}
+		return groups[0].Members[0]
+	}
+
+	m := checkMember()
+	if !m.Alive || m.Admission != "alive" || m.Reason != "ok" {
+		t.Fatalf("IPv4-only member status = %#v, want Alive=true Admission=alive Reason=ok", m)
+	}
+	if m.LatencyMs == nil || *m.LatencyMs != 42 {
+		t.Fatalf("IPv4-only member latency = %v, want 42", m.LatencyMs)
+	}
+
+	d.SetFailDegradedForTest(tcp4, true)
+	m = checkMember()
+	if !m.Alive || m.Admission != "degraded" || !strings.Contains(m.Reason, "fail") {
+		t.Fatalf("degraded IPv4 + dead IPv6 member = %#v, want Alive=true Admission=degraded fail reason", m)
+	}
+	if m.LatencyMs == nil || *m.LatencyMs != 42 {
+		t.Fatalf("degraded IPv4 member latency = %v, want 42", m.LatencyMs)
+	}
+
+	d.SetFailDegradedForTest(tcp4, false)
+	snap = d.HealthSnapshot()
+	snap.Collections[componentdialer.IdxTcp4].Alive = false
+	snap.Collections[componentdialer.IdxTcp4].LastProbe = componentdialer.DialerProbeObservationSnapshot{
+		CheckedAt: now,
+		Alive:     false,
+		Message:   "timeout",
+	}
+	d.RestoreHealthSnapshot(snap)
+	m = checkMember()
+	if m.Alive || m.Admission != "dead" {
+		t.Fatalf("all-dead member = %#v, want Alive=false Admission=dead", m)
+	}
+}

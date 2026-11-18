@@ -444,10 +444,14 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			removedBestWithoutLatency := minPolicy && !hasLatency && a.minLatency.dialer == dialer
 			// Dialer: alive -> not alive.
 			if a.log.IsLevelEnabled(logrus.InfoLevel) {
-				a.log.WithFields(logrus.Fields{
+				fields := logrus.Fields{
 					"dialer": dialer.property.Name,
 					"group":  a.dialerGroupName,
-				}).Infof("[ALIVE --%v-> NOT ALIVE]", a.CheckTyp.String())
+				}
+				if obs := dialer.SnapshotLastProbe(a.CheckTyp); obs.Message != "" && !obs.Alive {
+					fields["err"] = obs.Message
+				}
+				a.log.WithFields(fields).Infof("[ALIVE --%v-> NOT ALIVE]", a.CheckTyp.String())
 			}
 			// Remove the dialer from aliveEntries.
 			if index >= len(a.aliveEntries) {

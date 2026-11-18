@@ -253,26 +253,44 @@ func adminAdmissionForDialer(d *dialer.Dialer) (state, reason string) {
 	if d == nil {
 		return dialer.AdmissionDead.String(), "not_alive"
 	}
-	found := false
-	worst := dialer.AdmissionAlive
-	reason = "ok"
+	foundProbed := false
+	bestProbed := dialer.AdmissionDead
+	probedReason := "not_alive"
+
+	foundAny := false
+	worstUnprobed := dialer.AdmissionAlive
+	unprobedReason := "ok"
+
 	for _, nt := range adminTCPNetworkTypes() {
 		obs := d.SnapshotLastProbe(nt)
-		if obs.CheckedAt.IsZero() && d.MustGetAlive(nt) {
+		_, hasLat := d.MustGetLatencies10(nt).LastLatency()
+		alive := d.MustGetAlive(nt)
+		st := d.AdmissionState(nt)
+		r := d.AdmissionReason(nt)
+
+		probed := obs.HasLatency || hasLat || (!obs.CheckedAt.IsZero() && !obs.Alive) || !alive
+		if probed {
+			if !foundProbed || st < bestProbed {
+				foundProbed = true
+				bestProbed = st
+				probedReason = r
+			}
 			continue
 		}
-		st := d.AdmissionState(nt)
-		if !found || st > worst {
-			found = true
-			worst = st
-			reason = d.AdmissionReason(nt)
+		if !foundAny || st > worstUnprobed {
+			foundAny = true
+			worstUnprobed = st
+			unprobedReason = r
 		}
 	}
-	if !found {
-		nt := adminTCPNetworkTypes()[0]
-		return d.AdmissionState(nt).String(), d.AdmissionReason(nt)
+	if foundProbed {
+		return bestProbed.String(), probedReason
 	}
-	return worst.String(), reason
+	if foundAny {
+		return worstUnprobed.String(), unprobedReason
+	}
+	nt := adminTCPNetworkTypes()[0]
+	return d.AdmissionState(nt).String(), d.AdmissionReason(nt)
 }
 
 func adminPeekSelected(group *outbound.DialerGroup, policy consts.DialerSelectionPolicy) string {
