@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -130,7 +132,53 @@ routing {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if conf.Global.AdminListen != "" || conf.Global.AdminSecret != "" {
-		t.Fatalf("admin defaults = listen %q secret %q, want empty", conf.Global.AdminListen, conf.Global.AdminSecret)
+	if conf.Global.AdminListen != "" || conf.Global.AdminSecret != "" || len(conf.Global.AdminCorsOrigins) != 0 {
+		t.Fatalf("admin defaults = listen %q secret %q cors %v, want empty", conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins)
+	}
+}
+
+func TestValidateAdminCorsOrigins(t *testing.T) {
+	t.Parallel()
+	got, err := ValidateAdminCorsOrigins([]string{
+		"HTTPS://Panel.Example.com:443",
+		"https://panel.example.com",
+		"http://192.168.1.10:3000",
+		"http://[::1]:8080",
+		"tauri://localhost",
+		"app://fdae.local",
+		"  ",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAdminCorsOrigins valid error = %v", err)
+	}
+	want := []string{
+		"https://panel.example.com",
+		"http://192.168.1.10:3000",
+		"http://[::1]:8080",
+		"tauri://localhost",
+		"app://fdae.local",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ValidateAdminCorsOrigins = %v, want %v", got, want)
+	}
+
+	for _, bad := range []string{
+		"*",
+		"https://*",
+		"https://*.example.com",
+		"https://panel.example.com/",
+		"https://panel.example.com/app",
+		"https://panel.example.com?x=1",
+		"https://user:pass@panel.example.com",
+		"javascript://alert(1)",
+		"ftp://example.com",
+		"https://panel.example.com:99999",
+		"panel.example.com",
+	} {
+		if _, err := ValidateAdminCorsOrigins([]string{bad}); err == nil {
+			t.Fatalf("ValidateAdminCorsOrigins(%q) = nil, want error", bad)
+		} else if strings.Contains(err.Error(), "://") {
+			t.Fatalf("ValidateAdminCorsOrigins(%q) error %q should not contain ://", bad, err.Error())
+		}
 	}
 }

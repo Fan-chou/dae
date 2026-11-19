@@ -118,4 +118,27 @@ dae.@inbound[0].password=a'b"c
 UCI
 if run; then fail "a password with both quote kinds was accepted"; fi
 
+# --- admin_cors_origins rendering and validation
+reset
+cat > "$tmp/uci" <<'UCI'
+dae.config.admin_cors_origins=https://panel.example.com
+UCI
+run || fail "single admin_cors_origins failed: $(cat "$tmp/err")"
+grep -qx "    admin_cors_origins: 'https://panel.example.com'" "$tmp/local.dae" || fail "missing single admin_cors_origins: $(cat "$tmp/local.dae")"
+
+reset
+cat > "$tmp/uci" <<'UCI'
+dae.config.admin_cors_origins= https://panel.example.com , http://192.168.1.10:3000 ,
+UCI
+run || fail "multi admin_cors_origins failed: $(cat "$tmp/err")"
+grep -qx "    admin_cors_origins: 'https://panel.example.com', 'http://192.168.1.10:3000'" "$tmp/local.dae" || fail "missing multi admin_cors_origins: $(cat "$tmp/local.dae")"
+
+reset
+printf 'old\n' > "$tmp/local.dae"
+cat > "$tmp/uci" <<'UCI'
+dae.config.admin_cors_origins=https://a'b"c.example.com
+UCI
+if run; then fail "unquotable admin_cors_origins was accepted"; fi
+[ "$(cat "$tmp/local.dae")" = old ] || fail "local.dae was replaced after invalid admin_cors_origins"
+
 echo ok

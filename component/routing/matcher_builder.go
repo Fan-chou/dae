@@ -26,8 +26,9 @@ type Outbound struct {
 }
 
 type RulesBuilder struct {
-	log     *logrus.Logger
-	parsers map[string]FunctionParser
+	log        *logrus.Logger
+	parsers    map[string]FunctionParser
+	beforeRule func(*config_parser.RoutingRule)
 }
 
 func NewRulesBuilder(log *logrus.Logger) *RulesBuilder {
@@ -37,12 +38,19 @@ func NewRulesBuilder(log *logrus.Logger) *RulesBuilder {
 	}
 }
 
+func (b *RulesBuilder) SetBeforeRuleHook(hook func(*config_parser.RoutingRule)) {
+	b.beforeRule = hook
+}
+
 func (b *RulesBuilder) RegisterFunctionParser(funcName string, parser FunctionParser) {
 	b.parsers[funcName] = parser
 }
 
 func (b *RulesBuilder) Apply(rules []*config_parser.RoutingRule) (err error) {
 	for _, rule := range rules {
+		if b.beforeRule != nil {
+			b.beforeRule(rule)
+		}
 		b.log.Debugln("[rule]", rule.String(true, false, false))
 		outbound, err := ParseOutbound(&rule.Outbound)
 		if err != nil {

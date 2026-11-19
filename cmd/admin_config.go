@@ -83,27 +83,146 @@ func adminConfigPaths(configDir string) (configPath, routingPath string, err err
 	return filepath.Join(dir, "config.dae"), filepath.Join(dir, "routing.dae"), nil
 }
 
-func loadAdminConfig(configDir string) (adminConfigResponse, error) {
+type adminFileStatKey struct {
+	exists  bool
+	modNano int64
+	size    int64
+}
+
+func statAdminFileKey(path string) (adminFileStatKey, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return adminFileStatKey{exists: false}, nil
+		}
+		return adminFileStatKey{}, err
+	}
+	return adminFileStatKey{
+		exists:  true,
+		modNano: info.ModTime().UnixNano(),
+		size:    info.Size(),
+	}, nil
+}
+
+var adminConfigCache = struct {
+	mu        sync.Mutex
+	configDir string
+	cfgStat   adminFileStatKey
+	routeStat adminFileStatKey
+	resp      adminConfigResponse
+	etag      string
+}{}
+
+func invalidateAdminFileCaches() {
+	adminConfigCache.mu.Lock()
+	adminConfigCache.configDir = ""
+	adminConfigCache.mu.Unlock()
+
+	adminInboundsCache.mu.Lock()
+	adminInboundsCache.configDir = ""
+	adminInboundsCache.mu.Unlock()
+}
+
+func formatAdminETag(digest string) string {
+	if len(digest) > 32 {
+		digest = digest[:32]
+	}
+	return `"` + digest + `"`
+}
+
+func checkAdminIfMatch(header, currentETag string) bool {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return true
+	}
+	if header == "*" {
+		return currentETag != ""
+	}
+	cur := strings.Trim(strings.TrimPrefix(strings.TrimSpace(currentETag), "W/"), `"`)
+	if cur == "" {
+		return false
+	}
+	for _, part := range strings.Split(header, ",") {
+		cand := strings.TrimSpace(part)
+		cand = strings.TrimPrefix(cand, "W/")
+		cand = strings.Trim(cand, `"`)
+		if cand == cur {
+			return true
+		}
+	}
+	return false
+}
+
+func currentAdminConfigETag(configDir string) (string, error) {
+	snap, err := readAdminConfigSnapshot(configDir)
+	if err != nil {
+		return "", err
+	}
+	return formatAdminETag(snap.digest), nil
+}
+
+func loadAdminConfigCached(configDir string) (adminConfigResponse, string, error) {
 	configPath, routingPath, err := adminConfigPaths(configDir)
 	if err != nil {
-		return adminConfigResponse{}, err
+		return adminConfigResponse{}, "", err
 	}
+	cfgStat, err := statAdminFileKey(configPath)
+	if err != nil {
+		return adminConfigResponse{}, "", err
+	}
+	routeStat, err := statAdminFileKey(routingPath)
+	if err != nil {
+		return adminConfigResponse{}, "", err
+	}
+
+	adminConfigCache.mu.Lock()
+	if adminConfigCache.configDir == configDir &&
+		adminConfigCache.cfgStat == cfgStat &&
+		adminConfigCache.routeStat == routeStat &&
+		adminConfigCache.etag != "" {
+		resp := adminConfigCache.resp
+		etag := adminConfigCache.etag
+		adminConfigCache.mu.Unlock()
+		return resp, etag, nil
+	}
+	adminConfigCache.mu.Unlock()
+
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
-		return adminConfigResponse{}, err
+		return adminConfigResponse{}, "", err
 	}
 	extracted, err := extractNamedSections(string(raw), "global", "routing")
 	if err != nil {
-		return adminConfigResponse{}, err
+		return adminConfigResponse{}, "", err
 	}
 	extracted = stripNodeURILines(rewriteAdminSecret(extracted, adminSecretPlaceholder))
-	routing := ""
+	routingText := ""
+	var routingBytes []byte
+	routingExists := false
 	if body, readErr := os.ReadFile(routingPath); readErr == nil {
-		routing = stripNodeURILines(redactInboundPasswords(string(body)))
+		routingExists = true
+		routingBytes = body
+		routingText = stripNodeURILines(redactInboundPasswords(string(body)))
 	} else if !os.IsNotExist(readErr) {
-		return adminConfigResponse{}, readErr
+		return adminConfigResponse{}, "", readErr
 	}
-	return adminConfigResponse{Config: extracted, Routing: routing}, nil
+	resp := adminConfigResponse{Config: extracted, Routing: routingText}
+	etag := formatAdminETag(adminSnapshotDigest(raw, routingExists, routingBytes))
+
+	adminConfigCache.mu.Lock()
+	adminConfigCache.configDir = configDir
+	adminConfigCache.cfgStat = cfgStat
+	adminConfigCache.routeStat = routeStat
+	adminConfigCache.resp = resp
+	adminConfigCache.etag = etag
+	adminConfigCache.mu.Unlock()
+
+	return resp, etag, nil
+}
+
+func loadAdminConfig(configDir string) (adminConfigResponse, error) {
+	resp, _, err := loadAdminConfigCached(configDir)
+	return resp, err
 }
 
 func validateLoadedAdminConfig(configDir string) error {
@@ -214,9 +333,11 @@ func applyAdminConfigLocked(configDir string, incoming adminConfigBody, reload a
 	}
 	if reload == nil || !reload() {
 		restore()
+		invalidateAdminFileCaches()
 		return false, errAdminReloadQueueFull
 	}
 	cleanupBak()
+	invalidateAdminFileCaches()
 	return true, nil
 }
 

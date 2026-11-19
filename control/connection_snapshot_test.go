@@ -28,7 +28,11 @@ func TestAdminConnectionsSnapshotFiltersAndOmitsURI(t *testing.T) {
 		&memoryLayoutConn{id: 9},
 		nil,
 		TcpFlowBinding{
-			Mac: mac,
+			Mac:     mac,
+			Process: "curl",
+			Route: TcpRouteBinding{
+				Rule: &RoutingRuleMeta{Index: 3, Raw: "domain(suffix:cursor.sh) -> AI", Origin: "config"},
+			},
 			Egress: TcpEgressBinding{
 				Outbound:      group,
 				SniffedDomain: "hy2://should-not-leak",
@@ -44,13 +48,18 @@ func TestAdminConnectionsSnapshotFiltersAndOmitsURI(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow.recordUpload(32)
-	snap := manager.adminConnectionsSnapshot(256, adminConnectionFilter{outbound: "AI"})
+	snap := manager.adminConnectionsSnapshot(256, AdminConnectionFilter{Outbound: "AI"})
 	if snap.Total != 1 || len(snap.Connections) != 1 {
 		t.Fatalf("snap = %+v", snap)
 	}
 	item := snap.Connections[0]
-	if item.Outbound != "AI" || item.Src != "192.168.124.202:44321" || item.Mac != "3e:0a:a5:de:ae:a3" || item.Upload != 32 {
+	if item.Outbound != "AI" || item.SrcIP != "192.168.124.202" || item.SrcPort != 44321 ||
+		item.DstIP != "198.51.100.10" || item.DstPort != 443 ||
+		item.Mac != "3e:0a:a5:de:ae:a3" || item.Process != "curl" || item.Upload != 32 {
 		t.Fatalf("item = %+v", item)
+	}
+	if !strings.HasPrefix(item.ID, "tcp:") || item.Rule == nil || item.Rule.Index != 3 {
+		t.Fatalf("expected tcp: prefix and rule meta, got %+v", item)
 	}
 	if item.Domain != "" {
 		t.Fatalf("domain should drop URI, got %q", item.Domain)
@@ -62,7 +71,7 @@ func TestAdminConnectionsSnapshotFiltersAndOmitsURI(t *testing.T) {
 	if strings.Contains(string(body), "://") {
 		t.Fatalf("connections JSON leaked a URI: %s", body)
 	}
-	empty := manager.adminConnectionsSnapshot(256, adminConnectionFilter{outbound: "Cherry_Proxy"})
+	empty := manager.adminConnectionsSnapshot(256, AdminConnectionFilter{Outbound: "Cherry_Proxy"})
 	if empty.Total != 0 {
 		t.Fatalf("filter missed: %+v", empty)
 	}
@@ -85,7 +94,7 @@ func TestAdminConnectionsSnapshotHidesInvalidAddrPort(t *testing.T) {
 		src: netip.MustParseAddrPort("192.168.124.202:50000"),
 		dst: netip.MustParseAddrPort("1.2.3.4:443"),
 	})
-	item := adminConnectionFromUDP(&UDPFlowRuntime{
+	item := adminConnectionFromUDPAt(&UDPFlowRuntime{
 		id:       9,
 		network:  "udp4",
 		src:      ue.poolKey.Src,
@@ -98,14 +107,14 @@ func TestAdminConnectionsSnapshotHidesInvalidAddrPort(t *testing.T) {
 				IsDialIp: true,
 			},
 		},
-	})
-	if item.Dst != "1.2.3.4:443" {
-		t.Fatalf("dst = %q", item.Dst)
+	}, time.Now())
+	if item.DstIP != "1.2.3.4" || item.DstPort != 443 || item.Target != "1.2.3.4:443" {
+		t.Fatalf("dst = %s:%d target=%q", item.DstIP, item.DstPort, item.Target)
 	}
 	if item.Mac != "3e:0a:a5:de:ae:a3" {
 		t.Fatalf("mac = %q", item.Mac)
 	}
-	if item.Dst == "invalid AddrPort" || item.Src == "invalid AddrPort" {
+	if strings.Contains(item.Target, "invalid AddrPort") || strings.Contains(item.SrcIP, "invalid") {
 		t.Fatalf("leaked zero AddrPort: %+v", item)
 	}
 	if formatAddrPort(netip.AddrPort{}) != "" {
@@ -133,7 +142,7 @@ func TestAdminConnectionsSnapshotTruncates(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	snap := manager.adminConnectionsSnapshot(2, adminConnectionFilter{})
+	snap := manager.adminConnectionsSnapshot(2, AdminConnectionFilter{})
 	if snap.Total != 3 || !snap.Truncated || len(snap.Connections) != 2 {
 		t.Fatalf("truncated snap = %+v", snap)
 	}
@@ -141,14 +150,14 @@ func TestAdminConnectionsSnapshotTruncates(t *testing.T) {
 		t.Fatal("missing snapshot scope")
 	}
 	for i := 0; i < 5; i++ {
-		next := manager.adminConnectionsSnapshot(2, adminConnectionFilter{})
+		next := manager.adminConnectionsSnapshot(2, AdminConnectionFilter{})
 		if next.Connections[0].ID != snap.Connections[0].ID || next.Connections[1].ID != snap.Connections[1].ID {
 			t.Fatal("bounded snapshot order changed")
 		}
 	}
 	other := NewSessionManager(context.Background())
 	defer other.Close()
-	if other.adminConnectionsSnapshot(2, adminConnectionFilter{}).Scope == snap.Scope {
+	if other.adminConnectionsSnapshot(2, AdminConnectionFilter{}).Scope == snap.Scope {
 		t.Fatal("different managers share scope")
 	}
 	if clampAdminConnectionLimit(0) != adminConnectionsDefaultLimit || clampAdminConnectionLimit(4096) != adminConnectionsMaxLimit {
@@ -162,8 +171,6 @@ func TestAdminConnectionsSnapshotKeepsHeaviestFlowsWhenTruncated(t *testing.T) {
 	runtime := newEgressRuntime(nil, nil)
 	t.Cleanup(func() { _ = runtime.releaseOwner() })
 	group := &outbound.DialerGroup{Name: "AI"}
-	// Bytes per flow, in adoption (= id) order: the heaviest ones are the
-	// newest, which an id-ordered cut would have dropped first.
 	bytes := []int64{0, 10, 5000, 700}
 	for i, n := range bytes {
 		flow, err := manager.adoptTCP(
@@ -182,7 +189,7 @@ func TestAdminConnectionsSnapshotKeepsHeaviestFlowsWhenTruncated(t *testing.T) {
 		flow.recordDownload(n / 2)
 	}
 	before := time.Now().UnixMilli()
-	snap := manager.adminConnectionsSnapshot(2, adminConnectionFilter{})
+	snap := manager.adminConnectionsSnapshot(2, AdminConnectionFilter{})
 	after := time.Now().UnixMilli()
 	if snap.Total != 4 || !snap.Truncated || len(snap.Connections) != 2 {
 		t.Fatalf("snap = %+v", snap)

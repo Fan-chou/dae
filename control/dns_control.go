@@ -433,3 +433,31 @@ var qtypeStrCache = map[uint16]string{
 	dnsmessage.TypeAAAA:  "28",
 	dnsmessage.TypeSRV:   "33",
 }
+
+// AdminDNSStats reports lock-free DNS controller counters for GET /api/v1/metrics.
+type AdminDNSStats struct {
+	CacheEntries         int64  `json:"cache_entries"`
+	Inflight             int64  `json:"inflight"`
+	DroppedDatagrams     uint64 `json:"dropped_datagrams"`
+	DroppedRetries       uint64 `json:"dropped_retries"`
+	DroppedRetryFailures uint64 `json:"dropped_retry_failures"`
+	UpstreamCount        int    `json:"upstream_count"`
+}
+
+func (c *DnsController) AdminStats() AdminDNSStats {
+	if c == nil || c.dnsControllerStore == nil {
+		return AdminDNSStats{}
+	}
+	upstreams := 0
+	if rt := c.runtime(); rt != nil && rt.routing != nil {
+		upstreams = rt.routing.UpstreamCount()
+	}
+	return AdminDNSStats{
+		CacheEntries:         max(0, c.dnsCacheSize.Load()),
+		Inflight:             max(0, c.handleInflight.Load()),
+		DroppedDatagrams:     c.dnsDroppedDatagrams.Load(),
+		DroppedRetries:       c.dnsDroppedRetries.Load(),
+		DroppedRetryFailures: c.dnsDroppedRetryFailures.Load(),
+		UpstreamCount:        upstreams,
+	}
+}

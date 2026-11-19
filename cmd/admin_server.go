@@ -6,8 +6,8 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,12 +15,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/component/outbound"
@@ -33,39 +32,56 @@ const (
 	adminReadTimeout     = 10 * time.Second
 	adminWriteTimeout    = 30 * time.Second
 	adminShutdownTimeout = 2 * time.Second
-	adminMaxLogLines     = 500
-	adminDefaultLogLines = 200
-	adminMaxBodyBytes    = 1 << 12
+	adminMaxBodyBytes    = 1 << 14
+	adminProbeCooldown   = 3 * time.Second
 )
 
 type adminPlane interface {
+	AdminSystemInfo(version string) control.AdminSystemInfo
+	AdminMetricsSnapshot() control.AdminMetricsSnapshot
+	AdminMetricsHistory(windowSec, maxPoints int) []control.AdminTrafficSample
 	AdminQuality(group, host string) []map[string]any
 	AdminGroups() []control.AdminGroup
-	AdminStatusSnapshot(version string) control.AdminStatus
 	SetGroupSelection(groupName, memberName string) error
 	TriggerLatencyChecksForGroup(groupName string) error
-	AdminConnections(limit int, outbound, src, mac, inbound string) control.AdminConnectionsSnapshot
-	AdminKernelConnections(limit int, src, mac string) control.AdminKernelConnectionsSnapshot
+	AdminConnections(limit int, filter control.AdminConnectionFilter) control.AdminConnectionsSnapshot
+	AdminClosedFlows(limit int, filter control.AdminConnectionFilter) control.AdminClosedFlowsSnapshot
+	AdminTrafficSummary(topN int) control.AdminTrafficSummary
+	AdminResetTrafficSummary()
+	AdminCloseConnection(id string) bool
+	AdminCloseConnections(filter control.AdminConnectionFilter) int
+	AdminKernelConnections(limit int, src, mac string, resolveDomains bool) control.AdminKernelConnectionsSnapshot
+	AdminCloseKernelConnection(req control.AdminKernelCloseRequest) (control.AdminKernelCloseResult, error)
+	SetClosedFlowObserver(fn func(control.AdminClosedFlow))
 }
 
 type adminPlaneProvider func() adminPlane
 
 type adminReloadFunc func() bool
 
+type adminSourcesRefreshResult struct {
+	Changed      bool   `json:"changed"`
+	UsedLastGood bool   `json:"used_last_good,omitempty"`
+	ReloadQueued bool   `json:"reload_queued,omitempty"`
+	Warning      string `json:"warning,omitempty"`
+}
+
+type adminSourcesRefresher func(context.Context) (adminSourcesRefreshResult, error)
+
 type adminServer struct {
-	mu        sync.Mutex
-	http      *http.Server
-	listen    string
-	boundAddr string
-	secret    string
-	logFile   string
-	configDir string
-	log       *logrus.Logger
-	plane     adminPlaneProvider
-	reload    adminReloadFunc
-	// inbounds reports the user-space inbounds that are running; nil before
-	// the manager exists.
-	inbounds func() []control.InboundStatus
+	mu          sync.Mutex
+	http        *http.Server
+	listen      string
+	boundAddr   string
+	secret      string
+	corsOrigins map[string]struct{}
+	rawCorsList []string
+	logFile     string
+	configDir   string
+	log         *logrus.Logger
+	plane       adminPlaneProvider
+	reload      adminReloadFunc
+	inbounds    func() []control.InboundStatus
 
 	reloadManager        *reloadManager
 	resolveListenFn      func(context.Context, string) (string, error)
@@ -74,32 +90,57 @@ type adminServer struct {
 	lastReloadError      string
 	lastReloadRolledBack bool
 	suspended            bool
+
+	authLimiter *adminAuthLimiter
+	logRing     *adminLogRing
+	connTracker *adminConnectionTracker
+	wsHub       *adminWSHub
+
+	probeMu       sync.Mutex
+	lastProbeByGp map[string]time.Time
+
+	sourcesMu        sync.Mutex
+	sourcesRefreshing atomic.Bool
+	sourcesRefresher adminSourcesRefresher
+}
+
+type adminAPIErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type adminAPIErrorBody struct {
+	Error adminAPIErrorDetail `json:"error"`
+}
+
+type adminSystemBody struct {
+	control.AdminSystemInfo
+	Generation           string `json:"generation,omitempty"`
+	SyncWarning          string `json:"sync_warning,omitempty"`
+	ConfigInSync         bool   `json:"config_in_sync"`
+	LastReloadError      string `json:"last_reload_error,omitempty"`
+	ReloadPending        bool   `json:"reload_pending,omitempty"`
+	LastReloadRolledBack bool   `json:"last_reload_rolled_back,omitempty"`
 }
 
 type adminGroupPutBody struct {
 	Member string `json:"member"`
 }
 
-type adminErrorBody struct {
-	Error string `json:"error"`
+type adminLogLevelPutBody struct {
+	Level string `json:"level"`
 }
 
-type adminStatusBody struct {
-	control.AdminStatus
-	Generation string `json:"generation,omitempty"`
-	// SyncWarning is set when the Mihomo routing source is not being read
-	// fresh: the last attempt failed or the last good copy is in use.
-	SyncWarning          string        `json:"sync_warning,omitempty"`
-	ConfigInSync         bool          `json:"config_in_sync"`
-	LastReloadError      string        `json:"last_reload_error,omitempty"`
-	ReloadPending        bool          `json:"reload_pending,omitempty"`
-	LastReloadRolledBack bool          `json:"last_reload_rolled_back,omitempty"`
-	Mihomo               MihomoStatus  `json:"mihomo"`
-	Geodata              GeodataStatus `json:"geodata"`
+type adminLogsResponseBody struct {
+	Entries   []AdminLogEntry `json:"entries"`
+	LatestSeq uint64          `json:"latest_seq"`
 }
 
-type adminLogsBody struct {
-	Lines []string `json:"lines"`
+type adminSourcesBody struct {
+	Mihomo        MihomoStatus       `json:"mihomo"`
+	Geodata       GeodataStatus      `json:"geodata"`
+	RuleProviders RuleProviderStatus `json:"rule_providers"`
+	SyncWarning   string             `json:"sync_warning,omitempty"`
 }
 
 type adminReloadBody struct {
@@ -107,16 +148,39 @@ type adminReloadBody struct {
 }
 
 func newAdminServer(log *logrus.Logger, logFile, configDir string, plane adminPlaneProvider, reload adminReloadFunc) *adminServer {
-	return &adminServer{
-		logFile:   logFile,
-		configDir: configDir,
-		log:       log,
-		plane:     plane,
-		reload:    reload,
+	s := &adminServer{
+		logFile:       logFile,
+		configDir:     configDir,
+		log:           log,
+		plane:         plane,
+		reload:        reload,
+		authLimiter:   newAdminAuthLimiter(),
+		logRing:       newAdminLogRing(),
+		connTracker:   newAdminConnectionTracker(),
+		lastProbeByGp: make(map[string]time.Time),
 	}
+	s.wsHub = newAdminWSHub(s)
+	return s
 }
 
-// setInbounds tells the server where to read the state of the inbounds from.
+func (s *adminServer) setLogRing(ring *adminLogRing) {
+	if s == nil || ring == nil {
+		return
+	}
+	s.mu.Lock()
+	s.logRing = ring
+	s.mu.Unlock()
+}
+
+func (s *adminServer) setSourcesRefresher(fn adminSourcesRefresher) {
+	if s == nil {
+		return
+	}
+	s.sourcesMu.Lock()
+	s.sourcesRefresher = fn
+	s.sourcesMu.Unlock()
+}
+
 func (s *adminServer) setInbounds(provider func() []control.InboundStatus) {
 	if s == nil {
 		return
@@ -153,6 +217,12 @@ func (s *adminServer) currentSecret() string {
 	return s.secret
 }
 
+func (s *adminServer) emitWSEvent(event string, data any) {
+	if s != nil && s.wsHub != nil {
+		s.wsHub.emitEvent(event, data)
+	}
+}
+
 func (s *adminServer) captureActiveSnapshot(snap *adminConfigSnapshot) {
 	if s == nil {
 		return
@@ -172,10 +242,6 @@ func (s *adminServer) captureActiveSnapshot(snap *adminConfigSnapshot) {
 	s.mu.Unlock()
 }
 
-// recordPendingAdminWriteLocked records the digest of the configuration just
-// committed by an admin PUT so a subsequent async reload failure can safely
-// restore .admin-last-good only if no newer manual edit superseded it.
-// Caller must hold adminConfigWriteMu.
 func (s *adminServer) recordPendingAdminWriteLocked() {
 	if s == nil {
 		return
@@ -206,6 +272,7 @@ func (s *adminServer) markReloadStarted() {
 	s.lastReloadError = ""
 	s.lastReloadRolledBack = false
 	s.mu.Unlock()
+	s.emitWSEvent("reload_started", nil)
 }
 
 func (s *adminServer) markReloadSucceeded(snap *adminConfigSnapshot) {
@@ -229,6 +296,14 @@ func (s *adminServer) markReloadSucceeded(snap *adminConfigSnapshot) {
 	s.mu.Lock()
 	s.activeSnapshot = snap
 	s.mu.Unlock()
+	invalidateAdminFileCaches()
+	if s.connTracker != nil {
+		s.connTracker.Invalidate()
+	}
+	if s.wsHub != nil {
+		s.wsHub.syncFlowObserver()
+	}
+	s.emitWSEvent("reload_succeeded", nil)
 }
 
 func (s *adminServer) markSuspended() {
@@ -261,21 +336,26 @@ func (s *adminServer) handleAsyncReloadFailure(errMsg string) {
 	s.lastReloadRolledBack = false
 	s.mu.Unlock()
 
-	if pendingDigest == "" || activeSnap == nil {
-		return
+	rolledBack := false
+	if pendingDigest != "" && activeSnap != nil {
+		curSnap, err := readAdminConfigSnapshot(configDir)
+		if err == nil && curSnap.digest == pendingDigest {
+			if rErr := restoreAdminConfigSnapshot(configDir, *activeSnap); rErr != nil {
+				s.warnf("admin config reload failed (%s) and rollback failed: %v", sanitized, rErr)
+			} else {
+				invalidateAdminFileCaches()
+				s.mu.Lock()
+				s.lastReloadRolledBack = true
+				s.mu.Unlock()
+				rolledBack = true
+				s.warnf("admin config reload failed (%s); restored last good configuration", sanitized)
+			}
+		}
 	}
-	curSnap, err := readAdminConfigSnapshot(configDir)
-	if err != nil || curSnap.digest != pendingDigest {
-		return
-	}
-	if rErr := restoreAdminConfigSnapshot(configDir, *activeSnap); rErr != nil {
-		s.warnf("admin config reload failed (%s) and rollback failed: %v", sanitized, rErr)
-		return
-	}
-	s.mu.Lock()
-	s.lastReloadRolledBack = true
-	s.mu.Unlock()
-	s.warnf("admin config reload failed (%s); restored last good configuration", sanitized)
+	s.emitWSEvent("reload_failed", map[string]any{
+		"error":       sanitized,
+		"rolled_back": rolledBack,
+	})
 }
 
 type adminReloadStatusSnapshot struct {
@@ -327,7 +407,42 @@ func (s *adminServer) reloadStatusSnapshot() adminReloadStatusSnapshot {
 	}
 }
 
+func buildCorsOriginSet(origins []string) map[string]struct{} {
+	if len(origins) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(origins))
+	for _, raw := range origins {
+		canon, err := config.CanonicalizeAdminOrigin(raw)
+		if err == nil && canon != "" {
+			set[canon] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+func (s *adminServer) isOriginAllowed(origin string) bool {
+	if s == nil {
+		return false
+	}
+	canon, err := config.CanonicalizeAdminOrigin(origin)
+	if err != nil {
+		return false
+	}
+	s.mu.Lock()
+	_, ok := s.corsOrigins[canon]
+	s.mu.Unlock()
+	return ok
+}
+
 func (s *adminServer) refresh(listen, secret string) {
+	s.refreshWithCORS(listen, secret, nil)
+}
+
+func (s *adminServer) refreshWithCORS(listen, secret string, corsOrigins []string) {
 	if s == nil {
 		return
 	}
@@ -336,6 +451,9 @@ func (s *adminServer) refresh(listen, secret string) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.corsOrigins = buildCorsOriginSet(corsOrigins)
+	s.rawCorsList = append([]string(nil), corsOrigins...)
 
 	if listen == s.listen && secret == s.secret && (s.http != nil || listen == "") {
 		return
@@ -364,26 +482,11 @@ func (s *adminServer) refresh(listen, secret string) {
 		s.warnf("admin HTTP listen failed (tproxy continues): %v", err)
 		return
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/status", s.withAdminAuth(s.handleStatus))
-	mux.HandleFunc("/v1/udp-recovery", s.withAdminAuth(s.handleUDPRecovery))
-	mux.HandleFunc("/v1/evidence", s.withAdminAuth(s.handleEvidence))
-	mux.HandleFunc("/v1/capture", s.withAdminAuth(s.handleCapture))
-	mux.HandleFunc("/v1/quality", s.withAdminAuth(s.handleQuality))
-	mux.HandleFunc("/v1/groups", s.withAdminAuth(s.handleGroups))
-	mux.HandleFunc("/v1/groups/", s.withAdminAuth(s.handleGroup))
-	mux.HandleFunc("/v1/connections", s.withAdminAuth(s.handleConnections))
-	mux.HandleFunc("/v1/kernel-connections", s.withAdminAuth(s.handleKernelConnections))
-	mux.HandleFunc("/v1/config", s.withAdminAuth(s.handleConfig))
-	mux.HandleFunc("/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
-	mux.HandleFunc("/v1/inbounds", s.withAdminAuth(s.handleInbounds))
-	mux.HandleFunc("/v1/reload", s.withAdminAuth(s.handleReload))
-	mux.HandleFunc("/v1/logs", s.withAdminAuth(s.handleLogs))
-	registerAdminUI(mux)
+	mux := s.buildMux()
 	boundAddr := ln.Addr().String()
 	server := &http.Server{
 		Addr:         boundAddr,
-		Handler:      s.withAdminCORS(mux),
+		Handler:      s.withSecurityHeaders(s.withAdminCORS(mux)),
 		ReadTimeout:  adminReadTimeout,
 		WriteTimeout: adminWriteTimeout,
 	}
@@ -397,9 +500,45 @@ func (s *adminServer) refresh(listen, secret string) {
 	s.infof("admin HTTP listening on %s", boundAddr)
 }
 
+func (s *adminServer) buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/system", s.withAdminAuth(s.handleSystem))
+	mux.HandleFunc("/api/v1/system/log-level", s.withAdminAuth(s.handleSystemLogLevel))
+	mux.HandleFunc("/api/v1/system/reload", s.withAdminAuth(s.handleReload))
+	mux.HandleFunc("/api/v1/metrics", s.withAdminAuth(s.handleMetrics))
+	mux.HandleFunc("/api/v1/metrics/history", s.withAdminAuth(s.handleMetricsHistory))
+	mux.HandleFunc("/api/v1/groups", s.withAdminAuth(s.handleGroups))
+	mux.HandleFunc("/api/v1/groups/", s.withAdminAuth(s.handleGroup))
+	mux.HandleFunc("/api/v1/connections", s.withAdminAuth(s.handleConnections))
+	mux.HandleFunc("/api/v1/connections/close", s.withAdminAuth(s.handleConnectionsClose))
+	mux.HandleFunc("/api/v1/connections/kernel", s.withAdminAuth(s.handleKernelConnections))
+	mux.HandleFunc("/api/v1/connections/", s.withAdminAuth(s.handleConnectionByID))
+	mux.HandleFunc("/api/v1/flows/closed", s.withAdminAuth(s.handleClosedFlows))
+	mux.HandleFunc("/api/v1/traffic/summary", s.withAdminAuth(s.handleTrafficSummary))
+	mux.HandleFunc("/api/v1/traffic/reset", s.withAdminAuth(s.handleTrafficReset))
+	mux.HandleFunc("/api/v1/inbounds", s.withAdminAuth(s.handleInbounds))
+	mux.HandleFunc("/api/v1/config", s.withAdminAuth(s.handleConfig))
+	mux.HandleFunc("/api/v1/config/effective", s.withAdminAuth(s.handleEffectiveConfig))
+	mux.HandleFunc("/api/v1/sources", s.withAdminAuth(s.handleSources))
+	mux.HandleFunc("/api/v1/sources/refresh", s.withAdminAuth(s.handleSourcesRefresh))
+	mux.HandleFunc("/api/v1/logs", s.withAdminAuth(s.handleLogs))
+	mux.HandleFunc("/api/v1/debug/quality", s.withAdminAuth(s.handleQuality))
+	mux.HandleFunc("/api/v1/debug/capture", s.withAdminAuth(s.handleCapture))
+	mux.HandleFunc("/api/v1/debug/evidence", s.withAdminAuth(s.handleEvidence))
+	mux.HandleFunc("/api/v1/debug/udp-recovery", s.withAdminAuth(s.handleUDPRecovery))
+	if s.wsHub != nil {
+		mux.HandleFunc("/api/v1/ws", s.wsHub.handleWS)
+	}
+	mux.HandleFunc("/", s.withAdminAuth(s.handleNotFound))
+	return mux
+}
+
 func (s *adminServer) shutdown() {
 	if s == nil {
 		return
+	}
+	if s.wsHub != nil {
+		s.wsHub.close()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -417,15 +556,41 @@ func (s *adminServer) stopLocked() {
 	s.http = nil
 }
 
+func (s *adminServer) withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Add("Vary", "Origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *adminServer) withAdminCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); origin != "" && adminOriginAllowed(origin) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
-		}
 		if r.Method == http.MethodOptions {
+			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
+			w.Header().Add("Vary", "Access-Control-Request-Method")
+		}
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			if !s.isOriginAllowed(origin) {
+				writeAdminAPIError(w, http.StatusForbidden, "origin_forbidden", "origin not allowed")
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+			w.Header().Set("Access-Control-Expose-Headers", "ETag")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			if strings.EqualFold(strings.TrimSpace(r.Header.Get("Access-Control-Request-Private-Network")), "true") {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		} else if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -435,29 +600,48 @@ func (s *adminServer) withAdminCORS(next http.Handler) http.Handler {
 
 func (s *adminServer) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		clientIP := clientIPFromRequest(r)
+		if s.authLimiter != nil {
+			if allowed, retryAfter := s.authLimiter.allow(clientIP); !allowed {
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				writeAdminAPIError(w, http.StatusTooManyRequests, "rate_limited", "too many authentication failures")
+				return
+			}
+		}
 		if !adminBearerOK(r.Header.Get("Authorization"), s.currentSecret()) {
-			writeAdminError(w, http.StatusUnauthorized, "unauthorized")
+			if s.authLimiter != nil {
+				s.authLimiter.recordFailure(clientIP)
+			}
+			writeAdminAPIError(w, http.StatusUnauthorized, "unauthorized", "invalid or missing bearer token")
 			return
+		}
+		if s.authLimiter != nil {
+			s.authLimiter.recordSuccess(clientIP)
 		}
 		next(w, r)
 	}
 }
 
-func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (s *adminServer) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+	writeAdminAPIError(w, http.StatusNotFound, "not_found", "endpoint not found")
+}
+
+func (s *adminServer) handleSystem(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	plane := s.currentPlane()
-	body := adminStatusBody{
-		AdminStatus: control.AdminStatus{Version: Version, Running: plane != nil},
+	body := adminSystemBody{
+		AdminSystemInfo: control.AdminSystemInfo{Version: Version, Running: plane != nil},
 	}
 	if plane != nil {
-		body.AdminStatus = plane.AdminStatusSnapshot(Version)
+		body.AdminSystemInfo = plane.AdminSystemInfo(Version)
 	}
-	body.Mihomo = CurrentMihomoStatus()
-	body.Geodata = CurrentGeodataStatus()
-	body.SyncWarning = mihomoWarning(body.Mihomo)
+	if body.LogLevel == "" && s.log != nil {
+		body.LogLevel = s.log.GetLevel().String()
+	}
+	body.SyncWarning = mihomoWarning(CurrentMihomoStatus())
 	syncStatus := s.reloadStatusSnapshot()
 	body.ConfigInSync = syncStatus.configInSync
 	body.LastReloadError = syncStatus.lastReloadError
@@ -469,141 +653,472 @@ func (s *adminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeAdminJSON(w, http.StatusOK, body)
 }
 
-func (s *adminServer) handleGroups(w http.ResponseWriter, r *http.Request) {
+func (s *adminServer) handleSystemLogLevel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	if s.log == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "logger_unavailable", "logger is unavailable")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
+	var body adminLogLevelPutBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+		return
+	}
+	rawLevel := strings.ToLower(strings.TrimSpace(body.Level))
+	switch rawLevel {
+	case "error", "warn", "warning", "info", "debug", "trace":
+	default:
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_log_level", "level must be error, warn, info, debug, or trace")
+		return
+	}
+	lvl, err := logrus.ParseLevel(rawLevel)
+	if err != nil {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_log_level", "invalid log level")
+		return
+	}
+	s.log.SetLevel(lvl)
+	canonical := lvl.String()
+	if lvl == logrus.WarnLevel {
+		canonical = "warn"
+	}
+	s.emitWSEvent("log_level_changed", map[string]string{"level": canonical})
+	writeAdminJSON(w, http.StatusOK, map[string]string{"level": canonical})
+}
+
+func (s *adminServer) buildMetricsBody() any {
+	plane := s.currentPlane()
+	if plane == nil {
+		return control.AdminMetricsSnapshot{
+			TimestampMs: time.Now().UnixMilli(),
+		}
+	}
+	return plane.AdminMetricsSnapshot()
+}
+
+func (s *adminServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	plane := s.currentPlane()
 	if plane == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"groups": plane.AdminGroups(), "display_names": CurrentDisplayNames()})
+	writeAdminJSON(w, http.StatusOK, plane.AdminMetricsSnapshot())
+}
+
+func (s *adminServer) handleMetricsHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	windowSec := 1800
+	if raw := strings.TrimSpace(r.URL.Query().Get("window")); raw != "" {
+		v, err := parsePositiveInt(raw, 3600)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid window")
+			return
+		}
+		windowSec = v
+	}
+	points := 180
+	if raw := strings.TrimSpace(r.URL.Query().Get("points")); raw != "" {
+		v, err := parsePositiveInt(raw, 720)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid points")
+			return
+		}
+		points = v
+	}
+	samples := plane.AdminMetricsHistory(windowSec, points)
+	writeAdminJSON(w, http.StatusOK, map[string]any{
+		"window_sec": windowSec,
+		"points":     len(samples),
+		"samples":    samples,
+	})
+}
+
+func (s *adminServer) buildGroupsBody() (any, bool) {
+	plane := s.currentPlane()
+	if plane == nil {
+		return nil, false
+	}
+	groups := plane.AdminGroups()
+	displayNames := CurrentDisplayNames()
+	if len(displayNames) > 0 {
+		for gi := range groups {
+			for mi := range groups[gi].Members {
+				if dn := displayNames[groups[gi].Members[mi].Name]; dn != "" {
+					groups[gi].Members[mi].DisplayName = dn
+				}
+			}
+		}
+	}
+	return map[string]any{
+		"groups":        groups,
+		"display_names": displayNames,
+	}, true
+}
+
+func (s *adminServer) handleGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	body, ok := s.buildGroupsBody()
+	if !ok {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, body)
 }
 
 func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 	name, action, err := parseAdminGroupPath(r.URL.Path)
 	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if action == "delay" {
-		if r.Method != http.MethodPost {
-			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		plane := s.currentPlane()
-		if plane == nil {
-			writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
-			return
-		}
-		if err := plane.TriggerLatencyChecksForGroup(name); err != nil {
-			writeAdminError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeAdminJSON(w, http.StatusAccepted, map[string]string{"group": name, "action": "delay"})
-		return
-	}
-	if r.Method != http.MethodPut {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
-	var body adminGroupPutBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	body.Member = strings.TrimSpace(body.Member)
-	if body.Member == "" {
-		writeAdminError(w, http.StatusBadRequest, "member is required")
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_group", err.Error())
 		return
 	}
 	plane := s.currentPlane()
 	if plane == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
 		return
 	}
-	if err := plane.SetGroupSelection(name, body.Member); err != nil {
-		writeAdminError(w, http.StatusBadRequest, err.Error())
-		return
+	switch action {
+	case "probe":
+		if r.Method != http.MethodPost {
+			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		if !s.allowGroupProbe(name) {
+			w.Header().Set("Retry-After", "3")
+			writeAdminAPIError(w, http.StatusTooManyRequests, "probe_cooldown", "probe requested too frequently for group "+name)
+			return
+		}
+		if err := plane.TriggerLatencyChecksForGroup(name); err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "probe_failed", sanitizeAdminError(err))
+			return
+		}
+		writeAdminJSON(w, http.StatusAccepted, map[string]string{"group": name, "action": "probe"})
+	case "selection":
+		if r.Method != http.MethodPut {
+			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
+		var body adminGroupPutBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+			return
+		}
+		body.Member = strings.TrimSpace(body.Member)
+		if body.Member == "" {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_member", "member is required")
+			return
+		}
+		if err := plane.SetGroupSelection(name, body.Member); err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "selection_failed", sanitizeAdminError(err))
+			return
+		}
+		s.emitWSEvent("group_selection_changed", map[string]string{"group": name, "member": body.Member})
+		writeAdminJSON(w, http.StatusOK, map[string]string{"group": name, "member": body.Member})
+	default:
+		writeAdminAPIError(w, http.StatusNotFound, "not_found", "group endpoint not found")
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]string{"group": name, "member": body.Member})
+}
+
+func (s *adminServer) allowGroupProbe(group string) bool {
+	if s == nil {
+		return true
+	}
+	now := time.Now()
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.lastProbeByGp == nil {
+		s.lastProbeByGp = make(map[string]time.Time)
+	}
+	if prev, ok := s.lastProbeByGp[group]; ok && now.Sub(prev) < adminProbeCooldown {
+		return false
+	}
+	if len(s.lastProbeByGp) >= 256 {
+		for k, ts := range s.lastProbeByGp {
+			if now.Sub(ts) >= adminProbeCooldown {
+				delete(s.lastProbeByGp, k)
+			}
+		}
+	}
+	s.lastProbeByGp[group] = now
+	return true
+}
+
+func parseConnectionFilterQuery(q url.Values) control.AdminConnectionFilter {
+	srcIP := q.Get("src_ip")
+	if srcIP == "" {
+		srcIP = q.Get("src")
+	}
+	return control.AdminConnectionFilter{
+		Network:  q.Get("network"),
+		Outbound: q.Get("outbound"),
+		Dialer:   q.Get("dialer"),
+		SrcIP:    srcIP,
+		DstIP:    q.Get("dst_ip"),
+		Domain:   q.Get("domain"),
+		Mac:      q.Get("mac"),
+		Process:  q.Get("process"),
+		Inbound:  q.Get("inbound"),
+		Rule:     q.Get("rule"),
+		Query:    q.Get("q"),
+	}
+}
+
+func (s *adminServer) snapshotTrackedConnections(limit int, filter control.AdminConnectionFilter, sortBy, order string) control.AdminConnectionsSnapshot {
+	plane := s.currentPlane()
+	if plane == nil {
+		return control.AdminConnectionsSnapshot{Connections: []control.AdminConnection{}}
+	}
+	if s.connTracker != nil {
+		return s.connTracker.Snapshot(plane, limit, filter, sortBy, order)
+	}
+	return plane.AdminConnections(limit, filter)
 }
 
 func (s *adminServer) handleConnections(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	plane := s.currentPlane()
 	if plane == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
 		return
 	}
+	q := r.URL.Query()
 	limit := 0
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
 		parsed, err := parsePositiveInt(raw, 1024)
 		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid limit")
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid limit")
 			return
 		}
 		limit = parsed
 	}
-	snap := plane.AdminConnections(limit, r.URL.Query().Get("outbound"), r.URL.Query().Get("src"), r.URL.Query().Get("mac"), r.URL.Query().Get("inbound"))
+	filter := parseConnectionFilterQuery(q)
+	snap := s.snapshotTrackedConnections(limit, filter, q.Get("sort"), q.Get("order"))
 	writeAdminJSON(w, http.StatusOK, snap)
 }
 
-// handleKernelConnections lists flows the kernel forwards without dae's
-// userspace relay. It reads the conntrack table, so it is its own endpoint and
-// only runs when a client asks for it; /v1/connections never triggers it.
-func (s *adminServer) handleKernelConnections(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+func (s *adminServer) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	plane := s.currentPlane()
 	if plane == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
 		return
 	}
-	limit := 0
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		parsed, err := parsePositiveInt(raw, 1024)
+	const prefix = "/api/v1/connections/"
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	if rest == "" || strings.Contains(rest, "/") {
+		writeAdminAPIError(w, http.StatusNotFound, "not_found", "connection not found")
+		return
+	}
+	id, err := url.PathUnescape(rest)
+	if err != nil || strings.TrimSpace(id) == "" {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_id", "invalid connection id")
+		return
+	}
+	if !plane.AdminCloseConnection(id) {
+		writeAdminAPIError(w, http.StatusNotFound, "not_found", "connection not found")
+		return
+	}
+	if s.connTracker != nil {
+		s.connTracker.Invalidate()
+	}
+	s.emitWSEvent("connections_closed", map[string]any{"closed": 1, "id": id})
+	writeAdminJSON(w, http.StatusOK, map[string]any{"closed": true, "id": id})
+}
+
+func (s *adminServer) handleConnectionsClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
+	var filter control.AdminConnectionFilter
+	if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+		return
+	}
+	if !filter.All && filter.IsEmpty() {
+		writeAdminAPIError(w, http.StatusBadRequest, "filter_required", "at least one filter field or all=true is required")
+		return
+	}
+	closed := plane.AdminCloseConnections(filter)
+	if s.connTracker != nil {
+		s.connTracker.Invalidate()
+	}
+	if closed > 0 {
+		s.emitWSEvent("connections_closed", map[string]any{"closed": closed})
+	}
+	writeAdminJSON(w, http.StatusOK, map[string]int{"closed": closed})
+}
+
+func (s *adminServer) handleKernelConnections(w http.ResponseWriter, r *http.Request) {
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		limit := 0
+		q := r.URL.Query()
+		if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+			parsed, err := parsePositiveInt(raw, 1024)
+			if err != nil {
+				writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid limit")
+				return
+			}
+			limit = parsed
+		}
+		resolveDomains := false
+		if raw := strings.TrimSpace(q.Get("resolve_domains")); raw == "true" || raw == "1" {
+			resolveDomains = true
+		}
+		snap := plane.AdminKernelConnections(limit, q.Get("src"), q.Get("mac"), resolveDomains)
+		if snap.Error == "invalid src" || snap.Error == "invalid mac" {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", snap.Error)
+			return
+		}
+		writeAdminJSON(w, http.StatusOK, snap)
+	case http.MethodDelete:
+		r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
+		var req control.AdminKernelCloseRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+			return
+		}
+		res, err := plane.AdminCloseKernelConnection(req)
 		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid limit")
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_tuple", err.Error())
+			return
+		}
+		if res.UserspaceClosed && s.connTracker != nil {
+			s.connTracker.Invalidate()
+		}
+		writeAdminJSON(w, http.StatusOK, res)
+	default:
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+	}
+}
+
+func (s *adminServer) handleClosedFlows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	q := r.URL.Query()
+	limit := 0
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := parsePositiveInt(raw, 500)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid limit")
 			return
 		}
 		limit = parsed
 	}
-	snap := plane.AdminKernelConnections(limit, r.URL.Query().Get("src"), r.URL.Query().Get("mac"))
-	if snap.Error == "invalid src" || snap.Error == "invalid mac" {
-		writeAdminError(w, http.StatusBadRequest, snap.Error)
+	writeAdminJSON(w, http.StatusOK, plane.AdminClosedFlows(limit, parseConnectionFilterQuery(q)))
+}
+
+func (s *adminServer) handleTrafficSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, snap)
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	top := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("top")); raw != "" {
+		parsed, err := parsePositiveInt(raw, 200)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid top")
+			return
+		}
+		top = parsed
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminTrafficSummary(top))
+}
+
+func (s *adminServer) handleTrafficReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	plane.AdminResetTrafficSummary()
+	s.emitWSEvent("traffic_reset", nil)
+	writeAdminJSON(w, http.StatusOK, map[string]bool{"reset": true})
 }
 
 func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		adminConfigWriteMu.Lock()
-		body, err := loadAdminConfig(s.configDir)
+		body, etag, err := loadAdminConfigCached(s.configDir)
 		adminConfigWriteMu.Unlock()
 		if err != nil {
-			writeAdminError(w, http.StatusInternalServerError, sanitizeAdminError(err))
+			writeAdminAPIError(w, http.StatusInternalServerError, "config_read_failed", sanitizeAdminError(err))
 			return
+		}
+		if etag != "" {
+			w.Header().Set("ETag", etag)
 		}
 		writeAdminJSON(w, http.StatusOK, body)
 	case http.MethodPut:
 		r.Body = http.MaxBytesReader(w, r.Body, adminMaxConfigBytes)
 		var body adminConfigBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid json")
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
 			return
 		}
+		ifMatch := r.Header.Get("If-Match")
 		adminConfigWriteMu.Lock()
+		if ifMatch != "" {
+			currentETag, etagErr := currentAdminConfigETag(s.configDir)
+			if etagErr == nil && !checkAdminIfMatch(ifMatch, currentETag) {
+				adminConfigWriteMu.Unlock()
+				writeAdminAPIError(w, http.StatusPreconditionFailed, "precondition_failed", "configuration changed since last read")
+				return
+			}
+		}
 		queued, err := applyAdminConfigLocked(s.configDir, body, s.reload)
 		if err == nil {
 			s.recordPendingAdminWriteLocked()
@@ -611,34 +1126,33 @@ func (s *adminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 		adminConfigWriteMu.Unlock()
 		if err != nil {
 			status := http.StatusBadRequest
+			code := "config_invalid"
 			if errors.Is(err, errAdminReloadQueueFull) {
 				status = http.StatusConflict
+				code = "reload_busy"
 			}
-			writeAdminError(w, status, sanitizeAdminError(err))
+			writeAdminAPIError(w, status, code, sanitizeAdminError(err))
 			return
 		}
+		s.emitWSEvent("config_updated", map[string]any{"queued": queued})
 		writeAdminJSON(w, http.StatusOK, adminReloadBody{Queued: queued})
 	default:
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
 }
 
-// handleEffectiveConfig serves the read-only view of the running configuration
-// after the Mihomo source was converted and merged. ?format=text returns the
-// same content as plain text.
 func (s *adminServer) handleEffectiveConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	view := CurrentEffectiveConfig()
 	if view == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "no configuration is running yet")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "config_unavailable", "no configuration is running yet")
 		return
 	}
 	if r.URL.Query().Get("format") == "text" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, view.Text())
 		return
@@ -648,17 +1162,17 @@ func (s *adminServer) handleEffectiveConfig(w http.ResponseWriter, r *http.Reque
 
 func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
 	if s.reload == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "reload is unavailable")
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "reload_unavailable", "reload is unavailable")
 		return
 	}
 	adminConfigWriteMu.Lock()
 	defer adminConfigWriteMu.Unlock()
 	if err := validateLoadedAdminConfig(s.configDir); err != nil {
-		writeAdminError(w, http.StatusBadRequest, sanitizeAdminError(err))
+		writeAdminAPIError(w, http.StatusBadRequest, "config_invalid", sanitizeAdminError(err))
 		return
 	}
 	queued := s.reload()
@@ -669,30 +1183,196 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 	writeAdminJSON(w, status, adminReloadBody{Queued: queued})
 }
 
+func (s *adminServer) handleSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	mihomo := CurrentMihomoStatus()
+	writeAdminJSON(w, http.StatusOK, adminSourcesBody{
+		Mihomo:        mihomo,
+		Geodata:       CurrentGeodataStatus(),
+		RuleProviders: CurrentRuleProviderStatus(),
+		SyncWarning:   mihomoWarning(mihomo),
+	})
+}
+
+func (s *adminServer) handleSourcesRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	s.sourcesMu.Lock()
+	refresher := s.sourcesRefresher
+	s.sourcesMu.Unlock()
+	if refresher == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "refresh_unavailable", "sources refresher is unavailable")
+		return
+	}
+	if !s.sourcesRefreshing.CompareAndSwap(false, true) {
+		writeAdminAPIError(w, http.StatusConflict, "refresh_in_progress", "sources refresh already in progress")
+		return
+	}
+	defer s.sourcesRefreshing.Store(false)
+
+	res, err := refresher(r.Context())
+	if err != nil {
+		writeAdminAPIError(w, http.StatusInternalServerError, "refresh_failed", sanitizeAdminError(err))
+		return
+	}
+	mihomo := CurrentMihomoStatus()
+	sources := adminSourcesBody{
+		Mihomo:        mihomo,
+		Geodata:       CurrentGeodataStatus(),
+		RuleProviders: CurrentRuleProviderStatus(),
+		SyncWarning:   mihomoWarning(mihomo),
+	}
+	s.emitWSEvent("sources_refreshed", res)
+	writeAdminJSON(w, http.StatusOK, map[string]any{
+		"refreshed":      true,
+		"changed":        res.Changed,
+		"used_last_good": res.UsedLastGood,
+		"reload_queued":  res.ReloadQueued,
+		"warning":        res.Warning,
+		"sources":        sources,
+	})
+}
+
 func (s *adminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	n := adminDefaultLogLines
-	if raw := strings.TrimSpace(r.URL.Query().Get("n")); raw != "" {
-		parsed, err := parsePositiveInt(raw, adminMaxLogLines)
+	q := r.URL.Query()
+	limit := adminLogDefaultLimit
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := parsePositiveInt(raw, adminLogMaxLimit)
 		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid n")
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid limit")
 			return
 		}
-		n = parsed
+		limit = parsed
 	}
-	lines, err := tailLogLines(s.logFile, n)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeAdminJSON(w, http.StatusOK, adminLogsBody{Lines: []string{}})
+	minLevel := logrus.TraceLevel
+	if rawLvl := strings.TrimSpace(q.Get("level")); rawLvl != "" {
+		parsed, err := logrus.ParseLevel(strings.ToLower(rawLvl))
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_log_level", "invalid level")
 			return
 		}
-		writeAdminError(w, http.StatusInternalServerError, "failed to read logs")
+		minLevel = parsed
+	}
+	var afterSeq uint64
+	if rawAfter := strings.TrimSpace(q.Get("after_seq")); rawAfter != "" {
+		parsed, err := strconv.ParseUint(rawAfter, 10, 64)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid after_seq")
+			return
+		}
+		afterSeq = parsed
+	}
+	entries, latest := s.logRing.Snapshot(limit, minLevel, afterSeq)
+	writeAdminJSON(w, http.StatusOK, adminLogsResponseBody{
+		Entries:   entries,
+		LatestSeq: latest,
+	})
+}
+
+func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, adminLogsBody{Lines: lines})
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	body := map[string]any{"entries": plane.AdminQuality(r.URL.Query().Get("group"), r.URL.Query().Get("host")), "limit": 256}
+	if diagnostics, ok := plane.(interface {
+		AdminRecoveryDiagnostics() []outbound.RecoveryDiagnostics
+	}); ok {
+		body["recovery_diagnostics"] = diagnostics.AdminRecoveryDiagnostics()
+		body["recovery_diagnostics_limit"] = 256
+	}
+	writeAdminJSON(w, http.StatusOK, body)
+}
+
+func (s *adminServer) handleCapture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid after cursor")
+			return
+		}
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminCapture(uint64) observation.Snapshot
+	})
+	if !ok {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "capture_unavailable", "capture unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminCapture(after))
+}
+
+func (s *adminServer) handleUDPRecovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid after cursor")
+			return
+		}
+	}
+	process := r.URL.Query().Get("process")
+	if len(process) > 64 {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid process cursor")
+		return
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminUDPRecovery(uint64, string) control.UDPRecoverySnapshot
+	})
+	if !ok {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "recovery_unavailable", "UDP recovery diagnostics unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminUDPRecovery(after, process))
+}
+
+func (s *adminServer) handleEvidence(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	after := uint64(0)
+	if value := r.URL.Query().Get("after"); value != "" {
+		var err error
+		after, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid after cursor")
+			return
+		}
+	}
+	plane, ok := s.currentPlane().(interface {
+		AdminEvidence(uint64) observation.EvidenceSnapshot
+	})
+	if !ok {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "evidence_unavailable", "evidence unavailable")
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminEvidence(after))
 }
 
 func (s *adminServer) currentPlane() adminPlane {
@@ -714,42 +1394,35 @@ func (s *adminServer) infof(format string, args ...any) {
 	}
 }
 
+func adminSecretMatches(candidate, secret string) bool {
+	if secret == "" || candidate == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(secret)) == 1
+}
+
 func adminBearerOK(header, secret string) bool {
 	const prefix = "Bearer "
 	if secret == "" || !strings.HasPrefix(header, prefix) {
 		return false
 	}
 	got := strings.TrimSpace(strings.TrimPrefix(header, prefix))
-	return got != "" && got == secret
+	return adminSecretMatches(got, secret)
 }
 
-func adminOriginAllowed(origin string) bool {
-	parsed, err := url.Parse(origin)
-	if err != nil || parsed.Host == "" {
-		return false
+func clientIPFromRequest(r *http.Request) string {
+	if r == nil || r.RemoteAddr == "" {
+		return "unknown"
 	}
-	host := parsed.Hostname()
-	if host == "localhost" || host == "127.0.0.1" {
-		return true
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
 	}
-	ip := net.ParseIP(host)
-	if ip != nil {
-		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
-	}
-	// LAN hostnames used by OpenWrt LuCI (router.lan, OpenWrt.lan).
-	return strings.HasSuffix(strings.ToLower(host), ".lan")
-}
-
-func adminGroupNameFromPath(path string) (string, error) {
-	name, action, err := parseAdminGroupPath(path)
-	if err != nil || action != "" {
-		return "", fmt.Errorf("invalid group")
-	}
-	return name, nil
+	return host
 }
 
 func parseAdminGroupPath(path string) (name, action string, err error) {
-	const prefix = "/v1/groups/"
+	const prefix = "/api/v1/groups/"
 	if !strings.HasPrefix(path, prefix) {
 		return "", "", fmt.Errorf("group is required")
 	}
@@ -758,17 +1431,19 @@ func parseAdminGroupPath(path string) (name, action string, err error) {
 		return "", "", fmt.Errorf("group is required")
 	}
 	parts := strings.Split(rest, "/")
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid group action path")
+	}
 	name, err = url.PathUnescape(parts[0])
 	if err != nil || name == "" || strings.Contains(name, "/") {
 		return "", "", fmt.Errorf("invalid group")
 	}
-	if len(parts) == 1 {
-		return name, "", nil
+	switch parts[1] {
+	case "selection", "probe":
+		return name, parts[1], nil
+	default:
+		return "", "", fmt.Errorf("invalid group action")
 	}
-	if len(parts) == 2 && parts[1] == "delay" {
-		return name, "delay", nil
-	}
-	return "", "", fmt.Errorf("invalid group")
 }
 
 func writeAdminJSON(w http.ResponseWriter, status int, body any) {
@@ -777,179 +1452,28 @@ func writeAdminJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-func writeAdminError(w http.ResponseWriter, status int, message string) {
-	writeAdminJSON(w, status, adminErrorBody{Error: message})
+func writeAdminAPIError(w http.ResponseWriter, status int, code, message string) {
+	writeAdminJSON(w, status, adminAPIErrorBody{
+		Error: adminAPIErrorDetail{
+			Code:    code,
+			Message: message,
+		},
+	})
 }
 
-func parsePositiveInt(raw string, max int) (int, error) {
+func parsePositiveInt(raw string, maxVal int) (int, error) {
 	n := 0
 	for _, r := range raw {
 		if r < '0' || r > '9' {
 			return 0, fmt.Errorf("invalid integer")
 		}
 		n = n*10 + int(r-'0')
-		if n > max {
-			return max, nil
+		if n > maxVal {
+			return maxVal, nil
 		}
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("invalid integer")
 	}
 	return n, nil
-}
-
-func tailLogLines(path string, n int) ([]string, error) {
-	if path == "" {
-		return []string{}, nil
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	if n <= 0 {
-		return []string{}, nil
-	}
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	// Read backwards from a fixed size snapshot. Rotation keeps this fd on
-	// the original file; concurrent truncation is handled by ReadAt's EOF.
-	end := stat.Size()
-	floor := max(int64(0), end-(1<<20))
-	var data []byte
-	for end > floor {
-		start := max(floor, end-16*1024)
-		block := make([]byte, int(end-start))
-		read, err := file.ReadAt(block, start)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, err
-		}
-		data = append(block[:read], data...)
-		end = start
-		if bytes.Count(data, []byte{'\n'}) > n {
-			break
-		}
-	}
-	if end > 0 {
-		if cut := bytes.IndexByte(data, '\n'); cut >= 0 {
-			data = data[cut+1:]
-		} else {
-			return []string{}, nil
-		}
-	}
-	data = bytes.TrimSuffix(data, []byte{'\n'})
-	lines := make([]string, 0, n)
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		line = bytes.TrimSuffix(line, []byte{'\r'})
-		if utf8.Valid(line) {
-			lines = append(lines, string(line))
-		}
-	}
-	if len(data) == 0 {
-		return []string{}, nil
-	}
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-
-	return lines, nil
-}
-
-func (s *adminServer) handleQuality(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	plane := s.currentPlane()
-	if plane == nil {
-		writeAdminError(w, http.StatusServiceUnavailable, "control plane is not ready")
-		return
-	}
-	body := map[string]any{"entries": plane.AdminQuality(r.URL.Query().Get("group"), r.URL.Query().Get("host")), "limit": 256}
-	if diagnostics, ok := plane.(interface {
-		AdminRecoveryDiagnostics() []outbound.RecoveryDiagnostics
-	}); ok {
-		body["recovery_diagnostics"] = diagnostics.AdminRecoveryDiagnostics()
-		body["recovery_diagnostics_limit"] = 256
-	}
-	writeAdminJSON(w, http.StatusOK, body)
-}
-
-func (s *adminServer) handleCapture(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	after := uint64(0)
-	if value := r.URL.Query().Get("after"); value != "" {
-		var err error
-		after, err = strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
-			return
-		}
-	}
-	plane, ok := s.currentPlane().(interface {
-		AdminCapture(uint64) observation.Snapshot
-	})
-	if !ok {
-		writeAdminError(w, http.StatusServiceUnavailable, "capture unavailable")
-		return
-	}
-	writeAdminJSON(w, http.StatusOK, plane.AdminCapture(after))
-}
-
-func (s *adminServer) handleUDPRecovery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	after := uint64(0)
-	if value := r.URL.Query().Get("after"); value != "" {
-		var err error
-		after, err = strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
-			return
-		}
-	}
-	process := r.URL.Query().Get("process")
-	if len(process) > 64 {
-		writeAdminError(w, http.StatusBadRequest, "invalid process cursor")
-		return
-	}
-	plane, ok := s.currentPlane().(interface {
-		AdminUDPRecovery(uint64, string) control.UDPRecoverySnapshot
-	})
-	if !ok {
-		writeAdminError(w, http.StatusServiceUnavailable, "UDP recovery diagnostics unavailable")
-		return
-	}
-	writeAdminJSON(w, http.StatusOK, plane.AdminUDPRecovery(after, process))
-}
-
-func (s *adminServer) handleEvidence(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	after := uint64(0)
-	if value := r.URL.Query().Get("after"); value != "" {
-		var err error
-		after, err = strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid after cursor")
-			return
-		}
-	}
-	plane, ok := s.currentPlane().(interface {
-		AdminEvidence(uint64) observation.EvidenceSnapshot
-	})
-	if !ok {
-		writeAdminError(w, http.StatusServiceUnavailable, "evidence unavailable")
-		return
-	}
-	writeAdminJSON(w, http.StatusOK, plane.AdminEvidence(after))
 }

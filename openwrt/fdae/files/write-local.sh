@@ -23,6 +23,7 @@ lan=$(uci -q get dae.config.lan_interface || true)
 wan=$(uci -q get dae.config.wan_interface || true)
 listen=$(uci -q get dae.config.admin_listen || true)
 secret=$(uci -q get dae.config.admin_secret || true)
+cors_origins=$(uci -q get dae.config.admin_cors_origins || true)
 mihomo_file=$(uci -q get dae.config.mihomo_config || true)
 mihomo_interval=$(uci -q get dae.config.mihomo_interval || true)
 isolate_groups=$(uci -q get dae.config.isolate_transport_groups || true)
@@ -201,6 +202,20 @@ umask 077
 	fi
 	if [ -n "$secret" ]; then
 		echo "    admin_secret: $(quote_dae "$secret")"
+	fi
+	if [ -n "$cors_origins" ]; then
+		single_line "$cors_origins" "admin_cors_origins" || exit 1
+		list=""
+		old_ifs=$IFS
+		IFS=','
+		for o in $cors_origins; do
+			o=$(printf '%s' "$o" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+			[ -n "$o" ] || continue
+			q=$(quote_dae "$o") || exit 1
+			list="${list:+$list, }$q"
+		done
+		IFS=$old_ifs
+		[ -z "$list" ] || echo "    admin_cors_origins: ${list}"
 	fi
 	echo "}"
 

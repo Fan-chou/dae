@@ -54,9 +54,11 @@ type proxyDialResult struct {
 	Dialer             *dialer.Dialer
 	DialTarget         string
 	Network            string
-	Mark               uint32
-	Must               bool
-	SniffedDomain      string
+	Mark                    uint32
+	Must                    bool
+	RuleMatchIndex          uint16
+	Rule                    *RoutingRuleMeta
+	SniffedDomain           string
 	// StickySite is the fallback/url_test pin key. It may be a dest IP when
 	// the flow has no sniffed name; it must not replace SniffedDomain.
 	StickySite string
@@ -179,6 +181,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 
 	pinnedFakeIPRealDest := false
+	matchIdx := UnknownRuleMatchIndex
 	if outboundIndex == consts.OutboundControlPlaneRouting {
 		routingResult := &bpfRoutingResult{
 			Mark:     mark,
@@ -194,11 +197,11 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			proto = consts.L4ProtoType_UDP
 		}
 		if fakeDest {
-			outboundIndex, newMark, must, realIP, err = c.routeFakeIPInbound(ctx, p.Inbound, src, dst, domain, proto, routingResult, realIPFor)
+			outboundIndex, newMark, must, realIP, matchIdx, err = c.routeFakeIPInboundWithRule(ctx, p.Inbound, src, dst, domain, proto, routingResult, realIPFor)
 			if err != nil {
 				return nil, err
 			}
-		} else if outboundIndex, newMark, must, err = c.RouteInbound(
+		} else if outboundIndex, newMark, must, matchIdx, err = c.RouteInboundWithRule(
 			p.Inbound,
 			src,
 			dst,
@@ -227,6 +230,36 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			outboundIndex.String(),
 		)
 	}
+	if matchIdx == UnknownRuleMatchIndex && c.routingMatcher != nil {
+		// Option A attribution for kernel-routed flows: read-only userspace rule lookup
+		// without changing kernel-chosen outbound/mark/must.
+		proto := consts.L4ProtoType_TCP
+		if p.Network == "udp" {
+			proto = consts.L4ProtoType_UDP
+		}
+		var mac16 [16]uint8
+		copy(mac16[10:], p.Mac[:])
+		ipVersion := consts.IpVersion_6
+		if dst.Addr().Is4() || dst.Addr().Is4In6() {
+			ipVersion = consts.IpVersion_4
+		}
+		if _, _, _, attrIdx, attrErr := c.routingMatcher.MatchInboundWithRule(
+			p.Inbound,
+			src.Addr().As16(),
+			dst.Addr().As16(),
+			src.Port(),
+			dst.Port(),
+			ipVersion,
+			proto,
+			domain,
+			p.ProcessName,
+			p.Dscp,
+			mac16,
+		); attrErr == nil {
+			matchIdx = attrIdx
+		}
+	}
+	ruleMeta := c.routingMatcher.RuleMetaForMatchIndex(matchIdx)
 
 	if err := c.guardFakeIPOutbound(outboundIndex, dst.Addr()); err != nil {
 		return nil, err
@@ -289,6 +322,8 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 			OutboundIndex:           outboundIndex,
 			Outbound:                outbound,
 			Must:                    must,
+			RuleMatchIndex:          matchIdx,
+			Rule:                    ruleMeta,
 			IsDialIp:                strictIpVersion,
 			OrigNetworkType:         networkType.StringWithoutDns(),
 			SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),
@@ -321,6 +356,8 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		StickySite:              stickySite,
 		Mark:                    mark,
 		Must:                    must,
+		RuleMatchIndex:          matchIdx,
+		Rule:                    ruleMeta,
 		IsDialIp:                strictIpVersion,
 		PinnedFakeIPRealDest:    pinnedFakeIPRealDest,
 		OrigNetworkType:         networkType.StringWithoutDns(),

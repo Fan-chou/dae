@@ -38,23 +38,26 @@ func TestMihomoStatusCommandReadsRunningDaemon(t *testing.T) {
 			http.Error(w, "no", http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path == "/v1/config/effective" {
+		switch r.URL.Path {
+		case "/api/v1/config/effective":
 			_ = json.NewEncoder(w).Encode(EffectiveConfig{Nodes: []EffectiveNode{
 				{Tag: "HK_01", DisplayName: "🇭🇰 HK 01", Origin: originMihomo},
 				{Tag: "plain", Origin: originMihomo},
 				{Tag: "mine", Origin: originConfig},
 			}})
-			return
-		}
-		if r.URL.Path != "/v1/status" {
+		case "/api/v1/system":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"generation":   "g1",
+				"sync_warning": "careful",
+			})
+		case "/api/v1/sources":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sync_warning": "careful",
+				"mihomo":       MihomoStatus{Enabled: true, Nodes: 3},
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"generation":   "g1",
-			"sync_warning": "careful",
-			"mihomo":       MihomoStatus{Enabled: true, Nodes: 3},
-		})
 	}))
 	defer srv.Close()
 	dir := t.TempDir()

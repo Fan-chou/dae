@@ -35,7 +35,7 @@ func TestAdminUDPRecoveryAuthReadOnlyAndCursor(t *testing.T) {
 		p := &recoveryAdminPlane{}
 		s := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return p }, nil)
 		s.secret = "test"
-		r := httptest.NewRequest(tc.method, "/v1/udp-recovery"+tc.query, nil)
+		r := httptest.NewRequest(tc.method, "/api/v1/debug/udp-recovery"+tc.query, nil)
 		r.Header.Set("Authorization", tc.token)
 		w := httptest.NewRecorder()
 		s.withAdminAuth(s.handleUDPRecovery)(w, r)

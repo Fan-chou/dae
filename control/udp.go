@@ -215,8 +215,10 @@ type DialOption struct {
 	NowNano int64
 	// FakeIPName is the DNS mapping name of a FakeIP destination at flow
 	// creation; it can differ from a sniffed domain.
-	FakeIPName  string
-	FakeIPStore *FakeIPStore
+	FakeIPName     string
+	FakeIPStore    *FakeIPStore
+	RuleMatchIndex uint16
+	Rule           *RoutingRuleMeta
 }
 
 // dnsFastPathPermitted reports whether port-53 traffic may be absorbed into
@@ -1236,14 +1238,17 @@ getNew:
 					StickySite:    res.StickySite,
 					IsDialIp:      res.IsDialIp,
 					SelectPath:    res.SelectPath,
-					Excluded:      excludedDialer,
-					NowNano:       nowNano,
+					Excluded:                 excludedDialer,
+					NowNano:                  nowNano,
+					RuleMatchIndex:           res.RuleMatchIndex,
+					Rule:                     res.Rule,
 				}
 				if res.ResolveDNSRestored && dialParam.ResolveDNSRecovery != nil {
 					option.ResolveDNSInitial = dialParam.ResolveDNSRecovery.initial
 				}
 				option.Binding = newUdpFlowBinding(c.PolicyEpoch(), res.OutboundIndex, res.Mark, res.Must, option)
 				option.Binding.Mac = routingResult.Mac
+				option.Binding.Process = pnameString(routingResult.Pname)
 				return option, nil
 			},
 		})

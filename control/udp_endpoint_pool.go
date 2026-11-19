@@ -251,6 +251,7 @@ type UdpEndpointPool struct {
 	rebuildOverrides    sync.Map // target-specific key -> process-owned peer claim
 	hasRebuildOverrides atomic.Bool
 	hasPinnedDNSRebuild atomic.Bool
+	count               atomic.Int64
 	shards              [udpEndpointCreateShardCount]udpEndpointPoolShard
 	janitorOnce         sync.Once
 	janitorStop         chan struct{}
@@ -345,18 +346,27 @@ func NewUdpEndpointPool() *UdpEndpointPool {
 	return p
 }
 
+func (p *UdpEndpointPool) setShardEntryLocked(shard *udpEndpointPoolShard, key UdpEndpointKey, ue *UdpEndpoint) {
+	m := shard.poolLocked()
+	if _, exists := m[key]; !exists {
+		p.count.Add(1)
+	}
+	m[key] = ue
+}
+
+func (p *UdpEndpointPool) deleteShardEntryLocked(shard *udpEndpointPoolShard, key UdpEndpointKey) {
+	if _, exists := shard.pool[key]; exists {
+		delete(shard.pool, key)
+		p.count.Add(-1)
+	}
+}
+
+// Len returns the approximate number of pooled UDP endpoints in O(1) without locking shards.
 func (p *UdpEndpointPool) Len() int {
 	if p == nil {
 		return 0
 	}
-	total := 0
-	for i := range p.shards {
-		shard := &p.shards[i]
-		shard.mu.RLock()
-		total += len(shard.pool)
-		shard.mu.RUnlock()
-	}
-	return total
+	return max(0, int(p.count.Load()))
 }
 
 func normalizeUdpEndpointPoolNetworkType(networkType dialer.NetworkType) dialer.NetworkType {
@@ -546,7 +556,7 @@ func (p *UdpEndpointPool) AbortEndpointsOwnedBy(owner udpConnStateOwner) error {
 			if ue == nil || !ue.markDeadIfOwnedBy(owner) {
 				continue
 			}
-			delete(shard.pool, key)
+			p.deleteShardEntryLocked(shard, key)
 			endpoints = append(endpoints, ue)
 		}
 		shard.mu.Unlock()
@@ -570,7 +580,7 @@ func (p *UdpEndpointPool) Reset() {
 		shard.mu.Lock()
 		toClose := make([]*UdpEndpoint, 0, len(shard.pool))
 		for key, ue := range shard.pool {
-			delete(shard.pool, key)
+			p.deleteShardEntryLocked(shard, key)
 			if ue != nil {
 				toClose = append(toClose, ue)
 			}
@@ -639,7 +649,7 @@ func (p *UdpEndpointPool) remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint, r
 		_ = closeEndpoint()
 		return fmt.Errorf("target udp endpoint is not in the pool")
 	}
-	delete(shard.pool, key)
+	p.deleteShardEntryLocked(shard, key)
 	shard.mu.Unlock()
 	// Close waits for the reply sender; never hold shard.mu across it.
 	return closeEndpoint()
@@ -824,7 +834,7 @@ dialSuccess:
 
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	shard.poolLocked()[key] = ue
+	p.setShardEntryLocked(shard, key, ue)
 	shard.mu.Unlock()
 	p.registerEndpoint(ue)
 
@@ -961,7 +971,7 @@ func (p *UdpEndpointPool) cacheFailureLocked(key UdpEndpointKey, log *logrus.Log
 
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	shard.poolLocked()[key] = failedUe
+	p.setShardEntryLocked(shard, key, failedUe)
 	shard.mu.Unlock()
 }
 
@@ -1055,7 +1065,7 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 			shard.mu.Unlock()
 			return ue, false, nil
 		default:
-			delete(shard.pool, key)
+			p.deleteShardEntryLocked(shard, key)
 			staleToClose = ue
 		}
 	}
@@ -1115,12 +1125,12 @@ func (p *UdpEndpointPool) startJanitor() {
 						expiredIdle = expiredIdle[:0]
 						for key, ue := range shard.pool {
 							if ue.IsExpired(nowNano) {
-								delete(shard.pool, key)
+								p.deleteShardEntryLocked(shard, key)
 								expiredIdle = append(expiredIdle, ue)
 								continue
 							}
 							if !p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue) {
-								delete(shard.pool, key)
+								p.deleteShardEntryLocked(shard, key)
 								toClose = append(toClose, ue)
 							}
 						}

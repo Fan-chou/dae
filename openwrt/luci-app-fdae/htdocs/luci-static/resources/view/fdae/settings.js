@@ -206,7 +206,8 @@ return view.extend({
 	render(data) {
 		const nodeNames = (data[1] && data[1].node_names) || {};
 		const names = Object.keys(nodeNames).sort();
-		const listen = uci.get('dae', 'config', 'admin_listen');
+		const panelUrl = String(uci.get('dae', 'config', 'panel_url') || '').trim();
+		const safePanelUrl = /^https?:\/\/[^\s"'<>]+$/i.test(panelUrl) ? panelUrl : '';
 		const m = new form.Map('dae', _('fdae'));
 
 		let s = m.section(form.TypedSection);
@@ -222,9 +223,9 @@ return view.extend({
 				head.replaceChildren(
 					E('strong', { style: 'color:' + (running ? 'green' : 'red') }, running ? _('运行中') : _('未运行')),
 					E('span', { style: 'opacity:.7' }, p.running_version || p.installed_version || ''),
-					listen
-						? E('a', { class: 'cbi-button', href: 'http://' + listen + '/fdae-ui/', target: '_blank', rel: 'noreferrer' }, _('打开面板'))
-						: E('em', { style: 'opacity:.7' }, _('设置 API 地址后可打开面板'))
+					safePanelUrl
+						? E('a', { class: 'cbi-button', href: safePanelUrl, target: '_blank', rel: 'noreferrer' }, _('打开面板'))
+						: E('em', { style: 'opacity:.7' }, _('可在下方“面板地址”填入独立前端 URL'))
 				);
 				if (p.pending === '1') {
 					banner.style.display = '';
@@ -316,10 +317,14 @@ return view.extend({
 		o = s.option(form.Value, 'lan_interface', _('LAN'), _('逗号分隔的接口名'));
 		o.placeholder = 'br-lan';
 		o = s.option(form.Value, 'wan_interface', _('WAN'), _('留空则不代理本机'));
-		o = s.option(form.Value, 'admin_listen', _('API 地址'), _('LAN 上的 ip:port，面板也在这个地址。不要用 0.0.0.0'));
+		o = s.option(form.Value, 'admin_listen', _('API 地址'), _('LAN 上的 ip:port，不要用 0.0.0.0 或端口 9090'));
 		o.placeholder = '192.168.1.1:2025';
 		o = s.option(form.Value, 'admin_secret', _('API 密钥'));
 		o.password = true;
+		o = s.option(form.Value, 'admin_cors_origins', _('允许的前端来源'), _('逗号分隔的 Origin，如 https://panel.example.com；留空则拒绝所有浏览器跨域请求（仅允许非浏览器客户端或同源反代访问）'));
+		o.placeholder = 'https://panel.example.com';
+		o = s.option(form.Value, 'panel_url', _('面板地址'), _('独立前端面板 URL（可选，用于在顶部显示“打开面板”按钮）'));
+		o.placeholder = 'https://panel.example.com';
 
 		s = m.section(form.NamedSection, 'config', 'dae', _('路由源'),
 			_('完整的 Mihomo 配置由 dae 自己读取、转换并合并，保留上一份有效副本。'));

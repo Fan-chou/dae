@@ -14,10 +14,12 @@ import (
 
 // TcpRouteBinding records the immutable policy result selected for a TCP connection.
 type TcpRouteBinding struct {
-	PolicyEpoch routing.PolicyEpoch
-	Outbound    consts.OutboundIndex
-	Mark        uint32
-	Must        bool
+	PolicyEpoch    routing.PolicyEpoch
+	Outbound       consts.OutboundIndex
+	Mark           uint32
+	Must           bool
+	RuleMatchIndex uint16
+	Rule           *RoutingRuleMeta
 }
 
 // TcpEgressBinding records the concrete transport selection for a TCP connection.
@@ -44,17 +46,21 @@ type TcpFlowBinding struct {
 	// Inbound names the user-space inbound that accepted the flow; empty for
 	// transparent traffic.
 	Inbound string
+	Process string
 }
 
 func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult, mac [6]uint8) TcpFlowBinding {
 	binding := TcpFlowBinding{Mac: mac}
 	binding.Route.PolicyEpoch = policyEpoch
+	binding.Route.RuleMatchIndex = UnknownRuleMatchIndex
 	if result == nil {
 		return binding
 	}
 	binding.Route.Outbound = result.OutboundIndex
 	binding.Route.Mark = result.Mark
 	binding.Route.Must = result.Must
+	binding.Route.RuleMatchIndex = result.RuleMatchIndex
+	binding.Route.Rule = result.Rule
 	binding.Egress = TcpEgressBinding{
 		Dialer:        result.Dialer,
 		Quality:       result.Quality,

@@ -157,27 +157,126 @@ func (s *inboundUDPSession) adminConnection() (AdminConnection, bool) {
 	if !s.ready || s.closed {
 		return AdminConnection{}, false
 	}
+	now := time.Now()
+	return s.toAdminConnectionLocked(now), true
+}
+
+func (s *inboundUDPSession) toAdminConnectionLocked(now time.Time) AdminConnection {
+	srcIP, srcPort := splitAddrPort(s.relay.src)
+	var dstIP string
+	if s.target.IP.IsValid() {
+		dstIP = s.target.IP.Unmap().String()
+	}
+	target := displayConnectionTarget(s.target.String())
+	if dstIP == "" && s.dialTarget != "" {
+		if parsed, _ := splitTargetHostPort(s.dialTarget); parsed != "" {
+			dstIP = parsed
+		}
+	}
 	return AdminConnection{
-		ID:       "i" + strconv.FormatUint(s.id, 10),
-		Network:  "udp",
-		Src:      formatAddrPort(s.relay.src),
-		Dst:      s.target.String(),
-		Domain:   s.domain,
-		Inbound:  s.relay.inbound,
-		Outbound: s.outbound,
-		Dialer:   s.dialer,
-		Policy:   s.policy,
-		Start:    formatFlowStart(s.startUnixNano),
-		Upload:   s.upload.Load(),
-		Download: s.download.Load(),
-	}, true
+		ID:         "in-udp:" + strconv.FormatUint(s.id, 10),
+		Network:    "udp",
+		Inbound:    s.relay.inbound,
+		SrcIP:      srcIP,
+		SrcPort:    srcPort,
+		DstIP:      dstIP,
+		DstPort:    s.target.Port,
+		Target:     target,
+		Domain:     s.domain,
+		Rule:       s.rule,
+		Outbound:   s.outbound,
+		Dialer:     s.dialer,
+		Policy:     s.policy,
+		StartTime:  formatFlowStart(s.startUnixNano),
+		DurationMs: flowDurationMs(s.startUnixNano, now),
+		Upload:     s.upload.Load(),
+		Download:   s.download.Load(),
+	}
+}
+
+// CloseUDPConnectionByID terminates one established inbound UDP session by id ("in-udp:<n>").
+func (m *InboundManager) CloseUDPConnectionByID(id string) bool {
+	if m == nil || id == "" {
+		return false
+	}
+	m.mu.Lock()
+	servers := make([]*inboundServer, 0, len(m.servers))
+	for _, s := range m.servers {
+		servers = append(servers, s)
+	}
+	m.mu.Unlock()
+
+	for _, srv := range servers {
+		srv.mu.Lock()
+		relays := make([]*InboundUDPRelay, 0, len(srv.relays))
+		for r := range srv.relays {
+			relays = append(relays, r)
+		}
+		srv.mu.Unlock()
+		for _, r := range relays {
+			r.mu.Lock()
+			var target *inboundUDPSession
+			for _, s := range r.sessions {
+				if "in-udp:"+strconv.FormatUint(s.id, 10) == id {
+					target = s
+					break
+				}
+			}
+			r.mu.Unlock()
+			if target != nil {
+				target.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+				target.close()
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CloseUDPConnections terminates inbound UDP sessions matching filter and returns the closed count.
+func (m *InboundManager) CloseUDPConnections(filter AdminConnectionFilter) int {
+	if m == nil {
+		return 0
+	}
+	filter = filter.normalized()
+	m.mu.Lock()
+	servers := make([]*inboundServer, 0, len(m.servers))
+	for _, s := range m.servers {
+		servers = append(servers, s)
+	}
+	m.mu.Unlock()
+
+	var matched []*inboundUDPSession
+	for _, srv := range servers {
+		srv.mu.Lock()
+		relays := make([]*InboundUDPRelay, 0, len(srv.relays))
+		for r := range srv.relays {
+			relays = append(relays, r)
+		}
+		srv.mu.Unlock()
+		for _, r := range relays {
+			r.mu.Lock()
+			for _, s := range r.sessions {
+				if item, ok := s.adminConnection(); ok && (filter.IsEmpty() || item.matches(filter)) {
+					matched = append(matched, s)
+				}
+			}
+			r.mu.Unlock()
+		}
+	}
+	for _, s := range matched {
+		s.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+		s.close()
+	}
+	return len(matched)
 }
 
 var inboundUDPSessionSeq atomic.Uint64
 
 // mergeInboundUDPConnections adds the inbound UDP sessions that pass filter to
 // a control plane snapshot, keeping the bounded, heaviest-first shape.
-func mergeInboundUDPConnections(snap AdminConnectionsSnapshot, udp []AdminConnection, filter adminConnectionFilter, limit int) AdminConnectionsSnapshot {
+func mergeInboundUDPConnections(snap AdminConnectionsSnapshot, udp []AdminConnection, filter AdminConnectionFilter, limit int) AdminConnectionsSnapshot {
+	filter = filter.normalized()
 	added := 0
 	for _, item := range udp {
 		if item.matches(filter) {

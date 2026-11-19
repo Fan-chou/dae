@@ -102,6 +102,16 @@ func (o *MergeAndSortRulesOptimizer) Optimize(rules []*config_parser.RoutingRule
 			mergingRule.AndFunctions[0].Name == rules[i].AndFunctions[0].Name &&
 			rules[i].Outbound.String(true, false, true) == mergingRule.Outbound.String(true, false, true) {
 			mergingRule.AndFunctions[0].Params = append(mergingRule.AndFunctions[0].Params, rules[i].AndFunctions[0].Params...)
+			sameProvider := mergingRule.SourceOrigin == "rule_provider" &&
+				rules[i].SourceOrigin == "rule_provider" &&
+				mergingRule.SourceSummary != "" &&
+				mergingRule.SourceSummary == rules[i].SourceSummary
+			if !sameProvider {
+				mergingRule.SourceSummary = SummarizeRoutingRule(mergingRule)
+				if mergingRule.SourceIndex != rules[i].SourceIndex {
+					mergingRule.SourceOrigin = "config"
+				}
+			}
 		} else {
 			newRules = append(newRules, mergingRule)
 			mergingRule = rules[i]

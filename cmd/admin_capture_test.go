@@ -24,10 +24,10 @@ func TestAdminCaptureAuthenticationAndCursor(t *testing.T) {
 		method, path, token string
 		code                int
 	}{
-		{"GET", "/v1/capture", "", 401},
-		{"POST", "/v1/capture", "capture-test", 405},
-		{"GET", "/v1/capture?after=-1", "capture-test", 400},
-		{"GET", "/v1/capture?after=42", "capture-test", 200},
+		{"GET", "/api/v1/debug/capture", "", 401},
+		{"POST", "/api/v1/debug/capture", "capture-test", 405},
+		{"GET", "/api/v1/debug/capture?after=-1", "capture-test", 400},
+		{"GET", "/api/v1/debug/capture?after=42", "capture-test", 200},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("Authorization", "Bearer "+tc.token)
@@ -54,7 +54,7 @@ func TestAdminEvidenceAuthenticationAndCursor(t *testing.T) {
 		path, token string
 		code        int
 	}{
-		{"/v1/evidence", "", 401}, {"/v1/evidence?after=-1", "test", 400}, {"/v1/evidence?after=42", "test", 200},
+		{"/api/v1/debug/evidence", "", 401}, {"/api/v1/debug/evidence?after=-1", "test", 400}, {"/api/v1/debug/evidence?after=42", "test", 200},
 	} {
 		req := httptest.NewRequest("GET", tc.path, nil)
 		req.Header.Set("Authorization", "Bearer "+tc.token)

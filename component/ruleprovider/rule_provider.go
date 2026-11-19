@@ -3873,15 +3873,87 @@ func functionKey(function *config_parser.Function) string {
 	return builder.String()
 }
 
+func orderedExprHasRuleset(e *routing.OrderedExpr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Op == "atom" {
+		return e.Atom != nil && (e.Atom.Name == "ruleset" || e.Atom.Name == "ruleset_no_resolve")
+	}
+	for _, child := range e.Children {
+		if orderedExprHasRuleset(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRulesetFunction(rule *config_parser.RoutingRule) bool {
+	if rule == nil {
+		return false
+	}
+	for _, f := range rule.AndFunctions {
+		if f == nil {
+			continue
+		}
+		if f.Name == "ruleset" || f.Name == "ruleset_no_resolve" {
+			return true
+		}
+		if routing.HasOrderedRules([]*config_parser.RoutingRule{{AndFunctions: []*config_parser.Function{f}}}) {
+			if expr, err := routing.ExprFromFunction(f); err == nil && orderedExprHasRuleset(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func ExpandRoutingRules(rules []*config_parser.RoutingRule, registry Registry) ([]*config_parser.RoutingRule, error) {
 	if len(rules) > maxExpandedRoutingRules {
 		return nil, fmt.Errorf("expanded routing rules exceed %d", maxExpandedRoutingRules)
 	}
-	result := make([]*config_parser.RoutingRule, 0, len(rules))
+	annotate := false
 	for _, rule := range rules {
+		if hasRulesetFunction(rule) {
+			annotate = true
+			break
+		}
+	}
+	result := make([]*config_parser.RoutingRule, 0, len(rules))
+	for i, rule := range rules {
+		var (
+			srcIdx     int
+			srcSummary string
+			srcOrigin  string
+		)
+		if annotate && rule != nil {
+			srcIdx = rule.SourceIndex
+			if srcIdx == 0 {
+				srcIdx = i + 1
+			}
+			srcSummary = rule.SourceSummary
+			if srcSummary == "" {
+				srcSummary = routing.SummarizeRoutingRule(rule)
+			}
+			srcOrigin = rule.SourceOrigin
+			if srcOrigin == "" {
+				if hasRulesetFunction(rule) {
+					srcOrigin = "rule_provider"
+				} else {
+					srcOrigin = "config"
+				}
+			}
+		}
 		expanded, err := expandRule(rule, registry)
 		if err != nil {
 			return nil, err
+		}
+		if annotate {
+			for _, r := range expanded {
+				r.SourceIndex = srcIdx
+				r.SourceSummary = srcSummary
+				r.SourceOrigin = srcOrigin
+			}
 		}
 		if len(result) > maxExpandedRoutingRules || len(expanded) > maxExpandedRoutingRules-len(result) {
 			return nil, fmt.Errorf("expanded routing rules exceed %d", maxExpandedRoutingRules)
@@ -3937,7 +4009,13 @@ func expandRule(rule *config_parser.RoutingRule, registry Registry) ([]*config_p
 		if err != nil {
 			return nil, err
 		}
-		return []*config_parser.RoutingRule{{AndFunctions: []*config_parser.Function{f}, Outbound: *cloneFunction(&rule.Outbound)}}, nil
+		return []*config_parser.RoutingRule{{
+			AndFunctions:  []*config_parser.Function{f},
+			Outbound:      *cloneFunction(&rule.Outbound),
+			SourceIndex:   rule.SourceIndex,
+			SourceSummary: rule.SourceSummary,
+			SourceOrigin:  rule.SourceOrigin,
+		}}, nil
 	}
 	current := []*config_parser.RoutingRule{cloneRule(rule)}
 	for index, function := range rule.AndFunctions {
@@ -4025,7 +4103,12 @@ func cloneRule(rule *config_parser.RoutingRule) *config_parser.RoutingRule {
 	if rule == nil {
 		return nil
 	}
-	copy := &config_parser.RoutingRule{Outbound: *cloneFunction(&rule.Outbound)}
+	copy := &config_parser.RoutingRule{
+		Outbound:      *cloneFunction(&rule.Outbound),
+		SourceIndex:   rule.SourceIndex,
+		SourceSummary: rule.SourceSummary,
+		SourceOrigin:  rule.SourceOrigin,
+	}
 	copy.AndFunctions = make([]*config_parser.Function, len(rule.AndFunctions))
 	for i, function := range rule.AndFunctions {
 		copy.AndFunctions[i] = cloneFunction(function)

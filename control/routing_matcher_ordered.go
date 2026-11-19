@@ -16,8 +16,9 @@ type orderedRoutingExpr struct {
 	children []*orderedRoutingExpr
 }
 type orderedRoutingRule struct {
-	expr   *orderedRoutingExpr
-	action compiledRoutingMatch
+	expr             *orderedRoutingExpr
+	action           compiledRoutingMatch
+	actionMatchIndex uint16
 }
 
 func compileOrderedRouting(rules []routing.OrderedRule, spans map[int][]int, matches []compiledRoutingMatch) ([]orderedRoutingRule, error) {
@@ -64,7 +65,11 @@ func compileOrderedRouting(rules []routing.OrderedRule, spans map[int][]int, mat
 		if last < 0 {
 			return nil, fmt.Errorf("missing compiled routing action")
 		}
-		result = append(result, orderedRoutingRule{expr: e, action: matches[last]})
+		matchIdx := UnknownRuleMatchIndex
+		if last < int(UnknownRuleMatchIndex) {
+			matchIdx = uint16(last)
+		}
+		result = append(result, orderedRoutingRule{expr: e, action: matches[last], actionMatchIndex: matchIdx})
 	}
 	return result, nil
 }
@@ -72,6 +77,11 @@ func compileOrderedRouting(rules []routing.OrderedRule, spans map[int][]int, mat
 // matchOrderedFakeIP keeps one address state for the entire walk. Resolving
 // during a later predicate never retroactively activates an earlier rule.
 func (m *RoutingMatcher) matchOrderedFakeIP(facts routingMatcherFacts, resolve func() (netip.Addr, error)) (consts.OutboundIndex, uint32, bool, netip.Addr, error) {
+	out, mark, must, real, _, err := m.matchOrderedFakeIPWithRule(facts, resolve)
+	return out, mark, must, real, err
+}
+
+func (m *RoutingMatcher) matchOrderedFakeIPWithRule(facts routingMatcherFacts, resolve func() (netip.Addr, error)) (consts.OutboundIndex, uint32, bool, netip.Addr, uint16, error) {
 	var real netip.Addr
 	attempted := false
 	// A SUB-RULE entry is decided once per call, even when child rules
@@ -162,7 +172,7 @@ func (m *RoutingMatcher) matchOrderedFakeIP(facts routingMatcherFacts, resolve f
 	for _, r := range m.orderedRules {
 		hit, err := eval(r.expr)
 		if err != nil {
-			return 0, 0, false, real, err
+			return 0, 0, false, real, UnknownRuleMatchIndex, err
 		}
 		if !hit {
 			continue
@@ -173,8 +183,16 @@ func (m *RoutingMatcher) matchOrderedFakeIP(facts routingMatcherFacts, resolve f
 			continue
 		}
 
-		return action.outbound, action.mark, must || action.must, real, nil
+		return action.outbound, action.mark, must || action.must, real, r.actionMatchIndex, nil
 	}
-	action := m.compiledMatches[len(m.compiledMatches)-1]
-	return action.outbound, action.mark, must || action.must, real, nil
+	lastIdx := len(m.compiledMatches) - 1
+	if lastIdx < 0 {
+		return 0, 0, false, real, UnknownRuleMatchIndex, fmt.Errorf("no compiled routing match set")
+	}
+	action := m.compiledMatches[lastIdx]
+	matchIdx := UnknownRuleMatchIndex
+	if lastIdx < int(UnknownRuleMatchIndex) {
+		matchIdx = uint16(lastIdx)
+	}
+	return action.outbound, action.mark, must || action.must, real, matchIdx, nil
 }

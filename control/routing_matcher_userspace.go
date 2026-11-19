@@ -20,10 +20,11 @@ type RoutingMatcher struct {
 	lpmMatcher    []*trie.Trie
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 
-	compiledMatches []compiledRoutingMatch
-	fakeIPRules     []fakeIPRule
-	predicateGroups []routingMatcherPredicateGroupSpan
-	lookupMacAssoc  macAssocLookup
+	compiledMatches      []compiledRoutingMatch
+	fakeIPRules          []fakeIPRule
+	predicateGroups      []routingMatcherPredicateGroupSpan
+	ruleMetaByMatchIndex []*RoutingRuleMeta
+	lookupMacAssoc       macAssocLookup
 	// fakeIPLeafIsProxy reports whether a user-defined outbound currently
 	// selects a proxy node. Nil treats every user group as PROXY (unit tests).
 	fakeIPLeafIsProxy func(consts.OutboundIndex) bool
@@ -303,6 +304,26 @@ func (m *RoutingMatcher) MatchInbound(
 	dscp uint8,
 	mac [16]uint8,
 ) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	outboundIndex, mark, must, _, err = m.MatchInboundWithRule(
+		inbound, sourceAddr, destAddr, sourcePort, destPort, ipVersion, l4proto, domain, processName, dscp, mac,
+	)
+	return outboundIndex, mark, must, err
+}
+
+// MatchInboundWithRule performs MatchInbound and also returns the compiled match-set index.
+func (m *RoutingMatcher) MatchInboundWithRule(
+	inbound uint32,
+	sourceAddr [16]uint8,
+	destAddr [16]uint8,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	dscp uint8,
+	mac [16]uint8,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, matchIndex uint16, err error) {
 	facts, err := m.newFacts(
 		sourceAddr,
 		destAddr,
@@ -316,11 +337,11 @@ func (m *RoutingMatcher) MatchInbound(
 		mac,
 	)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, UnknownRuleMatchIndex, err
 	}
 	facts.inbound = inbound
-	outbound, mark, must, _, err := m.matchFacts(facts)
-	return outbound, mark, must, err
+	outbound, mark, must, _, matchIndex, err := m.matchFactsWithRule(facts)
+	return outbound, mark, must, matchIndex, err
 }
 
 // MatchDeferringDestIP is Match with dest ip()/geoip left UNKNOWN.
@@ -354,6 +375,26 @@ func (m *RoutingMatcher) MatchDeferringDestIPInbound(
 	dscp uint8,
 	mac [16]uint8,
 ) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, err error) {
+	outboundIndex, mark, must, needsDestIP, _, err = m.MatchDeferringDestIPInboundWithRule(
+		inbound, sourceAddr, destAddr, sourcePort, destPort, ipVersion, l4proto, domain, processName, dscp, mac,
+	)
+	return outboundIndex, mark, must, needsDestIP, err
+}
+
+// MatchDeferringDestIPInboundWithRule returns the compiled match-set index alongside the deferred-IP verdict.
+func (m *RoutingMatcher) MatchDeferringDestIPInboundWithRule(
+	inbound uint32,
+	sourceAddr [16]uint8,
+	destAddr [16]uint8,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	dscp uint8,
+	mac [16]uint8,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, matchIndex uint16, err error) {
 	facts, err := m.newFacts(
 		sourceAddr,
 		destAddr,
@@ -367,10 +408,10 @@ func (m *RoutingMatcher) MatchDeferringDestIPInbound(
 		mac,
 	)
 	if err != nil {
-		return 0, 0, false, false, err
+		return 0, 0, false, false, UnknownRuleMatchIndex, err
 	}
 	facts.inbound = inbound
-	return m.matchFactsDeferringDestIP(facts)
+	return m.matchFactsDeferringDestIPWithRule(facts)
 }
 
 // identityRoutingMatch is MAC / source / port / process / DSCP / L4: known only
@@ -441,12 +482,17 @@ func (m *RoutingMatcher) conflictFingerprint(dest netip.Addr, domainBitmap []uin
 }
 
 func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, identitySensitive bool, err error) {
+	outboundIndex, mark, must, identitySensitive, _, err = m.matchFactsWithRule(facts)
+	return outboundIndex, mark, must, identitySensitive, err
+}
+
+func (m *RoutingMatcher) matchFactsWithRule(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, identitySensitive bool, matchIndex uint16, err error) {
 	if m == nil {
-		return 0, 0, false, false, fmt.Errorf("nil routing matcher")
+		return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("nil routing matcher")
 	}
 	matches := m.compiledMatches
 	if len(matches) == 0 {
-		return 0, 0, false, false, fmt.Errorf("no compiled routing match set")
+		return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("no compiled routing match set")
 	}
 
 	goodSubrule := false
@@ -466,7 +512,7 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 		if !identitySkip && !badRule && !goodSubrule {
 			matched, matchErr := m.matchCompiledMatch(i, match, &facts)
 			if matchErr != nil {
-				return 0, 0, false, false, matchErr
+				return 0, 0, false, false, UnknownRuleMatchIndex, matchErr
 			}
 			if matched {
 				goodSubrule = true
@@ -513,14 +559,18 @@ func (m *RoutingMatcher) matchFacts(facts routingMatcherFacts) (outboundIndex co
 					badRule = false
 					continue
 				}
-				return outbound, match.mark, match.must || must, ruleHasIdentitySkip, nil
+				idx := UnknownRuleMatchIndex
+				if i < int(UnknownRuleMatchIndex) {
+					idx = uint16(i)
+				}
+				return outbound, match.mark, match.must || must, ruleHasIdentitySkip, idx, nil
 			}
 			badRule = false
 			ruleHasDest = false
 			ruleHasIdentitySkip = false
 		}
 	}
-	return 0, 0, false, false, fmt.Errorf("no match set hit")
+	return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("no match set hit")
 }
 
 func (m *RoutingMatcher) evalDeferringDestIP(index int, match compiledRoutingMatch, facts *routingMatcherFacts) (fakeIPKleene, error) {
@@ -550,12 +600,17 @@ func (m *RoutingMatcher) evalDeferringDestIP(index int, match compiledRoutingMat
 // disjunct stops evaluating the rest of that rule so a later ip() cannot
 // turn a decided rule into UNKNOWN (and force a DNS lookup).
 func (m *RoutingMatcher) matchFactsDeferringDestIP(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, err error) {
+	outboundIndex, mark, must, needsDestIP, _, err = m.matchFactsDeferringDestIPWithRule(facts)
+	return outboundIndex, mark, must, needsDestIP, err
+}
+
+func (m *RoutingMatcher) matchFactsDeferringDestIPWithRule(facts routingMatcherFacts) (outboundIndex consts.OutboundIndex, mark uint32, must bool, needsDestIP bool, matchIndex uint16, err error) {
 	if m == nil {
-		return 0, 0, false, false, fmt.Errorf("nil routing matcher")
+		return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("nil routing matcher")
 	}
 	matches := m.compiledMatches
 	if len(matches) == 0 {
-		return 0, 0, false, false, fmt.Errorf("no compiled routing match set")
+		return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("no compiled routing match set")
 	}
 
 	subrule := fakeIPKleeneFalse
@@ -566,7 +621,7 @@ func (m *RoutingMatcher) matchFactsDeferringDestIP(facts routingMatcherFacts) (o
 		if rule != fakeIPKleeneFalse && subrule != fakeIPKleeneTrue {
 			val, evalErr := m.evalDeferringDestIP(i, match, &facts)
 			if evalErr != nil {
-				return 0, 0, false, false, evalErr
+				return 0, 0, false, false, UnknownRuleMatchIndex, evalErr
 			}
 			subrule = fakeIPKleeneOr(subrule, val)
 		}
@@ -582,7 +637,7 @@ func (m *RoutingMatcher) matchFactsDeferringDestIP(facts routingMatcherFacts) (o
 			if outbound == consts.OutboundMustRules {
 				switch rule {
 				case fakeIPKleeneUnknown:
-					return 0, 0, false, true, nil
+					return 0, 0, false, true, UnknownRuleMatchIndex, nil
 				case fakeIPKleeneTrue:
 					must = true
 				}
@@ -591,12 +646,16 @@ func (m *RoutingMatcher) matchFactsDeferringDestIP(facts routingMatcherFacts) (o
 			}
 			switch rule {
 			case fakeIPKleeneUnknown:
-				return 0, 0, false, true, nil
+				return 0, 0, false, true, UnknownRuleMatchIndex, nil
 			case fakeIPKleeneTrue:
-				return outbound, match.mark, match.must || must, false, nil
+				idx := UnknownRuleMatchIndex
+				if i < int(UnknownRuleMatchIndex) {
+					idx = uint16(i)
+				}
+				return outbound, match.mark, match.must || must, false, idx, nil
 			}
 			rule = fakeIPKleeneTrue
 		}
 	}
-	return 0, 0, false, false, fmt.Errorf("no match set hit")
+	return 0, 0, false, false, UnknownRuleMatchIndex, fmt.Errorf("no match set hit")
 }

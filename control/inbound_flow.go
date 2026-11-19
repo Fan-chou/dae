@@ -412,14 +412,17 @@ type inboundUDPSession struct {
 	closed     bool
 
 	// Shown in the connection list once the session is established.
-	id            uint64
-	startUnixNano int64
-	outbound      string
-	dialer        string
-	policy        string
-	domain        string
-	upload        atomic.Uint64
-	download      atomic.Uint64
+	id             uint64
+	startUnixNano  int64
+	outbound       string
+	dialer         string
+	policy         string
+	domain         string
+	ruleMatchIndex uint16
+	rule           *RoutingRuleMeta
+	upload         atomic.Uint64
+	download       atomic.Uint64
+	closeReason    atomic.Int32
 
 	lastActive atomic.Int64
 }
@@ -548,6 +551,8 @@ func (s *inboundUDPSession) dial() {
 	s.conn, s.dialTarget, s.ready = conn, res.DialTarget, true
 	s.startUnixNano = time.Now().UnixNano()
 	s.domain = domain
+	s.ruleMatchIndex = res.RuleMatchIndex
+	s.rule = res.Rule
 	if res.Outbound != nil {
 		s.outbound = res.Outbound.Name
 		s.policy = string(res.Outbound.GetSelectionPolicy())
@@ -624,12 +629,47 @@ func (s *inboundUDPSession) close() {
 	s.closed = true
 	conn := s.conn
 	s.pending = nil
+	var closedFlow AdminClosedFlow
+	recordClosed := s.ready
+	if recordClosed {
+		now := time.Now()
+		item := s.toAdminConnectionLocked(now)
+		closedFlow = AdminClosedFlow{
+			ID:          item.ID,
+			Network:     item.Network,
+			Inbound:     item.Inbound,
+			SrcIP:       item.SrcIP,
+			SrcPort:     item.SrcPort,
+			DstIP:       item.DstIP,
+			DstPort:     item.DstPort,
+			Target:      item.Target,
+			Domain:      item.Domain,
+			Mac:         item.Mac,
+			Process:     item.Process,
+			Rule:        item.Rule,
+			Outbound:    item.Outbound,
+			Dialer:      item.Dialer,
+			Policy:      item.Policy,
+			Offloaded:   false,
+			StartTime:   item.StartTime,
+			EndTime:     now.UTC().Format(time.RFC3339),
+			DurationMs:  item.DurationMs,
+			Upload:      item.Upload,
+			Download:    item.Download,
+			CloseReason: flowCloseReasonString(s.closeReason.Load()),
+		}
+	}
 	s.mu.Unlock()
 
 	if conn != nil {
 		_ = conn.Close()
 	}
 	r := s.relay
+	if recordClosed && r != nil {
+		if plane := r.plane(); plane != nil {
+			plane.recordClosedFlow(closedFlow)
+		}
+	}
 	// The session counted against the inbound's budget from creation; close
 	// runs its body exactly once (guarded by closed above).
 	r.budget.release()

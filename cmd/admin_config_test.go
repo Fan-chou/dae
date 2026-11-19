@@ -191,12 +191,15 @@ routing { fallback: direct }
 	})
 	server.secret = "test-token"
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	server.withAdminAuth(server.handleConfig)(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET config status = %d body %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("ETag") == "" {
+		t.Fatal("GET /api/v1/config missing ETag header")
 	}
 	if strings.Contains(rec.Body.String(), "keep-me") || strings.Contains(rec.Body.String(), "hy2://") {
 		t.Fatalf("GET leaked secret or URI: %s", rec.Body.String())
@@ -209,7 +212,16 @@ routing { fallback: direct }
 		t.Fatalf("placeholder missing: %+v", body)
 	}
 
-	req = httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(`{"routing":"routing { hy2://x }"}`))
+	staleReq := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"routing":"routing { fallback: direct }"}`))
+	staleReq.Header.Set("Authorization", "Bearer test-token")
+	staleReq.Header.Set("If-Match", `"stale-etag"`)
+	staleRec := httptest.NewRecorder()
+	server.withAdminAuth(server.handleConfig)(staleRec, staleReq)
+	if staleRec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale If-Match status = %d, want 412", staleRec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"routing":"routing { hy2://x }"}`))
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec = httptest.NewRecorder()
 	server.withAdminAuth(server.handleConfig)(rec, req)
@@ -268,7 +280,7 @@ routing {
 		return true
 	})
 	server.secret = "test-token"
-	req := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/reload", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	server.withAdminAuth(server.handleReload)(rec, req)
@@ -294,7 +306,7 @@ routing { fallback: direct }
 		return true
 	})
 	server.secret = "test-token"
-	req := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/reload", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	server.withAdminAuth(server.handleReload)(rec, req)
@@ -384,17 +396,17 @@ func TestHandleConfigReturns409WhenReloadQueueFull(t *testing.T) {
 	server := newAdminServer(nil, "", dir, nil, func() bool { return false })
 	server.secret = "test-token"
 
-	req := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n"}`))
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
 	server.withAdminAuth(server.handleConfig)(rec, req)
 
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("PUT /v1/config queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
+		t.Fatalf("PUT /api/v1/config queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
 	}
-	var errBody adminErrorBody
-	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil || errBody.Error == "" {
-		t.Fatalf("expected JSON error body, got %s (%v)", rec.Body.String(), err)
+	var errBody adminAPIErrorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil || errBody.Error.Code == "" || errBody.Error.Message == "" {
+		t.Fatalf("expected structured JSON error body, got %s (%v)", rec.Body.String(), err)
 	}
 	gotCfg, _ := os.ReadFile(configPath)
 	if string(gotCfg) != origConfig {
@@ -434,7 +446,7 @@ func TestAdminConfigWriteMuSerializesConfigAndInboundsWrites(t *testing.T) {
 				level = "warn"
 			}
 			body := `{"config":"global { tproxy_port: 12345\n log_level: ` + level + `\n wan_interface: auto\n lan_interface: lo }\nrouting { fallback: direct }\n"}`
-			req := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(body))
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(body))
 			req.Header.Set("Authorization", "Bearer test-token")
 			rec := httptest.NewRecorder()
 			server.withAdminAuth(server.handleConfig)(rec, req)
@@ -446,7 +458,7 @@ func TestAdminConfigWriteMuSerializesConfigAndInboundsWrites(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPut, "/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11080"}]}`))
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11080"}]}`))
 			req.Header.Set("Authorization", "Bearer test-token")
 			rec := httptest.NewRecorder()
 			server.withAdminAuth(server.handleInbounds)(rec, req)

@@ -16,7 +16,6 @@ go-mod/
 .gotmp/
 .gopath/
 node_modules/
-web/dist/
 *.log
 .build_tags
 .ebpf.config

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -86,22 +87,84 @@ func inboundsInText(src string) ([]config.Inbound, error) {
 	return config.ParseInbounds(extracted)
 }
 
+var adminInboundsCache = struct {
+	mu        sync.Mutex
+	configDir string
+	cfgStat   adminFileStatKey
+	routeStat adminFileStatKey
+	inConfig  []config.Inbound
+	inRouting []config.Inbound
+	editable  bool
+	etag      string
+}{}
+
 // loadAdminInbounds merges what the files define with what is running. The
 // running state wins for anything a client reads as "state"; the definition of
 // a config.dae inbound comes from the file, so a saved change shows at once
 // (as pending) instead of after the reload.
 func loadAdminInbounds(configDir string, running []control.InboundStatus) (adminInboundsBody, error) {
+	body, _, err := loadAdminInboundsCached(configDir, running)
+	return body, err
+}
+
+func loadAdminInboundsCached(configDir string, running []control.InboundStatus) (adminInboundsBody, string, error) {
 	configPath, routingPath, err := adminConfigPaths(configDir)
 	if err != nil {
-		return adminInboundsBody{}, err
+		return adminInboundsBody{}, "", err
 	}
-	inConfig, err := inboundsInFile(configPath)
+	cfgStat, err := statAdminFileKey(configPath)
 	if err != nil {
-		return adminInboundsBody{}, err
+		return adminInboundsBody{}, "", err
 	}
-	inRouting, err := inboundsInFile(routingPath)
+	routeStat, err := statAdminFileKey(routingPath)
 	if err != nil {
-		return adminInboundsBody{}, err
+		return adminInboundsBody{}, "", err
+	}
+
+	var (
+		inConfig  []config.Inbound
+		inRouting []config.Inbound
+		editable  bool
+		etag      string
+		cacheHit  bool
+	)
+
+	adminInboundsCache.mu.Lock()
+	if adminInboundsCache.configDir == configDir &&
+		adminInboundsCache.cfgStat == cfgStat &&
+		adminInboundsCache.routeStat == routeStat &&
+		adminInboundsCache.etag != "" {
+		inConfig = adminInboundsCache.inConfig
+		inRouting = adminInboundsCache.inRouting
+		editable = adminInboundsCache.editable
+		etag = adminInboundsCache.etag
+		cacheHit = true
+	}
+	adminInboundsCache.mu.Unlock()
+
+	if !cacheHit {
+		inConfig, err = inboundsInFile(configPath)
+		if err != nil {
+			return adminInboundsBody{}, "", err
+		}
+		inRouting, err = inboundsInFile(routingPath)
+		if err != nil {
+			return adminInboundsBody{}, "", err
+		}
+		editable = configWritable(configPath)
+		rawCfg, _ := os.ReadFile(configPath)
+		rawRoute, routeErr := os.ReadFile(routingPath)
+		etag = formatAdminETag(adminSnapshotDigest(rawCfg, routeErr == nil, rawRoute))
+
+		adminInboundsCache.mu.Lock()
+		adminInboundsCache.configDir = configDir
+		adminInboundsCache.cfgStat = cfgStat
+		adminInboundsCache.routeStat = routeStat
+		adminInboundsCache.inConfig = inConfig
+		adminInboundsCache.inRouting = inRouting
+		adminInboundsCache.editable = editable
+		adminInboundsCache.etag = etag
+		adminInboundsCache.mu.Unlock()
 	}
 
 	byName := make(map[string]control.InboundStatus, len(running))
@@ -109,7 +172,7 @@ func loadAdminInbounds(configDir string, running []control.InboundStatus) (admin
 		byName[st.Name] = st
 	}
 	seen := make(map[string]bool)
-	out := adminInboundsBody{Inbounds: []adminInbound{}, Editable: configWritable(configPath)}
+	out := adminInboundsBody{Inbounds: []adminInbound{}, Editable: editable}
 
 	add := func(def config.Inbound, origin string) {
 		st, isRunning := byName[def.Name]
@@ -153,7 +216,7 @@ func loadAdminInbounds(configDir string, running []control.InboundStatus) (admin
 		out.Inbounds = append(out.Inbounds, adminInbound{InboundStatus: st, Origin: origin})
 		seen[st.Name] = true
 	}
-	return out, nil
+	return out, etag, nil
 }
 
 func configWritable(path string) bool {
@@ -397,9 +460,11 @@ func applyAdminInboundsLocked(configDir string, in []adminInboundPut, reload adm
 	}
 	if reload == nil || !reload() {
 		restore()
+		invalidateAdminFileCaches()
 		return false, errAdminReloadQueueFull
 	}
 	_ = os.Remove(bak)
+	invalidateAdminFileCaches()
 	return true, nil
 }
 
@@ -463,21 +528,33 @@ func (s *adminServer) handleInbounds(w http.ResponseWriter, r *http.Request) {
 			running = inbounds()
 		}
 		adminConfigWriteMu.Lock()
-		body, err := loadAdminInbounds(s.configDir, running)
+		body, etag, err := loadAdminInboundsCached(s.configDir, running)
 		adminConfigWriteMu.Unlock()
 		if err != nil {
-			writeAdminError(w, http.StatusInternalServerError, sanitizeAdminError(err))
+			writeAdminAPIError(w, http.StatusInternalServerError, "inbounds_read_failed", sanitizeAdminError(err))
 			return
+		}
+		if etag != "" {
+			w.Header().Set("ETag", etag)
 		}
 		writeAdminJSON(w, http.StatusOK, body)
 	case http.MethodPut:
 		r.Body = http.MaxBytesReader(w, r.Body, adminMaxInboundBytes)
 		var body adminInboundsPutBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeAdminError(w, http.StatusBadRequest, "invalid json")
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
 			return
 		}
+		ifMatch := r.Header.Get("If-Match")
 		adminConfigWriteMu.Lock()
+		if ifMatch != "" {
+			currentETag, etagErr := currentAdminConfigETag(s.configDir)
+			if etagErr == nil && !checkAdminIfMatch(ifMatch, currentETag) {
+				adminConfigWriteMu.Unlock()
+				writeAdminAPIError(w, http.StatusPreconditionFailed, "precondition_failed", "configuration changed since last read")
+				return
+			}
+		}
 		queued, err := applyAdminInboundsLocked(s.configDir, body.Inbounds, s.reload)
 		if err == nil {
 			s.recordPendingAdminWriteLocked()
@@ -485,14 +562,17 @@ func (s *adminServer) handleInbounds(w http.ResponseWriter, r *http.Request) {
 		adminConfigWriteMu.Unlock()
 		if err != nil {
 			status := http.StatusBadRequest
+			code := "inbounds_invalid"
 			if errors.Is(err, errAdminReloadQueueFull) {
 				status = http.StatusConflict
+				code = "reload_busy"
 			}
-			writeAdminError(w, status, sanitizeAdminError(err))
+			writeAdminAPIError(w, status, code, sanitizeAdminError(err))
 			return
 		}
+		s.emitWSEvent("inbounds_updated", map[string]any{"queued": queued})
 		writeAdminJSON(w, http.StatusOK, adminReloadBody{Queued: queued})
 	default:
-		writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 	}
 }

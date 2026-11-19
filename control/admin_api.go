@@ -6,14 +6,21 @@
 package control
 
 import (
+	"encoding/hex"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"time"
 )
 
-// AdminStatus is the JSON body for GET /v1/status. It never includes node
-// URIs or credentials.
+var processStartedAt = time.Now().UTC()
+
+// AdminStatus is the JSON body kept for internal/diagnostic metrics helpers.
+// It never includes node URIs or credentials.
 type AdminStatus struct {
 	Version           string                   `json:"version"`
 	Running           bool                     `json:"running"`
@@ -31,6 +38,66 @@ type AdminStatus struct {
 	UDPReplyDrought   *UDPReplyDroughtSnapshot `json:"udp_reply_drought,omitempty"`
 }
 
+// AdminBpfOverflow reports eBPF map overflow counters.
+type AdminBpfOverflow struct {
+	UDP uint64 `json:"udp"`
+	TCP uint64 `json:"tcp"`
+}
+
+// AdminSystemInfo is the slow-changing runtime environment metadata for GET /api/v1/system.
+type AdminSystemInfo struct {
+	Version       string   `json:"version"`
+	Running       bool     `json:"running"`
+	Hostname      string   `json:"hostname,omitempty"`
+	GoVersion     string   `json:"go_version"`
+	OS            string   `json:"os"`
+	Arch          string   `json:"arch"`
+	NumCPU        int      `json:"num_cpu"`
+	StartedAt     string   `json:"started_at"`
+	UptimeSec     int64    `json:"uptime_sec"`
+	DialMode      string   `json:"dial_mode,omitempty"`
+	LanInterface  []string `json:"lan_interface"`
+	WanInterface  []string `json:"wan_interface"`
+	EBPFEnabled   bool     `json:"ebpf_enabled"`
+	LogLevel      string   `json:"log_level,omitempty"`
+	InboundsCount int      `json:"inbounds_count"`
+	GroupsCount   int      `json:"groups_count"`
+	PolicyEpoch   uint64   `json:"policy_epoch,omitempty"`
+	PolicyHash    string   `json:"policy_hash,omitempty"`
+}
+
+// AdminMetricsSnapshot is the real-time O(1) runtime metrics payload for GET /api/v1/metrics and WS metrics.
+type AdminUDPReplyDroughtSummary struct {
+	Mode       string               `json:"mode"`
+	Generation uint64               `json:"generation"`
+	Group      string               `json:"group,omitempty"`
+	Client     string               `json:"client,omitempty"`
+	Contract   string               `json:"contract,omitempty"`
+	Stats      UDPReplyDroughtStats `json:"stats"`
+	Excluded   map[string]int       `json:"excluded,omitempty"`
+}
+
+type AdminMetricsSnapshot struct {
+	TimestampMs       int64                        `json:"ts"`
+	UploadRate        uint64                       `json:"upload_rate"`
+	DownloadRate      uint64                       `json:"download_rate"`
+	UploadTotal       uint64                       `json:"upload_total"`
+	DownloadTotal     uint64                       `json:"download_total"`
+	ActiveConnections int                          `json:"active_connections"`
+	TCPConnections    int                          `json:"tcp_connections"`
+	UDPSessions       int                          `json:"udp_sessions"`
+	OffloadedTCP      int64                        `json:"offloaded_tcp"`
+	RssBytes          uint64                       `json:"rss_bytes"`
+	HeapBytes         uint64                       `json:"heap_bytes"`
+	FdCount           int                          `json:"fd_count"`
+	Goroutines        int                          `json:"goroutines"`
+	DNS               AdminDNSStats                `json:"dns"`
+	FakeIP            *AdminFakeIPStats            `json:"fakeip,omitempty"`
+	BpfOverflow       AdminBpfOverflow             `json:"bpf_overflow"`
+	TCPConnPanicCount uint64                       `json:"tcp_conn_panic_count"`
+	UDPReplyDrought   *AdminUDPReplyDroughtSummary `json:"udp_reply_drought,omitempty"`
+}
+
 // AdminTrafficSample is one overview chart point. Rates are bytes/sec.
 type AdminTrafficSample struct {
 	TimestampMs  int64  `json:"ts"`
@@ -38,28 +105,48 @@ type AdminTrafficSample struct {
 	DownloadRate uint64 `json:"down"`
 }
 
-// AdminGroupMember is one selectable or observed member. Name is the logical
-// identity persisted by SetGroupSelection; latency is optional.
-type AdminGroupMember struct {
-	Name      string `json:"name"`
+// AdminProbeHealth describes a per-transport health probe observation without credentials.
+type AdminProbeHealth struct {
 	Alive     bool   `json:"alive"`
 	LatencyMs *int32 `json:"latency_ms,omitempty"`
-	// Admission is alive | degraded | dead. It is the userspace three-state
-	// health shown on fallback / url_test groups; omitted when unknown.
 	Admission string `json:"admission,omitempty"`
-	// Reason is a machine-readable cause: ok, not_alive, fail, rtt,
-	// congestion, or a comma-joined combination.
-	Reason string `json:"reason,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	CheckedAt string `json:"checked_at,omitempty"`
 }
 
-// AdminGroup is one outbound group for the management UI.
+// AdminGroupMember is one selectable or observed member. Name is the logical
+// identity persisted by SetGroupSelection; node links are never exposed.
+type AdminGroupMember struct {
+	Name        string                       `json:"name"`
+	DisplayName string                       `json:"display_name,omitempty"`
+	Kind        string                       `json:"kind,omitempty"`
+	Protocol    string                       `json:"protocol,omitempty"`
+	Endpoint    string                       `json:"endpoint,omitempty"`
+	Alive       bool                         `json:"alive"`
+	LatencyMs   *int32                       `json:"latency_ms,omitempty"`
+	Admission   string                       `json:"admission,omitempty"`
+	Reason      string                       `json:"reason,omitempty"`
+	CheckedAt   string                       `json:"checked_at,omitempty"`
+	Probes      map[string]*AdminProbeHealth `json:"probes,omitempty"`
+}
+
+// AdminGroup is one outbound group for the management API.
 type AdminGroup struct {
 	Name             string             `json:"name"`
 	Selectable       bool               `json:"selectable"`
 	Policy           string             `json:"policy"`
 	Selected         string             `json:"selected"`
+	IsolateTransport bool               `json:"isolate_transport,omitempty"`
 	SelectionMembers []string           `json:"selection_members"`
 	Members          []AdminGroupMember `json:"members"`
+}
+
+func sanitizeSafeEndpoint(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" || strings.Contains(v, "://") || strings.Contains(v, "@") {
+		return ""
+	}
+	return v
 }
 
 // AdminGroups lists user-defined outbound groups. Built-in direct/block are
@@ -91,16 +178,22 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 			Selectable:       len(c.groupSelectionMembers[group.Name]) > 0,
 			Policy:           string(policy.Policy),
 			Selected:         selected,
+			IsolateTransport: group.IsolateTransport,
 			SelectionMembers: append([]string(nil), members...),
 			Members:          make([]AdminGroupMember, 0, len(members)),
 		}
 		for _, name := range members {
 			member := AdminGroupMember{Name: name}
 			if sample, ok := adminSampleForGroupMember(group, name); ok {
+				member.Kind = sample.Kind
+				member.Protocol = sample.Protocol
+				member.Endpoint = sample.Endpoint
 				member.Alive = sample.Alive
 				member.LatencyMs = sample.LatencyMs
 				member.Admission = sample.Admission
 				member.Reason = sample.Reason
+				member.CheckedAt = sample.CheckedAt
+				member.Probes = sample.Probes
 			}
 			item.Members = append(item.Members, member)
 		}
@@ -116,7 +209,126 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 	return groups
 }
 
-// AdminStatusSnapshot returns process-local status for GET /v1/status.
+// AdminSystemInfo returns static/slow-changing daemon system info for GET /api/v1/system.
+func (c *ControlPlane) AdminSystemInfo(version string) AdminSystemInfo {
+	hostname, _ := os.Hostname()
+	now := time.Now().UTC()
+	uptime := int64(now.Sub(processStartedAt).Seconds())
+	if uptime < 0 {
+		uptime = 0
+	}
+	info := AdminSystemInfo{
+		Version:       version,
+		Running:       c != nil,
+		Hostname:      hostname,
+		GoVersion:     runtime.Version(),
+		OS:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+		NumCPU:        runtime.NumCPU(),
+		StartedAt:     processStartedAt.Format(time.RFC3339),
+		UptimeSec:     uptime,
+		InboundsCount: len(activeInboundManager.Load().Snapshot()),
+	}
+	if c == nil {
+		info.LanInterface = []string{}
+		info.WanInterface = []string{}
+		return info
+	}
+	info.DialMode = string(c.dialMode)
+	info.LanInterface = append([]string(nil), c.lanInterface...)
+	info.WanInterface = append([]string(nil), c.wanInterface...)
+	if info.LanInterface == nil {
+		info.LanInterface = []string{}
+	}
+	if info.WanInterface == nil {
+		info.WanInterface = []string{}
+	}
+	info.EBPFEnabled = c.core != nil && c.core.bpf.Load() != nil
+	if c.log != nil {
+		info.LogLevel = c.log.GetLevel().String()
+	}
+	for _, g := range c.outbounds {
+		if g != nil && !isBuiltinAdminGroup(g.Name) {
+			info.GroupsCount++
+		}
+	}
+	info.PolicyEpoch = uint64(c.policyIdentity.Epoch())
+	if hash := c.policyIdentity.Hash(); hash != ([32]byte{}) {
+		info.PolicyHash = hex.EncodeToString(hash[:])
+	}
+	return info
+}
+
+// AdminMetricsSnapshot returns fast O(1) runtime metrics for GET /api/v1/metrics and WS metrics.
+func (c *ControlPlane) AdminMetricsSnapshot() AdminMetricsSnapshot {
+	now := time.Now()
+	proc := readSelfProcessStats()
+	snap := AdminMetricsSnapshot{
+		TimestampMs: now.UnixMilli(),
+		OffloadedTCP: tcpOffloadActive.Load(),
+		RssBytes:    proc.RSSBytes,
+		HeapBytes:   proc.HeapBytes,
+		FdCount:     proc.FDCount,
+		Goroutines:  proc.Goroutines,
+	}
+	if c == nil {
+		return snap
+	}
+	stats := c.SnapshotRuntimeScalars()
+	snap.UploadRate = stats.UploadRate
+	snap.DownloadRate = stats.DownloadRate
+	snap.UploadTotal = stats.UploadTotal
+	snap.DownloadTotal = stats.DownloadTotal
+	snap.ActiveConnections = stats.ActiveConnections
+	snap.TCPConnections = c.ActiveTCPConnections()
+	snap.UDPSessions = stats.UDPSessions
+	snap.TCPConnPanicCount = c.tcpConnPanicCount.Load()
+
+	if dns := c.ActiveDnsController(); dns != nil {
+		snap.DNS = dns.AdminStats()
+	}
+	if fake := c.fakeIPStore(); fake != nil {
+		fs := fake.AdminStats()
+		snap.FakeIP = &fs
+	}
+	if c.core != nil {
+		if objs := c.core.bpf.Load(); objs != nil && objs.BpfStatsMap != nil {
+			udpOv, tcpOv := c.readMapOverflowCounters(objs.BpfStatsMap)
+			snap.BpfOverflow = AdminBpfOverflow{UDP: udpOv, TCP: tcpOv}
+		}
+	}
+	if drought := c.udpReplyDrought.snapshot(now); drought != nil {
+		snap.UDPReplyDrought = &AdminUDPReplyDroughtSummary{
+			Mode:       drought.Mode,
+			Generation: drought.Generation,
+			Group:      drought.Group,
+			Client:     drought.Client,
+			Contract:   drought.Contract,
+			Stats:      drought.Stats,
+			Excluded:   drought.Excluded,
+		}
+	}
+	return snap
+}
+
+// AdminMetricsHistory returns downsampled rate history buckets for GET /api/v1/metrics/history.
+func (c *ControlPlane) AdminMetricsHistory(windowSec, maxPoints int) []AdminTrafficSample {
+	if c == nil {
+		return []AdminTrafficSample{}
+	}
+	stats := c.SnapshotRuntimeHistory(windowSec, maxPoints)
+	out := make([]AdminTrafficSample, 0, len(stats.Samples))
+	for _, sample := range stats.Samples {
+		out = append(out, AdminTrafficSample{
+			TimestampMs:  sample.Timestamp.UnixMilli(),
+			UploadRate:   sample.UploadRate,
+			DownloadRate: sample.DownloadRate,
+		})
+	}
+	return out
+}
+
+// AdminStatusSnapshot returns process-local status for internal tests/compatibility helpers.
 func (c *ControlPlane) AdminStatusSnapshot(version string) AdminStatus {
 	status := AdminStatus{
 		Version: version,
@@ -179,15 +391,20 @@ func adminMemberNamesFromDialers(dialers []*dialer.Dialer) []string {
 }
 
 type adminLatencySample struct {
+	Kind      string
+	Protocol  string
+	Endpoint  string
 	Alive     bool
 	LatencyMs *int32
 	Admission string
 	Reason    string
+	CheckedAt string
+	Probes    map[string]*AdminProbeHealth
 }
 
-func adminSampleFromDialer(d *dialer.Dialer) adminLatencySample {
+func adminSampleFromDialer(d *dialer.Dialer, kind string) adminLatencySample {
 	if d == nil {
-		return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
+		return adminLatencySample{Kind: kind, Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 	}
 	snapshot := bestNodeLatencySnapshotForDialer(d)
 	admission, reason := adminAdmissionForDialer(d)
@@ -198,12 +415,78 @@ func adminSampleFromDialer(d *dialer.Dialer) adminLatencySample {
 	if admission == dialer.AdmissionDead.String() {
 		alive = false
 	}
+	protocol := ""
+	endpoint := ""
+	if kind == "node" && d.Property() != nil {
+		protocol = d.Property().Protocol
+		endpoint = sanitizeSafeEndpoint(d.Property().Address)
+	}
+	probes, checkedAt := adminProbeMapForDialer(d)
 	return adminLatencySample{
+		Kind:      kind,
+		Protocol:  protocol,
+		Endpoint:  endpoint,
 		Alive:     alive,
 		LatencyMs: snapshot.LatencyMs,
 		Admission: admission,
 		Reason:    reason,
+		CheckedAt: checkedAt,
+		Probes:    probes,
 	}
+}
+
+func adminProbeMapForDialer(d *dialer.Dialer) (map[string]*AdminProbeHealth, string) {
+	if d == nil {
+		return nil, ""
+	}
+	specs := []struct {
+		key string
+		nt  *dialer.NetworkType
+	}{
+		{key: "tcp4", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}},
+		{key: "tcp6", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6}},
+		{key: "dns4", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}},
+		{key: "dns6", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}},
+	}
+	var probes map[string]*AdminProbeHealth
+	var maxChecked time.Time
+	for _, spec := range specs {
+		obs := d.SnapshotLastProbe(spec.nt)
+		lastLat, hasLat := d.MustGetLatencies10(spec.nt).LastLatency()
+		alive := d.MustGetAlive(spec.nt)
+		if obs.CheckedAt.IsZero() && !obs.HasLatency && !hasLat {
+			continue
+		}
+		if probes == nil {
+			probes = make(map[string]*AdminProbeHealth, 4)
+		}
+		var latMs *int32
+		if obs.HasLatency {
+			ms := int32(obs.Latency.Milliseconds())
+			latMs = &ms
+		} else if hasLat {
+			ms := int32(lastLat.Milliseconds())
+			latMs = &ms
+		}
+		checkedAtStr := ""
+		if !obs.CheckedAt.IsZero() {
+			checkedAtStr = obs.CheckedAt.UTC().Format(time.RFC3339)
+			if obs.CheckedAt.After(maxChecked) {
+				maxChecked = obs.CheckedAt
+			}
+		}
+		probes[spec.key] = &AdminProbeHealth{
+			Alive:     alive,
+			LatencyMs: latMs,
+			Admission: d.AdmissionState(spec.nt).String(),
+			Reason:    d.AdmissionReason(spec.nt),
+			CheckedAt: checkedAtStr,
+		}
+	}
+	if maxChecked.IsZero() {
+		return probes, ""
+	}
+	return probes, maxChecked.UTC().Format(time.RFC3339)
 }
 
 func adminSampleForGroupMember(group *outbound.DialerGroup, name string) (adminLatencySample, bool) {
@@ -214,14 +497,14 @@ func adminSampleForGroupMember(group *outbound.DialerGroup, name string) (adminL
 		return adminSampleForNestedMember(group, child), true
 	}
 	if d := group.DialerNamed(name); d != nil {
-		return adminSampleFromDialer(d), true
+		return adminSampleFromDialer(d, "node"), true
 	}
 	return adminLatencySample{}, false
 }
 
 func adminSampleForNestedMember(parent, child *outbound.DialerGroup) adminLatencySample {
 	if child == nil {
-		return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
+		return adminLatencySample{Kind: "group", Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 	}
 	for _, nt := range adminTCPNetworkTypes() {
 		var d *dialer.Dialer
@@ -237,9 +520,9 @@ func adminSampleForNestedMember(parent, child *outbound.DialerGroup) adminLatenc
 		if parent != nil {
 			d = parent.HealthViewOf(d)
 		}
-		return adminSampleFromDialer(d)
+		return adminSampleFromDialer(d, "group")
 	}
-	return adminLatencySample{Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
+	return adminLatencySample{Kind: "group", Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 }
 
 func adminTCPNetworkTypes() []*dialer.NetworkType {

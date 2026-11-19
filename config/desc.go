@@ -103,8 +103,9 @@ UDP is different: if a name is already known (FakeIP look-back or a previously s
 	"bootstrap_resolver":           "Explicit DNS resolver used only for bootstrap lookups that must happen before dae DNS routing is available, such as resolving named DNS upstream hosts and dial_mode real-domain probes. When unset, dae falls back to 119.29.29.29:53 and 223.5.5.5:53 in order. Setting bootstrap_resolver disables those defaults and uses only the configured resolver.",
 	"bpf_conn_state_map_size":      "Maximum entries for the shared TCP/UDP eBPF connection-state map. Lower values reduce locked kernel memory but also lower the maximum tracked concurrent flows. This takes effect on fresh eBPF load or restart; same-port reload keeps the live map to preserve connections.",
 	"pprof_port":                   "Non-zero enables Go pprof on localhost:<port> (typical 6060). 0 disables. The listener is loopback-only and is not the LAN admin API.",
-	"admin_listen":                 "Optional LAN-only HTTP management API, for example 192.168.124.223:2025. Empty disables the API. Unspecified addresses (0.0.0.0, ::) and port 9090 are rejected. A failed listen does not stop tproxy.",
+	"admin_listen":                 "Optional LAN-only HTTP/WebSocket management API, for example 192.168.124.223:2025. Empty disables the API. Unspecified addresses (0.0.0.0, ::) and port 9090 are rejected. A failed listen does not stop tproxy.",
 	"admin_secret":                 "Bearer token for the management API. The API stays disabled when this is empty.",
+	"admin_cors_origins":           "Optional list of exact extra CORS/WebSocket origins (for example https://panel.example.com) allowed to reach the management API.",
 }
 
 var DnsDesc = Desc{

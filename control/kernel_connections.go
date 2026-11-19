@@ -643,6 +643,10 @@ func readConntrackAccounting(path string) bool {
 }
 
 func (k *KernelConnectionsCollector) Snapshot(c *ControlPlane, limit int, src, mac string) AdminKernelConnectionsSnapshot {
+	return k.SnapshotWithOptions(c, limit, src, mac, false)
+}
+
+func (k *KernelConnectionsCollector) SnapshotWithOptions(c *ControlPlane, limit int, src, mac string, resolveDomains bool) AdminKernelConnectionsSnapshot {
 	limit = clampAdminConnectionLimit(limit)
 	src = strings.TrimSpace(src)
 	var srcAddr netip.Addr
@@ -665,13 +669,16 @@ func (k *KernelConnectionsCollector) Snapshot(c *ControlPlane, limit int, src, m
 	}
 
 	cacheKey := srcAddr.String() + "|" + macString(macAddr)
+	if resolveDomains {
+		cacheKey += "|dom"
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	now := k.now()
 	if !k.cachedAt.IsZero() && now.Sub(k.cachedAt) < k.cachedFor && k.cachedSrc == cacheKey {
 		return trimKernelSnapshot(k.cached, limit)
 	}
-	snap := k.collect(c, srcAddr, mac != "", macAddr)
+	snap := k.collect(c, srcAddr, mac != "", macAddr, resolveDomains)
 	k.cachedAt, k.cachedSrc, k.cached = now, cacheKey, snap
 	k.cachedFor = max(k.minInterval, kernelConnectionsBackoff*time.Duration(snap.ScanMs)*time.Millisecond)
 	return trimKernelSnapshot(snap, limit)
@@ -685,7 +692,7 @@ func trimKernelSnapshot(s AdminKernelConnectionsSnapshot, limit int) AdminKernel
 	return s
 }
 
-func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr, filterMac bool, mac [6]byte) AdminKernelConnectionsSnapshot {
+func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr, filterMac bool, mac [6]byte, resolveDomains bool) AdminKernelConnectionsSnapshot {
 	snap := AdminKernelConnectionsSnapshot{Connections: []AdminKernelConnection{}}
 	f, err := os.Open(k.procPath)
 	if err != nil {
@@ -747,7 +754,7 @@ func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr, fi
 		snap.Connections = append(snap.Connections, item)
 		wanted[entries[i].dst.Addr()] = struct{}{}
 	}
-	if c != nil && c.dnsController != nil {
+	if resolveDomains && c != nil && c.dnsController != nil {
 		if domains := c.dnsController.DomainsForIPs(wanted); len(domains) > 0 {
 			for i := range entries {
 				snap.Connections[i].Domain = domains[entries[i].dst.Addr()]
@@ -758,8 +765,8 @@ func (k *KernelConnectionsCollector) collect(c *ControlPlane, src netip.Addr, fi
 }
 
 // AdminKernelConnections returns the kernel-path flow list for
-// GET /v1/kernel-connections. src and mac optionally restrict it to one client.
-func (c *ControlPlane) AdminKernelConnections(limit int, src, mac string) AdminKernelConnectionsSnapshot {
+// GET /api/v1/connections/kernel. src and mac optionally restrict it to one client.
+func (c *ControlPlane) AdminKernelConnections(limit int, src, mac string, resolveDomains bool) AdminKernelConnectionsSnapshot {
 	if c == nil {
 		return AdminKernelConnectionsSnapshot{Connections: []AdminKernelConnection{}}
 	}
@@ -772,7 +779,7 @@ func (c *ControlPlane) AdminKernelConnections(limit int, src, mac string) AdminK
 			collector = c.kernelConns.Load()
 		}
 	}
-	return collector.Snapshot(c, limit, src, mac)
+	return collector.SnapshotWithOptions(c, limit, src, mac, resolveDomains)
 }
 
 // userspaceFlowKeys lists the flows dae relays itself, keyed the way conntrack

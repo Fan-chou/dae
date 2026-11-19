@@ -222,7 +222,7 @@ func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, relo
 		adminHTTP.markSuspended()
 		return
 	}
-	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
+	adminHTTP.refreshWithCORS(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins)
 	adminHTTP.markReloadSucceeded(snapshot)
 }
 
@@ -443,6 +443,11 @@ func (r *Runner) Run() (err error) {
 		}
 		return active.controlPlane
 	}, nil)
+	logRing := newAdminLogRing()
+	if log != nil {
+		log.AddHook(logRing)
+	}
+	adminHTTP.setLogRing(logRing)
 	w.adminHTTP = adminHTTP
 	sigs := make(chan os.Signal, 1)
 	// Keep internal wake-ups separate so queued OS signals cannot mask reload handoff notifications.
@@ -502,7 +507,7 @@ func (r *Runner) Run() (err error) {
 	defer unregisterProgressObserver()
 	publishEffectiveConfig(conf)
 	adminHTTP.captureActiveSnapshot(r.adminSnapshot)
-	adminHTTP.refresh(conf.Global.AdminListen, conf.Global.AdminSecret)
+	adminHTTP.refreshWithCORS(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins)
 	// User-space inbounds live outside any control plane generation: they keep
 	// their sockets across reloads and are reconciled with the active config
 	// whenever a generation is published.
@@ -510,7 +515,7 @@ func (r *Runner) Run() (err error) {
 	inboundManager.Apply(conf.Inbound)
 	inboundManager.SetActive()
 	adminHTTP.setInbounds(inboundManager.Snapshot)
-	var ruleProviderLifecycleHolder *ruleProviderLifecycleHolder
+	var sourcesHolder *ruleProviderLifecycleHolder
 	var ruleProviderLifecycleCancel context.CancelFunc
 	var ruleProviderLifecycleDone <-chan struct{}
 	if interval := ruleProviderRefreshInterval(conf); interval > 0 {
@@ -518,7 +523,7 @@ func (r *Runner) Run() (err error) {
 		if lifecycleErr != nil {
 			log.WithError(lifecycleErr).Errorln("[RuleProvider] Failed to start refresh lifecycle")
 		} else {
-			ruleProviderLifecycleHolder = holder
+			sourcesHolder = holder
 			lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			ruleProviderLifecycleCancel = cancelLifecycle
@@ -530,6 +535,37 @@ func (r *Runner) Run() (err error) {
 				}
 			}()
 		}
+	} else if baseDir := r.ruleProviderBaseDir(); baseDir != "" {
+		sourcesHolder = &ruleProviderLifecycleHolder{
+			conf:          conf,
+			baseDir:       baseDir,
+			reloadManager: reloadManager,
+			log:           log,
+		}
+	}
+	if sourcesHolder != nil {
+		holder := sourcesHolder
+		adminHTTP.setSourcesRefresher(func(ctx context.Context) (adminSourcesRefreshResult, error) {
+			report, refreshErr := holder.refresh(ctx)
+			res := adminSourcesRefreshResult{
+				Changed:      report.Changed,
+				UsedLastGood: report.UsedLastGood,
+			}
+			if refreshErr != nil {
+				res.Warning = refreshErr.Error()
+			}
+			if report.Changed {
+				if qErr := holder.queueReload(ctx); qErr == nil {
+					res.ReloadQueued = true
+				} else if res.Warning == "" {
+					res.Warning = qErr.Error()
+				}
+			}
+			if !report.Changed && refreshErr != nil {
+				return res, refreshErr
+			}
+			return res, nil
+		})
 	}
 	fastExit := false
 	var fatalRunErr error
@@ -882,8 +918,8 @@ loop:
 					w.adminSnapshot = handoff.preparedGeneration.adminSnapshot
 					isSuspend = handoff.isSuspend
 					publishEffectiveConfig(w.conf)
-					if ruleProviderLifecycleHolder != nil {
-						ruleProviderLifecycleHolder.setConfig(w.conf)
+					if sourcesHolder != nil {
+						sourcesHolder.setConfig(w.conf)
 					}
 					w.listener = handoff.preparedGeneration.listener
 					reloadManager.clearPendingStagedHandoff()

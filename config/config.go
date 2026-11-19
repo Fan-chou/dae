@@ -87,6 +87,9 @@ type Global struct {
 	// AdminSecret is the Bearer token required by the management API.
 	// The API stays disabled when this is empty, even if admin_listen is set.
 	AdminSecret string `mapstructure:"admin_secret"`
+	// AdminCorsOrigins lists additional exact origins (scheme://host[:port])
+	// allowed to call the management API cross-origin. Empty keeps LAN-only defaults.
+	AdminCorsOrigins []string `mapstructure:"admin_cors_origins"`
 	// AutoSniffPunt injects kernel-space-only sniff-punt lines for
 	// device-scoped whitelist shapes (selector && domain -> group with a
 	// later selector -> direct/block fallback) so the whitelist still
@@ -328,6 +331,11 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 	}
 	if _, _, err := conf.Global.UDPCrossFamilyPrefixes(conf.Dns.FakeIP); err != nil {
 		return nil, err
+	}
+	if canonicalOrigins, err := ValidateAdminCorsOrigins(conf.Global.AdminCorsOrigins); err != nil {
+		return nil, err
+	} else {
+		conf.Global.AdminCorsOrigins = canonicalOrigins
 	}
 	return conf, nil
 }

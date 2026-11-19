@@ -84,39 +84,39 @@ func TestAdminConnectionsCarryTheInbound(t *testing.T) {
 	defer a.finish()
 	defer b.finish()
 
-	all := manager.adminConnectionsSnapshot(256, adminConnectionFilter{})
+	all := manager.adminConnectionsSnapshot(256, AdminConnectionFilter{})
 	if all.Total != 2 {
 		t.Fatalf("all = %+v", all)
 	}
-	only := manager.adminConnectionsSnapshot(256, adminConnectionFilter{inbound: "s1"})
+	only := manager.adminConnectionsSnapshot(256, AdminConnectionFilter{Inbound: "s1"})
 	if only.Total != 1 || only.Connections[0].Inbound != "s1" {
 		t.Fatalf("filtered = %+v", only)
 	}
-	if none := manager.adminConnectionsSnapshot(256, adminConnectionFilter{inbound: "nope"}); none.Total != 0 {
+	if none := manager.adminConnectionsSnapshot(256, AdminConnectionFilter{Inbound: "nope"}); none.Total != 0 {
 		t.Fatalf("unknown inbound matched: %+v", none)
 	}
 }
 
 func TestMergeInboundUDPConnections(t *testing.T) {
-	snap := AdminConnectionsSnapshot{Total: 1, Connections: []AdminConnection{{ID: "5", Upload: 1}}}
+	snap := AdminConnectionsSnapshot{Total: 1, Connections: []AdminConnection{{ID: "tcp:5", Upload: 1}}}
 	udp := []AdminConnection{
-		{ID: "i1", Network: "udp", Inbound: "s1", Upload: 100},
-		{ID: "i2", Network: "udp", Inbound: "lan", Upload: 10},
+		{ID: "in-udp:1", Network: "udp", Inbound: "s1", Upload: 100},
+		{ID: "in-udp:2", Network: "udp", Inbound: "lan", Upload: 10},
 	}
-	got := mergeInboundUDPConnections(snap, udp, adminConnectionFilter{}, 256)
-	if got.Total != 3 || len(got.Connections) != 3 || got.Connections[0].ID != "i1" {
+	got := mergeInboundUDPConnections(snap, udp, AdminConnectionFilter{}, 256)
+	if got.Total != 3 || len(got.Connections) != 3 || got.Connections[0].ID != "in-udp:1" {
 		t.Fatalf("merged = %+v", got)
 	}
-	got = mergeInboundUDPConnections(snap, udp, adminConnectionFilter{inbound: "lan"}, 256)
-	if got.Total != 2 || got.Connections[0].ID != "i2" {
+	got = mergeInboundUDPConnections(snap, udp, AdminConnectionFilter{Inbound: "lan"}, 256)
+	if got.Total != 2 || got.Connections[0].ID != "in-udp:2" {
 		t.Fatalf("filtered = %+v", got)
 	}
-	got = mergeInboundUDPConnections(snap, udp, adminConnectionFilter{}, 2)
+	got = mergeInboundUDPConnections(snap, udp, AdminConnectionFilter{}, 2)
 	if got.Total != 3 || len(got.Connections) != 2 || !got.Truncated {
 		t.Fatalf("limit not applied: %+v", got)
 	}
 	// No inbound UDP sessions: the snapshot is returned as it was.
-	if same := mergeInboundUDPConnections(snap, nil, adminConnectionFilter{}, 256); same.Total != 1 || same.Truncated {
+	if same := mergeInboundUDPConnections(snap, nil, AdminConnectionFilter{}, 256); same.Total != 1 || same.Truncated {
 		t.Fatalf("unchanged snapshot altered: %+v", same)
 	}
 }
@@ -138,8 +138,9 @@ func TestInboundUDPSessionListedOnceEstablished(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 	c := got[0]
-	if c.ID != "i7" || c.Network != "udp" || c.Inbound != "s1" || c.Src != "127.0.0.1:50000" || c.Dst != "example.com:53" ||
-		c.Outbound != "proxy" || c.Dialer != "n1" || c.Upload != 5 || c.Download != 9 || c.Start == "" {
+	if c.ID != "in-udp:7" || c.Network != "udp" || c.Inbound != "s1" ||
+		c.SrcIP != "127.0.0.1" || c.SrcPort != 50000 || c.DstPort != 53 || c.Target != "example.com:53" ||
+		c.Outbound != "proxy" || c.Dialer != "n1" || c.Upload != 5 || c.Download != 9 || c.StartTime == "" {
 		t.Fatalf("connection = %+v", c)
 	}
 }

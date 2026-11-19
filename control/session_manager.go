@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -200,6 +202,7 @@ type SessionManager struct {
 	closeErr  error
 
 	nextFlowID atomic.Uint64
+	accounting *TrafficAccounting
 
 	// Test-only seam (nil in production) for exercising conn_state closing
 	// transitions, map-ID aliasing, and monotonic clock timestamps without privileged BPF maps.
@@ -270,6 +273,8 @@ type FlowRuntime struct {
 	uploadBytes         atomic.Uint64
 	downloadBytes       atomic.Uint64
 	firstByte           atomic.Bool
+	offloaded           atomic.Bool
+	closeReason         atomic.Int32
 
 	ingress            net.Conn
 	egressMu           sync.Mutex
@@ -314,6 +319,7 @@ type UDPFlowRuntime struct {
 	uploadBytes   atomic.Uint64
 	downloadBytes atomic.Uint64
 	firstByte     atomic.Bool
+	closeReason   atomic.Int32
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -337,6 +343,7 @@ func NewSessionManager(parent context.Context) *SessionManager {
 		cancel:          cancel,
 		generations:     make(map[routing.PolicyEpoch]*sessionGenerationState),
 		pinnedUDP:       make(map[bpfTuplesKey]int),
+		accounting:      NewTrafficAccounting(),
 	}
 	for i := range m.pinnedShards {
 		m.pinnedShards[i].keys = make(map[bpfTuplesKey]int)
@@ -840,7 +847,9 @@ func (f *FlowRuntime) finish() {
 			d.ObserveConnFinished(&nt, elapsed, upload, download)
 		}
 		if f.manager != nil {
+			closed := f.toClosedFlow(time.Now())
 			f.manager.releaseFlow(f)
+			f.manager.recordClosedFlow(closed)
 			return
 		}
 		if f.cancel != nil {
@@ -1110,7 +1119,9 @@ func (f *UDPFlowRuntime) finish() {
 			d.ObserveConnFinished(&nt, elapsed, upload, download)
 		}
 		if f.manager != nil {
+			closed := f.toClosedFlow(time.Now())
 			f.manager.releaseUDPFlow(f)
+			f.manager.recordClosedFlow(closed)
 			return
 		}
 		if f.cancel != nil {
@@ -1528,6 +1539,10 @@ func (m *SessionManager) MigrateGeneration(
 
 // AbortAll closes every established flow without closing the manager.
 func (m *SessionManager) AbortAll() error {
+	return m.abortAllWithReason(flowCloseReload)
+}
+
+func (m *SessionManager) abortAllWithReason(reason int32) error {
 	if m == nil {
 		return nil
 	}
@@ -1543,11 +1558,13 @@ func (m *SessionManager) AbortAll() error {
 	})
 	var errs []error
 	for _, flow := range flows {
+		flow.closeReason.CompareAndSwap(flowCloseNormal, reason)
 		if err := flow.abort(); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	for _, flow := range udpFlows {
+		flow.closeReason.CompareAndSwap(flowCloseNormal, reason)
 		if err := flow.abort(); err != nil {
 			errs = append(errs, err)
 		}
@@ -1563,7 +1580,209 @@ func (m *SessionManager) Close() error {
 	m.closeOnce.Do(func() {
 		m.closed.Store(true)
 		m.cancel()
-		m.closeErr = m.AbortAll()
+		m.closeErr = m.abortAllWithReason(flowCloseShutdown)
 	})
 	return m.closeErr
+}
+
+func (m *SessionManager) recordClosedFlow(flow AdminClosedFlow) {
+	if m == nil || m.accounting == nil {
+		return
+	}
+	m.accounting.RecordClosed(flow)
+}
+
+// CloseConnectionByID terminates one active TCP or UDP flow matching id ("tcp:<n>" or "udp:<n>").
+func (m *SessionManager) CloseConnectionByID(id string) bool {
+	if m == nil || id == "" {
+		return false
+	}
+	if raw, ok := strings.CutPrefix(id, "tcp:"); ok {
+		wantID, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return false
+		}
+		var target *FlowRuntime
+		m.flows.Range(func(_, value any) bool {
+			if flow := value.(*FlowRuntime); flow != nil && flow.id == wantID {
+				target = flow
+				return false
+			}
+			return true
+		})
+		if target != nil {
+			target.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+			_ = target.abort()
+			return true
+		}
+		return false
+	}
+	if raw, ok := strings.CutPrefix(id, "udp:"); ok {
+		wantID, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return false
+		}
+		var target *UDPFlowRuntime
+		m.udpFlows.Range(func(_, value any) bool {
+			if flow := value.(*UDPFlowRuntime); flow != nil && flow.id == wantID {
+				target = flow
+				return false
+			}
+			return true
+		})
+		if target != nil {
+			target.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+			_ = target.abort()
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// CloseConnections terminates all active TCP/UDP flows matching filter.
+func (m *SessionManager) CloseConnections(filter AdminConnectionFilter) int {
+	if m == nil {
+		return 0
+	}
+	filter = filter.normalized()
+	now := time.Now()
+	tcp, udp := m.snapshotFlowRuntimes()
+	var abortTCP []*FlowRuntime
+	var abortUDP []*UDPFlowRuntime
+	for _, flow := range tcp {
+		if filter.IsEmpty() || adminConnectionFromTCPAt(flow, now).matches(filter) {
+			abortTCP = append(abortTCP, flow)
+		}
+	}
+	for _, flow := range udp {
+		if filter.IsEmpty() || adminConnectionFromUDPAt(flow, now).matches(filter) {
+			abortUDP = append(abortUDP, flow)
+		}
+	}
+	for _, flow := range abortTCP {
+		flow.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+		_ = flow.abort()
+	}
+	for _, flow := range abortUDP {
+		flow.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+		_ = flow.abort()
+	}
+	return len(abortTCP) + len(abortUDP)
+}
+
+// CloseConnectionsByTuple aborts any active userspace flow matching the 5-tuple.
+func (m *SessionManager) CloseConnectionsByTuple(proto uint8, src, dst netip.AddrPort) int {
+	if m == nil || !src.IsValid() || !dst.IsValid() {
+		return 0
+	}
+	norm := func(a netip.AddrPort) netip.AddrPort {
+		return netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
+	}
+	wantSrc := norm(src)
+	wantDst := norm(dst)
+	closed := 0
+	tcp, udp := m.snapshotFlowRuntimes()
+	if proto == 6 {
+		for _, flow := range tcp {
+			if flow != nil && norm(flow.src) == wantSrc && norm(flow.dst) == wantDst {
+				flow.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+				_ = flow.abort()
+				closed++
+			}
+		}
+		return closed
+	}
+	if proto == 17 {
+		for _, flow := range udp {
+			if flow != nil {
+				fSrc, fDst := udpFlowAddrs(flow)
+				if norm(fSrc) == wantSrc && norm(fDst) == wantDst {
+					flow.closeReason.CompareAndSwap(flowCloseNormal, flowCloseAborted)
+					_ = flow.abort()
+					closed++
+				}
+			}
+		}
+	}
+	return closed
+}
+
+func (c *ControlPlane) recordClosedFlow(flow AdminClosedFlow) {
+	if c == nil {
+		return
+	}
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		manager.recordClosedFlow(flow)
+	}
+}
+
+func (c *ControlPlane) SetClosedFlowObserver(fn func(AdminClosedFlow)) {
+	if c == nil {
+		return
+	}
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil && manager.accounting != nil {
+		manager.accounting.SetClosedFlowObserver(fn)
+	}
+}
+
+func (c *ControlPlane) AdminClosedFlows(limit int, filter AdminConnectionFilter) AdminClosedFlowsSnapshot {
+	if c == nil {
+		return AdminClosedFlowsSnapshot{Flows: []AdminClosedFlow{}}
+	}
+	manager, _ := c.controlPlaneSessionManager()
+	if manager == nil || manager.accounting == nil {
+		return AdminClosedFlowsSnapshot{Flows: []AdminClosedFlow{}}
+	}
+	return manager.accounting.SnapshotClosed(limit, filter)
+}
+
+func (c *ControlPlane) AdminTrafficSummary(topN int) AdminTrafficSummary {
+	if c == nil {
+		return NewTrafficAccounting().Summary(nil, topN)
+	}
+	manager, _ := c.controlPlaneSessionManager()
+	if manager == nil || manager.accounting == nil {
+		return NewTrafficAccounting().Summary(nil, topN)
+	}
+	active := manager.adminConnectionsSnapshot(adminConnectionsMaxLimit, AdminConnectionFilter{})
+	active = mergeInboundUDPConnections(active, activeInboundManager.Load().udpConnections(), AdminConnectionFilter{}, adminConnectionsMaxLimit)
+	return manager.accounting.Summary(active.Connections, topN)
+}
+
+func (c *ControlPlane) AdminResetTrafficSummary() {
+	if c == nil {
+		return
+	}
+	manager, _ := c.controlPlaneSessionManager()
+	if manager == nil || manager.accounting == nil {
+		return
+	}
+	active := manager.adminConnectionsSnapshot(adminConnectionsMaxLimit, AdminConnectionFilter{})
+	active = mergeInboundUDPConnections(active, activeInboundManager.Load().udpConnections(), AdminConnectionFilter{}, adminConnectionsMaxLimit)
+	manager.accounting.Reset(active.Connections)
+}
+
+func (c *ControlPlane) AdminCloseConnection(id string) bool {
+	if c == nil || id == "" {
+		return false
+	}
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		if manager.CloseConnectionByID(id) {
+			return true
+		}
+	}
+	return activeInboundManager.Load().CloseUDPConnectionByID(id)
+}
+
+func (c *ControlPlane) AdminCloseConnections(filter AdminConnectionFilter) int {
+	if c == nil {
+		return 0
+	}
+	closed := 0
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		closed += manager.CloseConnections(filter)
+	}
+	closed += activeInboundManager.Load().CloseUDPConnections(filter)
+	return closed
 }

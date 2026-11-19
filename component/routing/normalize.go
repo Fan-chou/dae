@@ -6,10 +6,109 @@
 package routing
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/sirupsen/logrus"
 )
+
+const (
+	maxRuleSummaryParams = 3
+	maxRuleSummaryLen    = 128
+)
+
+// SummarizeRoutingRule builds a concise, URI-safe display summary of a routing rule.
+func SummarizeRoutingRule(r *config_parser.RoutingRule) string {
+	if r == nil {
+		return ""
+	}
+	parts := make([]string, 0, len(r.AndFunctions))
+	for _, f := range r.AndFunctions {
+		if f == nil {
+			continue
+		}
+		var b strings.Builder
+		if f.Not {
+			b.WriteByte('!')
+		}
+		b.WriteString(f.Name)
+		b.WriteByte('(')
+		limit := len(f.Params)
+		if limit > maxRuleSummaryParams {
+			limit = maxRuleSummaryParams
+		}
+		for i := 0; i < limit; i++ {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			p := f.Params[i]
+			if p == nil {
+				continue
+			}
+			val := sanitizeSummaryToken(p.Val)
+			if p.Key != "" {
+				b.WriteString(sanitizeSummaryToken(p.Key))
+				b.WriteByte(':')
+			}
+			if val != "" {
+				b.WriteString(val)
+			} else if len(p.AndFunctions) > 0 {
+				b.WriteString("...")
+			}
+		}
+		if len(f.Params) > maxRuleSummaryParams {
+			b.WriteString(fmt.Sprintf(", +%d", len(f.Params)-maxRuleSummaryParams))
+		}
+		b.WriteByte(')')
+		parts = append(parts, b.String())
+	}
+	left := strings.Join(parts, " && ")
+	if left == "" {
+		left = "*"
+	}
+	outStr := r.Outbound.Name
+	if len(r.Outbound.Params) > 0 {
+		outStr = r.Outbound.String(false, false, false)
+	}
+	out := sanitizeSummaryToken(outStr)
+	summary := left + " -> " + out
+	if len(summary) > maxRuleSummaryLen {
+		return summary[:maxRuleSummaryLen-3] + "..."
+	}
+	return summary
+}
+
+func sanitizeSummaryToken(s string) string {
+	if strings.Contains(s, "://") {
+		return "[redacted]"
+	}
+	return s
+}
+
+func stampMissingRuleMeta(rules []*config_parser.RoutingRule) {
+	for i, r := range rules {
+		if r == nil {
+			continue
+		}
+		if r.SourceIndex == 0 {
+			r.SourceIndex = i + 1
+		}
+		if r.SourceOrigin == "" {
+			r.SourceOrigin = "config"
+		}
+		if r.SourceSummary == "" {
+			r.SourceSummary = SummarizeRoutingRule(r)
+		}
+	}
+}
+
+type ruleSourceMeta struct {
+	index   int
+	summary string
+	origin  string
+}
 
 func NewNormalizedProgram(
 	rules []*config_parser.RoutingRule,
@@ -18,8 +117,11 @@ func NewNormalizedProgram(
 ) (*NormalizedProgram, error) {
 
 	if HasOrderedRules(rules) {
-		ordered := make([]OrderedRule, 0, len(rules))
-		for _, r := range DeepCloneRules(rules) {
+		cloned := DeepCloneRules(rules)
+		stampMissingRuleMeta(cloned)
+		ordered := make([]OrderedRule, 0, len(cloned))
+		orderedMeta := make([]ruleSourceMeta, 0, len(cloned))
+		for _, r := range cloned {
 			root := &OrderedExpr{Op: "and"}
 			for _, f := range r.AndFunctions {
 				e, err := ExprFromFunction(f)
@@ -35,11 +137,17 @@ func NewNormalizedProgram(
 				return nil, err
 			}
 			compactOrderedExpr(root)
+			prevLen := len(ordered)
 			ordered = appendOrderedRule(ordered, OrderedRule{Expr: root, Outbound: r.Outbound})
+			meta := ruleSourceMeta{index: r.SourceIndex, summary: r.SourceSummary, origin: r.SourceOrigin}
+			for len(orderedMeta) < len(ordered) {
+				orderedMeta = append(orderedMeta, meta)
+			}
+			_ = prevLen
 		}
 		var expanded []*config_parser.RoutingRule
 		id := 0
-		for _, r := range ordered {
+		for idx, r := range ordered {
 			if err := r.Expr.Walk(func(f *config_parser.Function) error { id++; f.EvaluationID = id; return nil }); err != nil {
 				return nil, err
 			}
@@ -47,8 +155,15 @@ func NewNormalizedProgram(
 			if err != nil {
 				return nil, err
 			}
+			meta := orderedMeta[idx]
 			for _, term := range terms {
-				expanded = append(expanded, &config_parser.RoutingRule{AndFunctions: term, Outbound: r.Outbound})
+				expanded = append(expanded, &config_parser.RoutingRule{
+					AndFunctions:  term,
+					Outbound:      r.Outbound,
+					SourceIndex:   meta.index,
+					SourceSummary: meta.summary,
+					SourceOrigin:  meta.origin,
+				})
 			}
 		}
 		// Safe set compaction is already done. Do not run the legacy optimizer,
@@ -65,17 +180,19 @@ func NewNormalizedProgram(
 		}
 		return &NormalizedProgram{Rules: normalized, Fallback: fallback, Ordered: ordered}, nil
 	}
+	stamped := DeepCloneRules(rules)
+	stampMissingRuleMeta(stamped)
 	var (
 		normalized []*config_parser.RoutingRule
 		err        error
 	)
 	if len(optimizers) > 0 {
-		normalized, err = ApplyRulesOptimizers(rules, optimizers...)
+		normalized, err = ApplyRulesOptimizers(stamped, optimizers...)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		normalized = DeepCloneRules(rules)
+		normalized = stamped
 	}
 	return &NormalizedProgram{
 		Rules:    normalized,

@@ -244,8 +244,10 @@ func InferSniffPunt(rules []*config_parser.RoutingRule) ([]*config_parser.Routin
 			insertions = append(insertions, insertion{
 				before: j,
 				rule: &config_parser.RoutingRule{
-					AndFunctions: []*config_parser.Function{puntFn},
-					Outbound:     config_parser.Function{Name: consts.OutboundControlPlaneRouting.String()},
+					AndFunctions:  []*config_parser.Function{puntFn},
+					Outbound:      config_parser.Function{Name: consts.OutboundControlPlaneRouting.String()},
+					SourceSummary: puntFn.String(false, true, false) + " -> control_plane",
+					SourceOrigin:  "auto",
 				},
 				inj: SniffPuntInjection{
 					Selector:          puntFn.String(false, true, false),

@@ -2,7 +2,6 @@
 # Package fdae for OpenWrt without the SDK: one ipk and one apk per
 # architecture, plus an arch-independent luci-app-fdae of each.
 #
-#   FDAE_UI=web-next/dist \
 #   FDAE_BIN_x86_64=build/dae-amd64 FDAE_BIN_aarch64=build/dae-arm64 \
 #   openwrt/build.sh [outdir]
 #
@@ -13,13 +12,6 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 OUT=${1:-"$ROOT/build/openwrt"}
-UI=${FDAE_UI:-"$ROOT/web-next/dist"}
-[ -f "$UI/index.html" ] || { echo "no built panel in $UI (build web-next first)" >&2; exit 1; }
-# A panel older than its sources is the mistake this guards against.
-if [ -d "$ROOT/web-next/src" ] && [ -n "$(find "$ROOT/web-next/src" "$ROOT/web-next/package.json" -newer "$UI/index.html" -print -quit)" ]; then
-	echo "$UI is older than web-next/src: rebuild the panel (FDAE_ALLOW_STALE_UI=1 to package it anyway)" >&2
-	[ "${FDAE_ALLOW_STALE_UI:-0}" = 1 ] || exit 1
-fi
 mkdir -p "$OUT"
 OUT=$(CDPATH= cd -- "$OUT" && pwd)
 
@@ -37,7 +29,7 @@ trap 'rm -rf "$WORK"' EXIT
 stage_fdae() {
 	d=$1
 	mkdir -p "$d/usr/bin" "$d/etc/init.d" "$d/etc/config" "$d/etc/dae" \
-		"$d/usr/libexec/fdae" "$d/usr/share/fdae-ui" "$d/lib/upgrade/keep.d"
+		"$d/usr/libexec/fdae" "$d/lib/upgrade/keep.d"
 	install -m 0755 "$2" "$d/usr/bin/dae"
 	install -m 0755 "$HERE/fdae/files/dae.init" "$d/etc/init.d/dae"
 	install -m 0644 "$HERE/fdae/files/dae.config" "$d/etc/config/dae"
@@ -45,7 +37,6 @@ stage_fdae() {
 	for f in apply write-local recover; do
 		install -m 0755 "$HERE/fdae/files/$f.sh" "$d/usr/libexec/fdae/$f.sh"
 	done
-	cp -R "$UI"/. "$d/usr/share/fdae-ui/"
 	printf '/etc/dae/\n/etc/config/dae\n/usr/libexec/fdae/dae.prev\n' > "$d/lib/upgrade/keep.d/fdae"
 }
 
@@ -162,7 +153,7 @@ for arch in x86_64 aarch64; do
 	[ "$arch" != aarch64 ] || ipkarch=aarch64_generic
 	s="$WORK/stage-fdae-$arch"
 	stage_fdae "$s" "$bin"
-	desc="fdae: eBPF transparent proxy, installs as dae with its own panel"
+	desc="fdae: eBPF transparent proxy, installs as dae"
 	ipk fdae "$ipkarch" "$s" "$DEPENDS" "$desc" "$WORK/fdae.prerm"
 	apk fdae "$arch" "$s" "$DEPENDS" "$desc" "$WORK/fdae.deinstall"
 	built=1

@@ -39,11 +39,13 @@ type RoutingMatcherBuilder struct {
 	log                *logrus.Logger
 	outboundName2Id    map[string]uint8
 	bpf                *bpfObjects
-	rules              []bpfMatchSet
-	compiledRules      []compiledRoutingMatch
-	orderedRules       []routing.OrderedRule
-	evaluationSpans    map[int][]int
-	predicateGroups    []routingMatcherPredicateGroupSpan
+	rules                []bpfMatchSet
+	compiledRules        []compiledRoutingMatch
+	orderedRules         []routing.OrderedRule
+	evaluationSpans      map[int][]int
+	predicateGroups      []routingMatcherPredicateGroupSpan
+	ruleMetaByMatchIndex []*RoutingRuleMeta
+	currentRuleMeta      *RoutingRuleMeta
 	simulatedLpmTries  [][]netip.Prefix
 	simulatedDomainSet []routing.DomainSet
 	// packetMetadataSensitiveRouting is true when routing rules depend on
@@ -152,9 +154,10 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 		// safe lower bound that avoids the early append-growth reallocations on
 		// the (cold) build/reload path. simulatedDomainSet/simulatedLpmTries are
 		// left nil because their counts depend on rule type, not rule count.
-		rules:               make([]bpfMatchSet, 0, ruleCap),
-		compiledRules:       make([]compiledRoutingMatch, 0, ruleCap),
-		predicateGroups:     make([]routingMatcherPredicateGroupSpan, 0, ruleCap),
+		rules:                make([]bpfMatchSet, 0, ruleCap),
+		compiledRules:        make([]compiledRoutingMatch, 0, ruleCap),
+		predicateGroups:      make([]routingMatcherPredicateGroupSpan, 0, ruleCap),
+		ruleMetaByMatchIndex: make([]*RoutingRuleMeta, 0, ruleCap),
 		lpmDedup:            make(map[uint64]lpmDedupEntry),
 		referencedOutbounds: make(map[string]struct{}),
 	}
@@ -165,6 +168,7 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 }
 
 func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
+	rulesBuilder.SetBeforeRuleHook(b.beforeProgramRule)
 	b.registerProgramParser(rulesBuilder, consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
 	b.registerProgramParser(rulesBuilder, consts.Function_Ip, routing.IpParserFactory(b.addIp))
 	b.registerProgramParser(rulesBuilder, "ip_no_resolve", routing.IpParserFactory(b.addIp))
@@ -263,9 +267,41 @@ func newCompiledRoutingBase(matchType consts.MatchType, not bool, outboundID uin
 	}
 }
 
+func (b *RoutingMatcherBuilder) beforeProgramRule(rule *config_parser.RoutingRule) {
+	if rule == nil {
+		b.currentRuleMeta = nil
+		return
+	}
+	raw := rule.SourceSummary
+	if raw == "" {
+		raw = routing.SummarizeRoutingRule(rule)
+	}
+	origin := rule.SourceOrigin
+	if origin == "" {
+		origin = "config"
+	}
+	b.currentRuleMeta = &RoutingRuleMeta{
+		Index:  rule.SourceIndex,
+		Raw:    raw,
+		Origin: origin,
+	}
+}
+
 func (b *RoutingMatcherBuilder) appendRule(set bpfMatchSet, compiled compiledRoutingMatch) {
+	idx := len(b.rules)
 	b.rules = append(b.rules, set)
 	b.compiledRules = append(b.compiledRules, compiled)
+	var meta *RoutingRuleMeta
+	if b.currentRuleMeta != nil {
+		copied := *b.currentRuleMeta
+		if idx < int(UnknownRuleMatchIndex) {
+			copied.MatchIndex = uint16(idx)
+		} else {
+			copied.MatchIndex = UnknownRuleMatchIndex
+		}
+		meta = &copied
+	}
+	b.ruleMetaByMatchIndex = append(b.ruleMetaByMatchIndex, meta)
 }
 
 func (b *RoutingMatcherBuilder) addDomain(f *config_parser.Function, key string, values []string, outbound *routing.Outbound) (err error) {
@@ -628,6 +664,11 @@ func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 		Outbound: outboundId,
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
+	}
+	b.currentRuleMeta = &RoutingRuleMeta{
+		Index:  0,
+		Raw:    "fallback -> " + outbound.Name,
+		Origin: "fallback",
 	}
 	b.appendRule(set, newCompiledRoutingBase(
 		consts.MatchType_Fallback, false, outboundId, outbound.Mark, outbound.Must,
@@ -1124,13 +1165,14 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		return nil, err
 	}
 	matcher = &RoutingMatcher{
-		orderedRules:    ordered,
-		lpmMatcher:      lpmMatcher,
-		domainMatcher:   domainMatcher,
-		compiledMatches: compiledMatches,
-		fakeIPRules:     compileFakeIPRules(compiledMatches),
-		needs:           computeRoutingMatcherNeeds(compiledMatches),
-		predicateGroups: append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
+		orderedRules:         ordered,
+		lpmMatcher:           lpmMatcher,
+		domainMatcher:        domainMatcher,
+		compiledMatches:      compiledMatches,
+		fakeIPRules:          compileFakeIPRules(compiledMatches),
+		needs:                computeRoutingMatcherNeeds(compiledMatches),
+		predicateGroups:      append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
+		ruleMetaByMatchIndex: append([]*RoutingRuleMeta(nil), b.ruleMetaByMatchIndex...),
 	}
 
 	// Memory optimization: Release large temporary data structures
@@ -1140,6 +1182,8 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	b.rules = nil
 	b.compiledRules = nil
 	b.predicateGroups = nil
+	b.ruleMetaByMatchIndex = nil
+	b.currentRuleMeta = nil
 	b.lpmDedup = nil
 
 	return matcher, nil

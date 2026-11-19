@@ -32,8 +32,14 @@ func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto con
 // RouteInbound is Route for a flow that entered through the inbound with the
 // given consts.InboundID (0 for transparent traffic).
 func (c *ControlPlane) RouteInbound(inbound uint32, src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	outboundIndex, mark, must, _, err = c.RouteInboundWithRule(inbound, src, dst, domain, l4proto, routingResult)
+	return
+}
+
+// RouteInboundWithRule resolves a routing input and returns the matched compiled match-set index.
+func (c *ControlPlane) RouteInboundWithRule(inbound uint32, src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, matchIndex uint16, err error) {
 	if c == nil || c.routingMatcher == nil {
-		return 0, 0, false, fmt.Errorf("nil routing matcher")
+		return 0, 0, false, UnknownRuleMatchIndex, fmt.Errorf("nil routing matcher")
 	}
 	if routingResult == nil {
 		routingResult = &bpfRoutingResult{}
@@ -48,7 +54,7 @@ func (c *ControlPlane) RouteInbound(inbound uint32, src, dst netip.AddrPort, dom
 	copy(mac16[10:], routingResult.Mac[:])
 	bSrc := src.Addr().As16()
 	bDst := dst.Addr().As16()
-	outboundIndex, mark, must, err = c.routingMatcher.MatchInbound(
+	return c.routingMatcher.MatchInboundWithRule(
 		inbound,
 		bSrc,
 		bDst,
@@ -61,7 +67,6 @@ func (c *ControlPlane) RouteInbound(inbound uint32, src, dst netip.AddrPort, dom
 		routingResult.Dscp,
 		mac16,
 	)
-	return
 }
 
 func bpfTuplesKeyFromAddrPorts(src, dst netip.AddrPort, l4proto uint8) bpfTuplesKey {

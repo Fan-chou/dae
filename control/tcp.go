@@ -336,6 +336,7 @@ func (c *ControlPlane) prepareConnWithRoutingResultOwned(
 		ownership.storePendingEgress(rConn)
 	}
 	binding := newTcpFlowBinding(c.PolicyEpoch(), res, routingResult.Mac)
+	binding.Process = pnameString(routingResult.Pname)
 	var captureAdoptStart time.Time
 	if dialParam.captureTrace != nil {
 		captureAdoptStart = time.Now()
@@ -858,12 +859,14 @@ func (c *ControlPlane) prepareTCPDnsFastPathOwned(
 		flowRoutingResult.Mark = c.soMarkFromDae
 	}
 	binding := TcpFlowBinding{
-		Mac: flowRoutingResult.Mac,
+		Mac:     flowRoutingResult.Mac,
+		Process: pnameString(flowRoutingResult.Pname),
 		Route: TcpRouteBinding{
-			PolicyEpoch: c.PolicyEpoch(),
-			Outbound:    consts.OutboundIndex(flowRoutingResult.Outbound),
-			Mark:        flowRoutingResult.Mark,
-			Must:        flowRoutingResult.Must != 0,
+			PolicyEpoch:    c.PolicyEpoch(),
+			Outbound:       consts.OutboundIndex(flowRoutingResult.Outbound),
+			Mark:           flowRoutingResult.Mark,
+			Must:           flowRoutingResult.Must != 0,
+			RuleMatchIndex: UnknownRuleMatchIndex,
 		},
 	}
 	// Standalone callers have no active publication and use their private

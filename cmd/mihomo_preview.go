@@ -148,7 +148,8 @@ func init() {
 	mihomoStatusCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
 }
 
-// mihomoStatus prints the Mihomo part of GET /v1/status as JSON.
+// mihomoStatus queries /api/v1/system, /api/v1/sources, and /api/v1/config/effective
+// and prints the summarized JSON schema consumed by OpenWrt scripts.
 func mihomoStatus(ctx context.Context, cfgPath string, w io.Writer) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -183,19 +184,33 @@ func mihomoStatus(ctx context.Context, cfgPath string, w io.Writer) error {
 		}
 		return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(into)
 	}
-	var body struct {
-		Generation  string       `json:"generation"`
-		SyncWarning string       `json:"sync_warning"`
-		Mihomo      MihomoStatus `json:"mihomo"`
-		// NodeNames maps the name a node has in the Mihomo source to its
-		// name in dae, for the nodes that came from that source.
-		NodeNames map[string]string `json:"node_names"`
+	var sys struct {
+		Generation  string `json:"generation"`
+		SyncWarning string `json:"sync_warning"`
 	}
-	if err := get("/v1/status", &body); err != nil {
+	if err := get("/api/v1/system", &sys); err != nil {
 		return err
 	}
+	var sources adminSourcesBody
+	if err := get("/api/v1/sources", &sources); err != nil {
+		return err
+	}
+	syncWarning := sources.SyncWarning
+	if syncWarning == "" {
+		syncWarning = sys.SyncWarning
+	}
+	body := struct {
+		Generation  string            `json:"generation"`
+		SyncWarning string            `json:"sync_warning"`
+		Mihomo      MihomoStatus      `json:"mihomo"`
+		NodeNames   map[string]string `json:"node_names"`
+	}{
+		Generation:  sys.Generation,
+		SyncWarning: syncWarning,
+		Mihomo:      sources.Mihomo,
+	}
 	var view EffectiveConfig
-	if err := get("/v1/config/effective", &view); err == nil {
+	if err := get("/api/v1/config/effective", &view); err == nil {
 		body.NodeNames = map[string]string{}
 		for _, n := range view.Nodes {
 			if n.Origin != originMihomo {

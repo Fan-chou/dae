@@ -17,8 +17,16 @@ const (
 	defaultRuntimeWindowSec  = 30 * 60
 	defaultRuntimeMaxPoints  = 180
 	runtimeBucketDuration    = 250 * time.Millisecond
-	runtimeRateWindow        = time.Second
+	minRateSampleBaseline    = 800 * time.Millisecond
+	minRateSampleFallback    = 200 * time.Millisecond
+	minRateSampleAppendGap   = 250 * time.Millisecond
 )
+
+type runtimeRateSample struct {
+	at            time.Time
+	uploadTotal   uint64
+	downloadTotal uint64
+}
 
 // RuntimeTrafficSample contains one upload/download rate point.
 type RuntimeTrafficSample struct {
@@ -58,6 +66,10 @@ type runtimeStats struct {
 	history       []runtimeBucket
 	historyStart  int
 	historyLen    int
+
+	rateRing [16]runtimeRateSample
+	rateHead int
+	rateLen  int
 }
 
 var (
@@ -147,6 +159,107 @@ func (s *runtimeStats) record(upload uint64, download uint64) {
 // periodic goroutine is needed. An empty-window ticker previously woke up
 // ~4x/second on idle just to perform a no-op rotation.
 
+func (s *runtimeStats) scalars(activeConnections int, udpSessions int, now time.Time) RuntimeStatsSnapshot {
+	if s == nil {
+		return RuntimeStatsSnapshot{
+			UpdatedAt:         now,
+			ActiveConnections: activeConnections,
+			UDPSessions:       udpSessions,
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.scalarsLocked(activeConnections, udpSessions, now)
+}
+
+func (s *runtimeStats) scalarsLocked(activeConnections int, udpSessions int, now time.Time) RuntimeStatsSnapshot {
+	s.rollLocked(now)
+
+	upTotal := s.uploadTotal.Load()
+	downTotal := s.downloadTotal.Load()
+	uploadRate, downloadRate := s.computeRatesLocked(now, upTotal, downTotal)
+	s.appendRateSampleLocked(now, upTotal, downTotal)
+
+	return RuntimeStatsSnapshot{
+		UpdatedAt:         now,
+		UploadRate:        uploadRate,
+		DownloadRate:      downloadRate,
+		UploadTotal:       upTotal,
+		DownloadTotal:     downTotal,
+		ActiveConnections: activeConnections,
+		UDPSessions:       udpSessions,
+	}
+}
+
+func (s *runtimeStats) computeRatesLocked(now time.Time, upTotal uint64, downTotal uint64) (uint64, uint64) {
+	if s.rateLen == 0 {
+		return 0, 0
+	}
+
+	var baseline *runtimeRateSample
+	var fallback *runtimeRateSample
+
+	// rateRing stores entries oldest -> newest starting at (rateHead - rateLen).
+	for offset := 1; offset <= s.rateLen; offset++ {
+		idx := (s.rateHead - offset + len(s.rateRing)) % len(s.rateRing)
+		candidate := &s.rateRing[idx]
+		age := now.Sub(candidate.at)
+		if age <= 0 {
+			continue
+		}
+		if age >= minRateSampleBaseline {
+			baseline = candidate
+			break
+		}
+		if age >= minRateSampleFallback {
+			fallback = candidate
+		}
+	}
+
+	if baseline == nil {
+		baseline = fallback
+	}
+	if baseline == nil {
+		return 0, 0
+	}
+
+	elapsed := now.Sub(baseline.at)
+	if elapsed < minRateSampleFallback {
+		return 0, 0
+	}
+
+	var dUp, dDown uint64
+	if upTotal >= baseline.uploadTotal {
+		dUp = upTotal - baseline.uploadTotal
+	}
+	if downTotal >= baseline.downloadTotal {
+		dDown = downTotal - baseline.downloadTotal
+	}
+	return rateFromBytes(dUp, elapsed), rateFromBytes(dDown, elapsed)
+}
+
+func (s *runtimeStats) appendRateSampleLocked(now time.Time, upTotal uint64, downTotal uint64) {
+	if s.rateLen > 0 {
+		newestIdx := (s.rateHead - 1 + len(s.rateRing)) % len(s.rateRing)
+		gap := now.Sub(s.rateRing[newestIdx].at)
+		if gap < minRateSampleAppendGap {
+			return
+		}
+	}
+
+	s.rateRing[s.rateHead] = runtimeRateSample{
+		at:            now,
+		uploadTotal:   upTotal,
+		downloadTotal: downTotal,
+	}
+	s.rateHead = (s.rateHead + 1) % len(s.rateRing)
+	if s.rateLen < len(s.rateRing) {
+		s.rateLen++
+	}
+}
+
 func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSec int, maxPoints int, now time.Time) RuntimeStatsSnapshot {
 	if s == nil {
 		return RuntimeStatsSnapshot{
@@ -165,7 +278,7 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.rollLocked(now)
+	snap := s.scalarsLocked(activeConnections, udpSessions, now)
 
 	startTime := now.Add(-time.Duration(windowSec) * time.Second)
 
@@ -177,30 +290,24 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 		}
 	}
 
-	currentBucketStart := s.currentBucketStartLocked()
-	currentDuration := now.Sub(currentBucketStart)
-	if currentDuration <= 0 {
-		currentDuration = runtimeBucketDuration
+	curUp := s.currentUploadBytes.Load()
+	curDown := s.currentDownloadBytes.Load()
+	if len(buckets) == 0 || curUp > 0 || curDown > 0 {
+		currentBucketStart := s.currentBucketStartLocked()
+		currentDuration := now.Sub(currentBucketStart)
+		if currentDuration <= 0 {
+			currentDuration = runtimeBucketDuration
+		}
+		buckets = append(buckets, runtimeBucket{
+			Timestamp:     now,
+			UploadBytes:   curUp,
+			DownloadBytes: curDown,
+			Duration:      currentDuration,
+		})
 	}
-	buckets = append(buckets, runtimeBucket{
-		Timestamp:     now,
-		UploadBytes:   s.currentUploadBytes.Load(),
-		DownloadBytes: s.currentDownloadBytes.Load(),
-		Duration:      currentDuration,
-	})
 
-	uploadRate, downloadRate := ratesFromBuckets(buckets, now, runtimeRateWindow)
-
-	return RuntimeStatsSnapshot{
-		UpdatedAt:         now,
-		UploadRate:        uploadRate,
-		DownloadRate:      downloadRate,
-		UploadTotal:       s.uploadTotal.Load(),
-		DownloadTotal:     s.downloadTotal.Load(),
-		ActiveConnections: activeConnections,
-		UDPSessions:       udpSessions,
-		Samples:           bucketizeRuntimeSamples(samplesFromBuckets(buckets), maxPoints),
-	}
+	snap.Samples = bucketizeRuntimeSamples(samplesFromBuckets(buckets), maxPoints)
+	return snap
 }
 
 func (s *runtimeStats) currentBucketStartLocked() time.Time {
@@ -224,18 +331,53 @@ func (s *runtimeStats) rollLocked(now time.Time) {
 		s.currentBucketStartUnixNano.Store(targetBucketStart.UnixNano())
 		return
 	}
-	for nextBucketStart := currentBucketStart.Add(runtimeBucketDuration); !nextBucketStart.After(targetBucketStart); nextBucketStart = nextBucketStart.Add(runtimeBucketDuration) {
+
+	steps := int(targetBucketStart.Sub(currentBucketStart) / runtimeBucketDuration)
+	if steps <= 0 {
+		s.currentBucketStartUnixNano.Store(targetBucketStart.UnixNano())
+		return
+	}
+
+	maxHist := maxRuntimeHistoryBuckets()
+	if uploadBytes == 0 && downloadBytes == 0 && steps >= maxHist {
+		s.historyStart = 0
+		s.historyLen = 0
+		s.currentBucketStartUnixNano.Store(targetBucketStart.UnixNano())
+		return
+	}
+
+	perUp := uploadBytes / uint64(steps)
+	remUp := int(uploadBytes % uint64(steps))
+	perDown := downloadBytes / uint64(steps)
+	remDown := int(downloadBytes % uint64(steps))
+
+	startStep := 0
+	if steps > maxHist {
+		startStep = steps - maxHist
+		s.historyStart = 0
+		s.historyLen = 0
+	}
+
+	remStartStep := steps - remUp
+	downRemStartStep := steps - remDown
+	for step := startStep; step < steps; step++ {
+		nextBucketStart := currentBucketStart.Add(time.Duration(step+1) * runtimeBucketDuration)
+		u := perUp
+		if step >= remStartStep {
+			u++
+		}
+		d := perDown
+		if step >= downRemStartStep {
+			d++
+		}
 		s.pushHistoryBucket(runtimeBucket{
 			Timestamp:     nextBucketStart,
-			UploadBytes:   uploadBytes,
-			DownloadBytes: downloadBytes,
+			UploadBytes:   u,
+			DownloadBytes: d,
 			Duration:      runtimeBucketDuration,
 		})
-		uploadBytes = 0
-		downloadBytes = 0
-		currentBucketStart = nextBucketStart
-		s.currentBucketStartUnixNano.Store(currentBucketStart.UnixNano())
 	}
+	s.currentBucketStartUnixNano.Store(targetBucketStart.UnixNano())
 }
 
 func (s *runtimeStats) pushHistoryBucket(bucket runtimeBucket) {
@@ -289,6 +431,22 @@ func (c *ControlPlane) recordDownloadTraffic(n int64) {
 		return
 	}
 	c.runtimeStatsStore().record(0, uint64(n))
+}
+
+// SnapshotRuntimeScalars returns aggregate counters and monotonic 1s rates in O(1) without scanning history buckets.
+func (c *ControlPlane) SnapshotRuntimeScalars() RuntimeStatsSnapshot {
+	activeConnections := 0
+	udpSessions := 0
+	if c != nil {
+		activeConnections = c.ActiveTCPConnections()
+		udpSessions = DefaultUdpEndpointPool.Len()
+	}
+	return c.runtimeStatsStore().scalars(activeConnections, udpSessions, time.Now())
+}
+
+// SnapshotRuntimeHistory returns downsampled rate history buckets alongside current scalars.
+func (c *ControlPlane) SnapshotRuntimeHistory(windowSec int, maxPoints int) RuntimeStatsSnapshot {
+	return c.SnapshotRuntimeStats(windowSec, maxPoints)
 }
 
 func (c *ControlPlane) SnapshotRuntimeStats(windowSec int, maxPoints int) RuntimeStatsSnapshot {
@@ -359,45 +517,4 @@ func samplesFromBuckets(buckets []runtimeBucket) []RuntimeTrafficSample {
 		})
 	}
 	return samples
-}
-
-func ratesFromBuckets(buckets []runtimeBucket, now time.Time, window time.Duration) (uploadRate uint64, downloadRate uint64) {
-	if len(buckets) == 0 {
-		return 0, 0
-	}
-
-	windowStart := now.Add(-window)
-	var (
-		totalUpload   uint64
-		totalDownload uint64
-		totalDuration time.Duration
-	)
-
-	for _, bucket := range buckets {
-		bucketEnd := bucket.Timestamp
-		bucketStart := bucketEnd.Add(-bucket.Duration)
-		if !bucketEnd.After(windowStart) {
-			continue
-		}
-
-		effectiveStart := bucketStart
-		if effectiveStart.Before(windowStart) {
-			effectiveStart = windowStart
-		}
-		effectiveDuration := bucketEnd.Sub(effectiveStart)
-		if effectiveDuration <= 0 {
-			continue
-		}
-
-		ratio := float64(effectiveDuration) / float64(bucket.Duration)
-		totalUpload += uint64(float64(bucket.UploadBytes) * ratio)
-		totalDownload += uint64(float64(bucket.DownloadBytes) * ratio)
-		totalDuration += effectiveDuration
-	}
-
-	if totalDuration <= 0 {
-		return 0, 0
-	}
-
-	return rateFromBytes(totalUpload, totalDuration), rateFromBytes(totalDownload, totalDuration)
 }

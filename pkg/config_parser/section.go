@@ -197,6 +197,12 @@ func (p *paramAndFunctions) String(compact bool, quoteVal bool) string {
 type RoutingRule struct {
 	AndFunctions []*Function
 	Outbound     Function
+
+	// Metadata preserved across rule expansion/optimization for control-plane attribution.
+	// Not part of routing policy semantics or PolicyHash.
+	SourceIndex   int    `json:"-"`
+	SourceSummary string `json:"-"`
+	SourceOrigin  string `json:"-"` // "config" | "rule_provider" | "fallback" | "auto"
 }
 
 func (r *RoutingRule) String(replaceParamWithN bool, compact bool, quoteVal bool) string {

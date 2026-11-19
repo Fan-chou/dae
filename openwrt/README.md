@@ -4,14 +4,15 @@ Two packages:
 
 | package | contents |
 |---|---|
-| `fdae` | `/usr/bin/dae`, `/etc/init.d/dae`, `/etc/config/dae`, `/etc/dae/config.dae`, the panel in `/usr/share/fdae-ui`, helper scripts in `/usr/libexec/fdae` |
+| `fdae` | `/usr/bin/dae`, `/etc/init.d/dae`, `/etc/config/dae`, `/etc/dae/config.dae`, helper scripts in `/usr/libexec/fdae` |
 | `luci-app-fdae` | LuCI: Services → fdae (settings, config, log) |
 
 The service keeps the name `dae`, so existing UCI settings, logs and habits
-carry over. The panel is served by dae itself on its admin address:
-`http://<admin_listen>/fdae-ui/`. There is no CGI, uhttpd instance, certificate
-or sidecar; the Mihomo source (subscription or local YAML) is read, converted
-and merged by dae in-process.
+carry over. When `admin_listen` and `admin_secret` are set, `dae` exposes
+its authenticated management HTTP/WebSocket API under `http://<admin_listen>/api/v1/`
+(see `docs/admin-api.md`) for an external dashboard project. There is no built-in
+web UI, CGI, uhttpd instance, or sidecar; the Mihomo source (subscription or
+local YAML) is read, converted and merged by dae in-process.
 
 ## Layout
 
@@ -32,8 +33,8 @@ SOCKS5 inbounds (`config inbound` sections, edited in Services → fdae → Sett
 are rendered into `local.dae` as well, and the same page shows the state of every
 inbound dae runs, wherever it is defined (`dae inbound status -c /etc/dae/config.dae`
 prints it as JSON). The rules that use them, `inbound(name)`, go in `config.dae`.
-The panel (`/fdae-ui/`) edits only the inbounds defined in `config.dae`; the ones
-this page owns are shown there read-only, so the two never overwrite each other.
+The management API (`/api/v1/inbounds`) edits only the inbounds defined in `config.dae`;
+the ones this page owns are shown there read-only, so the two never overwrite each other.
 
 ## Updating
 
@@ -65,8 +66,7 @@ from the package (`/etc/init.d/dae.apk-new`).
 
 ```sh
 make dae                                   # needs clang; see AGENTS.md for the Go cache env
-(cd web-next && pnpm install --frozen-lockfile && FONT=none pnpm build)
-FDAE_BIN_x86_64=$PWD/dae openwrt/build.sh  # also FDAE_BIN_aarch64, FDAE_UI, FDAE_VERSION
+FDAE_BIN_x86_64=$PWD/dae openwrt/build.sh  # also FDAE_BIN_aarch64, FDAE_VERSION
 ```
 
 apk files are made with `apk mkpkg` in an `alpine:edge` container (apk-tools 3

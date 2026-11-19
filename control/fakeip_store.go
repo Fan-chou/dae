@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -1733,4 +1734,47 @@ func fsyncDir(path string) error {
 	}
 	defer f.Close()
 	return unix.Fsync(int(f.Fd()))
+}
+
+// AdminFakeIPStats reports FakeIP pool and lease status for GET /api/v1/metrics.
+type AdminFakeIPStats struct {
+	Ready              bool   `json:"ready"`
+	DiskOK             bool   `json:"disk_ok"`
+	LiveCount          int    `json:"live_count"`
+	MaxLive            int    `json:"max_live"`
+	Leases             int    `json:"leases"`
+	RetainedTombstones int    `json:"retained_tombstones"`
+	LeaseLimit         int    `json:"lease_limit"`
+	LoadWarn           string `json:"load_warn,omitempty"`
+}
+
+func (s *FakeIPStore) AdminStats() AdminFakeIPStats {
+	if s == nil {
+		return AdminFakeIPStats{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	retained := 0
+	for id := range s.leases {
+		if int(id) < len(s.records) && s.records[id].retired {
+			retained++
+		}
+	}
+	warn := ""
+	if s.loadWarn != nil {
+		warn = s.loadWarn.Error()
+		if strings.Contains(warn, "://") {
+			warn = "fakeip store load warning"
+		}
+	}
+	return AdminFakeIPStats{
+		Ready:              s.ready,
+		DiskOK:             s.diskOK,
+		LiveCount:          len(s.names),
+		MaxLive:            s.maxLive,
+		Leases:             s.leaseCount,
+		RetainedTombstones: retained,
+		LeaseLimit:         s.leaseLimitLocked(),
+		LoadWarn:           warn,
+	}
 }

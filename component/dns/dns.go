@@ -32,6 +32,13 @@ type Dns struct {
 	respMatcher    *ResponseMatcher
 }
 
+func (d *Dns) UpstreamCount() int {
+	if d == nil {
+		return 0
+	}
+	return len(d.upstream)
+}
+
 type NewOption struct {
 	Logger                  *logrus.Logger
 	LocationFinder          *assets.LocationFinder

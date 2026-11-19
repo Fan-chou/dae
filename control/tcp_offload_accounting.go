@@ -17,8 +17,9 @@ package control
 // happens within one report interval of it. Only the early-data drain before
 // registration, which runs through the full recorder, yields a measured TTFB.
 type tcpOffloadLiveAccounting struct {
-	Upload   func(int64)
-	Download func(int64)
+	Upload       func(int64)
+	Download     func(int64)
+	SetOffloaded func(bool)
 }
 
 func (f *FlowRuntime) offloadLiveAccounting() *tcpOffloadLiveAccounting {
@@ -26,7 +27,8 @@ func (f *FlowRuntime) offloadLiveAccounting() *tcpOffloadLiveAccounting {
 		return nil
 	}
 	return &tcpOffloadLiveAccounting{
-		Upload:   f.recordUpload,
-		Download: f.recordDownloadLive,
+		Upload:       f.recordUpload,
+		Download:     f.recordDownloadLive,
+		SetOffloaded: func(v bool) { f.offloaded.Store(v) },
 	}
 }

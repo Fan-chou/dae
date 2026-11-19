@@ -79,8 +79,21 @@ func (c *ControlPlane) routeFakeIPInbound(
 	routingResult *bpfRoutingResult,
 	realIPFor func(context.Context, string, netip.Addr) (netip.Addr, error),
 ) (outboundIndex consts.OutboundIndex, mark uint32, must bool, realIP netip.Addr, err error) {
+	outboundIndex, mark, must, realIP, _, err = c.routeFakeIPInboundWithRule(ctx, inbound, src, dst, domain, l4proto, routingResult, realIPFor)
+	return
+}
+
+func (c *ControlPlane) routeFakeIPInboundWithRule(
+	ctx context.Context,
+	inbound uint32,
+	src, dst netip.AddrPort,
+	domain string,
+	l4proto consts.L4ProtoType,
+	routingResult *bpfRoutingResult,
+	realIPFor func(context.Context, string, netip.Addr) (netip.Addr, error),
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, realIP netip.Addr, matchIndex uint16, err error) {
 	if c == nil || c.routingMatcher == nil {
-		return 0, 0, false, netip.Addr{}, fmt.Errorf("nil routing matcher")
+		return 0, 0, false, netip.Addr{}, UnknownRuleMatchIndex, fmt.Errorf("nil routing matcher")
 	}
 	if routingResult == nil {
 		routingResult = &bpfRoutingResult{}
@@ -99,7 +112,7 @@ func (c *ControlPlane) routeFakeIPInbound(
 	if len(c.routingMatcher.orderedRules) > 0 {
 		facts, factErr := c.routingMatcher.newFacts(bSrc, bDst, src.Port(), dst.Port(), ipVersion, l4proto, domain, routingResult.Pname, routingResult.Dscp, mac16)
 		if factErr != nil {
-			return 0, 0, false, netip.Addr{}, factErr
+			return 0, 0, false, netip.Addr{}, UnknownRuleMatchIndex, factErr
 		}
 		facts.inbound = inbound
 		attempted := false
@@ -112,16 +125,16 @@ func (c *ControlPlane) routeFakeIPInbound(
 			}
 			return resolved, resolveErr
 		}
-		out, routeMark, routeMust, real, routeErr := c.routingMatcher.matchOrderedFakeIP(facts, lookup)
+		out, routeMark, routeMust, real, idx, routeErr := c.routingMatcher.matchOrderedFakeIPWithRule(facts, lookup)
 		if routeErr != nil {
-			return 0, 0, false, netip.Addr{}, routeErr
+			return 0, 0, false, netip.Addr{}, UnknownRuleMatchIndex, routeErr
 		}
 		if !real.IsValid() && !fakeIPDialSkipResolve(c.routingMatcher, out) {
 			real, routeErr = lookup()
 		}
-		return out, routeMark, routeMust, real, routeErr
+		return out, routeMark, routeMust, real, idx, routeErr
 	}
-	outboundIndex, mark, must, needsDestIP, err := c.routingMatcher.MatchDeferringDestIPInbound(
+	outboundIndex, mark, must, needsDestIP, matchIndex, err := c.routingMatcher.MatchDeferringDestIPInboundWithRule(
 		inbound,
 		bSrc,
 		bDst,
@@ -135,17 +148,17 @@ func (c *ControlPlane) routeFakeIPInbound(
 		mac16,
 	)
 	if err != nil {
-		return 0, 0, false, netip.Addr{}, err
+		return 0, 0, false, netip.Addr{}, UnknownRuleMatchIndex, err
 	}
 	if !needsDestIP && fakeIPDialSkipResolve(c.routingMatcher, outboundIndex) {
-		return outboundIndex, mark, must, netip.Addr{}, nil
+		return outboundIndex, mark, must, netip.Addr{}, matchIndex, nil
 	}
 	realIP, realErr := realIPFor(ctx, domain, dst.Addr())
 	if realErr != nil {
-		return 0, 0, false, netip.Addr{}, realErr
+		return 0, 0, false, netip.Addr{}, UnknownRuleMatchIndex, realErr
 	}
-	outboundIndex, mark, must, err = c.RouteInbound(inbound, src, netip.AddrPortFrom(realIP, dst.Port()), domain, l4proto, routingResult)
-	return outboundIndex, mark, must, realIP, err
+	outboundIndex, mark, must, matchIndex, err = c.RouteInboundWithRule(inbound, src, netip.AddrPortFrom(realIP, dst.Port()), domain, l4proto, routingResult)
+	return outboundIndex, mark, must, realIP, matchIndex, err
 }
 
 // realIPForFakeIPRoute looks up the on-wire destination for FakeIP rematch.

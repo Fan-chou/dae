@@ -605,7 +605,7 @@ func (x *udpRebuildExecutor) commit(ctx context.Context, q udpRebuildCandidate, 
 	slot.owner.Store(&udpRebuildOwnership{endpoint: next, revision: next.rebuildRevision})
 	p.rebuildOverrides.Store(next.poolKey, slot)
 	p.hasRebuildOverrides.Store(true)
-	b.poolLocked()[next.poolKey] = next
+	p.setShardEntryLocked(b, next.poolKey, next)
 	p.registerEndpoint(next)
 	return ""
 }

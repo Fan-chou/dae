@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -143,4 +144,87 @@ func netipAddrFromIPAddr(ipAddr net.IPAddr) (netip.Addr, bool) {
 		addr = addr.WithZone(ipAddr.Zone)
 	}
 	return addr, true
+}
+
+// CanonicalizeAdminOrigin validates and normalizes a single exact CORS/WS origin
+// ("scheme://host[:port]"). Wildcards, paths, queries, fragments, credentials,
+// and unsupported schemes are rejected. Error strings intentionally avoid "://".
+func CanonicalizeAdminOrigin(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", fmt.Errorf("origin cannot be empty")
+	}
+	if s == "*" || strings.Contains(s, "*") {
+		return "", fmt.Errorf("admin_cors_origins must not contain wildcards")
+	}
+	if strings.ContainsAny(s, " \t\r\n") {
+		return "", fmt.Errorf("admin_cors_origins entry contains whitespace")
+	}
+	parsed, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("admin_cors_origins entry is not a valid origin")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("admin_cors_origins entry must not contain user credentials")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	switch scheme {
+	case "http", "https", "tauri", "app":
+	default:
+		return "", fmt.Errorf("admin_cors_origins scheme %q must be http, https, tauri, or app", parsed.Scheme)
+	}
+	if parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("admin_cors_origins entry must not contain a path, query, or fragment")
+	}
+	hostname := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if hostname == "" {
+		return "", fmt.Errorf("admin_cors_origins entry is missing host")
+	}
+	port := parsed.Port()
+	if port != "" {
+		p, err := strconv.Atoi(port)
+		if err != nil || p <= 0 || p > 65535 {
+			return "", fmt.Errorf("admin_cors_origins port %q is invalid", port)
+		}
+		if (scheme == "http" && p == 80) || (scheme == "https" && p == 443) {
+			port = ""
+		}
+	} else if strings.HasSuffix(parsed.Host, ":") {
+		return "", fmt.Errorf("admin_cors_origins entry has empty port")
+	}
+	hostPart := hostname
+	if strings.Contains(hostname, ":") {
+		hostPart = "[" + hostname + "]"
+	}
+	if port != "" {
+		hostPart += ":" + port
+	}
+	return scheme + "://" + hostPart, nil
+}
+
+// ValidateAdminCorsOrigins validates and deduplicates configured extra CORS origins.
+func ValidateAdminCorsOrigins(origins []string) ([]string, error) {
+	if len(origins) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(origins))
+	seen := make(map[string]struct{}, len(origins))
+	for _, raw := range origins {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		canon, err := CanonicalizeAdminOrigin(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[canon]; ok {
+			continue
+		}
+		seen[canon] = struct{}{}
+		out = append(out, canon)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }

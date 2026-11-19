@@ -317,9 +317,12 @@ func TestHandleInboundsNeverReturnsPassword(t *testing.T) {
 		return []control.InboundStatus{{Name: "lan", Protocol: "socks5", Listen: "192.168.1.1:11081", Username: "alice", HasPassword: true, UDP: true, Sniff: "auto", Resolve: "local", State: "listening"}}
 	}
 	rec := httptest.NewRecorder()
-	s.handleInbounds(rec, httptest.NewRequest(http.MethodGet, "/v1/inbounds", nil))
+	s.handleInbounds(rec, httptest.NewRequest(http.MethodGet, "/api/v1/inbounds", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("ETag") == "" {
+		t.Fatal("GET /api/v1/inbounds missing ETag")
 	}
 	if strings.Contains(rec.Body.String(), "topsecret") {
 		t.Fatalf("password leaked: %s", rec.Body)
@@ -329,8 +332,19 @@ func TestHandleInboundsNeverReturnsPassword(t *testing.T) {
 		t.Fatalf("body = %s (%v)", rec.Body, err)
 	}
 
+	// Verify If-Match mismatch returns 412.
+	badPut := httptest.NewRequest(http.MethodPut, "/api/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"lan","listen":"192.168.1.1:11099","username":"alice"}]}`))
+	badPut.Header.Set("If-Match", `"mismatch"`)
+	badRec := httptest.NewRecorder()
+	s.handleInbounds(badRec, badPut)
+	if badRec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("mismatched If-Match status = %d, want 412", badRec.Code)
+	}
+
+	goodPut := httptest.NewRequest(http.MethodPut, "/api/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"lan","listen":"192.168.1.1:11099","username":"alice"}]}`))
+	goodPut.Header.Set("If-Match", rec.Header().Get("ETag"))
 	rec = httptest.NewRecorder()
-	s.handleInbounds(rec, httptest.NewRequest(http.MethodPut, "/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"lan","listen":"192.168.1.1:11099","username":"alice"}]}`)))
+	s.handleInbounds(rec, goodPut)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT status %d: %s", rec.Code, rec.Body)
 	}
@@ -340,7 +354,7 @@ func TestHandleInboundsNeverReturnsPassword(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	s.handleInbounds(rec, httptest.NewRequest(http.MethodDelete, "/v1/inbounds", nil))
+	s.handleInbounds(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/inbounds", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("DELETE status %d", rec.Code)
 	}
@@ -368,12 +382,12 @@ func TestApplyAdminInboundsRollsBackAndReturns409WhenQueueFull(t *testing.T) {
 
 	s := newAdminServer(nil, "", dir, nil, func() bool { return false })
 	s.secret = "x"
-	req := httptest.NewRequest(http.MethodPut, "/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11099"}]}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/inbounds", strings.NewReader(`{"inbounds":[{"name":"s1","listen":"127.0.0.1:11099"}]}`))
 	req.Header.Set("Authorization", "Bearer x")
 	rec := httptest.NewRecorder()
 	s.withAdminAuth(s.handleInbounds)(rec, req)
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("PUT /v1/inbounds queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
+		t.Fatalf("PUT /api/v1/inbounds queue full status = %d body %s, want 409", rec.Code, rec.Body.String())
 	}
 	after, _ = os.ReadFile(configPath)
 	if string(after) != string(before) {

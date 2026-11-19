@@ -84,7 +84,7 @@ func TestAdminServesTheEffectiveConfigReadOnly(t *testing.T) {
 	server := newAdminServer(nil, "", t.TempDir(), nil, nil)
 	server.secret = "token"
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/config/effective", server.withAdminAuth(server.handleEffectiveConfig))
+	mux.HandleFunc("/api/v1/config/effective", server.withAdminAuth(server.handleEffectiveConfig))
 
 	do := func(method, target, auth string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, target, nil)
@@ -96,18 +96,18 @@ func TestAdminServesTheEffectiveConfigReadOnly(t *testing.T) {
 		return rec
 	}
 
-	require.Equal(t, http.StatusUnauthorized, do(http.MethodGet, "/v1/config/effective", "").Code)
-	require.Equal(t, http.StatusMethodNotAllowed, do(http.MethodPut, "/v1/config/effective", "Bearer token").Code)
-	require.Equal(t, http.StatusMethodNotAllowed, do(http.MethodPost, "/v1/config/effective", "Bearer token").Code)
+	require.Equal(t, http.StatusUnauthorized, do(http.MethodGet, "/api/v1/config/effective", "").Code)
+	require.Equal(t, http.StatusMethodNotAllowed, do(http.MethodPut, "/api/v1/config/effective", "Bearer token").Code)
+	require.Equal(t, http.StatusMethodNotAllowed, do(http.MethodPost, "/api/v1/config/effective", "Bearer token").Code)
 
-	rec := do(http.MethodGet, "/v1/config/effective", "Bearer token")
+	rec := do(http.MethodGet, "/api/v1/config/effective", "Bearer token")
 	require.Equal(t, http.StatusOK, rec.Code)
 	var got EffectiveConfig
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	require.Equal(t, len(view.Rules), len(got.Rules))
 	require.Equal(t, "Rocket_Proxy", got.Fallback.Outbound)
 
-	rec = do(http.MethodGet, "/v1/config/effective?format=text", "Bearer token")
+	rec = do(http.MethodGet, "/api/v1/config/effective?format=text", "Bearer token")
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.True(t, strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain"))
 	text := rec.Body.String()
@@ -121,7 +121,7 @@ func TestAdminEffectiveConfigBeforeAnythingRuns(t *testing.T) {
 	resetEffective(t)
 	server := newAdminServer(nil, "", t.TempDir(), nil, nil)
 	rec := httptest.NewRecorder()
-	server.handleEffectiveConfig(rec, httptest.NewRequest(http.MethodGet, "/v1/config/effective", nil))
+	server.handleEffectiveConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/config/effective", nil))
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 

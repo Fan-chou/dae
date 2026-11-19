@@ -217,6 +217,10 @@ func (r *tcpRelayOffloadRuntime) run(ctx context.Context, left, right netproxy.C
 	}
 	defer func() { _ = session.Close() }()
 	session.live = live
+	if session.live != nil && session.live.SetOffloaded != nil {
+		session.live.SetOffloaded(true)
+		defer session.live.SetOffloaded(false)
+	}
 
 	if r.log != nil && r.log.IsLevelEnabled(logrus.DebugLevel) {
 		r.log.Debugf("TCP relay eBPF offload: %v <-> %v", session.left.RemoteAddr(), session.right.RemoteAddr())

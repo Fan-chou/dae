@@ -51,7 +51,7 @@ func init() {
 	inboundStatusCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
 }
 
-// inboundStatus copies GET /v1/inbounds to w.
+// inboundStatus copies GET /api/v1/inbounds to w.
 func inboundStatus(ctx context.Context, cfgPath string, w io.Writer) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -68,7 +68,7 @@ func inboundStatus(ctx context.Context, cfgPath string, w io.Writer) error {
 	if listen == "" {
 		return fmt.Errorf("admin_listen is not set; the status is served by the admin API")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+"/v1/inbounds", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listen+"/api/v1/inbounds", nil)
 	if err != nil {
 		return err
 	}

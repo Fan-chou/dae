@@ -378,7 +378,7 @@ func (ue *UdpEndpoint) selfRemoveFromPool() {
 	defer shard.mu.Unlock()
 
 	if v, ok := shard.pool[ue.poolKey]; ok && v == ue {
-		delete(shard.pool, ue.poolKey)
+		ue.poolRef.deleteShardEntryLocked(shard, ue.poolKey)
 	}
 }
 

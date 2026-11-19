@@ -301,7 +301,7 @@ func putPooledUdpEndpointForTest(t *testing.T, key UdpEndpointKey, ue *UdpEndpoi
 	t.Helper()
 	shard := DefaultUdpEndpointPool.shardFor(key)
 	shard.mu.Lock()
-	shard.poolLocked()[key] = ue
+	DefaultUdpEndpointPool.setShardEntryLocked(shard, key, ue)
 	shard.mu.Unlock()
 }
 

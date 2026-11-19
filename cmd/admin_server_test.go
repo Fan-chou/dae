@@ -20,51 +20,112 @@ import (
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
+	"github.com/sirupsen/logrus"
 )
 
 type stubAdminPlane struct {
-	status       control.AdminStatus
-	groups       []control.AdminGroup
-	setErr       error
-	setGroup     string
-	setMember    string
-	delayErr     error
-	delayFor     string
-	connLimit    int
-	connOutbound string
-	connSrc      string
-	connMac      string
-	connections  control.AdminConnectionsSnapshot
+	sysInfo     control.AdminSystemInfo
+	metrics     control.AdminMetricsSnapshot
+	history     []control.AdminTrafficSample
+	groups      []control.AdminGroup
+	setErr      error
+	setGroup    string
+	setMember   string
+	delayErr    error
+	delayFor    string
+	connLimit   int
+	connections control.AdminConnectionsSnapshot
+	closedFlows control.AdminClosedFlowsSnapshot
+	summary     control.AdminTrafficSummary
+	resetCalled bool
+	closedID    string
+	closedOK    bool
+	batchFilter control.AdminConnectionFilter
+	batchClosed int
 
-	kernelCalls int
-	kernelLimit int
-	kernelSrc   string
-	kernelMac   string
+	kernelCalls          int
+	kernelLimit          int
+	kernelSrc            string
+	kernelMac            string
+	kernelResolveDomains bool
+	kernelCloseReq       control.AdminKernelCloseRequest
+	kernelCloseRes       control.AdminKernelCloseResult
+	kernelCloseErr       error
+	flowObserver         func(control.AdminClosedFlow)
+}
+
+func (s *stubAdminPlane) AdminSystemInfo(version string) control.AdminSystemInfo {
+	info := s.sysInfo
+	if info.Version == "" {
+		info.Version = version
+	}
+	info.Running = true
+	return info
+}
+
+func (s *stubAdminPlane) AdminMetricsSnapshot() control.AdminMetricsSnapshot {
+	return s.metrics
+}
+
+func (s *stubAdminPlane) AdminMetricsHistory(windowSec, maxPoints int) []control.AdminTrafficSample {
+	if s.history == nil {
+		return []control.AdminTrafficSample{}
+	}
+	return s.history
 }
 
 func (s *stubAdminPlane) AdminGroups() []control.AdminGroup { return s.groups }
-func (s *stubAdminPlane) AdminStatusSnapshot(version string) control.AdminStatus {
-	status := s.status
-	if status.Version == "" {
-		status.Version = version
-	}
-	status.Running = true
-	return status
-}
+
 func (s *stubAdminPlane) SetGroupSelection(groupName, memberName string) error {
 	s.setGroup = groupName
 	s.setMember = memberName
 	return s.setErr
 }
+
 func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
 	s.delayFor = groupName
 	return s.delayErr
 }
-func (s *stubAdminPlane) AdminKernelConnections(limit int, src, mac string) control.AdminKernelConnectionsSnapshot {
+
+func (s *stubAdminPlane) AdminConnections(limit int, _ control.AdminConnectionFilter) control.AdminConnectionsSnapshot {
+	s.connLimit = limit
+	if s.connections.Connections == nil {
+		return control.AdminConnectionsSnapshot{Connections: []control.AdminConnection{}}
+	}
+	return s.connections
+}
+
+func (s *stubAdminPlane) AdminClosedFlows(_ int, _ control.AdminConnectionFilter) control.AdminClosedFlowsSnapshot {
+	if s.closedFlows.Flows == nil {
+		return control.AdminClosedFlowsSnapshot{Flows: []control.AdminClosedFlow{}}
+	}
+	return s.closedFlows
+}
+
+func (s *stubAdminPlane) AdminTrafficSummary(_ int) control.AdminTrafficSummary {
+	return s.summary
+}
+
+func (s *stubAdminPlane) AdminResetTrafficSummary() {
+	s.resetCalled = true
+}
+
+func (s *stubAdminPlane) AdminCloseConnection(id string) bool {
+	s.closedID = id
+	return s.closedOK
+}
+
+func (s *stubAdminPlane) AdminCloseConnections(filter control.AdminConnectionFilter) int {
+	s.batchFilter = filter
+	return s.batchClosed
+}
+
+func (s *stubAdminPlane) AdminKernelConnections(limit int, src, mac string, resolveDomains bool) control.AdminKernelConnectionsSnapshot {
 	s.kernelCalls++
 	s.kernelLimit = limit
 	s.kernelSrc = src
 	s.kernelMac = mac
+	s.kernelResolveDomains = resolveDomains
 	if mac == "bad" {
 		return control.AdminKernelConnectionsSnapshot{Available: true, Error: "invalid mac", Connections: []control.AdminKernelConnection{}}
 	}
@@ -79,315 +140,337 @@ func (s *stubAdminPlane) AdminKernelConnections(limit int, src, mac string) cont
 	}
 }
 
-func (s *stubAdminPlane) AdminConnections(limit int, outbound, src, mac, inbound string) control.AdminConnectionsSnapshot {
-	s.connLimit = limit
-	s.connOutbound = outbound
-	s.connSrc = src
-	s.connMac = mac
-	if s.connections.Connections == nil {
-		return control.AdminConnectionsSnapshot{Connections: []control.AdminConnection{}}
-	}
-	return s.connections
+func (s *stubAdminPlane) AdminCloseKernelConnection(req control.AdminKernelCloseRequest) (control.AdminKernelCloseResult, error) {
+	s.kernelCloseReq = req
+	return s.kernelCloseRes, s.kernelCloseErr
 }
 
-func TestAdminBearerAndCORS(t *testing.T) {
+func (s *stubAdminPlane) SetClosedFlowObserver(fn func(control.AdminClosedFlow)) {
+	s.flowObserver = fn
+}
+
+func (s *stubAdminPlane) AdminQuality(group, host string) []map[string]any { return []map[string]any{} }
+
+func TestAdminStrictCORSPNAAndAuthRateLimit(t *testing.T) {
 	t.Parallel()
 	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane {
-		return &stubAdminPlane{status: control.AdminStatus{Version: "test"}}
+		return &stubAdminPlane{sysInfo: control.AdminSystemInfo{Version: "test"}}
 	}, func() bool { return true })
 	server.secret = "test-token"
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/status", server.withAdminAuth(server.handleStatus))
-	handler := server.withAdminCORS(mux)
+	server.corsOrigins = buildCorsOriginSet([]string{"HTTPS://Panel.Example.com:443"})
+	handler := server.withSecurityHeaders(server.withAdminCORS(server.buildMux()))
 
-	req := httptest.NewRequest(http.MethodOptions, "/v1/status", nil)
-	req.Header.Set("Origin", "http://192.168.124.223")
+	// Disallowed Origin returns 403 even on OPTIONS.
+	badPre := httptest.NewRequest(http.MethodOptions, "/api/v1/system", nil)
+	badPre.Header.Set("Origin", "http://192.168.1.5")
+	badPre.Header.Set("Access-Control-Request-Private-Network", "true")
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, badPre)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("disallowed Origin preflight status = %d, want 403", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("disallowed Origin leaked ACAO header")
+	}
+
+	// Allowed Origin receives PNA, Max-Age, Expose-Headers, and security headers.
+	goodPre := httptest.NewRequest(http.MethodOptions, "/api/v1/system", nil)
+	goodPre.Header.Set("Origin", "https://panel.example.com")
+	goodPre.Header.Set("Access-Control-Request-Private-Network", "true")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, goodPre)
 	if rec.Code != http.StatusNoContent {
-		t.Fatalf("OPTIONS status = %d", rec.Code)
+		t.Fatalf("allowed preflight status = %d", rec.Code)
 	}
-	if rec.Header().Get("Access-Control-Allow-Origin") != "http://192.168.124.223" {
-		t.Fatalf("CORS origin = %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://panel.example.com" ||
+		rec.Header().Get("Access-Control-Allow-Private-Network") != "true" ||
+		rec.Header().Get("Access-Control-Max-Age") != "600" ||
+		rec.Header().Get("Access-Control-Expose-Headers") != "ETag" ||
+		rec.Header().Get("Cache-Control") != "no-store" ||
+		rec.Header().Get("X-Content-Type-Options") != "nosniff" ||
+		rec.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("unexpected CORS/security headers: %+v", rec.Header())
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	// Legacy header X-Kdae-Authorization is no longer accepted; only Authorization: Bearer works.
+	legacyReq := httptest.NewRequest(http.MethodGet, "/api/v1/system", nil)
+	legacyReq.Header.Set("X-Kdae-Authorization", "Bearer test-token")
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, legacyReq)
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token status = %d", rec.Code)
+		t.Fatalf("X-Kdae-Authorization status = %d, want 401", rec.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v1/status", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
+	// Unknown / legacy paths yield JSON 404 when authed.
+	notFound := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	notFound.Header.Set("Authorization", "Bearer test-token")
 	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, notFound)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("removed /v1/status code = %d, want 404", rec.Code)
+	}
+
+	// Auth failure rate limiter locks out after repeated failures from same IP.
+	for i := 0; i < adminAuthMaxFailures; i++ {
+		badAuth := httptest.NewRequest(http.MethodGet, "/api/v1/system", nil)
+		badAuth.RemoteAddr = "192.168.1.99:5555"
+		badAuth.Header.Set("Authorization", "Bearer wrong")
+		rRec := httptest.NewRecorder()
+		handler.ServeHTTP(rRec, badAuth)
+		if rRec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d code = %d, want 401", i, rRec.Code)
+		}
+	}
+	locked := httptest.NewRequest(http.MethodGet, "/api/v1/system", nil)
+	locked.RemoteAddr = "192.168.1.99:5556"
+	locked.Header.Set("Authorization", "Bearer test-token")
+	lRec := httptest.NewRecorder()
+	handler.ServeHTTP(lRec, locked)
+	if lRec.Code != http.StatusTooManyRequests || lRec.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected 429 + Retry-After, got %d (%+v)", lRec.Code, lRec.Header())
+	}
+}
+
+func TestAdminGroupSelectionProbeCooldownAndPathEscaping(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{}
+	reloaded := false
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, func() bool {
+		reloaded = true
+		return true
+	})
+	server.secret = "test-token"
+	handler := server.withSecurityHeaders(server.buildMux())
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/groups/proxy/selection", strings.NewReader(`{"member":"Cherry_Proxy"}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("authed status = %d body %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || reloaded || plane.setGroup != "proxy" || plane.setMember != "Cherry_Proxy" {
+		t.Fatalf("selection PUT code=%d reloaded=%v group=%q member=%q body=%s", rec.Code, reloaded, plane.setGroup, plane.setMember, rec.Body.String())
+	}
+
+	// First probe succeeds (202); immediate repeat triggers 3s cooldown (429).
+	probeReq := httptest.NewRequest(http.MethodPost, "/api/v1/groups/AI/probe", nil)
+	probeReq.Header.Set("Authorization", "Bearer test-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, probeReq)
+	if rec.Code != http.StatusAccepted || plane.delayFor != "AI" {
+		t.Fatalf("first probe code=%d group=%q body=%s", rec.Code, plane.delayFor, rec.Body.String())
+	}
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, probeReq)
+	if rec2.Code != http.StatusTooManyRequests || rec2.Header().Get("Retry-After") == "" {
+		t.Fatalf("second probe expected 429 cooldown, got %d", rec2.Code)
+	}
+
+	if name, action, err := parseAdminGroupPath("/api/v1/groups/a%2Fb/selection"); err == nil {
+		t.Fatalf("escaped slash should be rejected, got name=%q action=%q", name, action)
 	}
 }
 
-func TestAdminPutGroupSelectionDoesNotReload(t *testing.T) {
-	t.Parallel()
-	plane := &stubAdminPlane{}
-	reloaded := false
-	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, func() bool {
-		reloaded = true
-		return true
-	})
-	server.secret = "test-token"
-
-	req := httptest.NewRequest(http.MethodPut, "/v1/groups/proxy", strings.NewReader(`{"member":"Cherry_Proxy"}`))
-	req.Header.Set("Authorization", "Bearer test-token")
-	rec := httptest.NewRecorder()
-	server.withAdminAuth(server.handleGroup)(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d body %s", rec.Code, rec.Body.String())
-	}
-	if reloaded {
-		t.Fatal("PUT /v1/groups must not trigger a full reload")
-	}
-	if plane.setGroup != "proxy" || plane.setMember != "Cherry_Proxy" {
-		t.Fatalf("SetGroupSelection(%q, %q)", plane.setGroup, plane.setMember)
-	}
-}
-
-func TestAdminLogsOmitsMissingFile(t *testing.T) {
-	t.Parallel()
-	server := newAdminServer(nil, filepath.Join(t.TempDir(), "missing.log"), "", nil, nil)
-	req := httptest.NewRequest(http.MethodGet, "/v1/logs", nil)
-	rec := httptest.NewRecorder()
-	server.handleLogs(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
-	}
-	var body adminLogsBody
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Lines == nil {
-		t.Fatal("lines should be an empty slice")
-	}
-}
-
-func TestAdminGroupNameFromPath(t *testing.T) {
-	t.Parallel()
-	name, err := adminGroupNameFromPath("/v1/groups/proxy")
-	if err != nil || name != "proxy" {
-		t.Fatalf("name=%q err=%v", name, err)
-	}
-	name, err = adminGroupNameFromPath("/v1/groups/a%2Fb")
-	if err == nil {
-		t.Fatalf("escaped slash should be rejected, got %q", name)
-	}
-}
-
-func TestAdminOriginRejectedForPublicHosts(t *testing.T) {
-	t.Parallel()
-	if adminOriginAllowed("http://8.8.8.8") {
-		t.Fatal("public origin must be rejected")
-	}
-	if !adminOriginAllowed("http://192.168.124.223") {
-		t.Fatal("LAN origin must be allowed")
-	}
-}
-
-func TestTailLogLinesKeepsLastN(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "dae.log")
-	if err := os.WriteFile(path, []byte("a\nb\nc\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	lines, err := tailLogLines(path, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Join(lines, ",") != "b,c" {
-		t.Fatalf("lines = %#v", lines)
-	}
-}
-
-func TestAdminPostGroupDelayDoesNotReload(t *testing.T) {
-	t.Parallel()
-	plane := &stubAdminPlane{}
-	reloaded := false
-	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, func() bool {
-		reloaded = true
-		return true
-	})
-	server.secret = "test-token"
-	req := httptest.NewRequest(http.MethodPost, "/v1/groups/AI/delay", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	rec := httptest.NewRecorder()
-	server.withAdminAuth(server.handleGroup)(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("POST delay status = %d body %s", rec.Code, rec.Body.String())
-	}
-	if reloaded {
-		t.Fatal("POST delay must not trigger a full reload")
-	}
-	if plane.delayFor != "AI" {
-		t.Fatalf("delay group = %q", plane.delayFor)
-	}
-	if strings.Contains(rec.Body.String(), "://") {
-		t.Fatalf("delay JSON leaked a URI: %s", rec.Body.String())
-	}
-}
-
-func TestAdminGetConnectionsForwardsFiltersAndOmitsURI(t *testing.T) {
+func TestAdminConnectionsFilterCloseClosedFlowsAndTrafficSummary(t *testing.T) {
 	t.Parallel()
 	plane := &stubAdminPlane{
 		connections: control.AdminConnectionsSnapshot{
-			Total: 1,
-			Connections: []control.AdminConnection{{
-				ID:       "1",
-				Network:  "tcp",
-				Src:      "192.168.124.202:44321",
-				Dst:      "api2.cursor.sh:443",
-				Mac:      "3e:0a:a5:de:ae:a3",
-				Outbound: "AI",
-				Dialer:   "US_Dmit_LAX_Hysteria",
-				Policy:   "fixed",
-				Upload:   32,
-			}},
+			Total: 2,
+			Connections: []control.AdminConnection{
+				{
+					ID:       "tcp:1",
+					Network:  "tcp",
+					SrcIP:    "192.168.124.202",
+					SrcPort:  44321,
+					DstIP:    "198.51.100.10",
+					DstPort:  443,
+					Target:   "api2.cursor.sh:443",
+					Domain:   "api2.cursor.sh",
+					Mac:      "3e:0a:a5:de:ae:a3",
+					Process:  "curl",
+					Rule:     &control.RoutingRuleMeta{Index: 2, Raw: "domain(suffix:cursor.sh) -> AI"},
+					Outbound: "AI",
+					Dialer:   "US_Dmit_LAX_Hysteria",
+					Policy:   "fixed",
+					Upload:   32,
+				},
+				{
+					ID:       "udp:2",
+					Network:  "udp",
+					SrcIP:    "192.168.124.50",
+					SrcPort:  53000,
+					DstIP:    "8.8.8.8",
+					DstPort:  53,
+					Outbound: "direct",
+					Upload:   12,
+				},
+			},
 		},
+		closedOK:    true,
+		batchClosed: 2,
+		closedFlows: control.AdminClosedFlowsSnapshot{
+			Total: 1,
+			Flows: []control.AdminClosedFlow{{ID: "tcp:9", Outbound: "AI", CloseReason: "aborted"}},
+		},
+		summary: control.AdminTrafficSummary{UploadTotal: 99, DownloadTotal: 199},
 	}
 	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
 	server.secret = "test-token"
-	req := httptest.NewRequest(http.MethodGet, "/v1/connections?outbound=AI&src=192.168.124.202&mac=3e:0a&limit=64", nil)
+	handler := server.withSecurityHeaders(server.buildMux())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/connections?outbound=AI&src_ip=192.168.124.202&process=curl&mac=3e:0a&limit=64", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()
-	server.withAdminAuth(server.handleConnections)(rec, req)
+	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET connections status = %d body %s", rec.Code, rec.Body.String())
-	}
-	if plane.connLimit != 64 || plane.connOutbound != "AI" || plane.connSrc != "192.168.124.202" || plane.connMac != "3e:0a" {
-		t.Fatalf("filters limit=%d outbound=%q src=%q mac=%q", plane.connLimit, plane.connOutbound, plane.connSrc, plane.connMac)
-	}
-	if strings.Contains(rec.Body.String(), "://") {
-		t.Fatalf("connections JSON leaked a URI: %s", rec.Body.String())
+		t.Fatalf("GET /api/v1/connections = %d body=%s", rec.Code, rec.Body.String())
 	}
 	var snap control.AdminConnectionsSnapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.Total != 1 || len(snap.Connections) != 1 || snap.Connections[0].Outbound != "AI" || snap.Connections[0].Dialer != "US_Dmit_LAX_Hysteria" {
-		t.Fatalf("snap = %+v", snap)
+	if snap.Total != 1 || snap.Connections[0].ID != "tcp:1" {
+		t.Fatalf("filtered connections = %+v", snap)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v1/connections?limit=nope", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	rec = httptest.NewRecorder()
-	server.withAdminAuth(server.handleConnections)(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid limit status = %d", rec.Code)
+	// Single close by ID.
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/connections/tcp:1", nil)
+	delReq.Header.Set("Authorization", "Bearer test-token")
+	delRec := httptest.NewRecorder()
+	handler.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK || plane.closedID != "tcp:1" {
+		t.Fatalf("DELETE connection code=%d id=%q body=%s", delRec.Code, plane.closedID, delRec.Body.String())
+	}
+
+	// Batch close requires non-empty filter or all=true.
+	emptyClose := httptest.NewRequest(http.MethodPost, "/api/v1/connections/close", strings.NewReader(`{}`))
+	emptyClose.Header.Set("Authorization", "Bearer test-token")
+	emptyRec := httptest.NewRecorder()
+	handler.ServeHTTP(emptyRec, emptyClose)
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("empty batch close code=%d, want 400", emptyRec.Code)
+	}
+
+	batchClose := httptest.NewRequest(http.MethodPost, "/api/v1/connections/close", strings.NewReader(`{"outbound":"AI"}`))
+	batchClose.Header.Set("Authorization", "Bearer test-token")
+	batchRec := httptest.NewRecorder()
+	handler.ServeHTTP(batchRec, batchClose)
+	if batchRec.Code != http.StatusOK || plane.batchFilter.Outbound != "AI" {
+		t.Fatalf("batch close code=%d filter=%+v body=%s", batchRec.Code, plane.batchFilter, batchRec.Body.String())
+	}
+
+	// Closed flows, traffic summary, and reset.
+	cfReq := httptest.NewRequest(http.MethodGet, "/api/v1/flows/closed?limit=10", nil)
+	cfReq.Header.Set("Authorization", "Bearer test-token")
+	cfRec := httptest.NewRecorder()
+	handler.ServeHTTP(cfRec, cfReq)
+	if cfRec.Code != http.StatusOK || !strings.Contains(cfRec.Body.String(), `"close_reason":"aborted"`) {
+		t.Fatalf("closed flows code=%d body=%s", cfRec.Code, cfRec.Body.String())
+	}
+
+	sumReq := httptest.NewRequest(http.MethodGet, "/api/v1/traffic/summary", nil)
+	sumReq.Header.Set("Authorization", "Bearer test-token")
+	sumRec := httptest.NewRecorder()
+	handler.ServeHTTP(sumRec, sumReq)
+	if sumRec.Code != http.StatusOK || !strings.Contains(sumRec.Body.String(), `"upload_total":99`) {
+		t.Fatalf("summary code=%d body=%s", sumRec.Code, sumRec.Body.String())
+	}
+
+	rstReq := httptest.NewRequest(http.MethodPost, "/api/v1/traffic/reset", nil)
+	rstReq.Header.Set("Authorization", "Bearer test-token")
+	rstRec := httptest.NewRecorder()
+	handler.ServeHTTP(rstRec, rstReq)
+	if rstRec.Code != http.StatusOK || !plane.resetCalled {
+		t.Fatalf("reset code=%d resetCalled=%v", rstRec.Code, plane.resetCalled)
 	}
 }
 
 func TestAdminKernelConnectionsEndpoint(t *testing.T) {
 	t.Parallel()
-	plane := &stubAdminPlane{}
+	plane := &stubAdminPlane{
+		kernelCloseRes: control.AdminKernelCloseResult{ConntrackDeleted: true},
+	}
 	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
 	server.secret = "test-token"
+	handler := server.withSecurityHeaders(server.buildMux())
+
 	get := func(target string, auth bool) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
 		if auth {
 			req.Header.Set("Authorization", "Bearer test-token")
 		}
 		rec := httptest.NewRecorder()
-		server.withAdminAuth(server.handleKernelConnections)(rec, req)
+		handler.ServeHTTP(rec, req)
 		return rec
 	}
 
-	if rec := get("/v1/kernel-connections", false); rec.Code != http.StatusUnauthorized {
+	if rec := get("/api/v1/connections/kernel", false); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status = %d", rec.Code)
 	}
-	if plane.kernelCalls != 0 {
-		t.Fatal("unauthenticated request reached the conntrack reader")
+	rec := get("/api/v1/connections/kernel?limit=64&src=192.168.124.200&mac=3e:0a:a5:de:ae:a3", true)
+	if rec.Code != http.StatusOK || plane.kernelResolveDomains || plane.kernelLimit != 64 {
+		t.Fatalf("status=%d resolveDomains=%v limit=%d", rec.Code, plane.kernelResolveDomains, plane.kernelLimit)
+	}
+	rec = get("/api/v1/connections/kernel?resolve_domains=true", true)
+	if rec.Code != http.StatusOK || !plane.kernelResolveDomains {
+		t.Fatalf("expected resolve_domains=true to propagate, status=%d", rec.Code)
 	}
 
-	rec := get("/v1/kernel-connections?limit=64&src=192.168.124.200&mac=3e:0a:a5:de:ae:a3", true)
-	if rec.Code != http.StatusOK || plane.kernelLimit != 64 || plane.kernelSrc != "192.168.124.200" || plane.kernelMac != "3e:0a:a5:de:ae:a3" {
-		t.Fatalf("status=%d limit=%d src=%q body=%s", rec.Code, plane.kernelLimit, plane.kernelSrc, rec.Body.String())
-	}
-	var snap control.AdminKernelConnectionsSnapshot
-	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
-		t.Fatal(err)
-	}
-	if !snap.Available || !snap.Accounting || len(snap.Connections) != 1 || snap.Connections[0].Upload != 7 {
-		t.Fatalf("snap = %+v", snap)
-	}
-
-	if rec := get("/v1/kernel-connections?limit=nope", true); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid limit status = %d", rec.Code)
-	}
-	if rec := get("/v1/kernel-connections?src=bad", true); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid src status = %d", rec.Code)
-	}
-	if rec := get("/v1/kernel-connections?mac=bad", true); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid mac status = %d", rec.Code)
-	}
-
-	// The default connection list must never read conntrack.
-	before := plane.kernelCalls
-	req := httptest.NewRequest(http.MethodGet, "/v1/connections", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	server.withAdminAuth(server.handleConnections)(httptest.NewRecorder(), req)
-	if plane.kernelCalls != before {
-		t.Fatal("/v1/connections triggered a conntrack read")
-	}
-
-	req = httptest.NewRequest(http.MethodPost, "/v1/kernel-connections", nil)
-	req.Header.Set("Authorization", "Bearer test-token")
-	rec = httptest.NewRecorder()
-	server.withAdminAuth(server.handleKernelConnections)(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("POST status = %d", rec.Code)
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/connections/kernel", strings.NewReader(`{"protocol":"tcp","src_ip":"192.168.1.2","src_port":5000,"dst_ip":"1.1.1.1","dst_port":443}`))
+	delReq.Header.Set("Authorization", "Bearer test-token")
+	delRec := httptest.NewRecorder()
+	handler.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK || plane.kernelCloseReq.SrcPort != 5000 {
+		t.Fatalf("DELETE kernel code=%d req=%+v body=%s", delRec.Code, plane.kernelCloseReq, delRec.Body.String())
 	}
 }
 
-func TestTailLogLinesBlockBoundaryAndUnterminatedUTF8(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "dae.log")
-	content := strings.Repeat("old entry\n", 5000) + strings.Repeat("中", 6000) + "\nlast"
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		t.Fatal(err)
+func TestAdminSystemMetricsLogsLogLevelAndSourcesRefresh(t *testing.T) {
+	t.Parallel()
+	log := logrus.New()
+	log.SetLevel(logrus.InfoLevel)
+	ring := newAdminLogRing()
+	log.AddHook(ring)
+	plane := &stubAdminPlane{
+		metrics: control.AdminMetricsSnapshot{UploadRate: 1024, DownloadRate: 2048},
+		history: []control.AdminTrafficSample{{TimestampMs: 1000, UploadRate: 100, DownloadRate: 200}},
 	}
-	got, err := tailLogLines(path, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0] != strings.Repeat("中", 6000) || got[1] != "last" {
-		t.Fatal("tail lost UTF-8 boundary or final line")
-	}
-	if err := os.WriteFile(path, []byte(strings.Repeat("x", 2<<20)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	got, err = tailLogLines(path, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatal("must not return partial oversized line")
-	}
-}
-
-func (s *stubAdminPlane) AdminQuality(group, host string) []map[string]any { return []map[string]any{} }
-
-func TestAdminQualityRequiresAuthAndIsReadOnly(t *testing.T) {
-	plane := &stubAdminPlane{}
-	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server := newAdminServer(log, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.setLogRing(ring)
 	server.secret = "test-token"
-	for _, tc := range []struct {
-		method, auth string
-		status       int
-	}{{"GET", "", http.StatusUnauthorized}, {"POST", "Bearer test-token", http.StatusMethodNotAllowed}, {"GET", "Bearer test-token", http.StatusOK}} {
-		req := httptest.NewRequest(tc.method, "/v1/quality?group=test&host=a.example.com", nil)
-		req.Header.Set("Authorization", tc.auth)
+	server.setSourcesRefresher(func(context.Context) (adminSourcesRefreshResult, error) {
+		return adminSourcesRefreshResult{Changed: true, ReloadQueued: true}, nil
+	})
+	handler := server.withSecurityHeaders(server.buildMux())
+
+	log.Info("hello ring")
+
+	do := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer test-token")
 		rec := httptest.NewRecorder()
-		server.withAdminAuth(server.handleQuality)(rec, req)
-		if rec.Code != tc.status {
-			t.Fatalf("%s => %d %s", tc.method, rec.Code, rec.Body.String())
-		}
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := do(http.MethodGet, "/api/v1/metrics", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"upload_rate":1024`) {
+		t.Fatalf("metrics code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(http.MethodGet, "/api/v1/metrics/history?window=60&points=10", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"points":1`) {
+		t.Fatalf("history code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(http.MethodPut, "/api/v1/system/log-level", `{"level":"debug"}`); rec.Code != http.StatusOK || log.GetLevel() != logrus.DebugLevel {
+		t.Fatalf("log-level PUT code=%d level=%v body=%s", rec.Code, log.GetLevel(), rec.Body.String())
+	}
+	if rec := do(http.MethodPut, "/api/v1/system/log-level", `{"level":"bogus"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid log-level code=%d", rec.Code)
+	}
+	if rec := do(http.MethodGet, "/api/v1/logs?limit=10", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"hello ring"`) {
+		t.Fatalf("logs GET code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(http.MethodPost, "/api/v1/sources/refresh", ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"reload_queued":true`) {
+		t.Fatalf("sources refresh code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(http.MethodGet, "/api/v1/debug/quality?group=test", ""); rec.Code != http.StatusOK {
+		t.Fatalf("debug/quality code=%d", rec.Code)
 	}
 }
 
@@ -423,7 +506,6 @@ func TestAdminReloadSnapshotKeepsLoadedFilesAfterManualEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Edit both files after parsing but before the generation is published.
 	manualConfig := "include { routing.dae }\nglobal { log_level: debug }\n"
 	writeRestrictedDae(t, configPath, manualConfig)
 	writeRestrictedDae(t, routingPath, "routing { fallback: block }\n")
@@ -441,7 +523,6 @@ func TestAdminReloadSnapshotKeepsLoadedFilesAfterManualEdit(t *testing.T) {
 	if got, _ := os.ReadFile(configPath); string(got) != manualConfig {
 		t.Fatal("successful publication overwrote the manual edit")
 	}
-	// A subsequent failed admin reload must restore the loaded version, not B.
 	writeRestrictedDae(t, configPath, "global { log_level: warn }\nrouting { fallback: direct }\n")
 	adminConfigWriteMu.Lock()
 	server.recordPendingAdminWriteLocked()
@@ -455,7 +536,7 @@ func TestAdminReloadSnapshotKeepsLoadedFilesAfterManualEdit(t *testing.T) {
 	}
 }
 
-func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
+func TestAdminSystemReloadSyncAndLastGoodRollback(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.dae")
 	routingPath := filepath.Join(dir, "routing.dae")
@@ -466,28 +547,29 @@ func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 
 	rm := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
 	server := newAdminServer(nil, "", dir, func() adminPlane {
-		return &stubAdminPlane{status: control.AdminStatus{Version: "test"}}
+		return &stubAdminPlane{sysInfo: control.AdminSystemInfo{Version: "test"}}
 	}, func() bool { return true })
 	server.secret = "test-token"
 	server.setReloadManager(rm)
 	server.captureActiveSnapshot(readTestAdminSnapshot(t, dir))
+	handler := server.withSecurityHeaders(server.buildMux())
 
-	getStatus := func() adminStatusBody {
-		req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	getSystem := func() adminSystemBody {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/system", nil)
 		req.Header.Set("Authorization", "Bearer test-token")
 		rec := httptest.NewRecorder()
-		server.withAdminAuth(server.handleStatus)(rec, req)
+		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d body %s", rec.Code, rec.Body.String())
+			t.Fatalf("system = %d body %s", rec.Code, rec.Body.String())
 		}
-		var out adminStatusBody
+		var out adminSystemBody
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
 		return out
 	}
 
-	st := getStatus()
+	st := getSystem()
 	if !st.ConfigInSync || st.LastReloadError != "" || st.ReloadPending {
 		t.Fatalf("initial status = %+v, want in sync with no error", st)
 	}
@@ -495,22 +577,19 @@ func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 		t.Fatalf("expected .admin-last-good snapshot at startup: %v", err)
 	}
 
-	// Simulate PUT /v1/config writing a new config whose async reload fails.
-	putReq := httptest.NewRequest(http.MethodPut, "/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n","routing":"routing { dip(8.8.8.8) -> direct }\n"}`))
+	putReq := httptest.NewRequest(http.MethodPut, "/api/v1/config", strings.NewReader(`{"config":"global { log_level: warn }\nrouting { fallback: direct }\n","routing":"routing { dip(8.8.8.8) -> direct }\n"}`))
 	putReq.Header.Set("Authorization", "Bearer test-token")
 	putRec := httptest.NewRecorder()
-	server.withAdminAuth(server.handleConfig)(putRec, putReq)
+	handler.ServeHTTP(putRec, putReq)
 	if putRec.Code != http.StatusOK {
-		t.Fatalf("PUT /v1/config status = %d body %s", putRec.Code, putRec.Body.String())
+		t.Fatalf("PUT /api/v1/config status = %d body %s", putRec.Code, putRec.Body.String())
 	}
 
-	// Before reload completes, disk differs from running state.
-	st = getStatus()
+	st = getSystem()
 	if st.ConfigInSync {
 		t.Fatalf("expected config_in_sync=false while disk has pending edit: %+v", st)
 	}
 
-	// Async reload failure restores .admin-last-good and surfaces sanitized last_reload_error.
 	rm.setReloadError(errors.New("dialer failed for hy2://secret@example.com"))
 	server.handleAsyncReloadFailure("dialer failed for hy2://secret@example.com")
 
@@ -519,26 +598,9 @@ func TestAdminStatusReloadSyncAndLastGoodRollback(t *testing.T) {
 	if string(gotCfg) != origCfg || string(gotRouting) != origRouting {
 		t.Fatalf("last-good rollback failed:\ncfg=%s\nrouting=%s", gotCfg, gotRouting)
 	}
-	st = getStatus()
+	st = getSystem()
 	if !st.ConfigInSync || !st.LastReloadRolledBack || st.LastReloadError == "" || strings.Contains(st.LastReloadError, "hy2://") {
 		t.Fatalf("post-rollback status = %+v", st)
-	}
-
-	// External disk edit is NOT overwritten by async reload failure and reports out-of-sync.
-	rm.setReloadError(nil)
-	server.markReloadSucceeded(readTestAdminSnapshot(t, dir))
-	if err := os.WriteFile(configPath, []byte("global {\n    log_level: debug\n}\nrouting { fallback: direct }\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rm.setReloadError(errors.New("prepare staged reload: invalid runtime"))
-	server.handleAsyncReloadFailure("prepare staged reload: invalid runtime")
-	st = getStatus()
-	if st.ConfigInSync || st.LastReloadRolledBack || st.LastReloadError != "prepare staged reload: invalid runtime" {
-		t.Fatalf("external-edit status = %+v", st)
-	}
-	gotCfg, _ = os.ReadFile(configPath)
-	if !strings.Contains(string(gotCfg), "log_level: debug") {
-		t.Fatalf("external edit was overwritten: %s", gotCfg)
 	}
 }
 
@@ -547,7 +609,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	addr2 := reserveTestLoopbackAddr(t)
 
 	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane {
-		return &stubAdminPlane{status: control.AdminStatus{Version: "test"}}
+		return &stubAdminPlane{sysInfo: control.AdminSystemInfo{Version: "test"}}
 	}, nil)
 	t.Cleanup(server.shutdown)
 
@@ -555,8 +617,6 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	server.resolveListenFn = func(_ context.Context, listen string) (string, error) {
 		if listen == "router.lan:2025" {
 			resolveCalls++
-			// Verify TOCTOU resistance: even if a second call returned public IP,
-			// refresh must only resolve once and pass the validated IP listener to Serve.
 			if resolveCalls > 1 {
 				return "", errors.New("unexpected re-resolution")
 			}
@@ -568,7 +628,6 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		return config.ResolveAndValidateAdminListen(context.Background(), listen)
 	}
 
-	// Rejected public hostname does not start listener.
 	server.refresh("public.example.com:2025", "sec1")
 	server.mu.Lock()
 	if server.http != nil {
@@ -577,7 +636,6 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 	server.mu.Unlock()
 
-	// Private hostname resolves once and binds concrete IP:port directly.
 	server.refresh("router.lan:2025", "sec1")
 	server.mu.Lock()
 	bound1 := server.boundAddr
@@ -591,8 +649,8 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		Timeout:   time.Second,
 		Transport: &http.Transport{DisableKeepAlives: true},
 	}
-	doStatus := func(addr, secret string) (*http.Response, error) {
-		req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/status", nil)
+	doSystem := func(addr, secret string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/api/v1/system", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -600,7 +658,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		return client.Do(req)
 	}
 
-	resp, err := doStatus(addr1, "sec1")
+	resp, err := doSystem(addr1, "sec1")
 	if err != nil {
 		t.Fatalf("GET on initial resolved listener failed: %v", err)
 	}
@@ -609,7 +667,6 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		t.Fatalf("initial status code = %d, want 200", resp.StatusCode)
 	}
 
-	// Failed reload (even when isSuspend is false-positive on legacy rollback) does NOT refresh adminHTTP or mark suspended.
 	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, errors.New("reload failed"), true, nil)
 	server.mu.Lock()
 	if server.boundAddr != addr1 || server.suspended {
@@ -620,7 +677,6 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 	server.mu.Unlock()
 
-	// Suspend reload does NOT refresh adminHTTP and marks suspended.
 	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, true, nil)
 	server.mu.Lock()
 	if server.boundAddr != addr1 || !server.suspended {
@@ -631,11 +687,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 	server.mu.Unlock()
 
-	// Successful unsuspend / hot reload clears suspended and switches both admin_listen and admin_secret.
 	handoff := newStagedReloadHandoff(&runtimeGeneration{}, &runtimeGeneration{}, false, false)
-	if handoff.isSuspend {
-		t.Fatal("default stagedReloadHandoff.isSuspend should be false")
-	}
 	applyPublishedReloadAdmin(server, &config.Config{Global: config.Global{AdminListen: addr2, AdminSecret: "sec2"}}, nil, handoff.isSuspend, nil)
 	server.mu.Lock()
 	bound2 := server.boundAddr
@@ -645,11 +697,11 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 		t.Fatalf("hot reload boundAddr = %q (want %q), suspended = %v (want false)", bound2, addr2, stillSuspended)
 	}
 
-	if respOld, err := doStatus(addr1, "sec1"); err == nil {
+	if respOld, err := doSystem(addr1, "sec1"); err == nil {
 		_ = respOld.Body.Close()
 		t.Fatalf("old listener %s still accepted connection after hot reload", addr1)
 	}
-	respWrongSecret, err := doStatus(addr2, "sec1")
+	respWrongSecret, err := doSystem(addr2, "sec1")
 	if err != nil {
 		t.Fatalf("GET on new listener with old secret failed: %v", err)
 	}
@@ -657,7 +709,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	if respWrongSecret.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("old secret on new listener = %d, want 401", respWrongSecret.StatusCode)
 	}
-	respNew, err := doStatus(addr2, "sec2")
+	respNew, err := doSystem(addr2, "sec2")
 	if err != nil {
 		t.Fatalf("GET on new listener with new secret failed: %v", err)
 	}

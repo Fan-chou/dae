@@ -9,7 +9,6 @@ on:
     paths:
       - ".github/workflows/fdae-build.yml"
       - "openwrt/**"
-      - "web-next/**"
       - "**.go"
       - "control/kern/**"
       - "go.mod"
@@ -24,29 +23,6 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
-  panel:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-        with:
-          package_json_file: web-next/package.json
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: web-next/pnpm-lock.yaml
-      - name: Build the panel
-        working-directory: web-next
-        run: |
-          pnpm install --frozen-lockfile
-          FONT=none pnpm build
-      - uses: actions/upload-artifact@v7
-        with:
-          name: panel
-          path: web-next/dist
-          if-no-files-found: error
-
   binary:
     runs-on: ubuntu-latest
     strategy:
@@ -92,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   packages:
-    needs: [panel, binary]
+    needs: [binary]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -106,7 +82,6 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = tag ]; then
             export FDAE_VERSION="${GITHUB_REF_NAME#v}"
           fi
-          FDAE_UI="$PWD/artifacts/panel" \
           FDAE_BIN_x86_64="$PWD/artifacts/dae-amd64/dae-amd64" \
           FDAE_BIN_aarch64="$PWD/artifacts/dae-arm64/dae-arm64" \
           openwrt/build.sh "$PWD/out"

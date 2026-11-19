@@ -14,10 +14,11 @@ import (
 
 // UdpRouteBinding records the immutable policy result selected for a UDP endpoint.
 type UdpRouteBinding struct {
-	PolicyEpoch routing.PolicyEpoch
-	Outbound    consts.OutboundIndex
-	Mark        uint32
-	Must        bool
+	PolicyEpoch    routing.PolicyEpoch
+	Mark           uint32
+	RuleMatchIndex uint16
+	Outbound       consts.OutboundIndex
+	Must           bool
 }
 
 // UdpEgressBinding records the concrete transport selection for a UDP endpoint.
@@ -37,23 +38,28 @@ type UdpEgressBinding struct {
 
 // UdpFlowBinding combines the policy and egress decisions fixed at endpoint creation.
 type UdpFlowBinding struct {
-	Route  UdpRouteBinding
-	Egress UdpEgressBinding
-	Mac    [6]uint8
+	Route   UdpRouteBinding
+	Egress  UdpEgressBinding
+	Rule    *RoutingRuleMeta
+	Mac     [6]uint8
+	Process string
 }
 
 func newUdpFlowBinding(policyEpoch routing.PolicyEpoch, outboundIndex consts.OutboundIndex, mark uint32, must bool, option *DialOption) UdpFlowBinding {
 	binding := UdpFlowBinding{
 		Route: UdpRouteBinding{
-			PolicyEpoch: policyEpoch,
-			Outbound:    outboundIndex,
-			Mark:        mark,
-			Must:        must,
+			PolicyEpoch:    policyEpoch,
+			Outbound:       outboundIndex,
+			Mark:           mark,
+			Must:           must,
+			RuleMatchIndex: UnknownRuleMatchIndex,
 		},
 	}
 	if option == nil {
 		return binding
 	}
+	binding.Route.RuleMatchIndex = option.RuleMatchIndex
+	binding.Rule = option.Rule
 	binding.Egress = UdpEgressBinding{
 		Dialer:        option.Dialer,
 		Outbound:      option.Outbound,
