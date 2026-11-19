@@ -119,6 +119,7 @@ func (c *wsClient) enqueueFrame(frame wsServerFrame) {
 type adminWSHub struct {
 	server *adminServer
 
+	observerMu    sync.Mutex
 	mu            sync.Mutex
 	closed        bool
 	clients       map[*wsClient]struct{}
@@ -169,11 +170,7 @@ func (h *adminWSHub) close() {
 	h.flowsActive = false
 	h.mu.Unlock()
 
-	if h.server != nil {
-		if plane := h.server.currentPlane(); plane != nil {
-			plane.SetClosedFlowObserver(nil)
-		}
-	}
+	h.syncFlowObserver()
 	for _, c := range clients {
 		c.close()
 	}
@@ -601,6 +598,9 @@ func (h *adminWSHub) syncFlowObserver() {
 	if h == nil || h.server == nil {
 		return
 	}
+	h.observerMu.Lock()
+	defer h.observerMu.Unlock()
+
 	plane := h.server.currentPlane()
 	if plane == nil {
 		return

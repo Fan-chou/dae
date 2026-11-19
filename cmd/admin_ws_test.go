@@ -91,14 +91,15 @@ func TestAdminWebSocketOriginAuthMultiplexAndZeroIdleCleanup(t *testing.T) {
 
 	// Emit a log, closed flow, and system event.
 	deadline := time.Now().Add(2 * time.Second)
-	for plane.flowObserver == nil && time.Now().Before(deadline) {
+	for plane.getClosedFlowObserver() == nil && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if plane.flowObserver == nil {
+	observer := plane.getClosedFlowObserver()
+	if observer == nil {
 		t.Fatal("expected flows observer to be installed on sub")
 	}
 	log.Info("ws-live-log")
-	plane.flowObserver(control.AdminClosedFlow{ID: "tcp:99", CloseReason: "normal"})
+	observer(control.AdminClosedFlow{ID: "tcp:99", CloseReason: "normal"})
 	server.emitWSEvent("reload_succeeded", nil)
 
 	seen := map[string]bool{}
@@ -126,14 +127,14 @@ func TestAdminWebSocketOriginAuthMultiplexAndZeroIdleCleanup(t *testing.T) {
 	_ = conn.Close()
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if server.wsHub.ActiveClients() == 0 && len(server.wsHub.ActiveTopics()) == 0 && plane.flowObserver == nil {
+		if server.wsHub.ActiveClients() == 0 && len(server.wsHub.ActiveTopics()) == 0 && plane.getClosedFlowObserver() == nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if server.wsHub.ActiveClients() != 0 || len(server.wsHub.ActiveTopics()) != 0 || plane.flowObserver != nil {
+	if server.wsHub.ActiveClients() != 0 || len(server.wsHub.ActiveTopics()) != 0 || plane.getClosedFlowObserver() != nil {
 		t.Fatalf("expected clean zero-idle teardown: clients=%d topics=%v flowObserver=%v",
-			server.wsHub.ActiveClients(), server.wsHub.ActiveTopics(), plane.flowObserver != nil)
+			server.wsHub.ActiveClients(), server.wsHub.ActiveTopics(), plane.getClosedFlowObserver() != nil)
 	}
 
 	// Verify slow client non-blocking queue overflow drops without blocking callers.

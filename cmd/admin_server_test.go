@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,7 @@ type stubAdminPlane struct {
 	kernelCloseReq       control.AdminKernelCloseRequest
 	kernelCloseRes       control.AdminKernelCloseResult
 	kernelCloseErr       error
+	flowObserverMu       sync.Mutex
 	flowObserver         func(control.AdminClosedFlow)
 }
 
@@ -146,7 +148,16 @@ func (s *stubAdminPlane) AdminCloseKernelConnection(req control.AdminKernelClose
 }
 
 func (s *stubAdminPlane) SetClosedFlowObserver(fn func(control.AdminClosedFlow)) {
+	s.flowObserverMu.Lock()
 	s.flowObserver = fn
+	s.flowObserverMu.Unlock()
+}
+
+func (s *stubAdminPlane) getClosedFlowObserver() func(control.AdminClosedFlow) {
+	s.flowObserverMu.Lock()
+	fn := s.flowObserver
+	s.flowObserverMu.Unlock()
+	return fn
 }
 
 func (s *stubAdminPlane) AdminQuality(group, host string) []map[string]any { return []map[string]any{} }
