@@ -29,11 +29,12 @@ import (
 )
 
 const (
-	adminReadTimeout     = 10 * time.Second
-	adminWriteTimeout    = 30 * time.Second
-	adminShutdownTimeout = 2 * time.Second
-	adminMaxBodyBytes    = 1 << 14
-	adminProbeCooldown   = 3 * time.Second
+	adminReadTimeout           = 10 * time.Second
+	adminWriteTimeout          = 30 * time.Second
+	adminSourcesRefreshTimeout = 3 * time.Minute
+	adminShutdownTimeout       = 2 * time.Second
+	adminMaxBodyBytes          = 1 << 14
+	adminProbeCooldown         = 3 * time.Second
 )
 
 type adminPlane interface {
@@ -459,6 +460,9 @@ func (s *adminServer) refreshWithCORS(listen, secret string, corsOrigins []strin
 		return
 	}
 	s.stopLocked()
+	if s.wsHub != nil {
+		s.wsHub.disconnectAll()
+	}
 	s.listen = listen
 	s.secret = secret
 	if listen == "" {
@@ -1215,11 +1219,17 @@ func (s *adminServer) handleSourcesRefresh(w http.ResponseWriter, r *http.Reques
 	}
 	defer s.sourcesRefreshing.Store(false)
 
-	res, err := refresher(r.Context())
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(adminSourcesRefreshTimeout))
+	refreshCtx, cancel := context.WithTimeout(r.Context(), adminSourcesRefreshTimeout)
+	defer cancel()
+
+	res, err := refresher(refreshCtx)
 	if err != nil {
-		writeAdminAPIError(w, http.StatusInternalServerError, "refresh_failed", sanitizeAdminError(err))
+		writeAdminAPIError(w, http.StatusInternalServerError, "refresh_failed", sanitizeAdminSourceError(err))
 		return
 	}
+	res.Warning = sanitizeAdminSourceMessage(res.Warning)
 	mihomo := CurrentMihomoStatus()
 	sources := adminSourcesBody{
 		Mihomo:        mihomo,

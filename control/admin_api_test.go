@@ -6,8 +6,10 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -472,5 +474,68 @@ func TestAdminGroupsIPv4OnlyNodeRemainsAliveWithLatencyWhenIPv6Fails(t *testing.
 	m = checkMember()
 	if m.Alive || m.Admission != "dead" {
 		t.Fatalf("all-dead member = %#v, want Alive=false Admission=dead", m)
+	}
+}
+
+func TestAdminMetricsSnapshotIncludesTCPAndUDP(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+
+	directGroup := &outbound.DialerGroup{Name: consts.OutboundDirect.String()}
+	_, err := manager.adoptTCP(
+		&memoryLayoutConn{id: 1001},
+		nil,
+		TcpFlowBinding{
+			Egress: TcpEgressBinding{Outbound: directGroup, Target: "1.1.1.1:443"},
+		},
+		runtime,
+		nil,
+		netip.MustParseAddrPort("192.168.1.50:55001"),
+		netip.MustParseAddrPort("1.1.1.1:443"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := UdpEndpointKey{
+		Src: netip.MustParseAddrPort("192.168.1.50:55002"),
+		Dst: netip.MustParseAddrPort("8.8.8.8:53"),
+	}
+	ue := &UdpEndpoint{poolRef: DefaultUdpEndpointPool, poolKey: key, NatTimeout: time.Minute}
+	ue.RefreshTtl()
+	shard := DefaultUdpEndpointPool.shardFor(key)
+	shard.mu.Lock()
+	DefaultUdpEndpointPool.setShardEntryLocked(shard, key, ue)
+	shard.mu.Unlock()
+	t.Cleanup(func() {
+		shard := DefaultUdpEndpointPool.shardFor(key)
+		shard.mu.Lock()
+		DefaultUdpEndpointPool.deleteShardEntryLocked(shard, key)
+		shard.mu.Unlock()
+	})
+
+	c := &ControlPlane{runtimeStats: newRuntimeStats()}
+	if err := c.AttachSessionManager(manager); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := c.AdminMetricsSnapshot()
+	if snap.TCPConnections != 1 {
+		t.Fatalf("TCPConnections = %d, want 1", snap.TCPConnections)
+	}
+	if snap.UDPSessions < 1 {
+		t.Fatalf("UDPSessions = %d, want >= 1", snap.UDPSessions)
+	}
+	if snap.ActiveConnections != snap.TCPConnections+snap.UDPSessions {
+		t.Fatalf("ActiveConnections = %d, want TCP(%d)+UDP(%d)=%d",
+			snap.ActiveConnections, snap.TCPConnections, snap.UDPSessions, snap.TCPConnections+snap.UDPSessions)
+	}
+
+	scalars := c.SnapshotRuntimeScalars()
+	if scalars.ActiveConnections != snap.TCPConnections+scalars.UDPSessions {
+		t.Fatalf("SnapshotRuntimeScalars ActiveConnections = %d, want %d",
+			scalars.ActiveConnections, snap.TCPConnections+scalars.UDPSessions)
 	}
 }

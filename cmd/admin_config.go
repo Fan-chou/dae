@@ -609,8 +609,24 @@ func sanitizeAdminError(err error) string {
 	if nodeURIScheme.MatchString(msg) || strings.Contains(msg, "://") {
 		return "config validation failed"
 	}
-	if len(msg) > 400 {
-		return msg[:400]
+	return truncateUTF8Bytes(msg, 400)
+}
+
+func sanitizeAdminSourceMessage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	return truncateUTF8Bytes(sanitizeLogString(raw), 400)
+}
+
+func sanitizeAdminSourceError(err error) string {
+	if err == nil {
+		return "sources refresh failed"
+	}
+	msg := sanitizeAdminSourceMessage(err.Error())
+	if msg == "" {
+		return "sources refresh failed"
 	}
 	return msg
 }

@@ -109,6 +109,18 @@ func (s *inboundServer) removeRelay(r *InboundUDPRelay) {
 // are not flows of the control plane's session manager, so the connection list
 // would not show them otherwise.
 func (m *InboundManager) udpConnections() []AdminConnection {
+	return m.collectUDPConnections(func(r *InboundUDPRelay, out []AdminConnection) []AdminConnection {
+		return r.appendConnections(out)
+	})
+}
+
+func (m *InboundManager) accountingUDPConnections() []AdminConnection {
+	return m.collectUDPConnections(func(r *InboundUDPRelay, out []AdminConnection) []AdminConnection {
+		return r.appendAccountingConnections(out)
+	})
+}
+
+func (m *InboundManager) collectUDPConnections(collect func(*InboundUDPRelay, []AdminConnection) []AdminConnection) []AdminConnection {
 	if m == nil {
 		return nil
 	}
@@ -128,13 +140,21 @@ func (m *InboundManager) udpConnections() []AdminConnection {
 		}
 		s.mu.Unlock()
 		for _, r := range relays {
-			out = r.appendConnections(out)
+			out = collect(r, out)
 		}
 	}
 	return out
 }
 
 func (r *InboundUDPRelay) appendConnections(out []AdminConnection) []AdminConnection {
+	return r.appendSessionConnections(out, (*inboundUDPSession).adminConnection)
+}
+
+func (r *InboundUDPRelay) appendAccountingConnections(out []AdminConnection) []AdminConnection {
+	return r.appendSessionConnections(out, (*inboundUDPSession).accountingConnection)
+}
+
+func (r *InboundUDPRelay) appendSessionConnections(out []AdminConnection, build func(*inboundUDPSession) (AdminConnection, bool)) []AdminConnection {
 	r.mu.Lock()
 	sessions := make([]*inboundUDPSession, 0, len(r.sessions))
 	for _, s := range r.sessions {
@@ -142,7 +162,7 @@ func (r *InboundUDPRelay) appendConnections(out []AdminConnection) []AdminConnec
 	}
 	r.mu.Unlock()
 	for _, s := range sessions {
-		if item, ok := s.adminConnection(); ok {
+		if item, ok := build(s); ok {
 			out = append(out, item)
 		}
 	}
@@ -154,7 +174,19 @@ func (r *InboundUDPRelay) appendConnections(out []AdminConnection) []AdminConnec
 func (s *inboundUDPSession) adminConnection() (AdminConnection, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.ready || s.closed {
+	if !s.ready || s.closed || s.closedAccounted.Load() {
+		return AdminConnection{}, false
+	}
+	now := time.Now()
+	return s.toAdminConnectionLocked(now), true
+}
+
+// accountingConnection returns an established session until RecordClosed has
+// accounted for it, preventing gaps or double-counting during concurrent close.
+func (s *inboundUDPSession) accountingConnection() (AdminConnection, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready || s.closedAccounted.Load() {
 		return AdminConnection{}, false
 	}
 	now := time.Now()

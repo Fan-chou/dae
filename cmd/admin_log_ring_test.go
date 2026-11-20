@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 )
@@ -90,5 +91,39 @@ func TestAdminLogRingNonBlockingOnFullSubscriber(t *testing.T) {
 	}
 	if ring.dropped.Load() != 50 {
 		t.Fatalf("expected 50 dropped subscriber frames, got %d", ring.dropped.Load())
+	}
+}
+
+func TestAdminLogRingTruncatesUTF8Safely(t *testing.T) {
+	t.Parallel()
+	ring := newAdminLogRing()
+
+	// Cross both adminLogMaxMsgBytes-3 (2045) and 509 inside multi-byte runes.
+	longMsg := "ab" + strings.Repeat("中", 700) + "😀"
+	longField := "x" + strings.Repeat("字", 180) + "🚀"
+	if err := ring.Fire(&logrus.Entry{
+		Level:   logrus.InfoLevel,
+		Message: longMsg,
+		Data: logrus.Fields{
+			"str":      longField,
+			"err":      fmt.Errorf("%s", longField),
+			"stringer": time.Monday,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := ring.Snapshot(1, logrus.InfoLevel, 0)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	msg := entries[0].Message
+	if !utf8.ValidString(msg) || len(msg) > adminLogMaxMsgBytes || !strings.HasSuffix(msg, "...") {
+		t.Fatalf("invalid truncated message: valid=%v len=%d", utf8.ValidString(msg), len(msg))
+	}
+	for _, k := range []string{"str", "err"} {
+		v, ok := entries[0].Fields[k].(string)
+		if !ok || !utf8.ValidString(v) || len(v) > 512 || !strings.HasSuffix(v, "...") {
+			t.Fatalf("invalid truncated field %s: valid=%v len=%d val=%q", k, utf8.ValidString(v), len(v), v)
+		}
 	}
 }

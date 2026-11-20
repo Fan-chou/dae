@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 )
@@ -72,10 +73,7 @@ func (r *adminLogRing) Fire(entry *logrus.Entry) error {
 	if ts.IsZero() {
 		ts = time.Now()
 	}
-	msg := sanitizeLogString(entry.Message)
-	if len(msg) > adminLogMaxMsgBytes {
-		msg = msg[:adminLogMaxMsgBytes-3] + "..."
-	}
+	msg := truncateUTF8WithEllipsis(sanitizeLogString(entry.Message), adminLogMaxMsgBytes)
 	fields := sanitizeLogFields(entry.Data)
 	lvl := entry.Level
 
@@ -191,6 +189,30 @@ func (r *adminLogRing) SubscriberCount() int {
 	return len(r.subs)
 }
 
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	i := maxBytes
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i]
+}
+
+func truncateUTF8WithEllipsis(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 3 {
+		return truncateUTF8Bytes(s, maxBytes)
+	}
+	return truncateUTF8Bytes(s, maxBytes-3) + "..."
+}
+
 func sanitizeLogString(raw string) string {
 	if !strings.Contains(raw, "://") {
 		return raw
@@ -244,23 +266,11 @@ func sanitizeLogFields(data logrus.Fields) map[string]any {
 		v := data[k]
 		switch val := v.(type) {
 		case string:
-			s := sanitizeLogString(val)
-			if len(s) > 512 {
-				s = s[:509] + "..."
-			}
-			out[k] = s
+			out[k] = truncateUTF8WithEllipsis(sanitizeLogString(val), 512)
 		case error:
-			s := sanitizeLogString(val.Error())
-			if len(s) > 512 {
-				s = s[:509] + "..."
-			}
-			out[k] = s
+			out[k] = truncateUTF8WithEllipsis(sanitizeLogString(val.Error()), 512)
 		case fmt.Stringer:
-			s := sanitizeLogString(val.String())
-			if len(s) > 512 {
-				s = s[:509] + "..."
-			}
-			out[k] = s
+			out[k] = truncateUTF8WithEllipsis(sanitizeLogString(val.String()), 512)
 		default:
 			out[k] = v
 		}

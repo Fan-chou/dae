@@ -420,9 +420,10 @@ type inboundUDPSession struct {
 	domain         string
 	ruleMatchIndex uint16
 	rule           *RoutingRuleMeta
-	upload         atomic.Uint64
-	download       atomic.Uint64
-	closeReason    atomic.Int32
+	upload          atomic.Uint64
+	download        atomic.Uint64
+	closeReason     atomic.Int32
+	closedAccounted atomic.Bool
 
 	lastActive atomic.Int64
 }
@@ -664,10 +665,19 @@ func (s *inboundUDPSession) close() {
 	if conn != nil {
 		_ = conn.Close()
 	}
+	var notify func()
 	r := s.relay
-	if recordClosed && r != nil {
-		if plane := r.plane(); plane != nil {
-			plane.recordClosedFlow(closedFlow)
+	if recordClosed {
+		if r != nil {
+			if plane := r.plane(); plane != nil {
+				notify = plane.recordClosedFlowWithMark(closedFlow, func() {
+					s.closedAccounted.Store(true)
+				})
+			} else {
+				s.closedAccounted.Store(true)
+			}
+		} else {
+			s.closedAccounted.Store(true)
 		}
 	}
 	// The session counted against the inbound's budget from creation; close
@@ -678,6 +688,9 @@ func (s *inboundUDPSession) close() {
 		delete(r.sessions, s.key)
 	}
 	r.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
 }
 
 // sweep closes sessions that have been idle longer than their timeout.

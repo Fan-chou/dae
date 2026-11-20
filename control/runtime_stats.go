@@ -435,13 +435,13 @@ func (c *ControlPlane) recordDownloadTraffic(n int64) {
 
 // SnapshotRuntimeScalars returns aggregate counters and monotonic 1s rates in O(1) without scanning history buckets.
 func (c *ControlPlane) SnapshotRuntimeScalars() RuntimeStatsSnapshot {
-	activeConnections := 0
+	tcpConnections := 0
 	udpSessions := 0
 	if c != nil {
-		activeConnections = c.ActiveTCPConnections()
+		tcpConnections = c.ActiveTCPConnections()
 		udpSessions = DefaultUdpEndpointPool.Len()
 	}
-	return c.runtimeStatsStore().scalars(activeConnections, udpSessions, time.Now())
+	return c.runtimeStatsStore().scalars(tcpConnections+udpSessions, udpSessions, time.Now())
 }
 
 // SnapshotRuntimeHistory returns downsampled rate history buckets alongside current scalars.
@@ -450,13 +450,13 @@ func (c *ControlPlane) SnapshotRuntimeHistory(windowSec int, maxPoints int) Runt
 }
 
 func (c *ControlPlane) SnapshotRuntimeStats(windowSec int, maxPoints int) RuntimeStatsSnapshot {
-	activeConnections := 0
+	tcpConnections := 0
 	udpSessions := 0
 	if c != nil {
-		activeConnections = c.ActiveTCPConnections()
+		tcpConnections = c.ActiveTCPConnections()
 		udpSessions = DefaultUdpEndpointPool.Len()
 	}
-	return c.runtimeStatsStore().snapshot(activeConnections, udpSessions, windowSec, maxPoints, time.Now())
+	return c.runtimeStatsStore().snapshot(tcpConnections+udpSessions, udpSessions, windowSec, maxPoints, time.Now())
 }
 
 func bucketizeRuntimeSamples(samples []RuntimeTrafficSample, maxPoints int) []RuntimeTrafficSample {

@@ -275,6 +275,7 @@ type FlowRuntime struct {
 	firstByte           atomic.Bool
 	offloaded           atomic.Bool
 	closeReason         atomic.Int32
+	closedAccounted     atomic.Bool
 
 	ingress            net.Conn
 	egressMu           sync.Mutex
@@ -318,8 +319,9 @@ type UDPFlowRuntime struct {
 	network       string
 	uploadBytes   atomic.Uint64
 	downloadBytes atomic.Uint64
-	firstByte     atomic.Bool
-	closeReason   atomic.Int32
+	firstByte       atomic.Bool
+	closeReason     atomic.Int32
+	closedAccounted atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -848,8 +850,11 @@ func (f *FlowRuntime) finish() {
 		}
 		if f.manager != nil {
 			closed := f.toClosedFlow(time.Now())
+			notify := f.manager.recordClosedFlowWithMark(closed, func() {
+				f.closedAccounted.Store(true)
+			})
 			f.manager.releaseFlow(f)
-			f.manager.recordClosedFlow(closed)
+			notify()
 			return
 		}
 		if f.cancel != nil {
@@ -1120,8 +1125,11 @@ func (f *UDPFlowRuntime) finish() {
 		}
 		if f.manager != nil {
 			closed := f.toClosedFlow(time.Now())
+			notify := f.manager.recordClosedFlowWithMark(closed, func() {
+				f.closedAccounted.Store(true)
+			})
 			f.manager.releaseUDPFlow(f)
-			f.manager.recordClosedFlow(closed)
+			notify()
 			return
 		}
 		if f.cancel != nil {
@@ -1586,10 +1594,17 @@ func (m *SessionManager) Close() error {
 }
 
 func (m *SessionManager) recordClosedFlow(flow AdminClosedFlow) {
+	m.recordClosedFlowWithMark(flow, nil)()
+}
+
+func (m *SessionManager) recordClosedFlowWithMark(flow AdminClosedFlow, onRecorded func()) func() {
 	if m == nil || m.accounting == nil {
-		return
+		if onRecorded != nil {
+			onRecorded()
+		}
+		return func() {}
 	}
-	m.accounting.RecordClosed(flow)
+	return m.accounting.RecordClosedWithMark(flow, onRecorded)
 }
 
 // CloseConnectionByID terminates one active TCP or UDP flow matching id ("tcp:<n>" or "udp:<n>").
@@ -1709,12 +1724,23 @@ func (m *SessionManager) CloseConnectionsByTuple(proto uint8, src, dst netip.Add
 }
 
 func (c *ControlPlane) recordClosedFlow(flow AdminClosedFlow) {
+	c.recordClosedFlowWithMark(flow, nil)()
+}
+
+func (c *ControlPlane) recordClosedFlowWithMark(flow AdminClosedFlow, onRecorded func()) func() {
 	if c == nil {
-		return
+		if onRecorded != nil {
+			onRecorded()
+		}
+		return func() {}
 	}
 	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
-		manager.recordClosedFlow(flow)
+		return manager.recordClosedFlowWithMark(flow, onRecorded)
 	}
+	if onRecorded != nil {
+		onRecorded()
+	}
+	return func() {}
 }
 
 func (c *ControlPlane) SetClosedFlowObserver(fn func(AdminClosedFlow)) {
@@ -1737,6 +1763,20 @@ func (c *ControlPlane) AdminClosedFlows(limit int, filter AdminConnectionFilter)
 	return manager.accounting.SnapshotClosed(limit, filter)
 }
 
+func (c *ControlPlane) allActiveAdminConnections() []AdminConnection {
+	if c == nil {
+		return nil
+	}
+	var out []AdminConnection
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		out = manager.allActiveAdminConnections()
+	}
+	if inbound := activeInboundManager.Load().accountingUDPConnections(); len(inbound) > 0 {
+		out = append(out, inbound...)
+	}
+	return out
+}
+
 func (c *ControlPlane) AdminTrafficSummary(topN int) AdminTrafficSummary {
 	if c == nil {
 		return NewTrafficAccounting().Summary(nil, topN)
@@ -1745,9 +1785,7 @@ func (c *ControlPlane) AdminTrafficSummary(topN int) AdminTrafficSummary {
 	if manager == nil || manager.accounting == nil {
 		return NewTrafficAccounting().Summary(nil, topN)
 	}
-	active := manager.adminConnectionsSnapshot(adminConnectionsMaxLimit, AdminConnectionFilter{})
-	active = mergeInboundUDPConnections(active, activeInboundManager.Load().udpConnections(), AdminConnectionFilter{}, adminConnectionsMaxLimit)
-	return manager.accounting.Summary(active.Connections, topN)
+	return manager.accounting.SummaryWithCollector(c.allActiveAdminConnections, topN)
 }
 
 func (c *ControlPlane) AdminResetTrafficSummary() {
@@ -1758,9 +1796,7 @@ func (c *ControlPlane) AdminResetTrafficSummary() {
 	if manager == nil || manager.accounting == nil {
 		return
 	}
-	active := manager.adminConnectionsSnapshot(adminConnectionsMaxLimit, AdminConnectionFilter{})
-	active = mergeInboundUDPConnections(active, activeInboundManager.Load().udpConnections(), AdminConnectionFilter{}, adminConnectionsMaxLimit)
-	manager.accounting.Reset(active.Connections)
+	manager.accounting.ResetWithCollector(c.allActiveAdminConnections)
 }
 
 func (c *ControlPlane) AdminCloseConnection(id string) bool {

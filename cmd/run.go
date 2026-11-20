@@ -552,13 +552,13 @@ func (r *Runner) Run() (err error) {
 				UsedLastGood: report.UsedLastGood,
 			}
 			if refreshErr != nil {
-				res.Warning = refreshErr.Error()
+				res.Warning = sanitizeAdminSourceMessage(refreshErr.Error())
 			}
 			if report.Changed {
 				if qErr := holder.queueReload(ctx); qErr == nil {
 					res.ReloadQueued = true
 				} else if res.Warning == "" {
-					res.Warning = qErr.Error()
+					res.Warning = sanitizeAdminSourceMessage(qErr.Error())
 				}
 			}
 			if !report.Changed && refreshErr != nil {

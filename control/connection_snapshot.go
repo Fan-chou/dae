@@ -146,9 +146,15 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter AdminConnect
 		out = append(out, item)
 	}
 	for _, flow := range tcp {
+		if flow == nil || flow.closedAccounted.Load() {
+			continue
+		}
 		appendFiltered(adminConnectionFromTCPAt(flow, now))
 	}
 	for _, flow := range udp {
+		if flow == nil || flow.closedAccounted.Load() {
+			continue
+		}
 		appendFiltered(adminConnectionFromUDPAt(flow, now))
 	}
 	sortAdminConnections(out)
@@ -165,6 +171,30 @@ func (m *SessionManager) adminConnectionsSnapshot(limit int, filter AdminConnect
 		Connections:  out,
 		SnapshotAtMs: now.UnixMilli(),
 	}
+}
+
+// allActiveAdminConnections returns every unfinished TCP and UDP flow in m
+// without sorting or applying adminConnectionsMaxLimit.
+func (m *SessionManager) allActiveAdminConnections() []AdminConnection {
+	if m == nil {
+		return nil
+	}
+	now := time.Now()
+	tcp, udp := m.snapshotFlowRuntimes()
+	out := make([]AdminConnection, 0, len(tcp)+len(udp))
+	for _, flow := range tcp {
+		if flow == nil || flow.closedAccounted.Load() {
+			continue
+		}
+		out = append(out, adminConnectionFromTCPAt(flow, now))
+	}
+	for _, flow := range udp {
+		if flow == nil || flow.closedAccounted.Load() {
+			continue
+		}
+		out = append(out, adminConnectionFromUDPAt(flow, now))
+	}
+	return out
 }
 
 func sortAdminConnections(out []AdminConnection) {

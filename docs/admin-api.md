@@ -42,7 +42,7 @@ global {
 
 | 配置项 | 必填 | 校验规则与行为说明 |
 | --- | --- | --- |
-| `admin_listen` | 否 | 留空禁用管理接口。非空时（`host:port`）在配置校验/解析阶段通过 `config.ResolveAndValidateAdminListen` 解析所有 IP，必须全部为 Loopback（`127.0.0.0/8`、`::1`）、私有地址（RFC1918 / RFC4193 `fc00::/7`）或链路本地（`169.254.0.0/16`、`fe80::/10`）地址，禁止监听 `0.0.0.0`、`[::]` 或公网 IP。 |
+| `admin_listen` | 否 | 留空禁用管理接口。非空时（`host:port`）在配置校验/解析阶段通过 `config.ResolveAndValidateAdminListen` 解析所有 IP，必须全部为 Loopback（`127.0.0.0/8`、`::1`）、私有地址（RFC1918 / RFC4193 `fc00::/7`）或链路本地（`169.254.0.0/16`、`fe80::/10`）地址，禁止监听 `0.0.0.0`、`[::]` 或公网 IP，且明确拒绝端口 `9090`（`ClashCompatibleAdminPort`，防止误将 Clash 面板指向 kdae）。 |
 | `admin_secret` | 当启用 `admin_listen` 时必填 | 空字符串会阻止 Admin HTTP 启动。使用 `crypto/subtle.ConstantTimeCompare` 常量时间校验。 |
 | `admin_cors_origins` | 否 | 精确 `Origin` 白名单（格式 `scheme://host[:port]`）。仅支持 `http`、`https`、`tauri`、`app` 协议；自动小写化 scheme/host 并去除默认端口（`http:80` / `https:443`）；**严格拒绝**通配符 `*`、路径（含结尾 `/`）、Query、Fragment、空白字符以及用户信息 `user:pass@`。**留空时拒绝所有携带 `Origin` 头的浏览器跨域请求与预检（返回 `403 origin_forbidden`）。** |
 
@@ -61,7 +61,8 @@ global {
 - **正常请求无锁开销**：当前没有任何失败记录时快速路径直接放行。
 - **超限行为**：
   - HTTP 返回 `429 Too Many Requests`，响应头带 `Retry-After: <秒>`，JSON `error.code = "rate_limited"`。
-  - WebSocket 返回 `{"type":"auth_error","code":"rate_limited","message":"..."}` 并发送 Close Frame `4001`。
+  - WebSocket 在升级握手前检查限流，超限直接返回 HTTP `429 Too Many Requests`（带 `Retry-After: <秒>`，JSON `error.code = "rate_limited"`）；若在并发竞争下已升级后触发限流，则发送 `{"type":"auth_error","code":"rate_limited","message":"..."}` 并发送 Close Frame `4001`。
+  - 鉴权超时（`auth_timeout`）或首帧格式非法（`invalid_auth_frame`）同样计入来源 IP 的认证失败次数。
 - **清零**：同一 IP 任一请求认证通过后立即清除其失败计数。
 
 ### 1.4 安全响应头、CORS 与 Chrome PNA
@@ -97,7 +98,7 @@ global {
 | 参数 | 数值 | 说明 |
 | --- | --- | --- |
 | HTTP `ReadTimeout` | `10s` | 服务端读取请求超时 |
-| HTTP `WriteTimeout` | `30s` | 服务端写出响应超时 |
+| HTTP `WriteTimeout` | `30s` | 服务端写出响应超时（`POST /api/v1/sources/refresh` 单独放宽为 `180s` / `3m`） |
 | 常规 JSON 请求体上限 | `16 KiB` (`16384` bytes) | 适用于 `log-level`、`selection`、`connections/close`、`connections/kernel`（`DELETE`） |
 | `PUT /api/v1/inbounds` 上限 | `64 KiB` (`65536` bytes) | 入站配置 JSON 上限 |
 | `PUT /api/v1/config` 上限 | `2 MiB` (`2097152` bytes) | 配置文本 JSON 上限 |
@@ -239,7 +240,7 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `dialer` | `string` | 否 | 实际选中的节点 / 拨号器名 |
 | `policy` | `string` | 否 | 出站选路策略或选路路径描述 |
 | `offloaded` | `bool` | 否 | TCP Sockmap 内核卸载加速标志；为 `true` 时保留 `offloaded: true` |
-| `start_time` | `string` | 否 | 连接建立时间（RFC3339Nano UTC，如 `"2026-11-19T02:00:00Z"`） |
+| `start_time` | `string` | 否 | 连接建立时间（RFC3339 UTC，如 `"2026-11-19T02:00:00Z"`） |
 | `duration_ms` | `int64` | 是 | 连接已持续时长（毫秒） |
 | `upload` | `uint64` | 是 | 累计上行字节数 |
 | `download` | `uint64` | 是 | 累计下行字节数 |
@@ -286,8 +287,8 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `dialer` | `string` | 否 | 使用的节点名 |
 | `policy` | `string` | 否 | 选路策略 |
 | `offloaded` | `bool` | 否 | 结束前是否处于 offload 状态 |
-| `start_time` | `string` | 否 | 开始时间（RFC3339Nano UTC） |
-| `end_time` | `string` | 是 | 结束时间（RFC3339Nano UTC） |
+| `start_time` | `string` | 否 | 开始时间（RFC3339 UTC） |
+| `end_time` | `string` | 是 | 结束时间（RFC3339 UTC） |
 | `duration_ms` | `int64` | 是 | 持续毫秒数 |
 | `upload` | `uint64` | 是 | 最终上行总字节 |
 | `download` | `uint64` | 是 | 最终下行总字节 |
@@ -304,7 +305,7 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 }
 ```
 
-- 空值键归入 `"(none)"`。
+- 空值键默认归入 `"(none)"`；其中 `by_domain` 空域名归入 `"(ip-only)"`，`by_rule` 无归因规则归入 `"(unattributed)"`。
 - 超过该维度基数上限的尾部键会折叠合并到 `"other"`。
 - 返回列表按总流量 `upload + download` 降序排列。
 
@@ -479,7 +480,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 | `tcp_connections` | `int` | 是 | 活跃 TCP 流数量 |
 | `udp_sessions` | `int` | 是 | 活跃 UDP endpoint 数量（`O(1)` 原子计数） |
 | `offloaded_tcp` | `int64` | 是 | 当前处于 TCP Sockmap offload 状态的流数量 |
-| `rss_bytes` / `heap_bytes` | `uint64` | 是 | 进程常驻内存（Linux `/proc/self/statm`）、Go live heap 字节数 |
+| `rss_bytes` / `heap_bytes` | `uint64` | 是 | 进程常驻内存（Linux `/proc/self/status` `VmRSS`）、Go live heap 字节数 |
 | `fd_count` / `goroutines` | `int` | 是 | 打开文件描述符数、当前 Goroutine 数 |
 | `dns` | `AdminDNSStats` | 是 | `{cache_entries, inflight, dropped_datagrams, dropped_retries, dropped_retry_failures, upstream_count}` |
 | `fakeip` | `AdminFakeIPStats \| null` | 否 | 未启用 FakeIP 时省略；启用时含 `{ready, disk_ok, live_count, max_live, leases, retained_tombstones, lease_limit, load_warn?}` |
@@ -575,7 +576,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
     - `endpoint` (`string`, omitempty): 脱敏后的 `host:port`（不含协议串和认证信息）
     - `alive` (`bool`): 是否可用
     - `latency_ms` (`int32 | null`, omitempty): 代表性延迟（ms），未探测/失败时省略或 `null`
-    - `admission` (`string`, omitempty): 准入状态（如 `"alive"` / `"suspect"` / `"dead"`）
+    - `admission` (`string`, omitempty): 准入状态（`"alive"` / `"degraded"` / `"dead"`）
     - `reason` (`string`, omitempty): 准入判定原因（如 `"ok"` / `"not_alive"`）
     - `checked_at` (`string`, omitempty): 最近检测时间（RFC3339 UTC）
     - `probes` (`Record<string, AdminProbeHealth>`, omitempty): 按传输路径区分的最近探测结果，常见键为 `"tcp4"`、`"tcp6"`、`"dns4"`、`"dns6"`
@@ -660,9 +661,9 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 
 - **Query 参数**：
   - `limit`：`int`，最大 `1024`
-  - `src`：`string`，按源 IP 或 CIDR 过滤
+  - `src`：`string`，按单个源 IP 过滤（不支持 CIDR，非法值返回 `400 invalid_param`）
   - `mac`：`string`，按客户端 MAC（解析为控制面学到的 IP 集合后过滤）
-  - `resolve_domains`：`true` \| `1` 开启反向 FakeIP 域名解析；默认 `false`
+  - `resolve_domains`：`true` \| `1` 开启基于 DNS 缓存（A/AAAA 应答）的 IP→域名反查；默认 `false`
 - **响应体**（`AdminKernelConnectionsSnapshot`）：
   - 注意：`upload`/`download` 为内核 **IP 层字节数**（含 IP/L4 头部），且仅当系统开启 `net.netfilter.nf_conntrack_acct = 1` 时有计数；`admin_connections` 中的 `upload`/`download` 为应用载荷字节数，请勿直接混加。
 
@@ -783,8 +784,8 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 | --- | --- | --- | --- |
 | `by_src_ip` | 客户端源 IP | 如 `"192.168.1.20"` | `256` |
 | `by_mac` | 客户端 MAC | 如 `"3e:0a:a5:de:ae:a3"` | `256` |
-| `by_domain` | 目标域名 | 如 `"api.example.com"` | `512` |
-| `by_rule` | 命中规则 | 如 `"[12] domain(suffix: example.com) -> proxy"`（无序号则为 `raw`） | `256` |
+| `by_domain` | 目标域名 | 如 `"api.example.com"`；无域名流归入 `"(ip-only)"` | `512` |
+| `by_rule` | 命中规则 | 如 `"#12: domain(suffix: example.com) -> proxy"`（无序号则为 `raw`，未归因则为 `"(unattributed)"`） | `256` |
 | `by_outbound` | 最终出站 | 如 `"proxy"`、`"direct"` | `64` |
 | `by_dialer` | 最终节点 | 如 `"hk-node-01"` | `256` |
 | `by_inbound` | 入站名称 | 如 `"socks-in"` | `32` |
@@ -975,7 +976,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 
 #### `POST /api/v1/sources/refresh`
 
-立即拉取更新外部规则集、Mihomo 配置源与 GeoData，若有内容变更则自动入队热重载。
+立即拉取更新外部规则集、Mihomo 配置源与 GeoData，若有内容变更则自动入队热重载。该路由单次请求写超时放宽至 `180s`（`3m`），且部分失败时的 `warning` 与全失败时的 `refresh_failed` 错误信息均会经过 URI 脱敏与长度截断。
 
 - **请求体**：空
 - **成功响应**（`200`）：
@@ -989,7 +990,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
     "sources": { /* 与 GET /api/v1/sources 结构相同 */ }
   }
   ```
-- **事件推送**：向 WS `events` 主题广播 `sources_refreshed`。
+- **事件推送**：向 WS `events` 主题广播 `sources_refreshed`（其中 `warning` 同样经过脱敏处理）。
 - **错误**：`409 refresh_in_progress`（已有刷新进行中）、`500 refresh_failed`、`503 refresh_unavailable`。
 
 ---
@@ -1097,9 +1098,9 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 
 | 机制 | 参数 | 说明 |
 | --- | --- | --- |
-| 并发客户端上限 | `16` | 超出返回 HTTP `503 too_many_clients` |
+| 并发客户端上限 | `16` | 含待鉴权连接；超出返回 HTTP `503 too_many_clients` |
 | Origin 校验 | `admin_cors_origins` | 若握手带 `Origin` 头且不在白名单内，返回 `403 origin_forbidden` |
-| 鉴权超时 | `3s` | 握手后 3 秒内必须发首帧 `auth`；失败返回 `auth_error` 并以 close code `4001` 关闭 |
+| 失败限流与鉴权超时 | `3s` | 升级前即校验来源 IP 限流（超限直接返回 HTTP `429 rate_limited` + `Retry-After`）；握手后 3 秒内必须发首帧 `auth`；超时、格式非法或密钥错误返回 `auth_error`（均计入失败次数）并以 close code `4001` 关闭；停机或重载变更 `admin_secret`/`admin_listen` 会主动断开所有已连与待鉴权客户端 |
 | 客户端发送队列 | `64` 帧 | 慢消费者满队时直接丢弃新帧（不阻塞数据面与正常客户端） |
 | 单帧读取上限 | `16 KiB` | 控制帧以外 JSON 消息体大小上限 |
 | 心跳（协议层 + 应用层） | Ping `25s` / Pong `60s` | 服务端每 25s 发送 WS Ping；同时支持客户端发送 JSON `{"type":"ping"}` |
@@ -1113,7 +1114,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
    ```
 3. 服务端返回：
    - 成功：`{"type": "auth_ok", "version": "v1"}`
-   - 失败：`{"type": "auth_error", "code": "unauthorized" | "rate_limited", "message": "..."}`，随后 Close `4001`。
+   - 失败：升级前限流返回 HTTP `429 rate_limited`（带 `Retry-After`）；握手后失败返回 `{"type": "auth_error", "code": "unauthorized" | "auth_timeout" | "invalid_auth_frame" | "rate_limited", "message": "..."}`，随后 Close `4001`。
 
 ### 6.3 客户端帧格式
 
@@ -1195,8 +1196,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
     "topic": "events",
     "ts": 1763517605000,
     "seq": 3,
-    "event": "reload_succeeded",
-    "data": null
+    "event": "reload_succeeded"
   }
   ```
 

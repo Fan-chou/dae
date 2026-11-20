@@ -335,8 +335,18 @@ func (a *TrafficAccounting) SetClosedFlowObserver(fn func(AdminClosedFlow)) {
 }
 
 func (a *TrafficAccounting) RecordClosed(flow AdminClosedFlow) {
+	a.RecordClosedWithMark(flow, nil)()
+}
+
+// RecordClosedWithMark appends flow to cumulative accounting, clears any active
+// reset baseline, invokes onRecorded while holding a.mu, and returns a callback
+// that notifies the closed-flow observer outside the accounting lock.
+func (a *TrafficAccounting) RecordClosedWithMark(flow AdminClosedFlow, onRecorded func()) func() {
 	if a == nil {
-		return
+		if onRecorded != nil {
+			onRecorded()
+		}
+		return func() {}
 	}
 	a.mu.Lock()
 	a.nextSeq++
@@ -379,9 +389,15 @@ func (a *TrafficAccounting) RecordClosed(flow AdminClosedFlow) {
 	a.dims.addFlow(flow.SrcIP, flow.Mac, flow.Domain, flow.Rule, flow.Outbound, flow.Dialer, flow.Inbound, flow.Process, up, down)
 
 	obs := a.observer
+	if onRecorded != nil {
+		onRecorded()
+	}
 	a.mu.Unlock()
 
-	if obs != nil {
+	if obs == nil {
+		return func() {}
+	}
+	return func() {
 		obs(flow)
 	}
 }
@@ -441,6 +457,12 @@ func (a *TrafficAccounting) SnapshotClosed(limit int, filter AdminConnectionFilt
 
 // Summary combines closed cumulative accounting with live active flows.
 func (a *TrafficAccounting) Summary(active []AdminConnection, topN int) AdminTrafficSummary {
+	return a.SummaryWithCollector(func() []AdminConnection { return active }, topN)
+}
+
+// SummaryWithCollector snapshots closed accounting and runs collectActive under
+// a.mu so flows finishing concurrently are never double-counted or missed.
+func (a *TrafficAccounting) SummaryWithCollector(collectActive func() []AdminConnection, topN int) AdminTrafficSummary {
 	now := time.Now()
 	if a == nil {
 		return AdminTrafficSummary{
@@ -467,6 +489,10 @@ func (a *TrafficAccounting) Summary(active []AdminConnection, topN int) AdminTra
 	baselines := make(map[string]flowTrafficBaseline, len(a.activeBaselines))
 	for k, v := range a.activeBaselines {
 		baselines[k] = v
+	}
+	var active []AdminConnection
+	if collectActive != nil {
+		active = collectActive()
 	}
 	a.mu.Unlock()
 
@@ -510,6 +536,12 @@ func (a *TrafficAccounting) Summary(active []AdminConnection, topN int) AdminTra
 
 // Reset clears cumulative summary counters and snapshots current active byte baselines.
 func (a *TrafficAccounting) Reset(active []AdminConnection) {
+	a.ResetWithCollector(func() []AdminConnection { return active })
+}
+
+// ResetWithCollector clears cumulative summary counters and captures active
+// baselines under a.mu so concurrently finishing flows do not leave orphan keys.
+func (a *TrafficAccounting) ResetWithCollector(collectActive func() []AdminConnection) {
 	if a == nil {
 		return
 	}
@@ -526,6 +558,10 @@ func (a *TrafficAccounting) Reset(active []AdminConnection) {
 	a.dims.dialer.clear()
 	a.dims.inbound.clear()
 	a.dims.process.clear()
+	var active []AdminConnection
+	if collectActive != nil {
+		active = collectActive()
+	}
 	a.activeBaselines = make(map[string]flowTrafficBaseline, len(active))
 	for _, c := range active {
 		if c.ID != "" {

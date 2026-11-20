@@ -232,7 +232,8 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 	if matchIdx == UnknownRuleMatchIndex && c.routingMatcher != nil {
 		// Option A attribution for kernel-routed flows: read-only userspace rule lookup
-		// without changing kernel-chosen outbound/mark/must.
+		// without changing kernel-chosen outbound/mark/must. Only accept an attribution
+		// whose rule outbound matches the kernel-chosen outboundIndex.
 		proto := consts.L4ProtoType_TCP
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
@@ -243,20 +244,31 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		if dst.Addr().Is4() || dst.Addr().Is4In6() {
 			ipVersion = consts.IpVersion_4
 		}
-		if _, _, _, attrIdx, attrErr := c.routingMatcher.MatchInboundWithRule(
-			p.Inbound,
-			src.Addr().As16(),
-			dst.Addr().As16(),
-			src.Port(),
-			dst.Port(),
-			ipVersion,
-			proto,
-			domain,
-			p.ProcessName,
-			p.Dscp,
-			mac16,
-		); attrErr == nil {
+		lookupRuleForOutbound := func(lookupDomain string) (uint16, bool) {
+			attrOutbound, _, _, attrIdx, attrErr := c.routingMatcher.MatchInboundWithRule(
+				p.Inbound,
+				src.Addr().As16(),
+				dst.Addr().As16(),
+				src.Port(),
+				dst.Port(),
+				ipVersion,
+				proto,
+				lookupDomain,
+				p.ProcessName,
+				p.Dscp,
+				mac16,
+			)
+			if attrErr == nil && attrOutbound != consts.OutboundControlPlaneRouting && attrOutbound == outboundIndex {
+				return attrIdx, true
+			}
+			return UnknownRuleMatchIndex, false
+		}
+		if attrIdx, ok := lookupRuleForOutbound(domain); ok {
 			matchIdx = attrIdx
+		} else if domain != "" {
+			if attrIdx, ok := lookupRuleForOutbound(""); ok {
+				matchIdx = attrIdx
+			}
 		}
 	}
 	ruleMeta := c.routingMatcher.RuleMetaForMatchIndex(matchIdx)

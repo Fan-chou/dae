@@ -274,14 +274,15 @@ func (c *ControlPlane) AdminMetricsSnapshot() AdminMetricsSnapshot {
 	if c == nil {
 		return snap
 	}
+	tcpConnections := c.ActiveTCPConnections()
 	stats := c.SnapshotRuntimeScalars()
 	snap.UploadRate = stats.UploadRate
 	snap.DownloadRate = stats.DownloadRate
 	snap.UploadTotal = stats.UploadTotal
 	snap.DownloadTotal = stats.DownloadTotal
-	snap.ActiveConnections = stats.ActiveConnections
-	snap.TCPConnections = c.ActiveTCPConnections()
+	snap.TCPConnections = tcpConnections
 	snap.UDPSessions = stats.UDPSessions
+	snap.ActiveConnections = snap.TCPConnections + snap.UDPSessions
 	snap.TCPConnPanicCount = c.tcpConnPanicCount.Load()
 
 	if dns := c.ActiveDnsController(); dns != nil {

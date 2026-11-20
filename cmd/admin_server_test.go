@@ -21,6 +21,7 @@ import (
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
+	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 )
 
@@ -482,6 +483,109 @@ func TestAdminSystemMetricsLogsLogLevelAndSourcesRefresh(t *testing.T) {
 	}
 	if rec := do(http.MethodGet, "/api/v1/debug/quality?group=test", ""); rec.Code != http.StatusOK {
 		t.Fatalf("debug/quality code=%d", rec.Code)
+	}
+}
+
+func TestAdminSourcesRefreshSanitizesPartialAndFullErrors(t *testing.T) {
+	t.Parallel()
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return &stubAdminPlane{} }, nil)
+	server.secret = "test-token"
+	t.Cleanup(server.shutdown)
+
+	ts := httptest.NewServer(server.withSecurityHeaders(server.buildMux()))
+	t.Cleanup(ts.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsConn.Close()
+	if err := wsConn.WriteJSON(wsClientFrame{Type: "auth", Token: "test-token"}); err != nil {
+		t.Fatal(err)
+	}
+	var authOK wsServerFrame
+	if err := wsConn.ReadJSON(&authOK); err != nil || authOK.Type != "auth_ok" {
+		t.Fatalf("auth_ok failed: %+v err=%v", authOK, err)
+	}
+	if err := wsConn.WriteJSON(wsClientFrame{Type: "sub", Topic: "events"}); err != nil {
+		t.Fatal(err)
+	}
+
+	server.setSourcesRefresher(func(context.Context) (adminSourcesRefreshResult, error) {
+		return adminSourcesRefreshResult{
+			Changed: true,
+			Warning: "failed https://user:secret@sub.example.com/path?token=abc",
+		}, nil
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/sources/refresh", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partialBody struct {
+		Warning string `json:"warning"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&partialBody); err != nil {
+		_ = resp.Body.Close()
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("partial refresh status = %d", resp.StatusCode)
+	}
+	if strings.Contains(partialBody.Warning, "secret") || strings.Contains(partialBody.Warning, "token=abc") || strings.Contains(partialBody.Warning, "://") || !strings.Contains(partialBody.Warning, "[redacted-uri]") {
+		t.Fatalf("partial warning not sanitized: %q", partialBody.Warning)
+	}
+
+	_ = wsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var ev wsServerFrame
+	for {
+		if err := wsConn.ReadJSON(&ev); err != nil {
+			t.Fatalf("expected sources_refreshed WS event: %v", err)
+		}
+		if ev.Type == "event" && ev.Event == "sources_refreshed" {
+			break
+		}
+	}
+	evData, ok := ev.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected WS event data: %#v", ev.Data)
+	}
+	wsWarning, _ := evData["warning"].(string)
+	if strings.Contains(wsWarning, "secret") || strings.Contains(wsWarning, "token=abc") || strings.Contains(wsWarning, "://") || !strings.Contains(wsWarning, "[redacted-uri]") {
+		t.Fatalf("WS sources_refreshed warning not sanitized: %q", wsWarning)
+	}
+
+	server.setSourcesRefresher(func(context.Context) (adminSourcesRefreshResult, error) {
+		return adminSourcesRefreshResult{}, errors.New("get https://user:secret@sub.example.com/sub: timeout")
+	})
+	req2, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/sources/refresh", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Authorization", "Bearer test-token")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errBody adminAPIErrorBody
+	if err := json.NewDecoder(resp2.Body).Decode(&errBody); err != nil {
+		_ = resp2.Body.Close()
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusInternalServerError || errBody.Error.Code != "refresh_failed" {
+		t.Fatalf("full failure status=%d body=%+v", resp2.StatusCode, errBody)
+	}
+	if strings.Contains(errBody.Error.Message, "secret") || strings.Contains(errBody.Error.Message, "://") || errBody.Error.Message == "config validation failed" || !strings.Contains(errBody.Error.Message, "[redacted-uri]") {
+		t.Fatalf("unexpected sanitized full refresh error: %q", errBody.Error.Message)
 	}
 }
 

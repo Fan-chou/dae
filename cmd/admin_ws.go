@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,7 +25,6 @@ import (
 const (
 	wsMaxClients           = 16
 	wsSendQueueSize        = 64
-	wsAuthTimeout          = 3 * time.Second
 	wsWriteWait            = 5 * time.Second
 	wsPongWait             = 60 * time.Second
 	wsPingPeriod           = 25 * time.Second
@@ -33,6 +33,8 @@ const (
 	wsDefaultGroupsMs      = 5000
 	wsMaxFrameBytes        = 16 << 10
 )
+
+var wsAuthTimeout = 3 * time.Second
 
 type wsClientFrame struct {
 	Type       string                        `json:"type"`
@@ -91,6 +93,15 @@ func (c *wsClient) close() {
 	})
 }
 
+func (c *wsClient) isClosed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *wsClient) enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
@@ -123,6 +134,9 @@ type adminWSHub struct {
 	mu            sync.Mutex
 	closed        bool
 	clients       map[*wsClient]struct{}
+	pending       map[*wsClient]struct{}
+	pendingSlots  int
+	disconnectGen uint64
 	topicSeq      map[string]uint64
 	metricsCancel context.CancelFunc
 	connsCancel   context.CancelFunc
@@ -137,6 +151,7 @@ func newAdminWSHub(server *adminServer) *adminWSHub {
 	return &adminWSHub{
 		server:   server,
 		clients:  make(map[*wsClient]struct{}),
+		pending:  make(map[*wsClient]struct{}),
 		topicSeq: make(map[string]uint64),
 	}
 }
@@ -147,8 +162,12 @@ func (h *adminWSHub) close() {
 	}
 	h.mu.Lock()
 	h.closed = true
-	clients := make([]*wsClient, 0, len(h.clients))
+	h.disconnectGen++
+	clients := make([]*wsClient, 0, len(h.clients)+len(h.pending))
 	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	for c := range h.pending {
 		clients = append(clients, c)
 	}
 	if h.metricsCancel != nil {
@@ -166,6 +185,7 @@ func (h *adminWSHub) close() {
 	if h.logsCancel != nil {
 		h.logsCancel()
 		h.logsCancel = nil
+		h.logsDone = nil
 	}
 	h.flowsActive = false
 	h.mu.Unlock()
@@ -175,6 +195,51 @@ func (h *adminWSHub) close() {
 		c.close()
 	}
 	h.wg.Wait()
+}
+
+// disconnectAll drops all active and pending WebSocket clients without shutting
+// down the hub permanently (used on admin_secret or admin_listen hot reload).
+func (h *adminWSHub) disconnectAll() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.disconnectGen++
+	clients := make([]*wsClient, 0, len(h.clients)+len(h.pending))
+	for c := range h.clients {
+		clients = append(clients, c)
+		delete(h.clients, c)
+	}
+	for c := range h.pending {
+		clients = append(clients, c)
+	}
+	if h.metricsCancel != nil {
+		h.metricsCancel()
+		h.metricsCancel = nil
+	}
+	if h.connsCancel != nil {
+		h.connsCancel()
+		h.connsCancel = nil
+	}
+	if h.groupsCancel != nil {
+		h.groupsCancel()
+		h.groupsCancel = nil
+	}
+	if h.logsCancel != nil {
+		h.logsCancel()
+		h.logsCancel = nil
+		h.logsDone = nil
+	}
+	flowsWereActive := h.flowsActive
+	h.flowsActive = false
+	h.mu.Unlock()
+
+	if flowsWereActive {
+		h.syncFlowObserver()
+	}
+	for _, c := range clients {
+		c.close()
+	}
 }
 
 func (h *adminWSHub) ActiveClients() int {
@@ -227,18 +292,49 @@ func (h *adminWSHub) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	clientIP := clientIPFromRequest(r)
+	if h.server != nil && h.server.authLimiter != nil {
+		if allowed, retryAfter := h.server.authLimiter.allow(clientIP); !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeAdminAPIError(w, http.StatusTooManyRequests, "rate_limited", "too many authentication failures")
+			return
+		}
+	}
+
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
 		writeAdminAPIError(w, http.StatusServiceUnavailable, "shutting_down", "server is shutting down")
 		return
 	}
-	if len(h.clients) >= wsMaxClients {
+	if len(h.clients)+h.pendingSlots >= wsMaxClients {
 		h.mu.Unlock()
 		writeAdminAPIError(w, http.StatusServiceUnavailable, "too_many_clients", "maximum WebSocket clients reached")
 		return
 	}
+	h.pendingSlots++
+	gen := h.disconnectGen
+	h.wg.Add(1)
 	h.mu.Unlock()
+	defer h.wg.Done()
+
+	slotHeld := true
+	var pendingClient *wsClient
+	releasePending := func() {
+		if !slotHeld {
+			return
+		}
+		slotHeld = false
+		h.mu.Lock()
+		if pendingClient != nil {
+			delete(h.pending, pendingClient)
+		}
+		if h.pendingSlots > 0 {
+			h.pendingSlots--
+		}
+		h.mu.Unlock()
+	}
+	defer releasePending()
 
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  4096,
@@ -264,21 +360,37 @@ func (h *adminWSHub) handleWS(w http.ResponseWriter, r *http.Request) {
 		subs:   make(map[string]*wsTopicSub),
 	}
 
+	h.mu.Lock()
+	if h.closed || h.disconnectGen != gen {
+		h.mu.Unlock()
+		client.close()
+		return
+	}
+	pendingClient = client
+	h.pending[client] = struct{}{}
+	h.mu.Unlock()
+
 	if !h.authenticateClient(client, r) {
 		client.close()
 		return
 	}
 
 	h.mu.Lock()
-	if h.closed || len(h.clients) >= wsMaxClients {
+	delete(h.pending, client)
+	pendingClient = nil
+	if h.pendingSlots > 0 {
+		h.pendingSlots--
+	}
+	slotHeld = false
+	if h.closed || h.disconnectGen != gen || len(h.clients) >= wsMaxClients {
 		h.mu.Unlock()
 		client.close()
 		return
 	}
 	h.clients[client] = struct{}{}
+	h.wg.Add(2)
 	h.mu.Unlock()
 
-	h.wg.Add(2)
 	go func() {
 		defer h.wg.Done()
 		client.writePump()
@@ -292,7 +404,7 @@ func (h *adminWSHub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (h *adminWSHub) authenticateClient(client *wsClient, r *http.Request) bool {
 	clientIP := clientIPFromRequest(r)
-	if h.server.authLimiter != nil {
+	if h.server != nil && h.server.authLimiter != nil {
 		if allowed, retryAfter := h.server.authLimiter.allow(clientIP); !allowed {
 			_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 			_ = client.conn.WriteJSON(wsServerFrame{
@@ -309,11 +421,30 @@ func (h *adminWSHub) authenticateClient(client *wsClient, r *http.Request) bool 
 	_ = client.conn.SetReadDeadline(time.Now().Add(wsAuthTimeout))
 	var frame wsClientFrame
 	if err := client.conn.ReadJSON(&frame); err != nil {
-		_ = client.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4001, "authentication timeout"), time.Now().Add(wsWriteWait))
+		if client.isClosed() {
+			return false
+		}
+		if h.server != nil && h.server.authLimiter != nil {
+			h.server.authLimiter.recordFailure(clientIP)
+		}
+		var netErr net.Error
+		code := "invalid_auth_frame"
+		msg := "invalid authentication frame"
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			code = "auth_timeout"
+			msg = "authentication timeout"
+		}
+		_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		_ = client.conn.WriteJSON(wsServerFrame{
+			Type: "auth_error",
+			Code: code,
+			Msg:  msg,
+		})
+		_ = client.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4001, msg), time.Now().Add(wsWriteWait))
 		return false
 	}
 	if frame.Type != "auth" || !adminSecretMatches(frame.Token, h.server.currentSecret()) {
-		if h.server.authLimiter != nil {
+		if h.server != nil && h.server.authLimiter != nil {
 			h.server.authLimiter.recordFailure(clientIP)
 		}
 		_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
@@ -325,7 +456,7 @@ func (h *adminWSHub) authenticateClient(client *wsClient, r *http.Request) bool 
 		_ = client.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4001, "unauthorized"), time.Now().Add(wsWriteWait))
 		return false
 	}
-	if h.server.authLimiter != nil {
+	if h.server != nil && h.server.authLimiter != nil {
 		h.server.authLimiter.recordSuccess(clientIP)
 	}
 	_ = client.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))

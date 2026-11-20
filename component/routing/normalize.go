@@ -8,6 +8,7 @@ package routing
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -18,6 +19,27 @@ const (
 	maxRuleSummaryParams = 3
 	maxRuleSummaryLen    = 128
 )
+
+func truncateUTF8WithEllipsis(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 3 {
+		i := maxBytes
+		for i > 0 && !utf8.RuneStart(s[i]) {
+			i--
+		}
+		return s[:i]
+	}
+	i := maxBytes - 3
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i] + "..."
+}
 
 // SummarizeRoutingRule builds a concise, URI-safe display summary of a routing rule.
 func SummarizeRoutingRule(r *config_parser.RoutingRule) string {
@@ -74,10 +96,7 @@ func SummarizeRoutingRule(r *config_parser.RoutingRule) string {
 	}
 	out := sanitizeSummaryToken(outStr)
 	summary := left + " -> " + out
-	if len(summary) > maxRuleSummaryLen {
-		return summary[:maxRuleSummaryLen-3] + "..."
-	}
-	return summary
+	return truncateUTF8WithEllipsis(summary, maxRuleSummaryLen)
 }
 
 func sanitizeSummaryToken(s string) string {

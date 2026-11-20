@@ -6,9 +6,12 @@
 package cmd
 
 import (
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,4 +151,251 @@ func TestAdminWebSocketOriginAuthMultiplexAndZeroIdleCleanup(t *testing.T) {
 	if c.dropped.Load() != 20 {
 		t.Fatalf("expected 20 dropped WS frames on full queue, got %d", c.dropped.Load())
 	}
+}
+
+func TestAdminWebSocketWaitGroupCloseRace(t *testing.T) {
+	for round := 0; round < 12; round++ {
+		plane := &stubAdminPlane{}
+		server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+		server.secret = "ws-secret"
+		ts := httptest.NewServer(server.withSecurityHeaders(server.buildMux()))
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+
+		var wg sync.WaitGroup
+		for i := 0; i < 6; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+				if err != nil {
+					if resp != nil && resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+					return
+				}
+				defer conn.Close()
+				_ = conn.WriteJSON(wsClientFrame{Type: "auth", Token: "ws-secret"})
+				var f wsServerFrame
+				_ = conn.ReadJSON(&f)
+			}()
+		}
+		time.Sleep(5 * time.Millisecond)
+		server.shutdown()
+		wg.Wait()
+		ts.Close()
+	}
+}
+
+func TestAdminWebSocketDisconnectsOnSecretChangeAndListenDisable(t *testing.T) {
+	addr := reserveTestLoopbackAddr(t)
+	plane := &stubAdminPlane{}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	t.Cleanup(server.shutdown)
+
+	server.refresh(addr, "sec1")
+	wsURL := "ws://" + addr + "/api/v1/ws"
+
+	dialAndAuth := func(secret string) (*websocket.Conn, error) {
+		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, err
+		}
+		if err := conn.WriteJSON(wsClientFrame{Type: "auth", Token: secret}); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		var okFrame wsServerFrame
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.ReadJSON(&okFrame); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if okFrame.Type != "auth_ok" {
+			_ = conn.Close()
+			return nil, fmt.Errorf("unexpected auth frame: %+v", okFrame)
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		return conn, nil
+	}
+
+	c1, err := dialAndAuth("sec1")
+	if err != nil {
+		t.Fatalf("initial WS dial/auth failed: %v", err)
+	}
+	defer c1.Close()
+	for _, topic := range []string{"metrics", "flows", "events"} {
+		if err := c1.WriteJSON(wsClientFrame{Type: "sub", Topic: topic, IntervalMs: 500}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for plane.getClosedFlowObserver() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if plane.getClosedFlowObserver() == nil {
+		t.Fatal("expected flows observer to be installed")
+	}
+
+	// Secret change must immediately drop c1 and clear the flow observer.
+	server.refresh(addr, "sec2")
+	_ = c1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var f wsServerFrame
+		if err := c1.ReadJSON(&f); err != nil {
+			break
+		}
+	}
+	if server.wsHub.ActiveClients() != 0 {
+		t.Fatalf("expected 0 active clients after secret rotation, got %d", server.wsHub.ActiveClients())
+	}
+	if plane.getClosedFlowObserver() != nil {
+		t.Fatal("expected closed flow observer to be cleared after secret rotation")
+	}
+
+	// New secret works on the refreshed server; disabling listen disconnects it too.
+	c2, err := dialAndAuth("sec2")
+	if err != nil {
+		t.Fatalf("WS dial/auth with sec2 failed: %v", err)
+	}
+	defer c2.Close()
+
+	server.refresh("", "sec2")
+	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var f wsServerFrame
+		if err := c2.ReadJSON(&f); err != nil {
+			break
+		}
+	}
+	if server.wsHub.ActiveClients() != 0 {
+		t.Fatalf("expected 0 active clients after disabling admin_listen, got %d", server.wsHub.ActiveClients())
+	}
+}
+
+func TestAdminWebSocketPreUpgradeRateLimitPendingCapShutdownAndMalformedAuth(t *testing.T) {
+	t.Run("malformed auth frame records failure and triggers pre-upgrade 429", func(t *testing.T) {
+		server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return &stubAdminPlane{} }, nil)
+		server.secret = "ws-secret"
+		t.Cleanup(server.shutdown)
+		ts := httptest.NewServer(server.withSecurityHeaders(server.buildMux()))
+		t.Cleanup(ts.Close)
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+
+		for i := 0; i < adminAuthMaxFailures; i++ {
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				t.Fatalf("dial %d failed: %v", i, err)
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("not-json")); err != nil {
+				_ = conn.Close()
+				t.Fatalf("write malformed frame %d failed: %v", i, err)
+			}
+			var errFrame wsServerFrame
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if err := conn.ReadJSON(&errFrame); err != nil {
+				_ = conn.Close()
+				t.Fatalf("read auth_error %d failed: %v", i, err)
+			}
+			_ = conn.Close()
+			if errFrame.Type != "auth_error" || errFrame.Code != "invalid_auth_frame" {
+				t.Fatalf("expected invalid_auth_frame, got %+v", errFrame)
+			}
+		}
+
+		// Subsequent attempt must be rejected with HTTP 429 BEFORE WebSocket upgrade.
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err == nil || resp == nil {
+			t.Fatalf("expected handshake rejection, got err=%v resp=%v", err, resp)
+		}
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("expected HTTP 429 + Retry-After before upgrade, got status=%d headers=%+v", resp.StatusCode, resp.Header)
+		}
+	})
+
+	t.Run("auth timeout sends auth_timeout and records failure", func(t *testing.T) {
+		origTimeout := wsAuthTimeout
+		wsAuthTimeout = 120 * time.Millisecond
+		t.Cleanup(func() { wsAuthTimeout = origTimeout })
+
+		server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return &stubAdminPlane{} }, nil)
+		server.secret = "ws-secret"
+		t.Cleanup(server.shutdown)
+		ts := httptest.NewServer(server.withSecurityHeaders(server.buildMux()))
+		t.Cleanup(ts.Close)
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		var errFrame wsServerFrame
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.ReadJSON(&errFrame); err != nil {
+			t.Fatalf("expected auth_error frame on timeout, got err=%v", err)
+		}
+		if errFrame.Type != "auth_error" || errFrame.Code != "auth_timeout" {
+			t.Fatalf("expected auth_timeout frame, got %+v", errFrame)
+		}
+
+		host, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+		server.authLimiter.mu.Lock()
+		entry := server.authLimiter.entries[normalizeAdminRemoteIP(host)]
+		server.authLimiter.mu.Unlock()
+		if entry.count != 1 {
+			t.Fatalf("expected auth timeout to record 1 failure, got %d", entry.count)
+		}
+	})
+
+	t.Run("pending unauthenticated connections honor wsMaxClients and shutdown interrupts cleanly", func(t *testing.T) {
+		server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return &stubAdminPlane{} }, nil)
+		server.secret = "ws-secret"
+		ts := httptest.NewServer(server.withSecurityHeaders(server.buildMux()))
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/v1/ws"
+
+		conns := make([]*websocket.Conn, 0, wsMaxClients)
+		defer func() {
+			for _, c := range conns {
+				_ = c.Close()
+			}
+		}()
+		for i := 0; i < wsMaxClients; i++ {
+			c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				t.Fatalf("pending dial %d failed: %v", i, err)
+			}
+			conns = append(conns, c)
+		}
+
+		// 17th pending connection must be rejected with 503 too_many_clients.
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err == nil || resp == nil {
+			t.Fatalf("expected 503 for 17th pending client, got err=%v resp=%v", err, resp)
+		}
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 too_many_clients, got %d", resp.StatusCode)
+		}
+
+		// Shutdown must interrupt all pending connections quickly without waiting for 3s wsAuthTimeout
+		// and without charging auth failures to the client IP.
+		start := time.Now()
+		server.shutdown()
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("shutdown took too long with pending WS clients: %v", elapsed)
+		}
+		if server.authLimiter.hasFailures.Load() {
+			t.Fatal("server shutdown must not record auth failures for interrupted pending WS clients")
+		}
+	})
 }

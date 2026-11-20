@@ -6,7 +6,9 @@
 package routing
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
@@ -101,5 +103,41 @@ func TestSummarizeRoutingRuleRedactsURIAndBoundsLength(t *testing.T) {
 	summary := SummarizeRoutingRule(rule)
 	if summary != "domain(suffix:[redacted]) -> proxy" {
 		t.Fatalf("unexpected sanitized summary: %q", summary)
+	}
+}
+
+func TestSummarizeRoutingRuleTruncatesUTF8Safely(t *testing.T) {
+	// Ensure truncation at maxRuleSummaryLen (128) does not split a multi-byte rune.
+	val := "a" + strings.Repeat("测", 50) + "🚀"
+	rule := &config_parser.RoutingRule{
+		AndFunctions: []*config_parser.Function{{
+			Name:   "pname",
+			Params: []*config_parser.Param{{Val: val}},
+		}},
+		Outbound: config_parser.Function{Name: "proxy"},
+	}
+	summary := SummarizeRoutingRule(rule)
+	if !utf8.ValidString(summary) {
+		t.Fatalf("SummarizeRoutingRule produced invalid UTF-8: %q", summary)
+	}
+	if len(summary) > maxRuleSummaryLen || !strings.HasSuffix(summary, "...") {
+		t.Fatalf("unexpected truncated summary (len=%d): %q", len(summary), summary)
+	}
+}
+
+var benchRuleSummarySink string
+
+func BenchmarkSummarizeRoutingRuleUTF8(b *testing.B) {
+	rule := &config_parser.RoutingRule{
+		AndFunctions: []*config_parser.Function{{
+			Name:   "pname",
+			Params: []*config_parser.Param{{Val: "a" + strings.Repeat("测", 50) + "🚀"}},
+		}},
+		Outbound: config_parser.Function{Name: "proxy"},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchRuleSummarySink = SummarizeRoutingRule(rule)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func writeRestrictedDae(t *testing.T, path, body string) {
@@ -480,5 +481,18 @@ func TestAdminConfigWriteMuSerializesConfigAndInboundsWrites(t *testing.T) {
 	}
 	if _, err := os.Stat(configPath + ".admin-bak"); !os.IsNotExist(err) {
 		t.Fatalf("backup left behind: %v", err)
+	}
+}
+
+func TestSanitizeAdminErrorTruncatesUTF8Safely(t *testing.T) {
+	t.Parallel()
+	// 133 * 3 + 2 = 401 bytes: byte 400 cuts inside the final 3-byte Chinese rune.
+	msg := "ab" + strings.Repeat("汉", 134) + "😀"
+	got := sanitizeAdminError(errors.New(msg))
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeAdminError produced invalid UTF-8: %q", got)
+	}
+	if len(got) > 400 || len(got) == 0 {
+		t.Fatalf("unexpected truncated length %d", len(got))
 	}
 }
