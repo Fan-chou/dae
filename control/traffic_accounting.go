@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,48 +51,57 @@ func flowCloseReasonString(code int32) string {
 
 // AdminClosedFlow is one completed or interrupted connection kept in the bounded ring.
 type AdminClosedFlow struct {
-	Seq         uint64           `json:"seq"`
-	ID          string           `json:"id"`
-	Network     string           `json:"network"`
-	Inbound     string           `json:"inbound,omitempty"`
-	SrcIP       string           `json:"src_ip"`
-	SrcPort     uint16           `json:"src_port"`
-	DstIP       string           `json:"dst_ip"`
-	DstPort     uint16           `json:"dst_port"`
-	Target      string           `json:"target,omitempty"`
-	Domain      string           `json:"domain,omitempty"`
-	Mac         string           `json:"mac,omitempty"`
-	Process     string           `json:"process,omitempty"`
-	Rule        *RoutingRuleMeta `json:"rule,omitempty"`
-	Outbound    string           `json:"outbound"`
-	Dialer      string           `json:"dialer,omitempty"`
-	Policy      string           `json:"policy,omitempty"`
-	Offloaded   bool             `json:"offloaded,omitempty"`
-	StartTime   string           `json:"start_time,omitempty"`
-	EndTime     string           `json:"end_time"`
-	DurationMs  int64            `json:"duration_ms"`
-	Upload      uint64           `json:"upload"`
-	Download    uint64           `json:"download"`
-	CloseReason string           `json:"close_reason"`
+	Seq           uint64           `json:"seq"`
+	ID            string           `json:"id"`
+	Network       string           `json:"network"`
+	Inbound       string           `json:"inbound,omitempty"`
+	SrcIP         string           `json:"src_ip"`
+	SrcPort       uint16           `json:"src_port"`
+	DstIP         string           `json:"dst_ip"`
+	DstPort       uint16           `json:"dst_port"`
+	Target        string           `json:"target,omitempty"`
+	Domain        string           `json:"domain,omitempty"`
+	SniffedDomain string           `json:"sniffed_domain,omitempty"`
+	StickySite    string           `json:"sticky_site,omitempty"`
+	Mac           string           `json:"mac,omitempty"`
+	Process       string           `json:"process,omitempty"`
+	Rule          *RoutingRuleMeta `json:"rule,omitempty"`
+	Outbound      string           `json:"outbound"`
+	Dialer        string           `json:"dialer,omitempty"`
+	Chain         []string         `json:"chain,omitempty"`
+	Policy        string           `json:"policy,omitempty"`
+	Offloaded     bool             `json:"offloaded,omitempty"`
+	StartTime     string           `json:"start_time,omitempty"`
+	EndTime       string           `json:"end_time"`
+	DurationMs    int64            `json:"duration_ms"`
+	Upload        uint64           `json:"upload"`
+	Download      uint64           `json:"download"`
+	CloseReason   string           `json:"close_reason"`
 }
 
 func (f AdminClosedFlow) matches(filter AdminConnectionFilter) bool {
+	if filter.CloseReason != "" && !strings.EqualFold(f.CloseReason, filter.CloseReason) {
+		return false
+	}
+	sub := filter
+	sub.CloseReason = ""
 	return AdminConnection{
-		ID:       f.ID,
-		Network:  f.Network,
-		Inbound:  f.Inbound,
-		SrcIP:    f.SrcIP,
-		SrcPort:  f.SrcPort,
-		DstIP:    f.DstIP,
-		DstPort:  f.DstPort,
-		Target:   f.Target,
-		Domain:   f.Domain,
-		Mac:      f.Mac,
-		Process:  f.Process,
-		Rule:     f.Rule,
-		Outbound: f.Outbound,
-		Dialer:   f.Dialer,
-	}.matches(filter)
+		ID:        f.ID,
+		Network:   f.Network,
+		Inbound:   f.Inbound,
+		SrcIP:     f.SrcIP,
+		SrcPort:   f.SrcPort,
+		DstIP:     f.DstIP,
+		DstPort:   f.DstPort,
+		Target:    f.Target,
+		Domain:    f.Domain,
+		Mac:       f.Mac,
+		Process:   f.Process,
+		Rule:      f.Rule,
+		Outbound:  f.Outbound,
+		Dialer:    f.Dialer,
+		Offloaded: f.Offloaded,
+	}.matches(sub)
 }
 
 // AdminClosedFlowsSnapshot is returned by GET /api/v1/flows/closed.
@@ -424,6 +434,11 @@ func clampTrafficTopN(topN int) int {
 
 // SnapshotClosed returns closed flows newest-first matching filter.
 func (a *TrafficAccounting) SnapshotClosed(limit int, filter AdminConnectionFilter) AdminClosedFlowsSnapshot {
+	return a.SnapshotClosedAfter(limit, filter, 0)
+}
+
+// SnapshotClosedAfter returns closed flows newest-first with Seq > afterSeq matching filter.
+func (a *TrafficAccounting) SnapshotClosedAfter(limit int, filter AdminConnectionFilter, afterSeq uint64) AdminClosedFlowsSnapshot {
 	nowMs := time.Now().UnixMilli()
 	if a == nil {
 		return AdminClosedFlowsSnapshot{Flows: []AdminClosedFlow{}, SnapshotAtMs: nowMs}
@@ -434,9 +449,13 @@ func (a *TrafficAccounting) SnapshotClosed(limit int, filter AdminConnectionFilt
 	a.mu.Lock()
 	matchedTotal := 0
 	out := make([]AdminClosedFlow, 0, min(limit, a.ringLen))
-	// Walk newest -> oldest.
+	// Walk newest -> oldest. Seq increases strictly monotonically, so once we
+	// reach Seq <= afterSeq all older entries can be skipped.
 	for i := a.ringLen - 1; i >= 0; i-- {
 		flow := a.ring[(a.ringHead+i)%len(a.ring)]
+		if afterSeq > 0 && flow.Seq <= afterSeq {
+			break
+		}
 		if !filter.IsEmpty() && !flow.matches(filter) {
 			continue
 		}
@@ -577,56 +596,62 @@ func (a *TrafficAccounting) ResetWithCollector(collectActive func() []AdminConne
 func (f *FlowRuntime) toClosedFlow(now time.Time) AdminClosedFlow {
 	item := adminConnectionFromTCPAt(f, now)
 	return AdminClosedFlow{
-		ID:          item.ID,
-		Network:     item.Network,
-		Inbound:     item.Inbound,
-		SrcIP:       item.SrcIP,
-		SrcPort:     item.SrcPort,
-		DstIP:       item.DstIP,
-		DstPort:     item.DstPort,
-		Target:      item.Target,
-		Domain:      item.Domain,
-		Mac:         item.Mac,
-		Process:     item.Process,
-		Rule:        item.Rule,
-		Outbound:    item.Outbound,
-		Dialer:      item.Dialer,
-		Policy:      item.Policy,
-		Offloaded:   item.Offloaded,
-		StartTime:   item.StartTime,
-		EndTime:     now.UTC().Format(time.RFC3339),
-		DurationMs:  item.DurationMs,
-		Upload:      item.Upload,
-		Download:    item.Download,
-		CloseReason: flowCloseReasonString(f.closeReason.Load()),
+		ID:            item.ID,
+		Network:       item.Network,
+		Inbound:       item.Inbound,
+		SrcIP:         item.SrcIP,
+		SrcPort:       item.SrcPort,
+		DstIP:         item.DstIP,
+		DstPort:       item.DstPort,
+		Target:        item.Target,
+		Domain:        item.Domain,
+		SniffedDomain: item.SniffedDomain,
+		StickySite:    item.StickySite,
+		Mac:           item.Mac,
+		Process:       item.Process,
+		Rule:          item.Rule,
+		Outbound:      item.Outbound,
+		Dialer:        item.Dialer,
+		Chain:         item.Chain,
+		Policy:        item.Policy,
+		Offloaded:     item.Offloaded,
+		StartTime:     item.StartTime,
+		EndTime:       now.UTC().Format(time.RFC3339),
+		DurationMs:    item.DurationMs,
+		Upload:        item.Upload,
+		Download:      item.Download,
+		CloseReason:   flowCloseReasonString(f.closeReason.Load()),
 	}
 }
 
 func (f *UDPFlowRuntime) toClosedFlow(now time.Time) AdminClosedFlow {
 	item := adminConnectionFromUDPAt(f, now)
 	return AdminClosedFlow{
-		ID:          item.ID,
-		Network:     item.Network,
-		Inbound:     item.Inbound,
-		SrcIP:       item.SrcIP,
-		SrcPort:     item.SrcPort,
-		DstIP:       item.DstIP,
-		DstPort:     item.DstPort,
-		Target:      item.Target,
-		Domain:      item.Domain,
-		Mac:         item.Mac,
-		Process:     item.Process,
-		Rule:        item.Rule,
-		Outbound:    item.Outbound,
-		Dialer:      item.Dialer,
-		Policy:      item.Policy,
-		Offloaded:   false,
-		StartTime:   item.StartTime,
-		EndTime:     now.UTC().Format(time.RFC3339),
-		DurationMs:  item.DurationMs,
-		Upload:      item.Upload,
-		Download:    item.Download,
-		CloseReason: flowCloseReasonString(f.closeReason.Load()),
+		ID:            item.ID,
+		Network:       item.Network,
+		Inbound:       item.Inbound,
+		SrcIP:         item.SrcIP,
+		SrcPort:       item.SrcPort,
+		DstIP:         item.DstIP,
+		DstPort:       item.DstPort,
+		Target:        item.Target,
+		Domain:        item.Domain,
+		SniffedDomain: item.SniffedDomain,
+		StickySite:    item.StickySite,
+		Mac:           item.Mac,
+		Process:       item.Process,
+		Rule:          item.Rule,
+		Outbound:      item.Outbound,
+		Dialer:        item.Dialer,
+		Chain:         item.Chain,
+		Policy:        item.Policy,
+		Offloaded:     false,
+		StartTime:     item.StartTime,
+		EndTime:       now.UTC().Format(time.RFC3339),
+		DurationMs:    item.DurationMs,
+		Upload:        item.Upload,
+		Download:      item.Download,
+		CloseReason:   flowCloseReasonString(f.closeReason.Load()),
 	}
 }
 

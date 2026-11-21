@@ -101,7 +101,8 @@ func (w *reloadWorker) run() {
 		resetReloadProxyRuntimeState()
 
 		// Load new config.
-		abortConnections := os.Remove(AbortFile) == nil
+		abortFromFile := os.Remove(AbortFile) == nil
+		abortConnections := req.abortConnections || abortFromFile
 		w.log.Warnln("[Reload] Load new config")
 		var newConf *config.Config
 		var loadedSnapshot *adminConfigSnapshot

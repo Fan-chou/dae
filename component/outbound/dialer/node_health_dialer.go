@@ -6,11 +6,96 @@
 package dialer
 
 import (
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 )
+
+// AdmissionChangeEvent describes a node admission state transition for event listeners.
+type AdmissionChangeEvent struct {
+	Node      string `json:"node"`
+	Network   string `json:"network"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Reason    string `json:"reason"`
+	LatencyMs *int32 `json:"latency_ms,omitempty"`
+}
+
+var (
+	hasAdmissionListeners atomic.Bool
+	admissionListenerMu   sync.Mutex
+	admissionListeners    = make(map[uint64]func(AdmissionChangeEvent))
+	admissionListenerSeq  uint64
+)
+
+// RegisterAdmissionChangeListener registers a listener for node admission transitions
+// and returns an idempotent unregister function.
+func RegisterAdmissionChangeListener(fn func(AdmissionChangeEvent)) func() {
+	if fn == nil {
+		return func() {}
+	}
+	admissionListenerMu.Lock()
+	admissionListenerSeq++
+	id := admissionListenerSeq
+	admissionListeners[id] = fn
+	hasAdmissionListeners.Store(true)
+	admissionListenerMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			admissionListenerMu.Lock()
+			delete(admissionListeners, id)
+			hasAdmissionListeners.Store(len(admissionListeners) > 0)
+			admissionListenerMu.Unlock()
+		})
+	}
+}
+
+func emitAdmissionChange(ev AdmissionChangeEvent) {
+	if !hasAdmissionListeners.Load() {
+		return
+	}
+	admissionListenerMu.Lock()
+	fns := make([]func(AdmissionChangeEvent), 0, len(admissionListeners))
+	for _, fn := range admissionListeners {
+		if fn != nil {
+			fns = append(fns, fn)
+		}
+	}
+	admissionListenerMu.Unlock()
+	for _, fn := range fns {
+		fn(ev)
+	}
+}
+
+// HealthSlotDetail returns per-slot health metrics without exposing credentials.
+func (d *Dialer) HealthSlotDetail(typ *NetworkType) NodeHealthSlotDetail {
+	if d == nil || typ == nil {
+		return NodeHealthSlotDetail{}
+	}
+	var rawLatency time.Duration
+	var hasLatency bool
+	d.collectionFineMu.RLock()
+	collection := d.mustGetCollection(typ)
+	if collection != nil {
+		if collection.MovingAverage > 0 {
+			rawLatency = collection.MovingAverage
+			hasLatency = true
+		} else if avg, ok := collection.Latencies10.AvgLatency(); ok {
+			rawLatency = avg
+			hasLatency = true
+		} else if last, ok := collection.Latencies10.LastLatency(); ok {
+			rawLatency = last
+			hasLatency = true
+		}
+	}
+	d.collectionFineMu.RUnlock()
+	return d.health.slotDetail(typ.Index(), rawLatency, hasLatency, time.Now())
+}
 
 func (d *Dialer) AdmissionState(typ *NetworkType) AdmissionState {
 	if d == nil || typ == nil {
@@ -39,16 +124,39 @@ func (d *Dialer) AdmissionReason(typ *NetworkType) string {
 }
 
 func (d *Dialer) maybeLogAdmission(typ *NetworkType) {
-	if d == nil || typ == nil || d.Log == nil || !d.Log.IsLevelEnabled(logrus.DebugLevel) {
+	if d == nil || typ == nil {
 		return
 	}
 	change, ok := d.health.consumeAdmissionChange(typ.Index(), d.MustGetAlive(typ), time.Now())
 	if !ok {
 		return
 	}
+	needLog := d.Log != nil && d.Log.IsLevelEnabled(logrus.DebugLevel)
+	hasHook := hasAdmissionListeners.Load()
+	if !needLog && !hasHook {
+		return
+	}
 	node := ""
 	if d.property != nil {
 		node = d.property.Name
+	}
+	if hasHook {
+		var latMs *int32
+		if change.rtt > 0 {
+			ms := int32(change.rtt.Milliseconds())
+			latMs = &ms
+		}
+		emitAdmissionChange(AdmissionChangeEvent{
+			Node:      node,
+			Network:   typ.String(),
+			From:      change.from.String(),
+			To:        change.to.String(),
+			Reason:    change.toReason,
+			LatencyMs: latMs,
+		})
+	}
+	if !needLog {
+		return
 	}
 	fields := logrus.Fields{
 		"node":              node,

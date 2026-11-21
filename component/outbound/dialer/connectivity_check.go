@@ -971,6 +971,11 @@ func (d *Dialer) NotifyCheck() {
 	}
 }
 
+// HasPendingCheckForTest reports whether NotifyCheck queued an immediate check.
+func (d *Dialer) HasPendingCheckForTest() bool {
+	return d != nil && len(d.checkCh) > 0
+}
+
 // NotifyCheckDnsUdp triggers a targeted DNS-UDP health check for both IPv4 and IPv6.
 func (d *Dialer) NotifyCheckDnsUdp() {
 	select {

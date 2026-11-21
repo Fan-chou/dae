@@ -426,6 +426,83 @@ func (g *DialerGroup) NestedGroupNamed(name string) *DialerGroup {
 	return nil
 }
 
+// MemberLeafNames returns unique non-empty leaf dialer names reachable through this group.
+func (g *DialerGroup) MemberLeafNames() []string {
+	if g == nil {
+		return nil
+	}
+	var names []string
+	seen := make(map[string]struct{})
+	appendDialers := func(dialers []*dialer.Dialer) {
+		for _, d := range dialers {
+			if name := dialerName(d); name != "" {
+				if _, ok := seen[name]; !ok {
+					seen[name] = struct{}{}
+					names = append(names, name)
+				}
+			}
+		}
+	}
+	appendDialers(g.nestedConcreteDialers())
+	appendDialers(g.Dialers)
+	return names
+}
+
+// NotifyCheckMember triggers an immediate latency check for one direct member
+// (nested child group or leaf dialer) and any parent health views associated with it.
+func (g *DialerGroup) NotifyCheckMember(memberName string) bool {
+	if g == nil || memberName == "" {
+		return false
+	}
+	if child := g.NestedGroupNamed(memberName); child != nil {
+		seenDialers := make(map[*dialer.Dialer]struct{})
+		seenGroups := make(map[*DialerGroup]struct{})
+		notifyDialer := func(d *dialer.Dialer) {
+			if d == nil {
+				return
+			}
+			if _, ok := seenDialers[d]; ok {
+				return
+			}
+			seenDialers[d] = struct{}{}
+			d.NotifyCheck()
+		}
+		var notifyGroupTree func(cur *DialerGroup)
+		notifyGroupTree = func(cur *DialerGroup) {
+			if cur == nil {
+				return
+			}
+			if _, ok := seenGroups[cur]; ok {
+				return
+			}
+			seenGroups[cur] = struct{}{}
+			for _, d := range cur.Dialers {
+				notifyDialer(d)
+			}
+			for _, member := range cur.nestedMembers {
+				if member.group != nil {
+					notifyGroupTree(member.group)
+				}
+			}
+			for _, leaf := range cur.nestedConcreteDialers() {
+				notifyDialer(cur.HealthViewOf(leaf))
+				notifyDialer(leaf)
+			}
+		}
+		notifyGroupTree(child)
+		for _, leaf := range child.nestedConcreteDialers() {
+			notifyDialer(g.HealthViewOf(leaf))
+			notifyDialer(leaf)
+		}
+		return true
+	}
+	if d := g.DialerNamed(memberName); d != nil {
+		d.NotifyCheck()
+		return true
+	}
+	return false
+}
+
 // DialerNamed returns this group's dialer instance for name, preferring a
 // parent health clone when the group has a nested health layer.
 func (g *DialerGroup) DialerNamed(name string) *dialer.Dialer {
@@ -2163,4 +2240,28 @@ func (g *DialerGroup) PeekResolveDNSCandidate(nt *dialer.NetworkType) (*dialer.D
 	var path selectPathBuilder
 	d, _, _, _, err := g.selectWithSkip(nt, false, nil, nil, false, "", false, false, &path)
 	return d, err
+}
+
+// CheckToleranceMs returns the configured hysteresis tolerance in milliseconds.
+func (g *DialerGroup) CheckToleranceMs() int64 {
+	if g == nil {
+		return 0
+	}
+	return g.checkTolerance.Milliseconds()
+}
+
+// QualityMode returns the configured local TCP quality mode (e.g. "observe", "enforce").
+func (g *DialerGroup) QualityMode() string {
+	if g == nil || g.quality == nil {
+		return ""
+	}
+	return g.quality.options.Mode
+}
+
+// LazyCheck reports whether health checks for this group are lazily activated.
+func (g *DialerGroup) LazyCheck() bool {
+	if g == nil {
+		return false
+	}
+	return g.lazyCheck
 }

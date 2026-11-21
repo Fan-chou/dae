@@ -115,10 +115,11 @@ type signalShutdownStagedHandoff struct {
 }
 
 type reloadRequest struct {
-	isSuspend       bool
-	fromRefresh     bool
-	requestedAt     time.Time
-	requestedAtMono uint64
+	isSuspend        bool
+	abortConnections bool
+	fromRefresh      bool
+	requestedAt      time.Time
+	requestedAtMono  uint64
 }
 
 type reloadRetirementControlPlane interface {
@@ -494,6 +495,14 @@ func (r *Runner) Run() (err error) {
 		return reloadManager.queueReloadRequest(log, reloadRequest{
 			requestedAt:     time.Now(),
 			requestedAtMono: monotonicNowNano(),
+		})
+	}
+	adminHTTP.suspend = func(abort bool) bool {
+		return reloadManager.queueReloadRequest(log, reloadRequest{
+			isSuspend:        true,
+			abortConnections: abort,
+			requestedAt:      time.Now(),
+			requestedAtMono:  monotonicNowNano(),
 		})
 	}
 	unregisterProgressObserver := registerReloadProgressObserver(func(code byte, content string) {

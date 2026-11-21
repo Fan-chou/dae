@@ -103,8 +103,10 @@ coalesce:
 		select {
 		case nextReq := <-m.reloadReqs:
 			fromRefresh := req.fromRefresh && nextReq.fromRefresh
+			abortConnections := req.abortConnections || nextReq.abortConnections
 			req = nextReq
 			req.fromRefresh = fromRefresh
+			req.abortConnections = abortConnections
 			if req.requestedAt.IsZero() {
 				req.requestedAt = time.Now()
 			}

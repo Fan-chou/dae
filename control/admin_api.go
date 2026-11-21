@@ -7,6 +7,7 @@ package control
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
@@ -107,36 +108,56 @@ type AdminTrafficSample struct {
 
 // AdminProbeHealth describes a per-transport health probe observation without credentials.
 type AdminProbeHealth struct {
-	Alive     bool   `json:"alive"`
-	LatencyMs *int32 `json:"latency_ms,omitempty"`
-	Admission string `json:"admission,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	CheckedAt string `json:"checked_at,omitempty"`
+	Alive             bool     `json:"alive"`
+	LatencyMs         *int32   `json:"latency_ms,omitempty"`
+	BaselineMs        *int32   `json:"baseline_ms,omitempty"`
+	QualityScoreMs    *int32   `json:"quality_score_ms,omitempty"`
+	LossRate          *float64 `json:"loss_rate,omitempty"`
+	RecentLatenciesMs []int32  `json:"recent_latencies_ms,omitempty"`
+	Congested         bool     `json:"congested,omitempty"`
+	FailStreak        int      `json:"fail_streak,omitempty"`
+	PenaltyLevel      int      `json:"penalty_level,omitempty"`
+	Admission         string   `json:"admission,omitempty"`
+	Reason            string   `json:"reason,omitempty"`
+	CheckedAt         string   `json:"checked_at,omitempty"`
 }
 
 // AdminGroupMember is one selectable or observed member. Name is the logical
 // identity persisted by SetGroupSelection; node links are never exposed.
 type AdminGroupMember struct {
-	Name        string                       `json:"name"`
-	DisplayName string                       `json:"display_name,omitempty"`
-	Kind        string                       `json:"kind,omitempty"`
-	Protocol    string                       `json:"protocol,omitempty"`
-	Endpoint    string                       `json:"endpoint,omitempty"`
-	Alive       bool                         `json:"alive"`
-	LatencyMs   *int32                       `json:"latency_ms,omitempty"`
-	Admission   string                       `json:"admission,omitempty"`
-	Reason      string                       `json:"reason,omitempty"`
-	CheckedAt   string                       `json:"checked_at,omitempty"`
-	Probes      map[string]*AdminProbeHealth `json:"probes,omitempty"`
+	Name              string                       `json:"name"`
+	DisplayName       string                       `json:"display_name,omitempty"`
+	Kind              string                       `json:"kind,omitempty"`
+	ResolvedLeaf      string                       `json:"resolved_leaf,omitempty"`
+	Protocol          string                       `json:"protocol,omitempty"`
+	Endpoint          string                       `json:"endpoint,omitempty"`
+	Alive             bool                         `json:"alive"`
+	LatencyMs         *int32                       `json:"latency_ms,omitempty"`
+	BaselineMs        *int32                       `json:"baseline_ms,omitempty"`
+	QualityScoreMs    *int32                       `json:"quality_score_ms,omitempty"`
+	LossRate          *float64                     `json:"loss_rate,omitempty"`
+	RecentLatenciesMs []int32                      `json:"recent_latencies_ms,omitempty"`
+	Load              *dialer.LoadContext          `json:"load,omitempty"`
+	Admission         string                       `json:"admission,omitempty"`
+	Reason            string                       `json:"reason,omitempty"`
+	CheckedAt         string                       `json:"checked_at,omitempty"`
+	Probes            map[string]*AdminProbeHealth `json:"probes,omitempty"`
 }
 
 // AdminGroup is one outbound group for the management API.
 type AdminGroup struct {
 	Name             string             `json:"name"`
+	DisplayName      string             `json:"display_name,omitempty"`
+	Origin           string             `json:"origin,omitempty"`
+	Wrapper          bool               `json:"wrapper,omitempty"`
 	Selectable       bool               `json:"selectable"`
 	Policy           string             `json:"policy"`
 	Selected         string             `json:"selected"`
 	IsolateTransport bool               `json:"isolate_transport,omitempty"`
+	QualityMode      string             `json:"quality_mode,omitempty"`
+	CheckToleranceMs int64              `json:"check_tolerance_ms,omitempty"`
+	Lazy             bool               `json:"lazy,omitempty"`
+	StickyCount      int                `json:"sticky_count,omitempty"`
 	SelectionMembers []string           `json:"selection_members"`
 	Members          []AdminGroupMember `json:"members"`
 }
@@ -179,6 +200,10 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 			Policy:           string(policy.Policy),
 			Selected:         selected,
 			IsolateTransport: group.IsolateTransport,
+			QualityMode:      group.QualityMode(),
+			CheckToleranceMs: group.CheckToleranceMs(),
+			Lazy:             group.LazyCheck(),
+			StickyCount:      group.StickyCount(),
 			SelectionMembers: append([]string(nil), members...),
 			Members:          make([]AdminGroupMember, 0, len(members)),
 		}
@@ -186,10 +211,16 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 			member := AdminGroupMember{Name: name}
 			if sample, ok := adminSampleForGroupMember(group, name); ok {
 				member.Kind = sample.Kind
+				member.ResolvedLeaf = sample.ResolvedLeaf
 				member.Protocol = sample.Protocol
 				member.Endpoint = sample.Endpoint
 				member.Alive = sample.Alive
 				member.LatencyMs = sample.LatencyMs
+				member.BaselineMs = sample.BaselineMs
+				member.QualityScoreMs = sample.QualityScoreMs
+				member.LossRate = sample.LossRate
+				member.RecentLatenciesMs = sample.RecentLatenciesMs
+				member.Load = sample.Load
 				member.Admission = sample.Admission
 				member.Reason = sample.Reason
 				member.CheckedAt = sample.CheckedAt
@@ -392,15 +423,21 @@ func adminMemberNamesFromDialers(dialers []*dialer.Dialer) []string {
 }
 
 type adminLatencySample struct {
-	Kind      string
-	Protocol  string
-	Endpoint  string
-	Alive     bool
-	LatencyMs *int32
-	Admission string
-	Reason    string
-	CheckedAt string
-	Probes    map[string]*AdminProbeHealth
+	Kind              string
+	ResolvedLeaf      string
+	Protocol          string
+	Endpoint          string
+	Alive             bool
+	LatencyMs         *int32
+	BaselineMs        *int32
+	QualityScoreMs    *int32
+	LossRate          *float64
+	RecentLatenciesMs []int32
+	Load              *dialer.LoadContext
+	Admission         string
+	Reason            string
+	CheckedAt         string
+	Probes            map[string]*AdminProbeHealth
 }
 
 func adminSampleFromDialer(d *dialer.Dialer, kind string) adminLatencySample {
@@ -418,22 +455,67 @@ func adminSampleFromDialer(d *dialer.Dialer, kind string) adminLatencySample {
 	}
 	protocol := ""
 	endpoint := ""
+	var loadCtx *dialer.LoadContext
 	if kind == "node" && d.Property() != nil {
 		protocol = d.Property().Protocol
 		endpoint = sanitizeSafeEndpoint(d.Property().Address)
+		lc := d.LoadContext(time.Now())
+		if lc.Class != "" && (lc.Class != "unobserved" || lc.Active > 0) {
+			loadCopy := lc
+			loadCtx = &loadCopy
+		}
 	}
 	probes, checkedAt := adminProbeMapForDialer(d)
-	return adminLatencySample{
+	repProbe := selectRepresentativeAdminProbe(probes)
+	sample := adminLatencySample{
 		Kind:      kind,
 		Protocol:  protocol,
 		Endpoint:  endpoint,
 		Alive:     alive,
 		LatencyMs: snapshot.LatencyMs,
+		Load:      loadCtx,
 		Admission: admission,
 		Reason:    reason,
 		CheckedAt: checkedAt,
 		Probes:    probes,
 	}
+	if repProbe != nil {
+		sample.BaselineMs = repProbe.BaselineMs
+		sample.QualityScoreMs = repProbe.QualityScoreMs
+		sample.LossRate = repProbe.LossRate
+		sample.RecentLatenciesMs = repProbe.RecentLatenciesMs
+	}
+	return sample
+}
+
+func selectRepresentativeAdminProbe(probes map[string]*AdminProbeHealth) *AdminProbeHealth {
+	p4 := probes["tcp4"]
+	p6 := probes["tcp6"]
+	if p4 == nil {
+		return p6
+	}
+	if p6 == nil {
+		return p4
+	}
+	if p4.Alive != p6.Alive {
+		if p4.Alive {
+			return p4
+		}
+		return p6
+	}
+	if (p4.LatencyMs != nil) != (p6.LatencyMs != nil) {
+		if p4.LatencyMs != nil {
+			return p4
+		}
+		return p6
+	}
+	if p4.LatencyMs != nil && p6.LatencyMs != nil && *p4.LatencyMs != *p6.LatencyMs {
+		if *p4.LatencyMs < *p6.LatencyMs {
+			return p4
+		}
+		return p6
+	}
+	return p4
 }
 
 func adminProbeMapForDialer(d *dialer.Dialer) (map[string]*AdminProbeHealth, string) {
@@ -441,13 +523,16 @@ func adminProbeMapForDialer(d *dialer.Dialer) (map[string]*AdminProbeHealth, str
 		return nil, ""
 	}
 	specs := []struct {
-		key string
-		nt  *dialer.NetworkType
+		key       string
+		isDataUDP bool
+		nt        *dialer.NetworkType
 	}{
 		{key: "tcp4", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}},
 		{key: "tcp6", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6}},
 		{key: "dns4", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}},
 		{key: "dns6", nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}},
+		{key: "udp4", isDataUDP: true, nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, UdpHealthDomain: dialer.UdpHealthDomainData}},
+		{key: "udp6", isDataUDP: true, nt: &dialer.NetworkType{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, UdpHealthDomain: dialer.UdpHealthDomainData}},
 	}
 	var probes map[string]*AdminProbeHealth
 	var maxChecked time.Time
@@ -455,11 +540,17 @@ func adminProbeMapForDialer(d *dialer.Dialer) (map[string]*AdminProbeHealth, str
 		obs := d.SnapshotLastProbe(spec.nt)
 		lastLat, hasLat := d.MustGetLatencies10(spec.nt).LastLatency()
 		alive := d.MustGetAlive(spec.nt)
-		if obs.CheckedAt.IsZero() && !obs.HasLatency && !hasLat {
+		admission := d.AdmissionState(spec.nt)
+		detail := d.HealthSlotDetail(spec.nt)
+		if spec.isDataUDP {
+			if detail.TestSampleCount == 0 && alive && admission == dialer.AdmissionAlive && obs.CheckedAt.IsZero() && !obs.HasLatency && !hasLat {
+				continue
+			}
+		} else if obs.CheckedAt.IsZero() && !obs.HasLatency && !hasLat {
 			continue
 		}
 		if probes == nil {
-			probes = make(map[string]*AdminProbeHealth, 4)
+			probes = make(map[string]*AdminProbeHealth, 6)
 		}
 		var latMs *int32
 		if obs.HasLatency {
@@ -477,11 +568,18 @@ func adminProbeMapForDialer(d *dialer.Dialer) (map[string]*AdminProbeHealth, str
 			}
 		}
 		probes[spec.key] = &AdminProbeHealth{
-			Alive:     alive,
-			LatencyMs: latMs,
-			Admission: d.AdmissionState(spec.nt).String(),
-			Reason:    d.AdmissionReason(spec.nt),
-			CheckedAt: checkedAtStr,
+			Alive:             alive,
+			LatencyMs:         latMs,
+			BaselineMs:        detail.BaselineMs,
+			QualityScoreMs:    detail.QualityScoreMs,
+			LossRate:          detail.LossRate,
+			RecentLatenciesMs: detail.RecentLatenciesMs,
+			Congested:         detail.Congested,
+			FailStreak:        detail.FailStreak,
+			PenaltyLevel:      detail.PenaltyLevel,
+			Admission:         admission.String(),
+			Reason:            d.AdmissionReason(spec.nt),
+			CheckedAt:         checkedAtStr,
 		}
 	}
 	if maxChecked.IsZero() {
@@ -518,10 +616,16 @@ func adminSampleForNestedMember(parent, child *outbound.DialerGroup) adminLatenc
 		if err != nil || d == nil {
 			continue
 		}
+		resolvedLeaf := ""
+		if d.Property() != nil {
+			resolvedLeaf = d.Property().Name
+		}
 		if parent != nil {
 			d = parent.HealthViewOf(d)
 		}
-		return adminSampleFromDialer(d, "group")
+		sample := adminSampleFromDialer(d, "group")
+		sample.ResolvedLeaf = resolvedLeaf
+		return sample
 	}
 	return adminLatencySample{Kind: "group", Admission: dialer.AdmissionDead.String(), Reason: "not_alive"}
 }
@@ -673,4 +777,45 @@ func (c *ControlPlane) AdminRecoveryDiagnostics() []outbound.RecoveryDiagnostics
 func usesAdminRecoveryGroup(g *outbound.DialerGroup) bool {
 	p := g.GetSelectionPolicy()
 	return p == consts.DialerSelectionPolicy_Fallback || p == consts.DialerSelectionPolicy_UrlTest
+}
+
+func (c *ControlPlane) findAdminGroup(name string) (*outbound.DialerGroup, error) {
+	if c == nil {
+		return nil, fmt.Errorf("control plane is not ready")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || isBuiltinAdminGroup(name) {
+		return nil, fmt.Errorf("invalid group")
+	}
+	for _, g := range c.outbounds {
+		if g != nil && g.Name == name {
+			return g, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown group")
+}
+
+// AdminGroupSticky returns active per-site sticky pins for a group.
+func (c *ControlPlane) AdminGroupSticky(groupName, network, query string, limit int) ([]outbound.SiteStickyEntrySnapshot, int, error) {
+	group, err := c.findAdminGroup(groupName)
+	if err != nil {
+		return nil, 0, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	entries, total := group.SnapshotSiteSticky(network, query, limit)
+	return entries, total, nil
+}
+
+// AdminClearGroupSticky removes one site pin (if site != "") or all pins on groupName.
+func (c *ControlPlane) AdminClearGroupSticky(groupName, site, network string) (int, error) {
+	group, err := c.findAdminGroup(groupName)
+	if err != nil {
+		return 0, err
+	}
+	return group.ClearSiteSticky(site, network), nil
 }

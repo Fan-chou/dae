@@ -1655,23 +1655,22 @@ func (m *SessionManager) CloseConnectionByID(id string) bool {
 	return false
 }
 
-// CloseConnections terminates all active TCP/UDP flows matching filter.
-func (m *SessionManager) CloseConnections(filter AdminConnectionFilter) int {
+// CloseConnectionsWhere terminates all active TCP/UDP flows satisfying match.
+func (m *SessionManager) CloseConnectionsWhere(match func(AdminConnection) bool) int {
 	if m == nil {
 		return 0
 	}
-	filter = filter.normalized()
 	now := time.Now()
 	tcp, udp := m.snapshotFlowRuntimes()
 	var abortTCP []*FlowRuntime
 	var abortUDP []*UDPFlowRuntime
 	for _, flow := range tcp {
-		if filter.IsEmpty() || adminConnectionFromTCPAt(flow, now).matches(filter) {
+		if match == nil || match(adminConnectionFromTCPAt(flow, now)) {
 			abortTCP = append(abortTCP, flow)
 		}
 	}
 	for _, flow := range udp {
-		if filter.IsEmpty() || adminConnectionFromUDPAt(flow, now).matches(filter) {
+		if match == nil || match(adminConnectionFromUDPAt(flow, now)) {
 			abortUDP = append(abortUDP, flow)
 		}
 	}
@@ -1684,6 +1683,17 @@ func (m *SessionManager) CloseConnections(filter AdminConnectionFilter) int {
 		_ = flow.abort()
 	}
 	return len(abortTCP) + len(abortUDP)
+}
+
+// CloseConnections terminates all active TCP/UDP flows matching filter.
+func (m *SessionManager) CloseConnections(filter AdminConnectionFilter) int {
+	filter = filter.normalized()
+	if filter.IsEmpty() {
+		return m.CloseConnectionsWhere(nil)
+	}
+	return m.CloseConnectionsWhere(func(item AdminConnection) bool {
+		return item.matches(filter)
+	})
 }
 
 // CloseConnectionsByTuple aborts any active userspace flow matching the 5-tuple.
@@ -1753,6 +1763,10 @@ func (c *ControlPlane) SetClosedFlowObserver(fn func(AdminClosedFlow)) {
 }
 
 func (c *ControlPlane) AdminClosedFlows(limit int, filter AdminConnectionFilter) AdminClosedFlowsSnapshot {
+	return c.AdminClosedFlowsAfter(limit, filter, 0)
+}
+
+func (c *ControlPlane) AdminClosedFlowsAfter(limit int, filter AdminConnectionFilter, afterSeq uint64) AdminClosedFlowsSnapshot {
 	if c == nil {
 		return AdminClosedFlowsSnapshot{Flows: []AdminClosedFlow{}}
 	}
@@ -1760,7 +1774,7 @@ func (c *ControlPlane) AdminClosedFlows(limit int, filter AdminConnectionFilter)
 	if manager == nil || manager.accounting == nil {
 		return AdminClosedFlowsSnapshot{Flows: []AdminClosedFlow{}}
 	}
-	return manager.accounting.SnapshotClosed(limit, filter)
+	return manager.accounting.SnapshotClosedAfter(limit, filter, afterSeq)
 }
 
 func (c *ControlPlane) allActiveAdminConnections() []AdminConnection {
@@ -1820,5 +1834,56 @@ func (c *ControlPlane) AdminCloseConnections(filter AdminConnectionFilter) int {
 		closed += manager.CloseConnections(filter)
 	}
 	closed += activeInboundManager.Load().CloseUDPConnections(filter)
+	return closed
+}
+
+// AdminCloseGroupOtherConnections terminates active connections routed through
+// groupName that do not belong to keepMember.
+func (c *ControlPlane) AdminCloseGroupOtherConnections(groupName, keepMember string) int {
+	groupName = strings.TrimSpace(groupName)
+	keepMember = strings.TrimSpace(keepMember)
+	if c == nil || groupName == "" || keepMember == "" {
+		return 0
+	}
+	var group *outbound.DialerGroup
+	for _, g := range c.outbounds {
+		if g != nil && g.Name == groupName {
+			group = g
+			break
+		}
+	}
+	var child *outbound.DialerGroup
+	if group != nil {
+		child = group.NestedGroupNamed(keepMember)
+	}
+	var childLeaves map[string]struct{}
+	if child != nil {
+		leafNames := child.MemberLeafNames()
+		childLeaves = make(map[string]struct{}, len(leafNames))
+		for _, leaf := range leafNames {
+			childLeaves[strings.ToLower(leaf)] = struct{}{}
+		}
+	}
+	shouldClose := func(item AdminConnection) bool {
+		if !strings.EqualFold(item.Outbound, groupName) {
+			return false
+		}
+		if child != nil {
+			if len(item.Chain) >= 3 {
+				return !strings.EqualFold(item.Chain[1], keepMember)
+			}
+			if strings.HasPrefix(item.ID, "in-udp:") {
+				_, ok := childLeaves[strings.ToLower(item.Dialer)]
+				return !ok
+			}
+			return true
+		}
+		return !strings.EqualFold(item.Dialer, keepMember)
+	}
+	closed := 0
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		closed += manager.CloseConnectionsWhere(shouldClose)
+	}
+	closed += activeInboundManager.Load().CloseUDPConnectionsWhere(shouldClose)
 	return closed
 }

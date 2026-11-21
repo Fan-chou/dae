@@ -140,6 +140,7 @@ func TestInboundUDPSessionListedOnceEstablished(t *testing.T) {
 	c := got[0]
 	if c.ID != "in-udp:7" || c.Network != "udp" || c.Inbound != "s1" ||
 		c.SrcIP != "127.0.0.1" || c.SrcPort != 50000 || c.DstPort != 53 || c.Target != "example.com:53" ||
+		c.Domain != "example.com" || c.SniffedDomain != "" ||
 		c.Outbound != "proxy" || c.Dialer != "n1" || c.Upload != 5 || c.Download != 9 || c.StartTime == "" {
 		t.Fatalf("connection = %+v", c)
 	}

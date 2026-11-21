@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/gorilla/websocket"
@@ -26,24 +27,36 @@ import (
 )
 
 type stubAdminPlane struct {
-	sysInfo     control.AdminSystemInfo
-	metrics     control.AdminMetricsSnapshot
-	history     []control.AdminTrafficSample
-	groups      []control.AdminGroup
-	setErr      error
-	setGroup    string
-	setMember   string
-	delayErr    error
-	delayFor    string
-	connLimit   int
-	connections control.AdminConnectionsSnapshot
-	closedFlows control.AdminClosedFlowsSnapshot
-	summary     control.AdminTrafficSummary
-	resetCalled bool
-	closedID    string
-	closedOK    bool
-	batchFilter control.AdminConnectionFilter
-	batchClosed int
+	sysInfo       control.AdminSystemInfo
+	metrics       control.AdminMetricsSnapshot
+	history       []control.AdminTrafficSample
+	groups        []control.AdminGroup
+	setErr        error
+	setGroup      string
+	setMember     string
+	delayErr      error
+	delayFor      string
+	delayAllCount int
+	delayMember   string
+	stickyEntries []outbound.SiteStickyEntrySnapshot
+	stickyGroup   string
+	stickyNetwork string
+	stickyQuery   string
+	stickyLimit   int
+	stickyCleared int
+	stickySite    string
+	connLimit     int
+	connections   control.AdminConnectionsSnapshot
+	closedFlows   control.AdminClosedFlowsSnapshot
+	closedAfter   uint64
+	summary       control.AdminTrafficSummary
+	resetCalled   bool
+	closedID      string
+	closedOK        bool
+	batchFilter     control.AdminConnectionFilter
+	batchClosed     int
+	closeOtherGroup string
+	closeOtherKeep  string
 
 	kernelCalls          int
 	kernelLimit          int
@@ -90,6 +103,37 @@ func (s *stubAdminPlane) TriggerLatencyChecksForGroup(groupName string) error {
 	return s.delayErr
 }
 
+func (s *stubAdminPlane) TriggerLatencyChecksAllGroups() int {
+	if s.delayAllCount > 0 {
+		return s.delayAllCount
+	}
+	return len(s.groups)
+}
+
+func (s *stubAdminPlane) TriggerLatencyChecksForMember(groupName, memberName string) error {
+	s.delayFor = groupName
+	s.delayMember = memberName
+	return s.delayErr
+}
+
+func (s *stubAdminPlane) AdminGroupSticky(groupName, network, query string, limit int) ([]outbound.SiteStickyEntrySnapshot, int, error) {
+	s.stickyGroup = groupName
+	s.stickyNetwork = network
+	s.stickyQuery = query
+	s.stickyLimit = limit
+	if s.stickyEntries == nil {
+		return []outbound.SiteStickyEntrySnapshot{}, 0, nil
+	}
+	return s.stickyEntries, len(s.stickyEntries), nil
+}
+
+func (s *stubAdminPlane) AdminClearGroupSticky(groupName, site, network string) (int, error) {
+	s.stickyGroup = groupName
+	s.stickySite = site
+	s.stickyNetwork = network
+	return s.stickyCleared, nil
+}
+
 func (s *stubAdminPlane) AdminConnections(limit int, _ control.AdminConnectionFilter) control.AdminConnectionsSnapshot {
 	s.connLimit = limit
 	if s.connections.Connections == nil {
@@ -98,11 +142,42 @@ func (s *stubAdminPlane) AdminConnections(limit int, _ control.AdminConnectionFi
 	return s.connections
 }
 
-func (s *stubAdminPlane) AdminClosedFlows(_ int, _ control.AdminConnectionFilter) control.AdminClosedFlowsSnapshot {
+func (s *stubAdminPlane) AdminAllActiveConnections() control.AdminConnectionsSnapshot {
+	if s.connections.Connections == nil {
+		return control.AdminConnectionsSnapshot{Connections: []control.AdminConnection{}}
+	}
+	return s.connections
+}
+
+func (s *stubAdminPlane) AdminClosedFlows(limit int, filter control.AdminConnectionFilter) control.AdminClosedFlowsSnapshot {
+	return s.AdminClosedFlowsAfter(limit, filter, 0)
+}
+
+func (s *stubAdminPlane) AdminClosedFlowsAfter(_ int, filter control.AdminConnectionFilter, afterSeq uint64) control.AdminClosedFlowsSnapshot {
+	s.closedAfter = afterSeq
 	if s.closedFlows.Flows == nil {
 		return control.AdminClosedFlowsSnapshot{Flows: []control.AdminClosedFlow{}}
 	}
-	return s.closedFlows
+	if filter.IsEmpty() && afterSeq == 0 {
+		return s.closedFlows
+	}
+	filtered := make([]control.AdminClosedFlow, 0, len(s.closedFlows.Flows))
+	for _, f := range s.closedFlows.Flows {
+		if afterSeq > 0 && f.Seq <= afterSeq {
+			continue
+		}
+		if filter.CloseReason != "" && !strings.EqualFold(f.CloseReason, filter.CloseReason) {
+			continue
+		}
+		if filter.Offloaded != nil && f.Offloaded != *filter.Offloaded {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	return control.AdminClosedFlowsSnapshot{
+		Total: len(filtered),
+		Flows: filtered,
+	}
 }
 
 func (s *stubAdminPlane) AdminTrafficSummary(_ int) control.AdminTrafficSummary {
@@ -120,6 +195,12 @@ func (s *stubAdminPlane) AdminCloseConnection(id string) bool {
 
 func (s *stubAdminPlane) AdminCloseConnections(filter control.AdminConnectionFilter) int {
 	s.batchFilter = filter
+	return s.batchClosed
+}
+
+func (s *stubAdminPlane) AdminCloseGroupOtherConnections(groupName, keepMember string) int {
+	s.closeOtherGroup = groupName
+	s.closeOtherKeep = keepMember
 	return s.batchClosed
 }
 
@@ -276,8 +357,17 @@ func TestAdminGroupSelectionProbeCooldownAndPathEscaping(t *testing.T) {
 		t.Fatalf("second probe expected 429 cooldown, got %d", rec2.Code)
 	}
 
-	if name, action, err := parseAdminGroupPath("/api/v1/groups/a%2Fb/selection"); err == nil {
-		t.Fatalf("escaped slash should be rejected, got name=%q action=%q", name, action)
+	if name, action, err := parseAdminGroupPath("/api/v1/groups/a%2Fb/selection"); err != nil || name != "a/b" || action != "selection" {
+		t.Fatalf("escaped slash should decode once, got name=%q action=%q err=%v", name, action, err)
+	}
+	if name, action, err := parseAdminGroupPath("/api/v1/groups/a/b/selection"); err == nil {
+		t.Fatalf("unescaped slash should be rejected, got name=%q action=%q", name, action)
+	}
+	if _, _, err := parseAdminGroupPath("/api/v1/groups/bad%00name/selection"); err == nil {
+		t.Fatal("control char %00 in group name should be rejected")
+	}
+	if _, _, err := parseAdminGroupPath("/api/v1/groups/bad%0Aname/selection"); err == nil {
+		t.Fatal("control char %0A in group name should be rejected")
 	}
 }
 
@@ -831,5 +921,183 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	_ = respNew.Body.Close()
 	if respNew.StatusCode != http.StatusOK {
 		t.Fatalf("new listener status = %d, want 200", respNew.StatusCode)
+	}
+}
+
+func TestAdminP0ProbesStickySelectionCloseExistingAndSuspend(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{
+		groups: []control.AdminGroup{
+			{
+				Name:     "proxy",
+				Policy:   "fixed",
+				Selected: "hk-01",
+				Members: []control.AdminGroupMember{
+					{Name: "hk-01", Kind: "node"},
+					{Name: "sg-01", Kind: "node"},
+				},
+			},
+		},
+		stickyEntries: []outbound.SiteStickyEntrySnapshot{
+			{Site: "youtube.com", Network: "tcp", Leaf: "hk-01"},
+		},
+		stickyCleared: 1,
+		batchClosed:   3,
+		connections: control.AdminConnectionsSnapshot{
+			Total: 2,
+			Connections: []control.AdminConnection{
+				{ID: "tcp:1", Network: "tcp4", Outbound: "proxy", Dialer: "hk-01", Offloaded: true},
+				{ID: "tcp:2", Network: "tcp4", Outbound: "proxy", Dialer: "sg-01", Offloaded: false},
+			},
+		},
+		closedFlows: control.AdminClosedFlowsSnapshot{
+			Total: 2,
+			Flows: []control.AdminClosedFlow{
+				{Seq: 10, ID: "tcp:8", Outbound: "proxy", CloseReason: "normal"},
+				{Seq: 12, ID: "tcp:9", Outbound: "proxy", CloseReason: "aborted", Offloaded: true},
+			},
+		},
+	}
+
+	var suspendedAbort *bool
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, func() bool { return true })
+	server.secret = "p0-token"
+	server.suspend = func(abort bool) bool {
+		v := abort
+		suspendedAbort = &v
+		return true
+	}
+	handler := server.withSecurityHeaders(server.buildMux())
+
+	do := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer p0-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// All-groups probe + 3s cooldown
+	rec := do(http.MethodPost, "/api/v1/groups/probe", "")
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"groups":1`) {
+		t.Fatalf("all-groups probe code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec2 := do(http.MethodPost, "/api/v1/groups/probe", "")
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("all-groups probe cooldown code=%d, want 429", rec2.Code)
+	}
+
+	// Per-member probe + 2s cooldown
+	mRec := do(http.MethodPost, "/api/v1/groups/proxy/members/hk-01/probe", "")
+	if mRec.Code != http.StatusAccepted || plane.delayFor != "proxy" || plane.delayMember != "hk-01" {
+		t.Fatalf("member probe code=%d group=%q member=%q body=%s", mRec.Code, plane.delayFor, plane.delayMember, mRec.Body.String())
+	}
+	mRec2 := do(http.MethodPost, "/api/v1/groups/proxy/members/hk-01/probe", "")
+	if mRec2.Code != http.StatusTooManyRequests || mRec2.Header().Get("Retry-After") != "2" {
+		t.Fatalf("member probe cooldown code=%d retry=%q", mRec2.Code, mRec2.Header().Get("Retry-After"))
+	}
+
+	// Sticky GET + DELETE site + DELETE all
+	sRec := do(http.MethodGet, "/api/v1/groups/proxy/sticky?network=tcp&q=you&limit=50", "")
+	if sRec.Code != http.StatusOK || plane.stickyGroup != "proxy" || plane.stickyNetwork != "tcp" || plane.stickyQuery != "you" || plane.stickyLimit != 50 || !strings.Contains(sRec.Body.String(), `"youtube.com"`) {
+		t.Fatalf("sticky GET code=%d body=%s", sRec.Code, sRec.Body.String())
+	}
+	dRec := do(http.MethodDelete, "/api/v1/groups/proxy/sticky/youtube.com?network=tcp", "")
+	if dRec.Code != http.StatusOK || plane.stickySite != "youtube.com" || !strings.Contains(dRec.Body.String(), `"cleared":1`) {
+		t.Fatalf("sticky DELETE site code=%d body=%s", dRec.Code, dRec.Body.String())
+	}
+	dAll := do(http.MethodDelete, "/api/v1/groups/proxy/sticky", "")
+	if dAll.Code != http.StatusOK || plane.stickySite != "" {
+		t.Fatalf("sticky DELETE all code=%d site=%q", dAll.Code, plane.stickySite)
+	}
+
+	// Selection with close_existing delegates to AdminCloseGroupOtherConnections
+	selRec := do(http.MethodPut, "/api/v1/groups/proxy/selection", `{"member":"sg-01","close_existing":true}`)
+	if selRec.Code != http.StatusOK || plane.setMember != "sg-01" || plane.closeOtherGroup != "proxy" || plane.closeOtherKeep != "sg-01" || !strings.Contains(selRec.Body.String(), `"closed_connections":3`) {
+		t.Fatalf("selection close_existing code=%d group=%q keep=%q body=%s", selRec.Code, plane.closeOtherGroup, plane.closeOtherKeep, selRec.Body.String())
+	}
+
+	// Connections offloaded filter + closed flows close_reason & after_seq
+	offRec := do(http.MethodGet, "/api/v1/connections?offloaded=true", "")
+	if offRec.Code != http.StatusOK || !strings.Contains(offRec.Body.String(), `"tcp:1"`) || strings.Contains(offRec.Body.String(), `"tcp:2"`) {
+		t.Fatalf("offloaded filter body=%s", offRec.Body.String())
+	}
+	cfRec := do(http.MethodGet, "/api/v1/flows/closed?close_reason=aborted&after_seq=10", "")
+	if cfRec.Code != http.StatusOK || plane.closedAfter != 10 || !strings.Contains(cfRec.Body.String(), `"tcp:9"`) || strings.Contains(cfRec.Body.String(), `"tcp:8"`) {
+		t.Fatalf("closed flows filter body=%s", cfRec.Body.String())
+	}
+
+	// Invalid offloaded query param returns 400 invalid_param on both connections & closed flows.
+	if badOff := do(http.MethodGet, "/api/v1/connections?offloaded=abc", ""); badOff.Code != http.StatusBadRequest || !strings.Contains(badOff.Body.String(), `"invalid_param"`) {
+		t.Fatalf("connections offloaded=abc code=%d body=%s", badOff.Code, badOff.Body.String())
+	}
+	if badCFOff := do(http.MethodGet, "/api/v1/flows/closed?offloaded=abc", ""); badCFOff.Code != http.StatusBadRequest || !strings.Contains(badCFOff.Body.String(), `"invalid_param"`) {
+		t.Fatalf("flows/closed offloaded=abc code=%d body=%s", badCFOff.Code, badCFOff.Body.String())
+	}
+
+	// close_reason-only batch close returns 400 filter_required.
+	if crOnly := do(http.MethodPost, "/api/v1/connections/close", `{"close_reason":"aborted"}`); crOnly.Code != http.StatusBadRequest || !strings.Contains(crOnly.Body.String(), `"filter_required"`) {
+		t.Fatalf("close_reason-only batch close code=%d body=%s", crOnly.Code, crOnly.Body.String())
+	}
+
+	// Suspend endpoint & system suspended field
+	suspRec := do(http.MethodPost, "/api/v1/system/suspend", `{"abort":true}`)
+	if suspRec.Code != http.StatusAccepted || suspendedAbort == nil || !*suspendedAbort {
+		t.Fatalf("suspend code=%d abort=%v body=%s", suspRec.Code, suspendedAbort, suspRec.Body.String())
+	}
+	server.markSuspended()
+	sysRec := do(http.MethodGet, "/api/v1/system", "")
+	if sysRec.Code != http.StatusOK || !strings.Contains(sysRec.Body.String(), `"suspended":true`) {
+		t.Fatalf("system suspended body=%s", sysRec.Body.String())
+	}
+}
+
+func TestAdminGroupPathEscapingAndProbeCooldownIsolation(t *testing.T) {
+	t.Parallel()
+	plane := &stubAdminPlane{}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.secret = "escape-token"
+	handler := server.withSecurityHeaders(server.buildMux())
+
+	do := func(method, target, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer escape-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Member containing '%'
+	rec := do(http.MethodPost, "/api/v1/groups/proxy/members/HK%2001%20%7C%2050%25/probe", "")
+	if rec.Code != http.StatusAccepted || plane.delayFor != "proxy" || plane.delayMember != "HK 01 | 50%" {
+		t.Fatalf("percent member probe code=%d group=%q member=%q body=%s", rec.Code, plane.delayFor, plane.delayMember, rec.Body.String())
+	}
+
+	// Member containing literal '%20' must not double-unescape to space
+	rec = do(http.MethodPost, "/api/v1/groups/proxy/members/HK%2001%20%2520/probe", "")
+	if rec.Code != http.StatusAccepted || plane.delayMember != "HK 01 %20" {
+		t.Fatalf("literal %%20 member probe code=%d member=%q body=%s", rec.Code, plane.delayMember, rec.Body.String())
+	}
+
+	// Member containing encoded '/'
+	rec = do(http.MethodPost, "/api/v1/groups/proxy/members/HK%2001%20%2F%20IEPL/probe", "")
+	if rec.Code != http.StatusAccepted || plane.delayMember != "HK 01 / IEPL" {
+		t.Fatalf("slash member probe code=%d member=%q body=%s", rec.Code, plane.delayMember, rec.Body.String())
+	}
+
+	// Group containing encoded '/'
+	rec = do(http.MethodPut, "/api/v1/groups/HK%2FIEPL/selection", `{"member":"hk-01"}`)
+	if rec.Code != http.StatusOK || plane.setGroup != "HK/IEPL" || plane.setMember != "hk-01" {
+		t.Fatalf("slash group selection code=%d group=%q member=%q body=%s", rec.Code, plane.setGroup, plane.setMember, rec.Body.String())
+	}
+
+	// All-groups probe cooldown must not block a user group literally named "*"
+	allRec := do(http.MethodPost, "/api/v1/groups/probe", "")
+	if allRec.Code != http.StatusAccepted {
+		t.Fatalf("all-groups probe code=%d body=%s", allRec.Code, allRec.Body.String())
+	}
+	starRec := do(http.MethodPost, "/api/v1/groups/*/probe", "")
+	if starRec.Code != http.StatusAccepted || plane.delayFor != "*" {
+		t.Fatalf("star group probe code=%d delayFor=%q body=%s", starRec.Code, plane.delayFor, starRec.Body.String())
 	}
 }

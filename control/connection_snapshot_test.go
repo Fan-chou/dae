@@ -204,3 +204,84 @@ func TestAdminConnectionsSnapshotKeepsHeaviestFlowsWhenTruncated(t *testing.T) {
 		t.Fatalf("snapshot_at_ms %d outside [%d,%d]", snap.SnapshotAtMs, before, after)
 	}
 }
+
+func TestAdminConnectionsP0AllActiveFilterAndClosedFlowsAfter(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	runtime := newEgressRuntime(nil, nil)
+	t.Cleanup(func() { _ = runtime.releaseOwner() })
+
+	group := &outbound.DialerGroup{Name: "proxy"}
+	// Adopt >1024 connections (1026 total) where flow #1026 has 0 bytes and offloaded=true,
+	// proving AdminAllActiveConnections returns all 1026 so filtering/sorting does not drop it.
+	var lastFlow *FlowRuntime
+	for i := 0; i < 1026; i++ {
+		port := uint16(30000 + i)
+		flow, err := manager.adoptTCP(
+			&memoryLayoutConn{id: uint64(i + 1)},
+			nil,
+			TcpFlowBinding{
+				Egress: TcpEgressBinding{
+					Outbound:      group,
+					SniffedDomain: "stream.example.com",
+					StickySite:    "example.com",
+					Target:        "stream.example.com:443",
+					SelectPath:    outbound.SelectPath{NestedMember: "auto-hk"},
+				},
+			},
+			runtime,
+			nil,
+			netip.MustParseAddrPort(fmt.Sprintf("192.168.1.2:%d", port)),
+			netip.MustParseAddrPort("93.184.216.34:443"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 1025 {
+			flow.recordDownload(int64(1000 + i))
+		} else {
+			flow.offloaded.Store(true)
+			lastFlow = flow
+		}
+	}
+
+	c := &ControlPlane{runtimeStats: newRuntimeStats()}
+	if err := c.AttachSessionManager(manager); err != nil {
+		t.Fatal(err)
+	}
+
+	all := c.AdminAllActiveConnections()
+	if all.Total != 1026 || len(all.Connections) != 1026 || all.Truncated {
+		t.Fatalf("AdminAllActiveConnections got total=%d len=%d truncated=%v", all.Total, len(all.Connections), all.Truncated)
+	}
+
+	// Verify Chain, SniffedDomain, StickySite, and Offloaded filter match on flow #1026.
+	off := true
+	var matched []AdminConnection
+	for _, conn := range all.Connections {
+		if conn.Matches(AdminConnectionFilter{Offloaded: &off}) {
+			matched = append(matched, conn)
+		}
+	}
+	if len(matched) != 1 || matched[0].ID != fmt.Sprintf("tcp:%d", lastFlow.id) {
+		t.Fatalf("offloaded match = %+v", matched)
+	}
+	if len(matched[0].Chain) != 2 || matched[0].Chain[0] != "proxy" || matched[0].Chain[1] != "auto-hk" {
+		t.Fatalf("chain = %+v", matched[0].Chain)
+	}
+	if matched[0].StickySite != "example.com" || matched[0].SniffedDomain != "stream.example.com" {
+		t.Fatalf("sticky/sniffed = %q / %q", matched[0].StickySite, matched[0].SniffedDomain)
+	}
+
+	// Abort lastFlow and close another normally; test CloseReason and after_seq.
+	lastFlow.closeReason.Store(flowCloseAborted)
+	lastFlow.finish()
+	closed1 := manager.accounting.SnapshotClosedAfter(10, AdminConnectionFilter{CloseReason: "aborted"}, 0)
+	if closed1.Total != 1 || len(closed1.Flows) != 1 || !closed1.Flows[0].Offloaded {
+		t.Fatalf("closed1 = %+v", closed1)
+	}
+	closedAfter := manager.accounting.SnapshotClosedAfter(10, AdminConnectionFilter{}, closed1.Flows[0].Seq)
+	if closedAfter.Total != 0 {
+		t.Fatalf("expected 0 flows after seq %d, got %+v", closed1.Flows[0].Seq, closedAfter)
+	}
+}

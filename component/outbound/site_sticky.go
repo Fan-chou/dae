@@ -7,6 +7,8 @@ package outbound
 
 import (
 	"container/list"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -1215,4 +1217,260 @@ func (g *DialerGroup) stickyTable(nt *dialer.NetworkType) *siteStickyTable {
 		return g.siteStickyUDP
 	}
 	return g.siteSticky
+}
+
+// SiteStickyEntrySnapshot describes one active site-to-leaf pin for the admin API.
+type SiteStickyEntrySnapshot struct {
+	Site            string   `json:"site"`
+	Network         string   `json:"network"`
+	Leaf            string   `json:"leaf"`
+	PinnedAt        string   `json:"pinned_at,omitempty"`
+	LastSuccess     string   `json:"last_success,omitempty"`
+	TouchedAt       string   `json:"touched_at,omitempty"`
+	ConsecutiveSlow int      `json:"consecutive_slow,omitempty"`
+	TriedAlts       int      `json:"tried_alts,omitempty"`
+	Converged       bool     `json:"converged,omitempty"`
+	HoldDownLeaves  []string `json:"hold_down_leaves,omitempty"`
+	NextRecoveryAt  string   `json:"next_recovery_at,omitempty"`
+}
+
+func formatStickyTime(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
+func (e *siteStickyEntry) isExpiredAt(now time.Time) bool {
+	if e == nil {
+		return true
+	}
+	stamp := e.activityStamp()
+	return !stamp.IsZero() && now.Sub(stamp) > siteStickyTTL && !e.hasActiveHoldDown(now)
+}
+
+func (t *siteStickyTable) liveCount(now time.Time) int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.detached || len(t.entries) == 0 {
+		return 0
+	}
+	count := 0
+	for _, entry := range t.entries {
+		if entry == nil || entry.leaf == nil || entry.isExpiredAt(now) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+type stickySnapshotItem struct {
+	snap  SiteStickyEntrySnapshot
+	stamp time.Time
+}
+
+func (t *siteStickyTable) appendSnapshot(dst []stickySnapshotItem, network, query string, now time.Time) ([]stickySnapshotItem, int) {
+	if t == nil {
+		return dst, 0
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.detached || len(t.entries) == 0 {
+		return dst, 0
+	}
+
+	matched := 0
+	for site, entry := range t.entries {
+		if entry == nil || entry.leaf == nil || entry.isExpiredAt(now) {
+			continue
+		}
+		leaf := dialerName(entry.leaf)
+		if leaf == "" {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(site), q) && !strings.Contains(strings.ToLower(leaf), q) {
+			continue
+		}
+		var holdDown []string
+		for d, until := range entry.holdDownUntil {
+			if d != nil && now.Before(until) {
+				if name := dialerName(d); name != "" {
+					holdDown = append(holdDown, name)
+				}
+			}
+		}
+		if len(holdDown) > 1 {
+			sort.Strings(holdDown)
+		}
+		matched++
+		dst = append(dst, stickySnapshotItem{
+			snap: SiteStickyEntrySnapshot{
+				Site:            site,
+				Network:         network,
+				Leaf:            leaf,
+				PinnedAt:        formatStickyTime(entry.pinnedAt),
+				LastSuccess:     formatStickyTime(entry.lastSuccess),
+				TouchedAt:       formatStickyTime(entry.touchedAt),
+				ConsecutiveSlow: entry.consecutiveSlow,
+				TriedAlts:       entry.triedAlts,
+				Converged:       entry.converged,
+				HoldDownLeaves:  holdDown,
+				NextRecoveryAt:  formatStickyTime(entry.nextRecovery),
+			},
+			stamp: entry.activityStamp(),
+		})
+	}
+	return dst, matched
+}
+
+func (t *siteStickyTable) clearSite(site string, now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	trimmed := strings.TrimSpace(site)
+	if trimmed == "" {
+		return false
+	}
+	var keys []string
+	if k := t.key(trimmed); k != "" {
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 || keys[0] != trimmed {
+		keys = append(keys, trimmed)
+	}
+
+	var notify func()
+	clearedLive := false
+	mutated := false
+	t.mu.Lock()
+	if !t.detached && len(t.entries) > 0 {
+		for _, k := range keys {
+			if entry, ok := t.entries[k]; ok {
+				if entry != nil && entry.leaf != nil && !entry.isExpiredAt(now) {
+					clearedLive = true
+				}
+				t.removeLocked(k)
+				t.syncBlockingKeyLocked(k, nil, now)
+				mutated = true
+			}
+		}
+		if mutated {
+			notify = t.finishMutationLocked()
+		}
+	}
+	t.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
+	return clearedLive
+}
+
+func (t *siteStickyTable) clearAll(now time.Time) int {
+	if t == nil {
+		return 0
+	}
+	var notify func()
+	cleared := 0
+	t.mu.Lock()
+	if !t.detached {
+		for _, entry := range t.entries {
+			if entry != nil && entry.leaf != nil && !entry.isExpiredAt(now) {
+				cleared++
+			}
+		}
+		if len(t.entries) > 0 || len(t.blockingKeys) > 0 {
+			t.entries = make(map[string]*siteStickyEntry)
+			t.blockingKeys = make(map[string]struct{})
+			t.liveLRU = list.New()
+			t.deadLRU = list.New()
+			notify = t.finishMutationLocked()
+		}
+	}
+	t.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
+	return cleared
+}
+
+// StickyCount returns the total number of active TCP + UDP site pins on this group.
+func (g *DialerGroup) StickyCount() int {
+	if g == nil || !g.usesSiteSticky() {
+		return 0
+	}
+	now := g.now()
+	return g.siteSticky.liveCount(now) + g.siteStickyUDP.liveCount(now)
+}
+
+// SnapshotSiteSticky lists active TCP and/or UDP site pins for this group.
+func (g *DialerGroup) SnapshotSiteSticky(network, query string, limit int) ([]SiteStickyEntrySnapshot, int) {
+	if g == nil || !g.usesSiteSticky() {
+		return []SiteStickyEntrySnapshot{}, 0
+	}
+	now := g.now()
+	netFilter := strings.ToLower(strings.TrimSpace(network))
+	var items []stickySnapshotItem
+	total := 0
+	if netFilter == "" || netFilter == "tcp" {
+		var n int
+		items, n = g.siteSticky.appendSnapshot(items, "tcp", query, now)
+		total += n
+	}
+	if netFilter == "" || netFilter == "udp" {
+		var n int
+		items, n = g.siteStickyUDP.appendSnapshot(items, "udp", query, now)
+		total += n
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].stamp.Equal(items[j].stamp) {
+			return items[i].stamp.After(items[j].stamp)
+		}
+		if items[i].snap.Site != items[j].snap.Site {
+			return items[i].snap.Site < items[j].snap.Site
+		}
+		return items[i].snap.Network < items[j].snap.Network
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	combined := make([]SiteStickyEntrySnapshot, len(items))
+	for i, item := range items {
+		combined[i] = item.snap
+	}
+	return combined, total
+}
+
+// ClearSiteSticky clears either a single site (when site != "") or all site pins
+// in the requested network table(s) ("", "tcp", or "udp").
+func (g *DialerGroup) ClearSiteSticky(site, network string) int {
+	if g == nil || !g.usesSiteSticky() {
+		return 0
+	}
+	now := g.now()
+	netFilter := strings.ToLower(strings.TrimSpace(network))
+	site = strings.TrimSpace(site)
+	cleared := 0
+	clearTable := func(t *siteStickyTable) {
+		if t == nil {
+			return
+		}
+		if site == "" {
+			cleared += t.clearAll(now)
+		} else if t.clearSite(site, now) {
+			cleared++
+		}
+	}
+	if netFilter == "" || netFilter == "tcp" {
+		clearTable(g.siteSticky)
+	}
+	if netFilter == "" || netFilter == "udp" {
+		clearTable(g.siteStickyUDP)
+	}
+	return cleared
 }

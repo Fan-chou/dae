@@ -243,8 +243,17 @@ func (h *nodeHealth) consumeAdmissionChange(idx int, alive bool, now time.Time) 
 	}
 	h.logged[idx] = next
 	if !prev.inited {
-		// First observation is the baseline, not a promotion/demotion.
-		return change, false
+		if next.state == AdmissionAlive && next.fallback == AdmissionAlive {
+			// Initial healthy observation is the baseline, not a state change.
+			return change, false
+		}
+		prev = loggedAdmission{
+			inited:   true,
+			alive:    true,
+			state:    AdmissionAlive,
+			fallback: AdmissionAlive,
+			reason:   "ok",
+		}
 	}
 	change = admissionChange{
 		from:             prev.state,
@@ -814,6 +823,68 @@ func (h *nodeHealth) snapshot() [8]NodeHealthSlotSnapshot {
 		}
 	}
 	return out
+}
+
+// NodeHealthSlotDetail exposes per-slot diagnostic health metrics for the admin API.
+type NodeHealthSlotDetail struct {
+	BaselineMs        *int32
+	QualityScoreMs    *int32
+	LossRate          *float64
+	TestSampleCount   int
+	RecentLatenciesMs []int32
+	Congested         bool
+	FailStreak        int
+	PenaltyLevel      int
+}
+
+func (h *nodeHealth) slotDetail(idx int, base time.Duration, hasBase bool, now time.Time) NodeHealthSlotDetail {
+	var detail NodeHealthSlotDetail
+	if h == nil || idx < 0 || idx >= len(h.slots) {
+		return detail
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	slot := &h.slots[idx]
+	h.maybeUpdateCongestion(idx, slot, now)
+
+	if slot.baseline > 0 {
+		ms := int32(slot.baseline.Milliseconds())
+		detail.BaselineMs = &ms
+	}
+	if n := len(slot.testResults); n > 0 {
+		fails := 0
+		for _, ok := range slot.testResults {
+			if !ok {
+				fails++
+			}
+		}
+		detail.TestSampleCount = n
+		rate := float64(fails) / float64(n)
+		detail.LossRate = &rate
+	}
+	if len(slot.recentSuccessDelays) > 0 {
+		detail.RecentLatenciesMs = make([]int32, len(slot.recentSuccessDelays))
+		for i, d := range slot.recentSuccessDelays {
+			detail.RecentLatenciesMs[i] = int32(d.Milliseconds())
+		}
+	}
+	if !hasBase && slot.lastSampleRTT > 0 {
+		base = slot.lastSampleRTT
+		hasBase = true
+	}
+	if hasBase {
+		q := base + slot.lossPenaltyLocked()
+		if slot.failDegraded || slot.degraded || slot.congested {
+			q += nodeHealthDegradePenalty
+		}
+		q += slot.timeDecayPenaltyLocked(now)
+		ms := int32(q.Milliseconds())
+		detail.QualityScoreMs = &ms
+	}
+	detail.Congested = slot.congested
+	detail.FailStreak = slot.failStreak
+	detail.PenaltyLevel = slot.penaltyLevel
+	return detail
 }
 
 func (h *nodeHealth) restore(slots [8]NodeHealthSlotSnapshot) {

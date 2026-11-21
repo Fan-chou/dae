@@ -124,7 +124,7 @@ global {
 | HTTP 状态 | `error.code` | 触发场景 |
 | --- | --- | --- |
 | `400` | `invalid_json` | 请求体 JSON 解析失败或超出体积上限 |
-| `400` | `invalid_param` | Query 参数非法（`window`、`points`、`limit`、`top`、`after_seq`、`after`、`process`、`src`、`mac`） |
+| `400` | `invalid_param` | Query 参数非法（`window`、`points`、`limit`、`top`、`after_seq`、`after`、`offloaded`、`process`、`src`、`mac`） |
 | `400` | `invalid_log_level` | `level` 不是 `error`/`warn`/`warning`/`info`/`debug`/`trace` |
 | `400` | `invalid_group` | `/api/v1/groups/{name}/{action}` 路径或分组名不合法 |
 | `400` | `invalid_member` | `selection` 请求中 `member` 为空 |
@@ -144,9 +144,9 @@ global {
 | `409` | *（无 error 信封）* | `POST /api/v1/system/reload` 当重载队列繁忙时直接返回 `409` + `{"queued": false}` |
 | `412` | `precondition_failed` | `PUT /api/v1/config` 或 `PUT /api/v1/inbounds` 携带的 `If-Match` 与当前配置 `ETag` 不一致 |
 | `429` | `rate_limited` | 认证失败次数超限，附带 `Retry-After` 秒数响应头 |
-| `429` | `probe_cooldown` | `POST /api/v1/groups/{name}/probe` 处于 3 秒冷却期内，附带 `Retry-After: 3` |
+| `429` | `probe_cooldown` | `POST /api/v1/groups/{name}/probe` 或 `POST /api/v1/groups/probe` 处于 3 秒冷却期内（`Retry-After: 3`），或 `POST /api/v1/groups/{name}/members/{member}/probe` 处于 2 秒冷却期内（`Retry-After: 2`） |
 | `500` | `config_read_failed` / `inbounds_read_failed` / `refresh_failed` | 磁盘读写异常或数据源刷新内部错误 |
-| `503` | `plane_unavailable` / `logger_unavailable` / `config_unavailable` / `reload_unavailable` / `refresh_unavailable` / `capture_unavailable` / `recovery_unavailable` / `evidence_unavailable` / `shutting_down` / `too_many_clients` | 控制面尚未就绪、功能未启用、正在停机或 WS 客户端达到 16 上限 |
+| `503` | `plane_unavailable` / `logger_unavailable` / `config_unavailable` / `reload_unavailable` / `suspend_unavailable` / `refresh_unavailable` / `capture_unavailable` / `recovery_unavailable` / `evidence_unavailable` / `shutting_down` / `too_many_clients` | 控制面尚未就绪、功能未启用、正在停机或 WS 客户端达到 16 上限 |
 
 > 错误信息会经过 `sanitizeAdminError`，移除含 `://` 的敏感连接串或还原默认提示。
 
@@ -154,18 +154,24 @@ global {
 
 ## 3. 全量接口速查目录
 
-### 3.1 REST 接口（28 个操作）
+### 3.1 REST 接口（34 个操作）
 
 | 分类 | Method | Path | 说明 | 关键特性 / 缓存 / 副作用 |
 | --- | --- | --- | --- | --- |
-| 系统 | `GET` | `/api/v1/system` | 系统元信息与配置同步/重载状态 | 慢变化元数据 |
+| 系统 | `GET` | `/api/v1/system` | 系统元信息、配置同步/重载与 `suspended` 状态 | 慢变化元数据 |
 | 系统 | `PUT` | `/api/v1/system/log-level` | 动态调整运行时日志级别 | 不重载数据面；推 `log_level_changed` |
-| 系统 | `POST` | `/api/v1/system/reload` | 校验并异步触发配置热重载 | `202` 入队 / `409` 队列忙 |
+| 系统 | `POST` | `/api/v1/system/reload` | 校验并异步触发配置热重载（也可从 suspend 恢复） | `202` 入队 / `409` 队列忙 |
+| 系统 | `POST` | `/api/v1/system/suspend` | 异步将运行面挂起为无负载状态（支持 `{"abort": bool}`） | `202` 入队 / `409` 队列忙；推 `system_suspended` |
 | 指标 | `GET` | `/api/v1/metrics` | 实时运行指标、内存/FD、DNS/FakeIP、BPF 计数 | O(1) 无 STW；`/proc` 2s 缓存 |
 | 指标 | `GET` | `/api/v1/metrics/history` | 历史上下行速率时间序列 | 最长 3600s、最多 720 点 |
-| 代理组 | `GET` | `/api/v1/groups` | 全部代理分组、成员、健康状态与展示名 | 无节点明文 URI/密码 |
-| 代理组 | `PUT` | `/api/v1/groups/{name}/selection` | 切换 fixed 分组选中成员 | 不重载数据面；推 `group_selection_changed` |
-| 代理组 | `POST` | `/api/v1/groups/{name}/probe` | 触发指定分组异步延迟探测 | 同组 `3s` 冷却（429）；返回 `202` |
+| 代理组 | `GET` | `/api/v1/groups` | 全部代理分组、成员、多槽位健康/质量分/负载与展示名 | 无节点明文 URI/密码 |
+| 代理组 | `PUT` | `/api/v1/groups/{name}/selection` | 切换 fixed 分组选中成员（支持 `close_existing`） | 不重载数据面；推 `group_selection_changed` |
+| 代理组 | `POST` | `/api/v1/groups/{name}/probe` | 触发指定分组异步延迟探测 | 同组 `3s` 冷却（429）；推 `group_probe_triggered` |
+| 代理组 | `POST` | `/api/v1/groups/probe` | 触发全部用户分组异步延迟探测 | 全局 `3s` 冷却（429）；返回 `202` |
+| 代理组 | `POST` | `/api/v1/groups/{name}/members/{member}/probe` | 触发组内单个节点或子分组异步延迟探测 | 单成员 `2s` 冷却（429）；返回 `202` |
+| 代理组 | `GET` | `/api/v1/groups/{name}/sticky` | 查询按站点粘滞（Site-Sticky）Pin 表 | 支持 `network`/`q`/`limit` |
+| 代理组 | `DELETE` | `/api/v1/groups/{name}/sticky` | 清空分组站点粘滞表（支持 `?network=tcp\|udp`） | 推 `group_sticky_changed` |
+| 代理组 | `DELETE` | `/api/v1/groups/{name}/sticky/{site}` | 解除单个站点的节点粘滞绑定 | 推 `group_sticky_changed` |
 | 连接 | `GET` | `/api/v1/connections` | 查询活跃用户态连接（支持筛选与排序） | 500ms 快照合并 + 单连接实时网速 |
 | 连接 | `DELETE` | `/api/v1/connections/{id}` | 打断并关闭单条活跃用户态连接（含 Sockmap offload） | `close_reason="aborted"`；推 `connections_closed` |
 | 连接 | `POST` | `/api/v1/connections/close` | 按条件（或全量）批量打断用户态连接 | 需 filter 或 `all:true` |
@@ -233,11 +239,14 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `dst_port` | `uint16` | 是 | 目标端口 |
 | `target` | `string` | 否 | 格式化拨号目标（如 `"api.example.com:443"`） |
 | `domain` | `string` | 否 | 归因域名（优先 `sniffed_domain`，其次域名形式的 `target` 去端口） |
+| `sniffed_domain` | `string` | 否 | 协议嗅探得到的域名（如有） |
+| `sticky_site` | `string` | 否 | 按站点粘滞选路时使用的站点键（如 eTLD+1） |
 | `mac` | `string` | 否 | 客户端 MAC 地址（如 `"3e:0a:a5:de:ae:a3"`） |
 | `process` | `string` | 否 | 客户端进程名（若已采集） |
 | `rule` | `RoutingRuleMeta \| null` | 否 | 命中的路由规则元信息；部分直连/未归因连接可能省略 |
 | `outbound` | `string` | 是 | 最终出站分组名或 `"direct"` / `"block"` / `"must_rules"` |
 | `dialer` | `string` | 否 | 实际选中的节点 / 拨号器名 |
+| `chain` | `string[]` | 否 | 选路链路序列（如 `["proxy", "auto-hk", "hk-01"]`） |
 | `policy` | `string` | 否 | 出站选路策略或选路路径描述 |
 | `offloaded` | `bool` | 否 | TCP Sockmap 内核卸载加速标志；为 `true` 时保留 `offloaded: true` |
 | `start_time` | `string` | 否 | 连接建立时间（RFC3339 UTC，如 `"2026-11-19T02:00:00Z"`） |
@@ -263,6 +272,8 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `process` | `string` | 进程名忽略大小写精确匹配 |
 | `inbound` | `string` | 入站名忽略大小写精确匹配 |
 | `rule` | `string` | 精确匹配 `rule.index` 十进制数字，或对 `rule.raw` 做不区分大小写子串匹配 |
+| `offloaded` | `bool` | 按 TCP Sockmap 内核卸载标志过滤（`true` \| `false`） |
+| `close_reason` | `string` | 按已关闭流的 `close_reason` 过滤（`normal` \| `aborted` \| `reload` \| `shutdown`） |
 | `q` | `string` | 通用搜索关键词（不区分大小写子串匹配以下 10 个字段之一：`domain`, `target`, `src_ip`, `dst_ip`, `process`, `outbound`, `dialer`, `mac`, `inbound`, `rule.raw`） |
 | `all` | `bool` | 仅用于 `POST /api/v1/connections/close`：设为 `true` 时关闭全部活跃用户态连接 |
 
@@ -394,6 +405,7 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `reload_pending` | `bool` | 否 | 是否有热重载正在执行或排队 |
 | `last_reload_error` | `string` | 否 | 最近一次重载失败错误信息（已脱敏） |
 | `last_reload_rolled_back` | `bool` | 否 | 最近一次管理端写入触发的重载失败后是否已自动回滚 |
+| `suspended` | `bool` | 是 | 守护进程当前是否处于 suspend（无负载挂起）状态 |
 
 ---
 
@@ -410,13 +422,26 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 
 #### `POST /api/v1/system/reload`
 
-校验 `config.dae`（含 `admin_listen` 安全校验）后将异步热重载请求入队。
+校验 `config.dae`（含 `admin_listen` 安全校验）后将异步热重载请求入队。若当前处于 `suspended` 状态，执行热重载将同时恢复数据面。
 
 - **请求体**：无需请求体。
 - **成功响应**：
   - `202 Accepted`：`{"queued": true}`
   - `409 Conflict`：`{"queued": false}`（重载队列繁忙或已有任务等待合并）
 - **错误**：`400 config_invalid`、`503 reload_unavailable`。
+
+---
+
+#### `POST /api/v1/system/suspend`
+
+将 `fdae` 数据面异步挂起为无负载直连状态（保留管理面 HTTP/WS 运行，可通过 `POST /api/v1/system/reload` 恢复）。
+
+- **请求体**：可选 JSON `{"abort": false}`（设 `abort: true` 时立即中断既有连接）
+- **成功响应**：
+  - `202 Accepted`：`{"queued": true}`
+  - `409 Conflict`：`{"queued": false}`
+- **事件推送**：挂起完成后向 WS `events` 主题广播 `system_suspended`。
+- **错误**：`400 invalid_json`、`503 suspend_unavailable`。
 
 ---
 
@@ -563,34 +588,47 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 **字段说明**：
 - `groups[]`:
   - `name` (`string`): 分组名
+  - `display_name` (`string`, omitempty): 展示名（如有）
+  - `origin` (`string`, omitempty): 来源（`"config"` \| `"mihomo"`）
+  - `wrapper` (`bool`, omitempty): 是否为单节点规则兼容包装组
   - `selectable` (`bool`): 是否允许手动指定成员（`policy == "fixed"` 且存在可选列表时通常为 `true`）
   - `policy` (`string`): 选路策略（如 `fixed`、`min`、`min_avg10`、`min_moving_avg`、`fallback`、`urltest`、`first_alive` 等）
   - `selected` (`string`): 当前实际选中/生效的成员名称
   - `isolate_transport` (`bool`, omitempty): 是否启用同组独立传输连接
+  - `quality_mode` (`string`, omitempty): 本地 TCP 吞吐质量调度模式（`"off"` \| `"observe"` \| `"enforce"`）
+  - `check_tolerance_ms` (`int64`, omitempty): 选路滞后容差（ms）
+  - `lazy` (`bool`, omitempty): 是否启用延迟健康检查
+  - `sticky_count` (`int`, omitempty): 当前活跃站点粘滞（TCP+UDP）条目数
   - `selection_members` (`string[]`): 可切换成员有序列表
   - `members[]`:
     - `name` (`string`): 成员唯一标识（调用 `selection` 接口时传此值）
     - `display_name` (`string`, omitempty): Mihomo 源配置的展示名（如有）
     - `kind` (`string`, omitempty): `"node"` 或 `"group"`（嵌套子分组）
+    - `resolved_leaf` (`string`, omitempty): 嵌套子分组当前解析出的实际叶子节点名
     - `protocol` (`string`, omitempty): 节点协议名（如 `vless`、`trojan`、`hysteria2`、`ss`）
     - `endpoint` (`string`, omitempty): 脱敏后的 `host:port`（不含协议串和认证信息）
     - `alive` (`bool`): 是否可用
     - `latency_ms` (`int32 | null`, omitempty): 代表性延迟（ms），未探测/失败时省略或 `null`
+    - `baseline_ms` (`int32 | null`, omitempty): 代表性 RTT 基线（ms）
+    - `quality_score_ms` (`int32 | null`, omitempty): `url_test` 综合质量分（含丢包/降级/时间衰减惩罚，单位 ms）
+    - `loss_rate` (`float64 | null`, omitempty): 近期探测失败率（`0.0..1.0`）
+    - `recent_latencies_ms` (`int32[]`, omitempty): 最近成功延迟样本列表（最多 10 点，用于火花线）
+    - `load` (`LoadContext | null`, omitempty): 节点本地实时负载上下文（`class`, `active_connections`, `upload_bytes_per_second`, `download_bytes_per_second` 等）
     - `admission` (`string`, omitempty): 准入状态（`"alive"` / `"degraded"` / `"dead"`）
-    - `reason` (`string`, omitempty): 准入判定原因（如 `"ok"` / `"not_alive"`）
+    - `reason` (`string`, omitempty): 准入判定原因（如 `"ok"` / `"not_alive"` / `"fail"` / `"rtt"` / `"congestion"`）
     - `checked_at` (`string`, omitempty): 最近检测时间（RFC3339 UTC）
-    - `probes` (`Record<string, AdminProbeHealth>`, omitempty): 按传输路径区分的最近探测结果，常见键为 `"tcp4"`、`"tcp6"`、`"dns4"`、`"dns6"`
+    - `probes` (`Record<string, AdminProbeHealth>`, omitempty): 按传输路径区分的最近探测结果，常见键为 `"tcp4"`、`"tcp6"`、`"dns4"`、`"dns6"`、`"udp4"`、`"udp6"`；每槽含 `baseline_ms`、`quality_score_ms`、`loss_rate`、`recent_latencies_ms`、`congested`、`fail_streak`、`penalty_level` 等字段
 - `display_names` (`Record<string, string>`): 成员名到展示名的映射表。
 
 ---
 
 #### `PUT /api/v1/groups/{name}/selection`
 
-在运行时切换 `fixed` 分组当前选中的成员（分组名需 URL Path 编码）。不触发重载，新连接立即生效。
+在运行时切换 `fixed` 分组当前选中的成员（分组名如含 `%`、`/` 等特殊字符需做 URL Path 编码）。不触发重载，新连接立即生效。
 
-- **请求体**：`{"member": "hk-01"}`
-- **成功响应**（`200`）：`{"group": "proxy", "member": "hk-01"}`
-- **事件推送**：向 WS `events` 主题广播 `group_selection_changed`。
+- **请求体**：`{"member": "hk-01", "close_existing": false}`（`close_existing` 可选，为 `true` 时断开该分组下与新选中成员 `member` 不匹配的活跃连接；若重复选中当前成员且无残留旧连接，则返回 `closed_connections: 0`）
+- **成功响应**（`200`）：`{"group": "proxy", "member": "hk-01"}`（启用 `close_existing` 时额外返回 `"closed_connections": N`）
+- **事件推送**：向 WS `events` 主题广播 `group_selection_changed`（断开连接时另广播 `connections_closed`）。
 - **错误**：`400 invalid_group`、`400 invalid_json`、`400 invalid_member`、`400 selection_failed`。
 
 ---
@@ -601,8 +639,45 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 
 - **请求体**：空
 - **成功响应**（`202 Accepted`）：`{"group": "proxy", "action": "probe"}`
+- **事件推送**：向 WS `events` 主题广播 `group_probe_triggered`。
 - **冷却超频**（`429 Too Many Requests`）：`error.code = "probe_cooldown"` + `Retry-After: 3`
 - **其他错误**：`400 invalid_group`、`400 probe_failed`。
+
+---
+
+#### `POST /api/v1/groups/probe`
+
+触发全部用户分组的异步节点延迟探测（全局 **3 秒** 冷却）。
+
+- **成功响应**（`202 Accepted`）：`{"action": "probe", "groups": N}`
+- **事件推送**：向 WS `events` 主题广播 `group_probe_triggered`。
+
+---
+
+#### `POST /api/v1/groups/{name}/members/{member}/probe`
+
+触发指定分组中单个节点或嵌套子分组的异步延迟探测（单成员 **2 秒** 冷却）。
+
+- **成功响应**（`202 Accepted`）：`{"group": "proxy", "member": "hk-01", "action": "probe"}`
+- **事件推送**：向 WS `events` 主题广播 `group_probe_triggered`。
+
+---
+
+#### `GET /api/v1/groups/{name}/sticky`
+
+查看 `fallback` / `url_test` 分组的当前按站点粘滞（Site-Sticky）Pin 表。
+
+- **Query 参数**：`network`（`tcp` \| `udp`）、`q`（按站点或叶子节点子串过滤）、`limit`（默认 `100`，上限 `500`）
+- **成功响应**（`200`）：`{"group": "proxy", "total": 1, "truncated": false, "entries": [{"site": "youtube.com", "network": "tcp", "leaf": "hk-01", "pinned_at": "...", "last_success": "...", "touched_at": "...", "consecutive_slow": 0, "tried_alts": 0, "converged": false, "hold_down_leaves": [], "next_recovery_at": "..."}]}`
+
+---
+
+#### `DELETE /api/v1/groups/{name}/sticky` 与 `DELETE /api/v1/groups/{name}/sticky/{site}`
+
+手动清除指定分组的全部或单个站点粘滞记录，使下次新连接重新按组策略选路（可选 `?network=tcp|udp`）。
+
+- **成功响应**（`200`）：`{"group": "proxy", "site": "youtube.com", "cleared": 1}`
+- **事件推送**：向 WS `events` 主题广播 `group_sticky_changed`。
 
 ---
 
@@ -740,7 +815,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 
 读取内存环形缓存（最近 `2048` 条已结束或被打断的连接），按结束时间**从新到旧**返回。
 
-- **Query 参数**：支持全部 [4.3 `AdminConnectionFilter`](#43-adminconnectionfilter连接过滤条件) 字段 + `limit`（默认 `100`，最大 `500`）
+- **Query 参数**：支持全部 [4.3 `AdminConnectionFilter`](#43-adminconnectionfilter连接过滤条件) 字段（含 `offloaded`、`close_reason`） + `limit`（默认 `100`，最大 `500`） + `after_seq`（增量游标，仅返回 `seq > after_seq`）
 - **响应体**（`AdminClosedFlowsSnapshot`）：
   ```json
   {
@@ -1200,19 +1275,23 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
   }
   ```
 
-**全部 10 种控制面事件（`event`）清单**：
+**全部 14 种控制面事件（`event`）清单**：
 
 | `event` | 触发时机 | `data` 内容 |
 | --- | --- | --- |
 | `reload_started` | 热重载开始执行 | 无（省略） |
 | `reload_succeeded` | 热重载成功完成并切换新控制面 | 无（省略） |
 | `reload_failed` | 异步热重载失败（含是否自动回滚） | `{"error": "...", "rolled_back": true \| false}` |
+| `system_suspended` | `POST /api/v1/system/suspend` 挂起完成 | 无（省略） |
 | `group_selection_changed` | `PUT /api/v1/groups/{name}/selection` 成功 | `{"group": "...", "member": "..."}` |
+| `group_probe_triggered` | 组或单节点测速触发 | `{"group": "...", "member"?: "..."}` |
+| `group_sticky_changed` | 清理分组站点粘滞记录成功 | `{"group": "...", "site"?: "...", "cleared": N}` |
+| `node_health_changed` | 节点准入三态（alive/degraded/dead）发生变更 | `{"node": "...", "network": "...", "from": "...", "to": "...", "reason": "...", "latency_ms"?: N}` |
 | `log_level_changed` | `PUT /api/v1/system/log-level` 成功 | `{"level": "..."}` |
 | `config_updated` | `PUT /api/v1/config` 成功写入并触发重载 | `{"queued": true \| false}` |
 | `inbounds_updated` | `PUT /api/v1/inbounds` 成功写入并触发重载 | `{"queued": true \| false}` |
 | `sources_refreshed` | `POST /api/v1/sources/refresh` 成功完成 | `{"changed": bool, "used_last_good": bool, "reload_queued": bool, "warning": "..."}` |
-| `connections_closed` | `DELETE /api/v1/connections/{id}` 或批量 `close` 成功关闭流 | 单条时 `{"closed": 1, "id": "..."}`；批量时 `{"closed": N}` |
+| `connections_closed` | `DELETE /api/v1/connections/{id}`、批量 `close` 或切节点断旧流成功关闭流 | 单条时 `{"closed": 1, "id": "..."}`；批量时 `{"closed": N, "group"?: "..."}` |
 | `traffic_reset` | `POST /api/v1/traffic/reset` 成功 | 无（省略） |
 
 ---

@@ -7,6 +7,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
+	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/control"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
@@ -398,4 +401,94 @@ func TestAdminWebSocketPreUpgradeRateLimitPendingCapShutdownAndMalformedAuth(t *
 			t.Fatal("server shutdown must not record auth failures for interrupted pending WS clients")
 		}
 	})
+}
+
+func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
+	plane := &stubAdminPlane{
+		groups: []control.AdminGroup{
+			{Name: "proxy", Policy: "fixed", Selected: "hk-01"},
+		},
+		stickyCleared: 1,
+	}
+	addr := reserveTestLoopbackAddr(t)
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.refreshWithCORS(addr, "ws-p0-secret", nil)
+	t.Cleanup(server.shutdown)
+
+	wsURL := "ws://" + addr + "/api/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(wsClientFrame{Type: "auth", Token: "ws-p0-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	var authOK wsServerFrame
+	if err := conn.ReadJSON(&authOK); err != nil || authOK.Type != "auth_ok" {
+		t.Fatalf("auth_ok failed: %+v err=%v", authOK, err)
+	}
+	if err := conn.WriteJSON(wsClientFrame{Type: "sub", Topic: "events"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait briefly until subscription is registered.
+	deadline := time.Now().Add(2 * time.Second)
+	for server.wsHub.ActiveTopics()["events"] == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Trigger node admission state transition on a real dialer and verify node_health_changed WS event.
+	prop := &outbounddialer.Property{}
+	prop.Name = "hk-01"
+	prop.Protocol = "direct"
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	d := outbounddialer.NewDialer(
+		nil,
+		&outbounddialer.GlobalOption{Log: logger, CheckInterval: time.Second},
+		outbounddialer.InstanceOption{DisableCheck: true},
+		prop,
+	)
+	t.Cleanup(func() { _ = d.Close() })
+	typ := &outbounddialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	// First degradation from default alive must emit node_health_changed without needing a warmup call.
+	d.SetFailDegradedForTest(typ, true)
+
+	// Trigger group_probe_triggered, group_sticky_changed, and system_suspended events.
+	client := &http.Client{Timeout: 2 * time.Second}
+	postProbe, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/api/v1/groups/probe", nil)
+	postProbe.Header.Set("Authorization", "Bearer ws-p0-secret")
+	if resp, rerr := client.Do(postProbe); rerr != nil {
+		t.Fatal(rerr)
+	} else {
+		_ = resp.Body.Close()
+	}
+
+	delSticky, _ := http.NewRequest(http.MethodDelete, "http://"+addr+"/api/v1/groups/proxy/sticky/example.com", nil)
+	delSticky.Header.Set("Authorization", "Bearer ws-p0-secret")
+	if resp, rerr := client.Do(delSticky); rerr != nil {
+		t.Fatal(rerr)
+	} else {
+		_ = resp.Body.Close()
+	}
+
+	server.markSuspended()
+
+	seen := map[string]bool{}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for len(seen) < 4 {
+		var frame wsServerFrame
+		if err := conn.ReadJSON(&frame); err != nil {
+			t.Fatalf("missing WS P0 events (seen=%v): %v", seen, err)
+		}
+		if frame.Type == "event" {
+			seen[frame.Event] = true
+		}
+	}
+	for _, ev := range []string{"node_health_changed", "group_probe_triggered", "group_sticky_changed", "system_suspended"} {
+		if !seen[ev] {
+			t.Fatalf("missing event %q in %v", ev, seen)
+		}
+	}
 }

@@ -77,7 +77,7 @@ func (t *adminConnectionTracker) baseSnapshot(plane adminPlane) control.AdminCon
 	}
 	t.mu.Unlock()
 
-	fresh := plane.AdminConnections(adminFlowMaxSnapshotLimit, control.AdminConnectionFilter{})
+	fresh := plane.AdminAllActiveConnections()
 	fetchedAt := nowFn()
 
 	t.mu.Lock()
@@ -171,10 +171,11 @@ func (t *adminConnectionTracker) Snapshot(
 	}
 
 	sortBy = strings.ToLower(strings.TrimSpace(sortBy))
-	desc := strings.ToLower(strings.TrimSpace(order)) != "asc"
-	if sortBy != "" {
-		sortAdminConnectionsBy(snap.Connections, sortBy, desc)
+	if sortBy == "" {
+		sortBy = "total"
 	}
+	desc := strings.ToLower(strings.TrimSpace(order)) != "asc"
+	sortAdminConnectionsBy(snap.Connections, sortBy, desc)
 
 	if len(snap.Connections) > limit {
 		snap.Connections = snap.Connections[:limit]

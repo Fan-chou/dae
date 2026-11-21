@@ -206,23 +206,25 @@ func (s *inboundUDPSession) toAdminConnectionLocked(now time.Time) AdminConnecti
 		}
 	}
 	return AdminConnection{
-		ID:         "in-udp:" + strconv.FormatUint(s.id, 10),
-		Network:    "udp",
-		Inbound:    s.relay.inbound,
-		SrcIP:      srcIP,
-		SrcPort:    srcPort,
-		DstIP:      dstIP,
-		DstPort:    s.target.Port,
-		Target:     target,
-		Domain:     s.domain,
-		Rule:       s.rule,
-		Outbound:   s.outbound,
-		Dialer:     s.dialer,
-		Policy:     s.policy,
-		StartTime:  formatFlowStart(s.startUnixNano),
-		DurationMs: flowDurationMs(s.startUnixNano, now),
-		Upload:     s.upload.Load(),
-		Download:   s.download.Load(),
+		ID:            "in-udp:" + strconv.FormatUint(s.id, 10),
+		Network:       "udp",
+		Inbound:       s.relay.inbound,
+		SrcIP:         srcIP,
+		SrcPort:       srcPort,
+		DstIP:         dstIP,
+		DstPort:       s.target.Port,
+		Target:        target,
+		Domain:        sanitizeAdminDomain(s.domain),
+		SniffedDomain: "",
+		Rule:          s.rule,
+		Outbound:      s.outbound,
+		Dialer:        s.dialer,
+		Chain:         buildAdminConnectionChain(s.outbound, "", s.dialer),
+		Policy:        s.policy,
+		StartTime:     formatFlowStart(s.startUnixNano),
+		DurationMs:    flowDurationMs(s.startUnixNano, now),
+		Upload:        s.upload.Load(),
+		Download:      s.download.Load(),
 	}
 }
 
@@ -265,12 +267,11 @@ func (m *InboundManager) CloseUDPConnectionByID(id string) bool {
 	return false
 }
 
-// CloseUDPConnections terminates inbound UDP sessions matching filter and returns the closed count.
-func (m *InboundManager) CloseUDPConnections(filter AdminConnectionFilter) int {
+// CloseUDPConnectionsWhere terminates inbound UDP sessions satisfying match and returns the closed count.
+func (m *InboundManager) CloseUDPConnectionsWhere(match func(AdminConnection) bool) int {
 	if m == nil {
 		return 0
 	}
-	filter = filter.normalized()
 	m.mu.Lock()
 	servers := make([]*inboundServer, 0, len(m.servers))
 	for _, s := range m.servers {
@@ -289,7 +290,7 @@ func (m *InboundManager) CloseUDPConnections(filter AdminConnectionFilter) int {
 		for _, r := range relays {
 			r.mu.Lock()
 			for _, s := range r.sessions {
-				if item, ok := s.adminConnection(); ok && (filter.IsEmpty() || item.matches(filter)) {
+				if item, ok := s.adminConnection(); ok && (match == nil || match(item)) {
 					matched = append(matched, s)
 				}
 			}
@@ -301,6 +302,17 @@ func (m *InboundManager) CloseUDPConnections(filter AdminConnectionFilter) int {
 		s.close()
 	}
 	return len(matched)
+}
+
+// CloseUDPConnections terminates inbound UDP sessions matching filter and returns the closed count.
+func (m *InboundManager) CloseUDPConnections(filter AdminConnectionFilter) int {
+	filter = filter.normalized()
+	if filter.IsEmpty() {
+		return m.CloseUDPConnectionsWhere(nil)
+	}
+	return m.CloseUDPConnectionsWhere(func(item AdminConnection) bool {
+		return item.matches(filter)
+	})
 }
 
 var inboundUDPSessionSeq atomic.Uint64

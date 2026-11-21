@@ -23,6 +23,7 @@ import (
 
 	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/dae/component/outbound"
+	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/sirupsen/logrus"
@@ -35,6 +36,7 @@ const (
 	adminShutdownTimeout       = 2 * time.Second
 	adminMaxBodyBytes          = 1 << 14
 	adminProbeCooldown         = 3 * time.Second
+	adminMemberProbeCooldown   = 2 * time.Second
 )
 
 type adminPlane interface {
@@ -45,12 +47,19 @@ type adminPlane interface {
 	AdminGroups() []control.AdminGroup
 	SetGroupSelection(groupName, memberName string) error
 	TriggerLatencyChecksForGroup(groupName string) error
+	TriggerLatencyChecksAllGroups() int
+	TriggerLatencyChecksForMember(groupName, memberName string) error
+	AdminGroupSticky(groupName, network, query string, limit int) ([]outbound.SiteStickyEntrySnapshot, int, error)
+	AdminClearGroupSticky(groupName, site, network string) (int, error)
 	AdminConnections(limit int, filter control.AdminConnectionFilter) control.AdminConnectionsSnapshot
+	AdminAllActiveConnections() control.AdminConnectionsSnapshot
 	AdminClosedFlows(limit int, filter control.AdminConnectionFilter) control.AdminClosedFlowsSnapshot
+	AdminClosedFlowsAfter(limit int, filter control.AdminConnectionFilter, afterSeq uint64) control.AdminClosedFlowsSnapshot
 	AdminTrafficSummary(topN int) control.AdminTrafficSummary
 	AdminResetTrafficSummary()
 	AdminCloseConnection(id string) bool
 	AdminCloseConnections(filter control.AdminConnectionFilter) int
+	AdminCloseGroupOtherConnections(groupName, keepMember string) int
 	AdminKernelConnections(limit int, src, mac string, resolveDomains bool) control.AdminKernelConnectionsSnapshot
 	AdminCloseKernelConnection(req control.AdminKernelCloseRequest) (control.AdminKernelCloseResult, error)
 	SetClosedFlowObserver(fn func(control.AdminClosedFlow))
@@ -59,6 +68,8 @@ type adminPlane interface {
 type adminPlaneProvider func() adminPlane
 
 type adminReloadFunc func() bool
+
+type adminSuspendFunc func(abort bool) bool
 
 type adminSourcesRefreshResult struct {
 	Changed      bool   `json:"changed"`
@@ -82,6 +93,7 @@ type adminServer struct {
 	log         *logrus.Logger
 	plane       adminPlaneProvider
 	reload      adminReloadFunc
+	suspend     adminSuspendFunc
 	inbounds    func() []control.InboundStatus
 
 	reloadManager        *reloadManager
@@ -91,6 +103,7 @@ type adminServer struct {
 	lastReloadError      string
 	lastReloadRolledBack bool
 	suspended            bool
+	unregisterAdmission  func()
 
 	authLimiter *adminAuthLimiter
 	logRing     *adminLogRing
@@ -98,7 +111,9 @@ type adminServer struct {
 	wsHub       *adminWSHub
 
 	probeMu       sync.Mutex
+	lastAllProbe  time.Time
 	lastProbeByGp map[string]time.Time
+	lastMemberPrb map[string]time.Time
 
 	sourcesMu        sync.Mutex
 	sourcesRefreshing atomic.Bool
@@ -122,10 +137,16 @@ type adminSystemBody struct {
 	LastReloadError      string `json:"last_reload_error,omitempty"`
 	ReloadPending        bool   `json:"reload_pending,omitempty"`
 	LastReloadRolledBack bool   `json:"last_reload_rolled_back,omitempty"`
+	Suspended            bool   `json:"suspended"`
 }
 
 type adminGroupPutBody struct {
-	Member string `json:"member"`
+	Member        string `json:"member"`
+	CloseExisting bool   `json:"close_existing,omitempty"`
+}
+
+type adminSuspendPostBody struct {
+	Abort bool `json:"abort,omitempty"`
 }
 
 type adminLogLevelPutBody struct {
@@ -159,6 +180,7 @@ func newAdminServer(log *logrus.Logger, logFile, configDir string, plane adminPl
 		logRing:       newAdminLogRing(),
 		connTracker:   newAdminConnectionTracker(),
 		lastProbeByGp: make(map[string]time.Time),
+		lastMemberPrb: make(map[string]time.Time),
 	}
 	s.wsHub = newAdminWSHub(s)
 	return s
@@ -314,6 +336,7 @@ func (s *adminServer) markSuspended() {
 	s.mu.Lock()
 	s.suspended = true
 	s.mu.Unlock()
+	s.emitWSEvent("system_suspended", nil)
 }
 
 func (s *adminServer) handleAsyncReloadFailure(errMsg string) {
@@ -496,6 +519,9 @@ func (s *adminServer) refreshWithCORS(listen, secret string, corsOrigins []strin
 	}
 	s.http = server
 	s.boundAddr = boundAddr
+	s.unregisterAdmission = outbounddialer.RegisterAdmissionChangeListener(func(ev outbounddialer.AdmissionChangeEvent) {
+		s.emitWSEvent("node_health_changed", ev)
+	})
 	go func() {
 		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.warnf("admin HTTP listen failed (tproxy continues): %v", err)
@@ -509,9 +535,11 @@ func (s *adminServer) buildMux() *http.ServeMux {
 	mux.HandleFunc("/api/v1/system", s.withAdminAuth(s.handleSystem))
 	mux.HandleFunc("/api/v1/system/log-level", s.withAdminAuth(s.handleSystemLogLevel))
 	mux.HandleFunc("/api/v1/system/reload", s.withAdminAuth(s.handleReload))
+	mux.HandleFunc("/api/v1/system/suspend", s.withAdminAuth(s.handleSuspend))
 	mux.HandleFunc("/api/v1/metrics", s.withAdminAuth(s.handleMetrics))
 	mux.HandleFunc("/api/v1/metrics/history", s.withAdminAuth(s.handleMetricsHistory))
 	mux.HandleFunc("/api/v1/groups", s.withAdminAuth(s.handleGroups))
+	mux.HandleFunc("/api/v1/groups/probe", s.withAdminAuth(s.handleGroupsProbe))
 	mux.HandleFunc("/api/v1/groups/", s.withAdminAuth(s.handleGroup))
 	mux.HandleFunc("/api/v1/connections", s.withAdminAuth(s.handleConnections))
 	mux.HandleFunc("/api/v1/connections/close", s.withAdminAuth(s.handleConnectionsClose))
@@ -550,6 +578,10 @@ func (s *adminServer) shutdown() {
 }
 
 func (s *adminServer) stopLocked() {
+	if s.unregisterAdmission != nil {
+		s.unregisterAdmission()
+		s.unregisterAdmission = nil
+	}
 	s.boundAddr = ""
 	if s.http == nil {
 		return
@@ -651,6 +683,9 @@ func (s *adminServer) handleSystem(w http.ResponseWriter, r *http.Request) {
 	body.LastReloadError = syncStatus.lastReloadError
 	body.ReloadPending = syncStatus.reloadPending
 	body.LastReloadRolledBack = syncStatus.lastReloadRolledBack
+	s.mu.Lock()
+	body.Suspended = s.suspended
+	s.mu.Unlock()
 	if view := CurrentEffectiveConfig(); view != nil {
 		body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
 	}
@@ -759,8 +794,26 @@ func (s *adminServer) buildGroupsBody() (any, bool) {
 	}
 	groups := plane.AdminGroups()
 	displayNames := CurrentDisplayNames()
-	if len(displayNames) > 0 {
-		for gi := range groups {
+	effective := CurrentEffectiveConfig()
+	var effectiveByName map[string]EffectiveGroup
+	if effective != nil && len(effective.Groups) > 0 {
+		effectiveByName = make(map[string]EffectiveGroup, len(effective.Groups))
+		for _, eg := range effective.Groups {
+			effectiveByName[eg.Name] = eg
+		}
+	}
+	for gi := range groups {
+		if dn := displayNames[groups[gi].Name]; dn != "" {
+			groups[gi].DisplayName = dn
+		}
+		if eg, ok := effectiveByName[groups[gi].Name]; ok {
+			if groups[gi].DisplayName == "" && eg.DisplayName != "" {
+				groups[gi].DisplayName = eg.DisplayName
+			}
+			groups[gi].Origin = eg.Origin
+			groups[gi].Wrapper = eg.Wrapper
+		}
+		if len(displayNames) > 0 {
 			for mi := range groups[gi].Members {
 				if dn := displayNames[groups[gi].Members[mi].Name]; dn != "" {
 					groups[gi].Members[mi].DisplayName = dn
@@ -787,8 +840,28 @@ func (s *adminServer) handleGroups(w http.ResponseWriter, r *http.Request) {
 	writeAdminJSON(w, http.StatusOK, body)
 }
 
+func (s *adminServer) handleGroupsProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	plane := s.currentPlane()
+	if plane == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "plane_unavailable", "control plane is not ready")
+		return
+	}
+	if !s.allowAllGroupsProbe() {
+		w.Header().Set("Retry-After", "3")
+		writeAdminAPIError(w, http.StatusTooManyRequests, "probe_cooldown", "probe requested too frequently")
+		return
+	}
+	count := plane.TriggerLatencyChecksAllGroups()
+	s.emitWSEvent("group_probe_triggered", map[string]string{"group": "*"})
+	writeAdminJSON(w, http.StatusAccepted, map[string]any{"action": "probe", "groups": count})
+}
+
 func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
-	name, action, err := parseAdminGroupPath(r.URL.Path)
+	name, action, arg, err := parseAdminGroupPathWithArg(r.URL.EscapedPath())
 	if err != nil {
 		writeAdminAPIError(w, http.StatusBadRequest, "invalid_group", err.Error())
 		return
@@ -813,7 +886,77 @@ func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 			writeAdminAPIError(w, http.StatusBadRequest, "probe_failed", sanitizeAdminError(err))
 			return
 		}
+		s.emitWSEvent("group_probe_triggered", map[string]string{"group": name})
 		writeAdminJSON(w, http.StatusAccepted, map[string]string{"group": name, "action": "probe"})
+	case "member_probe":
+		if r.Method != http.MethodPost {
+			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		if !s.allowMemberProbe(name, arg) {
+			w.Header().Set("Retry-After", "2")
+			writeAdminAPIError(w, http.StatusTooManyRequests, "probe_cooldown", "probe requested too frequently for member "+arg)
+			return
+		}
+		if err := plane.TriggerLatencyChecksForMember(name, arg); err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "probe_failed", sanitizeAdminError(err))
+			return
+		}
+		s.emitWSEvent("group_probe_triggered", map[string]string{"group": name, "member": arg})
+		writeAdminJSON(w, http.StatusAccepted, map[string]string{"group": name, "member": arg, "action": "probe"})
+	case "sticky":
+		switch r.Method {
+		case http.MethodGet:
+			if arg != "" {
+				writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+				return
+			}
+			q := r.URL.Query()
+			limit := 100
+			if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+				parsed, perr := parsePositiveInt(raw, 500)
+				if perr != nil {
+					writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid limit")
+					return
+				}
+				limit = parsed
+			}
+			network := strings.ToLower(strings.TrimSpace(q.Get("network")))
+			if network != "" && network != "tcp" && network != "udp" {
+				writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid network")
+				return
+			}
+			entries, total, gerr := plane.AdminGroupSticky(name, network, q.Get("q"), limit)
+			if gerr != nil {
+				writeAdminAPIError(w, http.StatusBadRequest, "invalid_group", sanitizeAdminError(gerr))
+				return
+			}
+			writeAdminJSON(w, http.StatusOK, map[string]any{
+				"group":     name,
+				"total":     total,
+				"truncated": total > len(entries),
+				"entries":   entries,
+			})
+		case http.MethodDelete:
+			network := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("network")))
+			if network != "" && network != "tcp" && network != "udp" {
+				writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid network")
+				return
+			}
+			cleared, gerr := plane.AdminClearGroupSticky(name, arg, network)
+			if gerr != nil {
+				writeAdminAPIError(w, http.StatusBadRequest, "invalid_group", sanitizeAdminError(gerr))
+				return
+			}
+			ev := map[string]any{"group": name, "cleared": cleared}
+			if arg != "" {
+				ev["site"] = arg
+			}
+			s.emitWSEvent("group_sticky_changed", ev)
+			writeAdminJSON(w, http.StatusOK, ev)
+		default:
+			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
 	case "selection":
 		if r.Method != http.MethodPut {
 			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -835,10 +978,39 @@ func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.emitWSEvent("group_selection_changed", map[string]string{"group": name, "member": body.Member})
+		if body.CloseExisting {
+			closed := plane.AdminCloseGroupOtherConnections(name, body.Member)
+			if s.connTracker != nil {
+				s.connTracker.Invalidate()
+			}
+			if closed > 0 {
+				s.emitWSEvent("connections_closed", map[string]any{"closed": closed, "group": name})
+			}
+			writeAdminJSON(w, http.StatusOK, map[string]any{
+				"group":              name,
+				"member":             body.Member,
+				"closed_connections": closed,
+			})
+			return
+		}
 		writeAdminJSON(w, http.StatusOK, map[string]string{"group": name, "member": body.Member})
 	default:
 		writeAdminAPIError(w, http.StatusNotFound, "not_found", "group endpoint not found")
 	}
+}
+
+func (s *adminServer) allowAllGroupsProbe() bool {
+	if s == nil {
+		return true
+	}
+	now := time.Now()
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if !s.lastAllProbe.IsZero() && now.Sub(s.lastAllProbe) < adminProbeCooldown {
+		return false
+	}
+	s.lastAllProbe = now
+	return true
 }
 
 func (s *adminServer) allowGroupProbe(group string) bool {
@@ -865,24 +1037,64 @@ func (s *adminServer) allowGroupProbe(group string) bool {
 	return true
 }
 
-func parseConnectionFilterQuery(q url.Values) control.AdminConnectionFilter {
+func (s *adminServer) allowMemberProbe(group, member string) bool {
+	if s == nil {
+		return true
+	}
+	key := group + "\x00" + member
+	now := time.Now()
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.lastMemberPrb == nil {
+		s.lastMemberPrb = make(map[string]time.Time)
+	}
+	if prev, ok := s.lastMemberPrb[key]; ok && now.Sub(prev) < adminMemberProbeCooldown {
+		return false
+	}
+	if len(s.lastMemberPrb) >= 512 {
+		for k, ts := range s.lastMemberPrb {
+			if now.Sub(ts) >= adminMemberProbeCooldown {
+				delete(s.lastMemberPrb, k)
+			}
+		}
+	}
+	s.lastMemberPrb[key] = now
+	return true
+}
+
+func parseConnectionFilterQuery(q url.Values) (control.AdminConnectionFilter, error) {
 	srcIP := q.Get("src_ip")
 	if srcIP == "" {
 		srcIP = q.Get("src")
 	}
-	return control.AdminConnectionFilter{
-		Network:  q.Get("network"),
-		Outbound: q.Get("outbound"),
-		Dialer:   q.Get("dialer"),
-		SrcIP:    srcIP,
-		DstIP:    q.Get("dst_ip"),
-		Domain:   q.Get("domain"),
-		Mac:      q.Get("mac"),
-		Process:  q.Get("process"),
-		Inbound:  q.Get("inbound"),
-		Rule:     q.Get("rule"),
-		Query:    q.Get("q"),
+	var offloaded *bool
+	if rawOffloaded := strings.TrimSpace(q.Get("offloaded")); rawOffloaded != "" {
+		switch strings.ToLower(rawOffloaded) {
+		case "true", "1":
+			v := true
+			offloaded = &v
+		case "false", "0":
+			v := false
+			offloaded = &v
+		default:
+			return control.AdminConnectionFilter{}, fmt.Errorf("invalid offloaded")
+		}
 	}
+	return control.AdminConnectionFilter{
+		Network:     q.Get("network"),
+		Outbound:    q.Get("outbound"),
+		Dialer:      q.Get("dialer"),
+		SrcIP:       srcIP,
+		DstIP:       q.Get("dst_ip"),
+		Domain:      q.Get("domain"),
+		Mac:         q.Get("mac"),
+		Process:     q.Get("process"),
+		Inbound:     q.Get("inbound"),
+		Rule:        q.Get("rule"),
+		Offloaded:   offloaded,
+		CloseReason: q.Get("close_reason"),
+		Query:       q.Get("q"),
+	}, nil
 }
 
 func (s *adminServer) snapshotTrackedConnections(limit int, filter control.AdminConnectionFilter, sortBy, order string) control.AdminConnectionsSnapshot {
@@ -916,7 +1128,11 @@ func (s *adminServer) handleConnections(w http.ResponseWriter, r *http.Request) 
 		}
 		limit = parsed
 	}
-	filter := parseConnectionFilterQuery(q)
+	filter, err := parseConnectionFilterQuery(q)
+	if err != nil {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", err.Error())
+		return
+	}
 	snap := s.snapshotTrackedConnections(limit, filter, q.Get("sort"), q.Get("order"))
 	writeAdminJSON(w, http.StatusOK, snap)
 }
@@ -932,7 +1148,12 @@ func (s *adminServer) handleConnectionByID(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	const prefix = "/api/v1/connections/"
-	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	escapedPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(escapedPath, prefix) {
+		writeAdminAPIError(w, http.StatusNotFound, "not_found", "connection not found")
+		return
+	}
+	rest := strings.TrimPrefix(escapedPath, prefix)
 	if rest == "" || strings.Contains(rest, "/") {
 		writeAdminAPIError(w, http.StatusNotFound, "not_found", "connection not found")
 		return
@@ -969,7 +1190,7 @@ func (s *adminServer) handleConnectionsClose(w http.ResponseWriter, r *http.Requ
 		writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
 		return
 	}
-	if !filter.All && filter.IsEmpty() {
+	if !filter.All && !filter.HasActiveFilter() {
 		writeAdminAPIError(w, http.StatusBadRequest, "filter_required", "at least one filter field or all=true is required")
 		return
 	}
@@ -1052,7 +1273,21 @@ func (s *adminServer) handleClosedFlows(w http.ResponseWriter, r *http.Request) 
 		}
 		limit = parsed
 	}
-	writeAdminJSON(w, http.StatusOK, plane.AdminClosedFlows(limit, parseConnectionFilterQuery(q)))
+	var afterSeq uint64
+	if rawAfter := strings.TrimSpace(q.Get("after_seq")); rawAfter != "" {
+		parsed, err := strconv.ParseUint(rawAfter, 10, 64)
+		if err != nil {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", "invalid after_seq")
+			return
+		}
+		afterSeq = parsed
+	}
+	filter, err := parseConnectionFilterQuery(q)
+	if err != nil {
+		writeAdminAPIError(w, http.StatusBadRequest, "invalid_param", err.Error())
+		return
+	}
+	writeAdminJSON(w, http.StatusOK, plane.AdminClosedFlowsAfter(limit, filter, afterSeq))
 }
 
 func (s *adminServer) handleTrafficSummary(w http.ResponseWriter, r *http.Request) {
@@ -1180,6 +1415,31 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	queued := s.reload()
+	status := http.StatusAccepted
+	if !queued {
+		status = http.StatusConflict
+	}
+	writeAdminJSON(w, status, adminReloadBody{Queued: queued})
+}
+
+func (s *adminServer) handleSuspend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	var body adminSuspendPostBody
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, adminMaxBodyBytes)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeAdminAPIError(w, http.StatusBadRequest, "invalid_json", "invalid json")
+			return
+		}
+	}
+	if s.suspend == nil {
+		writeAdminAPIError(w, http.StatusServiceUnavailable, "suspend_unavailable", "suspend is unavailable")
+		return
+	}
+	queued := s.suspend(body.Abort)
 	status := http.StatusAccepted
 	if !queued {
 		status = http.StatusConflict
@@ -1432,27 +1692,67 @@ func clientIPFromRequest(r *http.Request) string {
 }
 
 func parseAdminGroupPath(path string) (name, action string, err error) {
-	const prefix = "/api/v1/groups/"
-	if !strings.HasPrefix(path, prefix) {
-		return "", "", fmt.Errorf("group is required")
+	name, action, arg, err := parseAdminGroupPathWithArg(path)
+	if err != nil {
+		return "", "", err
 	}
-	rest := strings.Trim(strings.TrimPrefix(path, prefix), "/")
-	if rest == "" {
-		return "", "", fmt.Errorf("group is required")
-	}
-	parts := strings.Split(rest, "/")
-	if len(parts) != 2 {
+	if arg != "" || (action != "selection" && action != "probe") {
 		return "", "", fmt.Errorf("invalid group action path")
 	}
-	name, err = url.PathUnescape(parts[0])
-	if err != nil || name == "" || strings.Contains(name, "/") {
-		return "", "", fmt.Errorf("invalid group")
+	return name, action, nil
+}
+
+func hasAdminControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
 	}
-	switch parts[1] {
-	case "selection", "probe":
-		return name, parts[1], nil
+	return false
+}
+
+func parseAdminGroupPathWithArg(escapedPath string) (name, action, arg string, err error) {
+	const prefix = "/api/v1/groups/"
+	if !strings.HasPrefix(escapedPath, prefix) {
+		return "", "", "", fmt.Errorf("group is required")
+	}
+	rest := strings.TrimSuffix(strings.TrimPrefix(escapedPath, prefix), "/")
+	if rest == "" {
+		return "", "", "", fmt.Errorf("group is required")
+	}
+	parts := strings.Split(rest, "/")
+	name, err = url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(name) == "" || hasAdminControlChar(name) {
+		return "", "", "", fmt.Errorf("invalid group")
+	}
+	switch len(parts) {
+	case 2:
+		switch parts[1] {
+		case "selection", "probe", "sticky":
+			return name, parts[1], "", nil
+		default:
+			return "", "", "", fmt.Errorf("invalid group action")
+		}
+	case 3:
+		if parts[1] != "sticky" {
+			return "", "", "", fmt.Errorf("invalid group action")
+		}
+		site, uerr := url.PathUnescape(parts[2])
+		if uerr != nil || strings.TrimSpace(site) == "" || strings.Contains(site, "/") || hasAdminControlChar(site) {
+			return "", "", "", fmt.Errorf("invalid sticky site")
+		}
+		return name, "sticky", strings.TrimSpace(site), nil
+	case 4:
+		if parts[1] != "members" || parts[3] != "probe" {
+			return "", "", "", fmt.Errorf("invalid group action")
+		}
+		member, uerr := url.PathUnescape(parts[2])
+		if uerr != nil || strings.TrimSpace(member) == "" || hasAdminControlChar(member) {
+			return "", "", "", fmt.Errorf("invalid member")
+		}
+		return name, "member_probe", strings.TrimSpace(member), nil
 	default:
-		return "", "", fmt.Errorf("invalid group action")
+		return "", "", "", fmt.Errorf("invalid group action path")
 	}
 }
 

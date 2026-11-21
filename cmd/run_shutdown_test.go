@@ -815,6 +815,30 @@ func TestReloadManagerCoalesceReloadRequestKeepsLatestQueuedRequest(t *testing.T
 	}
 }
 
+func TestReloadManagerCoalesceReloadRequestMergesAbortConnections(t *testing.T) {
+	reloadReqs := make(chan reloadRequest, 2)
+	manager := newReloadManager(reloadReqs, make(chan struct{}, 1), make(chan os.Signal, 1))
+
+	now := time.Now()
+	latest := reloadRequest{
+		isSuspend:        true,
+		abortConnections: false,
+		requestedAt:      now.Add(time.Second),
+		requestedAtMono:  99,
+	}
+	reloadReqs <- latest
+
+	got := manager.coalesceReloadRequest(reloadRequest{
+		isSuspend:        true,
+		abortConnections: true,
+		requestedAt:      now,
+		requestedAtMono:  11,
+	})
+	if !got.abortConnections || !got.isSuspend || got.requestedAtMono != 99 {
+		t.Fatalf("coalesceReloadRequest() = %+v, want abortConnections=true preserved", got)
+	}
+}
+
 func TestDNSConfigEqualUsesStableFingerprint(t *testing.T) {
 	oldConf := &config.Config{
 		Dns: config.Dns{

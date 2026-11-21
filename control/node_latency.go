@@ -34,6 +34,49 @@ func (c *ControlPlane) TriggerLatencyChecks() {
 	}
 }
 
+// TriggerLatencyChecksAllGroups refreshes latency checks on every non-builtin
+// outbound group and returns the number of groups triggered.
+func (c *ControlPlane) TriggerLatencyChecksAllGroups() int {
+	if c == nil {
+		return 0
+	}
+	count := 0
+	for _, group := range c.outbounds {
+		if group == nil || isBuiltinAdminGroup(group.Name) {
+			continue
+		}
+		c.notifyGroupLatencyChecks(group)
+		count++
+	}
+	return count
+}
+
+// TriggerLatencyChecksForMember triggers an immediate latency check on one
+// node or nested sub-group inside groupName.
+func (c *ControlPlane) TriggerLatencyChecksForMember(groupName, memberName string) error {
+	if c == nil {
+		return fmt.Errorf("control plane is not ready")
+	}
+	groupName = strings.TrimSpace(groupName)
+	memberName = strings.TrimSpace(memberName)
+	if groupName == "" || isBuiltinAdminGroup(groupName) {
+		return fmt.Errorf("invalid group")
+	}
+	if memberName == "" {
+		return fmt.Errorf("invalid member")
+	}
+	for _, group := range c.outbounds {
+		if group == nil || group.Name != groupName {
+			continue
+		}
+		if group.NotifyCheckMember(memberName) {
+			return nil
+		}
+		return fmt.Errorf("unknown member")
+	}
+	return fmt.Errorf("unknown group")
+}
+
 // TriggerLatencyChecksForGroup asks one outbound group's dialers to refresh
 // latency samples. Built-in groups are rejected.
 func (c *ControlPlane) TriggerLatencyChecksForGroup(name string) error {

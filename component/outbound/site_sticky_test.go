@@ -1435,3 +1435,94 @@ func TestDialerGroup_HasAlternativeDialerAndSkipQuality(t *testing.T) {
 		t.Fatalf("SelectWithSkipQuality selected %v, want p3", d)
 	}
 }
+
+func TestSiteStickySnapshotAndClear(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	p1 := namedNoopDialer(option, "p1")
+	p2 := namedNoopDialer(option, "p2")
+	defer p1.Close()
+	defer p2.Close()
+
+	fb := NewDialerGroup(option, "fallback", []*dialer.Dialer{p1, p2}, newEmptyAnnotations(2), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+	defer fb.Close()
+
+	now := time.Unix(1_700_000_000, 0)
+	fb.nowFn = func() time.Time { return now }
+
+	fb.PinSite("a.youtube.com", p1, false)
+	fb.PinSite("github.com", p2, false)
+	fb.siteStickyUDP.pin("discord.com", p2, now, false, nil)
+
+	if got := fb.StickyCount(); got != 3 {
+		t.Fatalf("StickyCount = %d, want 3", got)
+	}
+	entries, total := fb.SnapshotSiteSticky("", "you", 10)
+	if total != 1 || len(entries) != 1 || entries[0].Site != "youtube.com" || entries[0].Leaf != "p1" || entries[0].Network != "tcp" {
+		t.Fatalf("SnapshotSiteSticky = total:%d entries:%+v", total, entries)
+	}
+	if cleared := fb.ClearSiteSticky("youtube.com", "tcp"); cleared != 1 {
+		t.Fatalf("ClearSiteSticky single = %d, want 1", cleared)
+	}
+	if got := fb.StickyCount(); got != 2 {
+		t.Fatalf("StickyCount after single clear = %d, want 2", got)
+	}
+	if cleared := fb.ClearSiteSticky("", ""); cleared != 2 {
+		t.Fatalf("ClearSiteSticky all = %d, want 2", cleared)
+	}
+	if got := fb.StickyCount(); got != 0 {
+		t.Fatalf("StickyCount after clear all = %d, want 0", got)
+	}
+}
+
+func TestSiteStickyExpiredClearCountsAndNanosecondSort(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	p1 := namedNoopDialer(option, "p1")
+	p2 := namedNoopDialer(option, "p2")
+	defer p1.Close()
+	defer p2.Close()
+
+	fb := NewDialerGroup(option, "fallback", []*dialer.Dialer{p1, p2}, newEmptyAnnotations(2), DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Fallback}, func(bool, *dialer.NetworkType, bool) {})
+	defer fb.Close()
+
+	base := time.Unix(1_700_000_000, 0)
+	cur := base
+	fb.nowFn = func() time.Time { return cur }
+
+	// Pin two sites within the same RFC3339 second but different nanoseconds.
+	fb.siteSticky.pin("older.com", p1, base.Add(100*time.Millisecond), false, nil)
+	fb.siteSticky.pin("newer.com", p2, base.Add(500*time.Millisecond), false, nil)
+
+	cur = base.Add(time.Second)
+	entries, total := fb.SnapshotSiteSticky("", "", 10)
+	if total != 2 || len(entries) != 2 || entries[0].Site != "newer.com" || entries[1].Site != "older.com" {
+		t.Fatalf("sub-second sort order = %+v (total=%d), want newer.com before older.com", entries, total)
+	}
+
+	// Advance past siteStickyTTL so both entries expire.
+	cur = base.Add(siteStickyTTL + time.Minute)
+	if got := fb.StickyCount(); got != 0 {
+		t.Fatalf("StickyCount after TTL = %d, want 0", got)
+	}
+	if cleared := fb.ClearSiteSticky("older.com", "tcp"); cleared != 0 {
+		t.Fatalf("ClearSiteSticky(expired site) = %d, want 0", cleared)
+	}
+	if cleared := fb.ClearSiteSticky("", ""); cleared != 0 {
+		t.Fatalf("ClearSiteSticky(all expired) = %d, want 0", cleared)
+	}
+	fb.siteSticky.mu.Lock()
+	remaining := len(fb.siteSticky.entries)
+	fb.siteSticky.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expired entries should still be physically removed, remaining=%d", remaining)
+	}
+}

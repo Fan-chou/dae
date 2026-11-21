@@ -24,28 +24,31 @@ const (
 
 // AdminConnection is one active flow for GET /api/v1/connections and WS connections.
 type AdminConnection struct {
-	ID           string           `json:"id"`
-	Network      string           `json:"network"`
-	Inbound      string           `json:"inbound,omitempty"`
-	SrcIP        string           `json:"src_ip"`
-	SrcPort      uint16           `json:"src_port"`
-	DstIP        string           `json:"dst_ip"`
-	DstPort      uint16           `json:"dst_port"`
-	Target       string           `json:"target,omitempty"`
-	Domain       string           `json:"domain,omitempty"`
-	Mac          string           `json:"mac,omitempty"`
-	Process      string           `json:"process,omitempty"`
-	Rule         *RoutingRuleMeta `json:"rule,omitempty"`
-	Outbound     string           `json:"outbound"`
-	Dialer       string           `json:"dialer,omitempty"`
-	Policy       string           `json:"policy,omitempty"`
-	Offloaded    bool             `json:"offloaded,omitempty"`
-	StartTime    string           `json:"start_time,omitempty"`
-	DurationMs   int64            `json:"duration_ms"`
-	Upload       uint64           `json:"upload"`
-	Download     uint64           `json:"download"`
-	UploadRate   uint64           `json:"upload_rate"`
-	DownloadRate uint64           `json:"download_rate"`
+	ID            string           `json:"id"`
+	Network       string           `json:"network"`
+	Inbound       string           `json:"inbound,omitempty"`
+	SrcIP         string           `json:"src_ip"`
+	SrcPort       uint16           `json:"src_port"`
+	DstIP         string           `json:"dst_ip"`
+	DstPort       uint16           `json:"dst_port"`
+	Target        string           `json:"target,omitempty"`
+	Domain        string           `json:"domain,omitempty"`
+	SniffedDomain string           `json:"sniffed_domain,omitempty"`
+	StickySite    string           `json:"sticky_site,omitempty"`
+	Mac           string           `json:"mac,omitempty"`
+	Process       string           `json:"process,omitempty"`
+	Rule          *RoutingRuleMeta `json:"rule,omitempty"`
+	Outbound      string           `json:"outbound"`
+	Dialer        string           `json:"dialer,omitempty"`
+	Chain         []string         `json:"chain,omitempty"`
+	Policy        string           `json:"policy,omitempty"`
+	Offloaded     bool             `json:"offloaded,omitempty"`
+	StartTime     string           `json:"start_time,omitempty"`
+	DurationMs    int64            `json:"duration_ms"`
+	Upload        uint64           `json:"upload"`
+	Download      uint64           `json:"download"`
+	UploadRate    uint64           `json:"upload_rate"`
+	DownloadRate  uint64           `json:"download_rate"`
 }
 
 // AdminConnectionsSnapshot is the bounded live-flow list. It never includes node URIs.
@@ -61,18 +64,20 @@ type AdminConnectionsSnapshot struct {
 
 // AdminConnectionFilter constrains connection queries, WS streams, and batch closes.
 type AdminConnectionFilter struct {
-	Network  string `json:"network,omitempty"`
-	Outbound string `json:"outbound,omitempty"`
-	Dialer   string `json:"dialer,omitempty"`
-	SrcIP    string `json:"src_ip,omitempty"`
-	DstIP    string `json:"dst_ip,omitempty"`
-	Domain   string `json:"domain,omitempty"`
-	Mac      string `json:"mac,omitempty"`
-	Process  string `json:"process,omitempty"`
-	Inbound  string `json:"inbound,omitempty"`
-	Rule     string `json:"rule,omitempty"`
-	Query    string `json:"q,omitempty"`
-	All      bool   `json:"all,omitempty"`
+	Network     string `json:"network,omitempty"`
+	Outbound    string `json:"outbound,omitempty"`
+	Dialer      string `json:"dialer,omitempty"`
+	SrcIP       string `json:"src_ip,omitempty"`
+	DstIP       string `json:"dst_ip,omitempty"`
+	Domain      string `json:"domain,omitempty"`
+	Mac         string `json:"mac,omitempty"`
+	Process     string `json:"process,omitempty"`
+	Inbound     string `json:"inbound,omitempty"`
+	Rule        string `json:"rule,omitempty"`
+	Offloaded   *bool  `json:"offloaded,omitempty"`
+	CloseReason string `json:"close_reason,omitempty"`
+	Query       string `json:"q,omitempty"`
+	All         bool   `json:"all,omitempty"`
 }
 
 func (f AdminConnectionFilter) normalized() AdminConnectionFilter {
@@ -86,6 +91,7 @@ func (f AdminConnectionFilter) normalized() AdminConnectionFilter {
 	f.Process = strings.TrimSpace(f.Process)
 	f.Inbound = strings.TrimSpace(f.Inbound)
 	f.Rule = strings.TrimSpace(f.Rule)
+	f.CloseReason = strings.ToLower(strings.TrimSpace(f.CloseReason))
 	f.Query = strings.ToLower(strings.TrimSpace(f.Query))
 	return f
 }
@@ -101,7 +107,17 @@ func (f AdminConnectionFilter) IsEmpty() bool {
 		f.Process == "" &&
 		f.Inbound == "" &&
 		f.Rule == "" &&
+		f.Offloaded == nil &&
+		f.CloseReason == "" &&
 		f.Query == ""
+}
+
+// HasActiveFilter reports whether f specifies at least one filter field that can
+// match live active connections (excluding close_reason, which applies only to closed flows).
+func (f AdminConnectionFilter) HasActiveFilter() bool {
+	n := f.normalized()
+	n.CloseReason = ""
+	return !n.IsEmpty()
 }
 
 func clampAdminConnectionLimit(limit int) int {
@@ -130,6 +146,34 @@ func (c *ControlPlane) AdminConnections(limit int, filter AdminConnectionFilter)
 	snap.UploadTotal = store.uploadTotal.Load()
 	snap.DownloadTotal = store.downloadTotal.Load()
 	return snap
+}
+
+// AdminAllActiveConnections returns every live flow across TCP, UDP, and
+// inbound UDP without pre-truncating at adminConnectionsMaxLimit so server-side
+// filtering, sorting, and per-flow rate tracking never miss active flows.
+func (c *ControlPlane) AdminAllActiveConnections() AdminConnectionsSnapshot {
+	nowMs := time.Now().UnixMilli()
+	if c == nil {
+		return AdminConnectionsSnapshot{Connections: []AdminConnection{}, SnapshotAtMs: nowMs}
+	}
+	manager, _ := c.controlPlaneSessionManager()
+	if manager == nil {
+		return AdminConnectionsSnapshot{Connections: []AdminConnection{}, SnapshotAtMs: nowMs}
+	}
+	all := c.allActiveAdminConnections()
+	if all == nil {
+		all = []AdminConnection{}
+	}
+	store := c.runtimeStatsStore()
+	return AdminConnectionsSnapshot{
+		Scope:         manager.adminSnapshotID,
+		Total:         len(all),
+		Truncated:     false,
+		Connections:   all,
+		SnapshotAtMs:  nowMs,
+		UploadTotal:   store.uploadTotal.Load(),
+		DownloadTotal: store.downloadTotal.Load(),
+	}
 }
 
 func (m *SessionManager) adminConnectionsSnapshot(limit int, filter AdminConnectionFilter) AdminConnectionsSnapshot {
@@ -252,6 +296,9 @@ func adminConnectionFromTCPAt(flow *FlowRuntime, now time.Time) AdminConnection 
 		Download:   flow.downloadBytes.Load(),
 	}
 	fillAdminConnectionEgress(&item, binding.Egress.Outbound, binding.Egress.Dialer, binding.Egress.SniffedDomain, binding.Egress.Target, binding.Egress.IsDialIp)
+	item.SniffedDomain = sanitizeAdminDomain(binding.Egress.SniffedDomain)
+	item.StickySite = sanitizeAdminDomain(binding.Egress.StickySite)
+	item.Chain = buildAdminConnectionChain(item.Outbound, binding.Egress.SelectPath.NestedMember, item.Dialer)
 	return item
 }
 
@@ -291,6 +338,9 @@ func adminConnectionFromUDPAt(flow *UDPFlowRuntime, now time.Time) AdminConnecti
 		item.Mac = macString(flow.mac)
 	}
 	fillAdminConnectionEgress(&item, flow.binding.Egress.Outbound, flow.binding.Egress.Dialer, sniffed, targetRaw, isDialIP)
+	item.SniffedDomain = sanitizeAdminDomain(sniffed)
+	item.StickySite = sanitizeAdminDomain(flow.binding.Egress.StickySite)
+	item.Chain = buildAdminConnectionChain(item.Outbound, flow.binding.Egress.SelectPath.NestedMember, item.Dialer)
 	return item
 }
 
@@ -411,6 +461,32 @@ func udpFlowSniff(flow *UDPFlowRuntime) (sniffed, target string, isDialIP bool) 
 	return sniffed, target, isDialIP
 }
 
+func sanitizeAdminDomain(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" || strings.Contains(v, "://") {
+		return ""
+	}
+	return v
+}
+
+func buildAdminConnectionChain(outboundName, nestedMember, dialerName string) []string {
+	var chain []string
+	appendUnique := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		if len(chain) > 0 && chain[len(chain)-1] == s {
+			return
+		}
+		chain = append(chain, s)
+	}
+	appendUnique(outboundName)
+	appendUnique(nestedMember)
+	appendUnique(dialerName)
+	return chain
+}
+
 func fillAdminConnectionEgress(item *AdminConnection, group *outbound.DialerGroup, d *dialer.Dialer, sniffed, target string, isDialIP bool) {
 	if group != nil {
 		item.Outbound = group.Name
@@ -519,6 +595,12 @@ func (item AdminConnection) matches(filter AdminConnectionFilter) bool {
 			!strings.Contains(strings.ToLower(item.Rule.Raw), strings.ToLower(filter.Rule)) {
 			return false
 		}
+	}
+	if filter.Offloaded != nil && item.Offloaded != *filter.Offloaded {
+		return false
+	}
+	if filter.CloseReason != "" {
+		return false
 	}
 	if filter.Query != "" {
 		ruleRaw := ""
