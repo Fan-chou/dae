@@ -90,6 +90,9 @@ type Global struct {
 	// AdminCorsOrigins lists additional exact origins (scheme://host[:port])
 	// allowed to call the management API cross-origin. Empty keeps LAN-only defaults.
 	AdminCorsOrigins []string `mapstructure:"admin_cors_origins"`
+	// AdminWebDir is the optional local directory of static web panel assets
+	// served by the admin HTTP server under /web/ (default empty/disabled).
+	AdminWebDir string `mapstructure:"admin_web_dir"`
 	// AutoSniffPunt injects kernel-space-only sniff-punt lines for
 	// device-scoped whitelist shapes (selector && domain -> group with a
 	// later selector -> direct/block fallback) so the whitelist still
@@ -336,6 +339,11 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 		return nil, err
 	} else {
 		conf.Global.AdminCorsOrigins = canonicalOrigins
+	}
+	if cleanWebDir, err := ValidateAdminWebDir(conf.Global.AdminWebDir); err != nil {
+		return nil, err
+	} else {
+		conf.Global.AdminWebDir = cleanWebDir
 	}
 	return conf, nil
 }

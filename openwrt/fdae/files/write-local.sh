@@ -23,6 +23,7 @@ lan=$(uci -q get dae.config.lan_interface || true)
 wan=$(uci -q get dae.config.wan_interface || true)
 listen=$(uci -q get dae.config.admin_listen || true)
 secret=$(uci -q get dae.config.admin_secret || true)
+web_dir=$(uci -q get dae.config.admin_web_dir || true)
 cors_origins=$(uci -q get dae.config.admin_cors_origins || true)
 mihomo_file=$(uci -q get dae.config.mihomo_config || true)
 mihomo_interval=$(uci -q get dae.config.mihomo_interval || true)
@@ -202,6 +203,10 @@ umask 077
 	fi
 	if [ -n "$secret" ]; then
 		echo "    admin_secret: $(quote_dae "$secret")"
+	fi
+	if [ -n "$web_dir" ]; then
+		single_line "$web_dir" "admin_web_dir" || exit 1
+		echo "    admin_web_dir: $(quote_dae "$web_dir")"
 	fi
 	if [ -n "$cors_origins" ]; then
 		single_line "$cors_origins" "admin_cors_origins" || exit 1

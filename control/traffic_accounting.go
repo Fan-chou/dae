@@ -79,6 +79,11 @@ type AdminClosedFlow struct {
 	CloseReason   string           `json:"close_reason"`
 }
 
+// Matches reports whether f satisfies filter (including close_reason and offloaded).
+func (f AdminClosedFlow) Matches(filter AdminConnectionFilter) bool {
+	return f.matches(filter.normalized())
+}
+
 func (f AdminClosedFlow) matches(filter AdminConnectionFilter) bool {
 	if filter.CloseReason != "" && !strings.EqualFold(f.CloseReason, filter.CloseReason) {
 		return false

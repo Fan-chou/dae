@@ -106,6 +106,7 @@ UDP is different: if a name is already known (FakeIP look-back or a previously s
 	"admin_listen":                 "Optional LAN-only HTTP/WebSocket management API, for example 192.168.124.223:2025. Empty disables the API. Unspecified addresses (0.0.0.0, ::) and port 9090 are rejected. A failed listen does not stop tproxy.",
 	"admin_secret":                 "Bearer token for the management API. The API stays disabled when this is empty.",
 	"admin_cors_origins":           "Optional list of exact extra CORS/WebSocket origins (for example https://panel.example.com) allowed to reach the management API.",
+	"admin_web_dir":                "Optional absolute path to a static web UI directory served read-only by the admin HTTP server under /web/. Empty disables built-in static serving.",
 }
 
 var DnsDesc = Desc{

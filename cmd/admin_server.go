@@ -81,11 +81,13 @@ type adminSourcesRefreshResult struct {
 type adminSourcesRefresher func(context.Context) (adminSourcesRefreshResult, error)
 
 type adminServer struct {
+	refreshMu   sync.Mutex
 	mu          sync.Mutex
 	http        *http.Server
 	listen      string
 	boundAddr   string
 	secret      string
+	webDir      string
 	corsOrigins map[string]struct{}
 	rawCorsList []string
 	logFile     string
@@ -138,6 +140,8 @@ type adminSystemBody struct {
 	ReloadPending        bool   `json:"reload_pending,omitempty"`
 	LastReloadRolledBack bool   `json:"last_reload_rolled_back,omitempty"`
 	Suspended            bool   `json:"suspended"`
+	WebEnabled           bool   `json:"web_enabled,omitempty"`
+	WebPath              string `json:"web_path,omitempty"`
 }
 
 type adminGroupPutBody struct {
@@ -238,6 +242,15 @@ func (s *adminServer) currentSecret() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.secret
+}
+
+func (s *adminServer) currentWebDir() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webDir
 }
 
 func (s *adminServer) emitWSEvent(event string, data any) {
@@ -414,8 +427,8 @@ func (s *adminServer) reloadStatusSnapshot() adminReloadStatusSnapshot {
 
 	inSync := activeSnap != nil && !suspended && !reloadActive && !reloading
 	if inSync {
-		curSnap, err := readAdminConfigSnapshot(configDir)
-		if err != nil || curSnap.digest != activeSnap.digest {
+		curDigest, err := readAdminConfigDigestCached(configDir)
+		if err != nil || curDigest != activeSnap.digest {
 			inSync = false
 		}
 	}
@@ -462,36 +475,84 @@ func (s *adminServer) isOriginAllowed(origin string) bool {
 	return ok
 }
 
+func (s *adminServer) isSameOriginRequest(origin string, r *http.Request) bool {
+	if s == nil || r == nil || s.currentWebDir() == "" {
+		return false
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	expected, err := config.CanonicalizeAdminOrigin(scheme + "://" + host)
+	if err != nil {
+		return false
+	}
+	got, err := config.CanonicalizeAdminOrigin(origin)
+	if err != nil {
+		return false
+	}
+	return got == expected
+}
+
+func (s *adminServer) isOriginAllowedForRequest(origin string, r *http.Request) bool {
+	return s.isOriginAllowed(origin) || s.isSameOriginRequest(origin, r)
+}
+
 func (s *adminServer) refresh(listen, secret string) {
 	s.refreshWithCORS(listen, secret, nil)
 }
 
 func (s *adminServer) refreshWithCORS(listen, secret string, corsOrigins []string) {
+	s.applyRefresh(listen, secret, corsOrigins, nil)
+}
+
+func (s *adminServer) refreshWithOptions(listen, secret string, corsOrigins []string, webDir string) {
+	s.applyRefresh(listen, secret, corsOrigins, &webDir)
+}
+
+func (s *adminServer) applyRefresh(listen, secret string, corsOrigins []string, webDir *string) {
 	if s == nil {
 		return
 	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
 	listen = strings.TrimSpace(listen)
 	secret = strings.TrimSpace(secret)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.corsOrigins = buildCorsOriginSet(corsOrigins)
 	s.rawCorsList = append([]string(nil), corsOrigins...)
-
+	effectiveWebDir := s.webDir
+	if webDir != nil {
+		effectiveWebDir = strings.TrimSpace(*webDir)
+	}
 	if listen == s.listen && secret == s.secret && (s.http != nil || listen == "") {
+		s.webDir = effectiveWebDir
+		s.mu.Unlock()
 		return
 	}
-	s.stopLocked()
+	oldHTTP, oldUnreg := s.detachServerLocked()
+	s.listen = listen
+	s.secret = secret
+	s.webDir = effectiveWebDir
+	resolveFn := s.resolveListenFn
+	s.mu.Unlock()
+
+	// Disconnect WS clients and shut down the previous HTTP server OUTSIDE s.mu
+	// so in-flight HTTP handlers calling currentSecret/isOriginAllowed never deadlock.
 	if s.wsHub != nil {
 		s.wsHub.disconnectAll()
 	}
-	s.listen = listen
-	s.secret = secret
+	stopAdminHTTPServer(oldHTTP, oldUnreg)
+
 	if listen == "" {
 		return
 	}
-	resolveFn := s.resolveListenFn
 	if resolveFn == nil {
 		resolveFn = config.ResolveAndValidateAdminListen
 	}
@@ -517,11 +578,16 @@ func (s *adminServer) refreshWithCORS(listen, secret string, corsOrigins []strin
 		ReadTimeout:  adminReadTimeout,
 		WriteTimeout: adminWriteTimeout,
 	}
-	s.http = server
-	s.boundAddr = boundAddr
-	s.unregisterAdmission = outbounddialer.RegisterAdmissionChangeListener(func(ev outbounddialer.AdmissionChangeEvent) {
+	unreg := outbounddialer.RegisterAdmissionChangeListener(func(ev outbounddialer.AdmissionChangeEvent) {
 		s.emitWSEvent("node_health_changed", ev)
 	})
+
+	s.mu.Lock()
+	s.http = server
+	s.boundAddr = boundAddr
+	s.unregisterAdmission = unreg
+	s.mu.Unlock()
+
 	go func() {
 		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.warnf("admin HTTP listen failed (tproxy continues): %v", err)
@@ -561,7 +627,10 @@ func (s *adminServer) buildMux() *http.ServeMux {
 	if s.wsHub != nil {
 		mux.HandleFunc("/api/v1/ws", s.wsHub.handleWS)
 	}
-	mux.HandleFunc("/", s.withAdminAuth(s.handleNotFound))
+	mux.HandleFunc("/api/", s.withAdminAuth(s.handleNotFound))
+	mux.HandleFunc("/web", s.handleWebRedirect)
+	mux.HandleFunc("/web/", s.handleWeb)
+	mux.HandleFunc("/", s.handleRoot)
 	return mux
 }
 
@@ -569,27 +638,82 @@ func (s *adminServer) shutdown() {
 	if s == nil {
 		return
 	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
 	if s.wsHub != nil {
 		s.wsHub.close()
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.stopLocked()
+	oldHTTP, oldUnreg := s.detachServerLocked()
+	s.mu.Unlock()
+
+	stopAdminHTTPServer(oldHTTP, oldUnreg)
 }
 
-func (s *adminServer) stopLocked() {
-	if s.unregisterAdmission != nil {
-		s.unregisterAdmission()
-		s.unregisterAdmission = nil
-	}
+func (s *adminServer) detachServerLocked() (*http.Server, func()) {
+	oldHTTP := s.http
+	s.http = nil
+	oldUnreg := s.unregisterAdmission
+	s.unregisterAdmission = nil
 	s.boundAddr = ""
-	if s.http == nil {
+	return oldHTTP, oldUnreg
+}
+
+func stopAdminHTTPServer(srv *http.Server, unreg func()) {
+	if unreg != nil {
+		unreg()
+	}
+	if srv == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
-	_ = s.http.Shutdown(ctx)
+	_ = srv.Shutdown(ctx)
 	cancel()
-	s.http = nil
+}
+
+func (s *adminServer) handleWebRedirect(w http.ResponseWriter, r *http.Request) {
+	if s.currentWebDir() == "" {
+		s.withAdminAuth(s.handleNotFound)(w, r)
+		return
+	}
+	target := "/web/"
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+func (s *adminServer) handleWeb(w http.ResponseWriter, r *http.Request) {
+	webDir := s.currentWebDir()
+	if webDir == "" {
+		s.withAdminAuth(s.handleNotFound)(w, r)
+		return
+	}
+	rel := strings.TrimPrefix(r.URL.Path, "/web/")
+	if !serveAdminWebDir(w, r, webDir, rel, true) {
+		http.NotFound(w, r)
+	}
+}
+
+func (s *adminServer) handleRoot(w http.ResponseWriter, r *http.Request) {
+	webDir := s.currentWebDir()
+	if webDir == "" {
+		s.withAdminAuth(s.handleNotFound)(w, r)
+		return
+	}
+	if r.URL.Path == "/" {
+		target := "/web/"
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
+	rel := strings.TrimPrefix(r.URL.Path, "/")
+	if !serveAdminWebDir(w, r, webDir, rel, false) {
+		http.NotFound(w, r)
+	}
 }
 
 func (s *adminServer) withSecurityHeaders(next http.Handler) http.Handler {
@@ -610,7 +734,7 @@ func (s *adminServer) withAdminCORS(next http.Handler) http.Handler {
 		}
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
 		if origin != "" {
-			if !s.isOriginAllowed(origin) {
+			if !s.isOriginAllowedForRequest(origin, r) {
 				writeAdminAPIError(w, http.StatusForbidden, "origin_forbidden", "origin not allowed")
 				return
 			}
@@ -685,6 +809,10 @@ func (s *adminServer) handleSystem(w http.ResponseWriter, r *http.Request) {
 	body.LastReloadRolledBack = syncStatus.lastReloadRolledBack
 	s.mu.Lock()
 	body.Suspended = s.suspended
+	if s.webDir != "" {
+		body.WebEnabled = true
+		body.WebPath = "/web/"
+	}
 	s.mu.Unlock()
 	if view := CurrentEffectiveConfig(); view != nil {
 		body.Generation = view.LoadedAt.UTC().Format("20060102T150405Z")
@@ -877,12 +1005,14 @@ func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
 		}
-		if !s.allowGroupProbe(name) {
+		allowed, rollback := s.checkAndRecordGroupProbe(name)
+		if !allowed {
 			w.Header().Set("Retry-After", "3")
 			writeAdminAPIError(w, http.StatusTooManyRequests, "probe_cooldown", "probe requested too frequently for group "+name)
 			return
 		}
 		if err := plane.TriggerLatencyChecksForGroup(name); err != nil {
+			rollback()
 			writeAdminAPIError(w, http.StatusBadRequest, "probe_failed", sanitizeAdminError(err))
 			return
 		}
@@ -893,12 +1023,14 @@ func (s *adminServer) handleGroup(w http.ResponseWriter, r *http.Request) {
 			writeAdminAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
 		}
-		if !s.allowMemberProbe(name, arg) {
+		allowed, rollback := s.checkAndRecordMemberProbe(name, arg)
+		if !allowed {
 			w.Header().Set("Retry-After", "2")
 			writeAdminAPIError(w, http.StatusTooManyRequests, "probe_cooldown", "probe requested too frequently for member "+arg)
 			return
 		}
 		if err := plane.TriggerLatencyChecksForMember(name, arg); err != nil {
+			rollback()
 			writeAdminAPIError(w, http.StatusBadRequest, "probe_failed", sanitizeAdminError(err))
 			return
 		}
@@ -1013,9 +1145,46 @@ func (s *adminServer) allowAllGroupsProbe() bool {
 	return true
 }
 
-func (s *adminServer) allowGroupProbe(group string) bool {
+func checkAndRecordProbeMap(m map[string]time.Time, key string, now time.Time, cooldown time.Duration, maxEntries int) (bool, func()) {
+	if prev, ok := m[key]; ok && now.Sub(prev) < cooldown {
+		return false, nil
+	}
+	if len(m) >= maxEntries {
+		for k, ts := range m {
+			if now.Sub(ts) >= cooldown {
+				delete(m, k)
+			}
+		}
+		if len(m) >= maxEntries {
+			var oldestKey string
+			var oldestAt time.Time
+			first := true
+			for k, ts := range m {
+				if first || ts.Before(oldestAt) {
+					oldestKey = k
+					oldestAt = ts
+					first = false
+				}
+			}
+			if oldestKey != "" {
+				delete(m, oldestKey)
+			}
+		}
+	}
+	prevVal, hadPrev := m[key]
+	m[key] = now
+	return true, func() {
+		if hadPrev {
+			m[key] = prevVal
+		} else {
+			delete(m, key)
+		}
+	}
+}
+
+func (s *adminServer) checkAndRecordGroupProbe(group string) (bool, func()) {
 	if s == nil {
-		return true
+		return true, func() {}
 	}
 	now := time.Now()
 	s.probeMu.Lock()
@@ -1023,23 +1192,22 @@ func (s *adminServer) allowGroupProbe(group string) bool {
 	if s.lastProbeByGp == nil {
 		s.lastProbeByGp = make(map[string]time.Time)
 	}
-	if prev, ok := s.lastProbeByGp[group]; ok && now.Sub(prev) < adminProbeCooldown {
-		return false
+	ok, rb := checkAndRecordProbeMap(s.lastProbeByGp, group, now, adminProbeCooldown, 256)
+	if !ok {
+		return false, func() {}
 	}
-	if len(s.lastProbeByGp) >= 256 {
-		for k, ts := range s.lastProbeByGp {
-			if now.Sub(ts) >= adminProbeCooldown {
-				delete(s.lastProbeByGp, k)
-			}
+	return true, func() {
+		s.probeMu.Lock()
+		defer s.probeMu.Unlock()
+		if cur, exists := s.lastProbeByGp[group]; exists && cur.Equal(now) {
+			rb()
 		}
 	}
-	s.lastProbeByGp[group] = now
-	return true
 }
 
-func (s *adminServer) allowMemberProbe(group, member string) bool {
+func (s *adminServer) checkAndRecordMemberProbe(group, member string) (bool, func()) {
 	if s == nil {
-		return true
+		return true, func() {}
 	}
 	key := group + "\x00" + member
 	now := time.Now()
@@ -1048,18 +1216,17 @@ func (s *adminServer) allowMemberProbe(group, member string) bool {
 	if s.lastMemberPrb == nil {
 		s.lastMemberPrb = make(map[string]time.Time)
 	}
-	if prev, ok := s.lastMemberPrb[key]; ok && now.Sub(prev) < adminMemberProbeCooldown {
-		return false
+	ok, rb := checkAndRecordProbeMap(s.lastMemberPrb, key, now, adminMemberProbeCooldown, 512)
+	if !ok {
+		return false, func() {}
 	}
-	if len(s.lastMemberPrb) >= 512 {
-		for k, ts := range s.lastMemberPrb {
-			if now.Sub(ts) >= adminMemberProbeCooldown {
-				delete(s.lastMemberPrb, k)
-			}
+	return true, func() {
+		s.probeMu.Lock()
+		defer s.probeMu.Unlock()
+		if cur, exists := s.lastMemberPrb[key]; exists && cur.Equal(now) {
+			rb()
 		}
 	}
-	s.lastMemberPrb[key] = now
-	return true
 }
 
 func parseConnectionFilterQuery(q url.Values) (control.AdminConnectionFilter, error) {

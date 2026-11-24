@@ -1100,4 +1100,80 @@ func TestAdminGroupPathEscapingAndProbeCooldownIsolation(t *testing.T) {
 	if starRec.Code != http.StatusAccepted || plane.delayFor != "*" {
 		t.Fatalf("star group probe code=%d delayFor=%q body=%s", starRec.Code, plane.delayFor, starRec.Body.String())
 	}
+
+	// Failed group/member probe must roll back cooldown so repeated bad calls stay 400 (not 429).
+	plane.delayErr = errors.New("unknown group")
+	for attempt := 1; attempt <= 2; attempt++ {
+		badGrp := do(http.MethodPost, "/api/v1/groups/nonexistent/probe", "")
+		if badGrp.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d unknown group probe code=%d, want 400 (body=%s)", attempt, badGrp.Code, badGrp.Body.String())
+		}
+		badMem := do(http.MethodPost, "/api/v1/groups/proxy/members/missing/probe", "")
+		if badMem.Code != http.StatusBadRequest {
+			t.Fatalf("attempt %d unknown member probe code=%d, want 400 (body=%s)", attempt, badMem.Code, badMem.Body.String())
+		}
+	}
+}
+
+func TestAdminServerRefreshDoesNotDeadlockWithInFlightHandler(t *testing.T) {
+	addr1 := reserveTestLoopbackAddr(t)
+	addr2 := reserveTestLoopbackAddr(t)
+
+	inHandler := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var calls int
+	var mu sync.Mutex
+
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane {
+		mu.Lock()
+		calls++
+		callNum := calls
+		mu.Unlock()
+		if callNum == 1 {
+			close(inHandler)
+			<-releaseHandler
+		}
+		return &stubAdminPlane{sysInfo: control.AdminSystemInfo{Version: "test"}}
+	}, nil)
+	t.Cleanup(server.shutdown)
+	server.refreshWithCORS(addr1, "sec1", []string{"https://panel.example.com"})
+
+	reqDone := make(chan error, 1)
+	go func() {
+		client := &http.Client{Timeout: 2 * time.Second}
+		req, _ := http.NewRequest(http.MethodGet, "http://"+addr1+"/api/v1/system", nil)
+		req.Header.Set("Authorization", "Bearer sec1")
+		req.Header.Set("Origin", "https://panel.example.com")
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		reqDone <- err
+	}()
+
+	select {
+	case <-inHandler:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request never reached plane provider")
+	}
+
+	// Inside plane handler? Simulate handler releasing after brief overlap while another
+	// goroutine calls refreshWithCORS (which must not hold s.mu across Shutdown).
+	refreshDone := make(chan time.Duration, 1)
+	go func() {
+		t0 := time.Now()
+		server.refreshWithCORS(addr2, "sec2", []string{"https://panel.example.com"})
+		refreshDone <- time.Since(t0)
+	}()
+
+	time.Sleep(40 * time.Millisecond)
+	close(releaseHandler)
+
+	if err := <-reqDone; err != nil {
+		t.Fatalf("in-flight request error: %v", err)
+	}
+	dur := <-refreshDone
+	if dur >= time.Second {
+		t.Fatalf("refreshWithCORS stalled %v waiting on lock/shutdown", dur)
+	}
 }

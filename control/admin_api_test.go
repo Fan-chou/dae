@@ -888,4 +888,16 @@ func TestAdminCloseGroupOtherConnections(t *testing.T) {
 	if ids[fSG.id] || ids[fAutoHKShared.id] || !ids[fAutoJPShared.id] || !ids[fOther.id] {
 		t.Fatalf("unexpected active IDs after nested-to-nested: %+v", ids)
 	}
+
+	// 5. Nested fallback when SelectPath.NestedMember is absent (len(Chain) < 3):
+	// TCP flow on child leaf hk-01 must be kept when keepMember is auto-hk, while us-01 is closed.
+	fTCPChildLeafNoPath := adopt(proxy, hk01, "")
+	fTCPNonChildNoPath := adopt(proxy, us01, "")
+	if closed := c.AdminCloseGroupOtherConnections("proxy", "auto-hk"); closed != 2 {
+		t.Fatalf("nested fallback closed = %d, want 2 (fAutoJPShared + fTCPNonChildNoPath)", closed)
+	}
+	ids = activeIDs()
+	if !ids[fTCPChildLeafNoPath.id] || ids[fTCPNonChildNoPath.id] || !ids[fOther.id] {
+		t.Fatalf("unexpected active IDs after nested fallback close: %+v", ids)
+	}
 }

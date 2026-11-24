@@ -286,7 +286,7 @@ func (h *adminWSHub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
-		if !h.server.isOriginAllowed(origin) {
+		if !h.server.isOriginAllowedForRequest(origin, r) {
 			writeAdminAPIError(w, http.StatusForbidden, "origin_forbidden", "origin not allowed")
 			return
 		}
@@ -344,7 +344,7 @@ func (h *adminWSHub) handleWS(w http.ResponseWriter, r *http.Request) {
 			if origin == "" {
 				return true
 			}
-			return h.server.isOriginAllowed(origin)
+			return h.server.isOriginAllowedForRequest(origin, req)
 		},
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -906,26 +906,8 @@ func (h *adminWSHub) onClosedFlow(flow control.AdminClosedFlow) {
 	h.mu.Unlock()
 
 	for _, rec := range recipients {
-		if !rec.filter.IsEmpty() {
-			conn := control.AdminConnection{
-				ID:       flow.ID,
-				Network:  flow.Network,
-				Inbound:  flow.Inbound,
-				SrcIP:    flow.SrcIP,
-				SrcPort:  flow.SrcPort,
-				DstIP:    flow.DstIP,
-				DstPort:  flow.DstPort,
-				Target:   flow.Target,
-				Domain:   flow.Domain,
-				Mac:      flow.Mac,
-				Process:  flow.Process,
-				Rule:     flow.Rule,
-				Outbound: flow.Outbound,
-				Dialer:   flow.Dialer,
-			}
-			if !conn.Matches(rec.filter) {
-				continue
-			}
+		if !rec.filter.IsEmpty() && !flow.Matches(rec.filter) {
+			continue
 		}
 		rec.client.enqueueFrame(wsServerFrame{
 			Type:  "data",

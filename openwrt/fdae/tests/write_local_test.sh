@@ -141,4 +141,12 @@ UCI
 if run; then fail "unquotable admin_cors_origins was accepted"; fi
 [ "$(cat "$tmp/local.dae")" = old ] || fail "local.dae was replaced after invalid admin_cors_origins"
 
+# --- admin_web_dir rendering and validation
+reset
+cat > "$tmp/uci" <<'UCI'
+dae.config.admin_web_dir=/usr/share/fdae/web
+UCI
+run || fail "admin_web_dir failed: $(cat "$tmp/err")"
+grep -qx "    admin_web_dir: '/usr/share/fdae/web'" "$tmp/local.dae" || fail "missing admin_web_dir: $(cat "$tmp/local.dae")"
+
 echo ok

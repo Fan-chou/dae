@@ -1,6 +1,6 @@
 # fdae Admin API v1 接口对接文档
 
-`fdae` 不再内置任何前端静态资源，仅作为独立的 HTTP + WebSocket 控制面后端运行。所有外部独立 Web 面板、桌面端（Tauri / Electron）或自动化脚本统一通过 `/api/v1/*` 与 `/api/v1/ws` 对接。
+`fdae` 默认不打包、不内置前端二进制静态资源，核心控制面通过 `/api/v1/*` 与 `/api/v1/ws` 暴露。同时支持通过 `admin_web_dir` 按需挂载外部静态前端构建产物目录，使桌面面板、独立静态构建或 OpenWrt 本地面板均可统一接入。
 
 ---
 
@@ -36,6 +36,7 @@
 global {
     admin_listen: '192.168.1.1:2025'
     admin_secret: 'replace-with-strong-secret'
+    admin_web_dir: '/usr/share/fdae/web'
     admin_cors_origins: 'https://panel.example.com', 'http://localhost:5173'
 }
 ```
@@ -44,7 +45,8 @@ global {
 | --- | --- | --- |
 | `admin_listen` | 否 | 留空禁用管理接口。非空时（`host:port`）在配置校验/解析阶段通过 `config.ResolveAndValidateAdminListen` 解析所有 IP，必须全部为 Loopback（`127.0.0.0/8`、`::1`）、私有地址（RFC1918 / RFC4193 `fc00::/7`）或链路本地（`169.254.0.0/16`、`fe80::/10`）地址，禁止监听 `0.0.0.0`、`[::]` 或公网 IP，且明确拒绝端口 `9090`（`ClashCompatibleAdminPort`，防止误将 Clash 面板指向 kdae）。 |
 | `admin_secret` | 当启用 `admin_listen` 时必填 | 空字符串会阻止 Admin HTTP 启动。使用 `crypto/subtle.ConstantTimeCompare` 常量时间校验。 |
-| `admin_cors_origins` | 否 | 精确 `Origin` 白名单（格式 `scheme://host[:port]`）。仅支持 `http`、`https`、`tauri`、`app` 协议；自动小写化 scheme/host 并去除默认端口（`http:80` / `https:443`）；**严格拒绝**通配符 `*`、路径（含结尾 `/`）、Query、Fragment、空白字符以及用户信息 `user:pass@`。**留空时拒绝所有携带 `Origin` 头的浏览器跨域请求与预检（返回 `403 origin_forbidden`）。** |
+| `admin_web_dir` | 否 | 宿主机静态 Web 面板目录的绝对路径（例如 `/usr/share/fdae/web`）。留空禁用静态托管；严格拒绝相对路径、`..` 路径穿越以及系统根目录（`/`、`/etc`、`/etc/dae`、`/proc`、`/sys`、`/dev` 等）。启用后：`adminHTTP` 在 `/web/`（以及兼容 Vite `base: '/'` 根引用资源的 `/assets/*` 等直接文件）下以 `os.OpenRoot` 沙箱只读托管静态文件与 SPA 路由回退，禁止目录浏览及隐藏文件（`.` 开头），并自动放行来自当前 `admin_listen` 同源页面的 API 与 `/api/v1/ws` 请求。为防止令牌泄露后被远程改写指向宿主机任意目录，`PUT /api/v1/config` **禁止修改或新增** `admin_web_dir`（仅可由管理员在宿主机本地修改）。 |
+| `admin_cors_origins` | 否 | 精确 `Origin` 白名单（格式 `scheme://host[:port]`）。仅支持 `http`、`https`、`tauri`、`app` 协议；自动小写化 scheme/host 并去除默认端口（`http:80` / `https:443`）；**严格拒绝**通配符 `*`、路径（含结尾 `/`）、Query、Fragment、空白字符以及用户信息 `user:pass@`。**留空时拒绝所有跨源请求（返回 `403 origin_forbidden`）；若配置了 `admin_web_dir`，则额外放行严格匹配当前监听协议与 `Host` 的同源页面请求。** |
 
 > OpenWrt LuCI 可另外在 `/etc/config/dae` 配置 `panel_url`（可选，用于在 LuCI 顶部显示“打开面板”外链按钮），该字段仅由 LuCI 前端界面使用，不影响 `fdae` 运行。
 
@@ -103,6 +105,15 @@ global {
 | `PUT /api/v1/inbounds` 上限 | `64 KiB` (`65536` bytes) | 入站配置 JSON 上限 |
 | `PUT /api/v1/config` 上限 | `2 MiB` (`2097152` bytes) | 配置文本 JSON 上限 |
 | WebSocket 单帧读取上限 | `16 KiB` (`16384` bytes) | 超出将断开连接 |
+
+### 1.6 外部静态 Web 面板托管（`admin_web_dir`）
+
+- 当 `admin_web_dir` 配置为有效宿主机目录（例如 `/usr/share/fdae/web`）时，访问 `http://<admin_listen>/` 或 `/web` 会 `302` 重定向至 `/web/`，服务端通过 `os.OpenRoot` 沙箱只读输出该目录下的静态资源：
+  - `/web/` 与无扩展名路径（例如 `/web/groups`）在文件不存在时回退至 `index.html`（支持前端 SPA History 路由）；
+  - 静态资源响应带扩展名路径若不存在直接返回 `404`；所有 `.html` 下发 `Cache-Control: no-store`，JS/CSS/字体等资产下发 `Cache-Control: no-cache`（支持 `304 Not Modified`）；
+  - 根路径 `/assets/*`、`/favicon.ico` 等带路径请求也会按非 SPA 模式匹配 `admin_web_dir`（便于 Vite 默认 `base: '/'` 构建直接开箱可用），但任何 `/api/*` 路由始终强制要求 Bearer 鉴权且绝不会回退到 HTML；
+  - 禁用目录列表、拒绝路径穿越（`..`）、拒绝所有以 `.` 开头的隐藏文件/目录（`.env`、`.git` 等）以及跳出目录的符号链接；
+  - 从 `/web/` 发起的同源 API / `/api/v1/ws` 请求自动被 CORS 与 Origin 校验放行，无需额外配置 `admin_cors_origins`；若需公网/局域网域名 HTTPS 访问，仍建议前置 Caddy/Nginx 反代至 `http://127.0.0.1:2025`。
 
 ---
 
@@ -406,6 +417,8 @@ ID 带有显式类型命名空间，前端可直接按前缀区分：
 | `last_reload_error` | `string` | 否 | 最近一次重载失败错误信息（已脱敏） |
 | `last_reload_rolled_back` | `bool` | 否 | 最近一次管理端写入触发的重载失败后是否已自动回滚 |
 | `suspended` | `bool` | 是 | 守护进程当前是否处于 suspend（无负载挂起）状态 |
+| `web_enabled` | `bool` | 否 | 是否已启用 `admin_web_dir` 外部静态面板托管 |
+| `web_path` | `string` | 否 | 启用静态托管时的访问路径（固定为 `"/web/"`，不暴露宿主机磁盘路径） |
 
 ---
 

@@ -207,7 +207,11 @@ return view.extend({
 		const nodeNames = (data[1] && data[1].node_names) || {};
 		const names = Object.keys(nodeNames).sort();
 		const panelUrl = String(uci.get('dae', 'config', 'panel_url') || '').trim();
-		const safePanelUrl = /^https?:\/\/[^\s"'<>]+$/i.test(panelUrl) ? panelUrl : '';
+		const adminListen = String(uci.get('dae', 'config', 'admin_listen') || '').trim();
+		const adminWebDir = String(uci.get('dae', 'config', 'admin_web_dir') || '').trim();
+		const derivedWebUrl = (!panelUrl && adminListen && adminWebDir) ? ('http://' + adminListen + '/web/') : '';
+		const candidatePanelUrl = panelUrl || derivedWebUrl;
+		const safePanelUrl = /^https?:\/\/[^\s"'<>]+$/i.test(candidatePanelUrl) ? candidatePanelUrl : '';
 		const m = new form.Map('dae', _('fdae'));
 
 		let s = m.section(form.TypedSection);
@@ -321,6 +325,8 @@ return view.extend({
 		o.placeholder = '192.168.1.1:2025';
 		o = s.option(form.Value, 'admin_secret', _('API 密钥'));
 		o.password = true;
+		o = s.option(form.Value, 'admin_web_dir', _('静态面板目录'), _('可选，宿主机静态前端资源目录（如 /usr/share/fdae/web）；填写后可通过 http://<API 地址>/web/ 直接访问'));
+		o.placeholder = '/usr/share/fdae/web';
 		o = s.option(form.Value, 'admin_cors_origins', _('允许的前端来源'), _('逗号分隔的 Origin，如 https://panel.example.com；留空则拒绝所有浏览器跨域请求（仅允许非浏览器客户端或同源反代访问）'));
 		o.placeholder = 'https://panel.example.com';
 		o = s.option(form.Value, 'panel_url', _('面板地址'), _('独立前端面板 URL（可选，用于在顶部显示“打开面板”按钮）'));

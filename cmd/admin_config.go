@@ -38,6 +38,7 @@ var (
 
 var nodeURIScheme = regexp.MustCompile(`(?i)(hy2|hysteria2?|ssr?|vmess|vless|trojan|tuic|juicity|anytls|socks5?)://`)
 var adminSecretAssign = regexp.MustCompile(`(?m)^([ \t]*admin_secret[ \t]*:[ \t]*)('[^']*'|"[^"]*"|[^\s#]+)`)
+var adminWebDirAssign = regexp.MustCompile(`(?m)^([ \t]*admin_web_dir[ \t]*:[ \t]*)('[^']*'|"[^"]*"|[^\s#]+)`)
 
 // inboundPasswordAssign matches an inbound section's password line. routing.dae
 // is served whole, so an inbound section placed there must not leak it.
@@ -113,10 +114,22 @@ var adminConfigCache = struct {
 	etag      string
 }{}
 
+var adminSnapshotDigestCache = struct {
+	mu        sync.Mutex
+	configDir string
+	cfgStat   adminFileStatKey
+	routeStat adminFileStatKey
+	digest    string
+}{}
+
 func invalidateAdminFileCaches() {
 	adminConfigCache.mu.Lock()
 	adminConfigCache.configDir = ""
 	adminConfigCache.mu.Unlock()
+
+	adminSnapshotDigestCache.mu.Lock()
+	adminSnapshotDigestCache.configDir = ""
+	adminSnapshotDigestCache.mu.Unlock()
 
 	adminInboundsCache.mu.Lock()
 	adminInboundsCache.configDir = ""
@@ -234,7 +247,13 @@ func validateLoadedAdminConfig(configDir string) error {
 	if err != nil {
 		return err
 	}
-	return config.ValidateAdminListen(conf.Global.AdminListen)
+	if err := config.ValidateAdminListen(conf.Global.AdminListen); err != nil {
+		return err
+	}
+	if _, err := config.ValidateAdminWebDir(conf.Global.AdminWebDir); err != nil {
+		return err
+	}
+	return nil
 }
 
 func applyAdminConfig(configDir string, incoming adminConfigBody, reload adminReloadFunc) (queued bool, err error) {
@@ -268,6 +287,9 @@ func applyAdminConfigLocked(configDir string, incoming adminConfigBody, reload a
 			return false, err
 		}
 		if err := incomingSectionsOnly(*incoming.Config, "global", "routing"); err != nil {
+			return false, err
+		}
+		if err := checkAdminWebDirUnchanged(*incoming.Config, string(diskConfig)); err != nil {
 			return false, err
 		}
 		restored := overlayAdminSecret(*incoming.Config, string(diskConfig))
@@ -389,6 +411,52 @@ func readAdminConfigSnapshot(configDir string) (adminConfigSnapshot, error) {
 		routingExists: routingExists,
 		routingBytes:  routingBytes,
 	}, nil
+}
+
+// readAdminConfigDigestCached returns the current config+routing digest using
+// a stat(mtime, size) cache so frequent GET /api/v1/system polls avoid re-reading
+// and re-hashing unchanged files on every request.
+func readAdminConfigDigestCached(configDir string) (string, error) {
+	configPath, routingPath, err := adminConfigPaths(configDir)
+	if err != nil {
+		return "", err
+	}
+	cfgStat, err := statAdminFileKey(configPath)
+	if err != nil {
+		return "", err
+	}
+	if !cfgStat.exists {
+		return "", os.ErrNotExist
+	}
+	routeStat, err := statAdminFileKey(routingPath)
+	if err != nil {
+		return "", err
+	}
+
+	cleanDir := filepath.Clean(configDir)
+	adminSnapshotDigestCache.mu.Lock()
+	if adminSnapshotDigestCache.configDir == cleanDir &&
+		adminSnapshotDigestCache.cfgStat == cfgStat &&
+		adminSnapshotDigestCache.routeStat == routeStat &&
+		adminSnapshotDigestCache.digest != "" {
+		digest := adminSnapshotDigestCache.digest
+		adminSnapshotDigestCache.mu.Unlock()
+		return digest, nil
+	}
+	adminSnapshotDigestCache.mu.Unlock()
+
+	snap, err := readAdminConfigSnapshot(configDir)
+	if err != nil {
+		return "", err
+	}
+
+	adminSnapshotDigestCache.mu.Lock()
+	adminSnapshotDigestCache.configDir = cleanDir
+	adminSnapshotDigestCache.cfgStat = cfgStat
+	adminSnapshotDigestCache.routeStat = routeStat
+	adminSnapshotDigestCache.digest = snap.digest
+	adminSnapshotDigestCache.mu.Unlock()
+	return snap.digest, nil
 }
 
 func writeAdminLastGoodSnapshot(configDir string, snap adminConfigSnapshot) {
@@ -574,6 +642,37 @@ func adminSecretValue(src string) string {
 		return ""
 	}
 	return unquoteAdminScalar(match[2])
+}
+
+func adminWebDirValue(src string) string {
+	match := adminWebDirAssign.FindStringSubmatch(src)
+	if len(match) < 3 {
+		return ""
+	}
+	return strings.TrimSpace(unquoteAdminScalar(match[2]))
+}
+
+func hasGlobalSection(src string) bool {
+	sections, err := scanTopLevelSections(src)
+	if err != nil {
+		return true
+	}
+	for _, sec := range sections {
+		if strings.EqualFold(sec.Name, "global") {
+			return true
+		}
+	}
+	return false
+}
+
+func checkAdminWebDirUnchanged(incoming, disk string) error {
+	if !hasGlobalSection(incoming) {
+		return nil
+	}
+	if adminWebDirValue(incoming) != adminWebDirValue(disk) {
+		return fmt.Errorf("admin_web_dir cannot be changed via API; edit the config file on host instead")
+	}
+	return nil
 }
 
 func unquoteAdminScalar(raw string) string {

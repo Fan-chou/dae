@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -227,4 +228,37 @@ func ValidateAdminCorsOrigins(origins []string) ([]string, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// ValidateAdminWebDir checks the optional directory path used to serve static
+// admin web UI assets under /web/. An empty string disables static hosting.
+func ValidateAdminWebDir(raw string) (string, error) {
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("admin_web_dir contains invalid control characters")
+		}
+	}
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(s) {
+		return "", fmt.Errorf("admin_web_dir must be an absolute path")
+	}
+	for _, seg := range strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == filepath.Separator }) {
+		if seg == ".." {
+			return "", fmt.Errorf("admin_web_dir must not contain '..' path segments")
+		}
+	}
+	cleaned := filepath.Clean(s)
+	switch cleaned {
+	case "/", "/etc", "/etc/dae", "/root", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/usr", "/var", "/tmp", "/run":
+		return "", fmt.Errorf("admin_web_dir cannot point to system root directory %q", cleaned)
+	}
+	for _, forbiddenPrefix := range []string{"/proc", "/sys", "/dev"} {
+		if cleaned == forbiddenPrefix || strings.HasPrefix(cleaned, forbiddenPrefix+"/") {
+			return "", fmt.Errorf("admin_web_dir cannot point inside %q", forbiddenPrefix)
+		}
+	}
+	return cleaned, nil
 }

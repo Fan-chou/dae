@@ -1872,11 +1872,8 @@ func (c *ControlPlane) AdminCloseGroupOtherConnections(groupName, keepMember str
 			if len(item.Chain) >= 3 {
 				return !strings.EqualFold(item.Chain[1], keepMember)
 			}
-			if strings.HasPrefix(item.ID, "in-udp:") {
-				_, ok := childLeaves[strings.ToLower(item.Dialer)]
-				return !ok
-			}
-			return true
+			_, ok := childLeaves[strings.ToLower(item.Dialer)]
+			return !ok
 		}
 		return !strings.EqualFold(item.Dialer, keepMember)
 	}

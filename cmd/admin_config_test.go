@@ -496,3 +496,47 @@ func TestSanitizeAdminErrorTruncatesUTF8Safely(t *testing.T) {
 		t.Fatalf("unexpected truncated length %d", len(got))
 	}
 }
+
+func TestApplyAdminConfigForbidsMutatingAdminWebDir(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dae")
+	original := `global {
+    log_level: info
+    admin_web_dir: '/usr/share/fdae/web'
+}
+routing { fallback: direct }
+`
+	writeRestrictedDae(t, configPath, original)
+
+	// Changing admin_web_dir via API must be rejected.
+	if _, err := applyAdminConfig(dir, adminConfigBody{
+		Config: strPtr("global {\n    log_level: warn\n    admin_web_dir: '/etc/shadow'\n}\nrouting { fallback: direct }\n"),
+	}, func() bool { t.Fatal("reload on disallowed admin_web_dir change"); return true }); err == nil {
+		t.Fatal("expected error when mutating admin_web_dir via API")
+	}
+
+	// Omitting admin_web_dir while updating global must also be rejected rather than wiping it.
+	if _, err := applyAdminConfig(dir, adminConfigBody{
+		Config: strPtr("global {\n    log_level: warn\n}\nrouting { fallback: direct }\n"),
+	}, func() bool { t.Fatal("reload on omitted admin_web_dir"); return true }); err == nil {
+		t.Fatal("expected error when omitting configured admin_web_dir")
+	}
+
+	// Keeping admin_web_dir unchanged succeeds.
+	reloaded := false
+	queued, err := applyAdminConfig(dir, adminConfigBody{
+		Config: strPtr("global {\n    log_level: warn\n    admin_web_dir: '/usr/share/fdae/web'\n}\nrouting { fallback: direct }\n"),
+	}, func() bool { reloaded = true; return true })
+	if err != nil || !queued || !reloaded {
+		t.Fatalf("valid edit keeping admin_web_dir failed: queued=%v reloaded=%v err=%v", queued, reloaded, err)
+	}
+
+	// Editing only routing.dae without a global section keeps global intact and succeeds.
+	reloaded = false
+	queued, err = applyAdminConfig(dir, adminConfigBody{
+		Config: strPtr("routing { fallback: block }\n"),
+	}, func() bool { reloaded = true; return true })
+	if err != nil || !queued || !reloaded {
+		t.Fatalf("routing-only edit failed: queued=%v reloaded=%v err=%v", queued, reloaded, err)
+	}
+}

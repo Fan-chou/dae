@@ -182,3 +182,43 @@ func TestValidateAdminCorsOrigins(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAdminWebDir(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"/usr/share/fdae/web", "/usr/share/fdae/web"},
+		{"/usr/share/fdae/web/", "/usr/share/fdae/web"},
+		{"/etc/dae/web", "/etc/dae/web"},
+	} {
+		got, err := ValidateAdminWebDir(tc.raw)
+		if err != nil {
+			t.Fatalf("ValidateAdminWebDir(%q) error = %v", tc.raw, err)
+		}
+		if got != tc.want {
+			t.Fatalf("ValidateAdminWebDir(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	for _, bad := range []string{
+		"web",
+		"./web",
+		"/usr/share/../etc/web",
+		"/",
+		"/etc",
+		"/etc/dae",
+		"/proc",
+		"/proc/self/fd",
+		"/sys/kernel",
+		"/tmp",
+		"/usr/share/fdae/web\n",
+	} {
+		if got, err := ValidateAdminWebDir(bad); err == nil {
+			t.Fatalf("ValidateAdminWebDir(%q) = (%q, nil), want error", bad, got)
+		}
+	}
+}

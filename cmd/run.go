@@ -223,7 +223,7 @@ func applyPublishedReloadAdmin(adminHTTP *adminServer, conf *config.Config, relo
 		adminHTTP.markSuspended()
 		return
 	}
-	adminHTTP.refreshWithCORS(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins)
+	adminHTTP.refreshWithOptions(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins, conf.Global.AdminWebDir)
 	adminHTTP.markReloadSucceeded(snapshot)
 }
 
@@ -516,7 +516,7 @@ func (r *Runner) Run() (err error) {
 	defer unregisterProgressObserver()
 	publishEffectiveConfig(conf)
 	adminHTTP.captureActiveSnapshot(r.adminSnapshot)
-	adminHTTP.refreshWithCORS(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins)
+	adminHTTP.refreshWithOptions(conf.Global.AdminListen, conf.Global.AdminSecret, conf.Global.AdminCorsOrigins, conf.Global.AdminWebDir)
 	// User-space inbounds live outside any control plane generation: they keep
 	// their sockets across reloads and are reconciled with the active config
 	// whenever a generation is published.

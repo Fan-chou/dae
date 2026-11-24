@@ -492,3 +492,56 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminWebSocketFlowsFilterSupportsOffloadedAndCloseReason(t *testing.T) {
+	addr := reserveTestLoopbackAddr(t)
+	plane := &stubAdminPlane{}
+	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
+	server.refreshWithCORS(addr, "ws-flow-secret", nil)
+	t.Cleanup(server.shutdown)
+
+	wsURL := "ws://" + addr + "/api/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(wsClientFrame{Type: "auth", Token: "ws-flow-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	var authOK wsServerFrame
+	if err := conn.ReadJSON(&authOK); err != nil || authOK.Type != "auth_ok" {
+		t.Fatalf("auth_ok failed: %+v err=%v", authOK, err)
+	}
+
+	offTrue := true
+	if err := conn.WriteJSON(wsClientFrame{
+		Type:  "sub",
+		Topic: "flows",
+		Filter: control.AdminConnectionFilter{
+			Offloaded:   &offTrue,
+			CloseReason: "aborted",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for server.wsHub.ActiveTopics()["flows"] == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Non-matching flows (wrong close_reason or offloaded=false) must be dropped.
+	server.wsHub.onClosedFlow(control.AdminClosedFlow{Seq: 1, ID: "tcp:drop-reason", Network: "tcp", Offloaded: true, CloseReason: "normal"})
+	server.wsHub.onClosedFlow(control.AdminClosedFlow{Seq: 2, ID: "tcp:drop-offload", Network: "tcp", Offloaded: false, CloseReason: "aborted"})
+	// Matching flow (offloaded=true AND close_reason="aborted") must be delivered.
+	server.wsHub.onClosedFlow(control.AdminClosedFlow{Seq: 3, ID: "tcp:keep-match", Network: "tcp", Offloaded: true, CloseReason: "aborted"})
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var frame wsServerFrame
+	if err := conn.ReadJSON(&frame); err != nil {
+		t.Fatalf("ReadJSON matched closed flow failed: %v", err)
+	}
+	if frame.Topic != "flows" || frame.Seq != 3 {
+		t.Fatalf("unexpected flows frame delivered: %+v (want Seq=3 only)", frame)
+	}
+}
