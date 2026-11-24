@@ -96,3 +96,46 @@ func TestLocalAddressesRetryMapFailures(t *testing.T) {
 		t.Fatal("failed deletion was not retried")
 	}
 }
+
+func TestLocalAddressSetReplaceDetectsGlobalAddrChange(t *testing.T) {
+	m := &memoryLocalAddresses{values: make(map[[16]byte]uint8)}
+	s := &localAddressSet{target: m, installed: make(map[[16]byte]struct{})}
+
+	// Initial snapshot never reports a change.
+	changed, err := s.replaceWithChange([]netlink.Addr{
+		testHostAddress("127.0.0.1", 1, 0),
+		testHostAddress("203.0.113.10", 2, 0),
+	})
+	if err != nil {
+		t.Fatalf("initial replaceWithChange: %v", err)
+	}
+	if changed {
+		t.Fatal("initial snapshot unexpectedly reported globalChanged=true")
+	}
+
+	// Adding a link-local IPv6 address must NOT trigger a global address change.
+	changed, err = s.replaceWithChange([]netlink.Addr{
+		testHostAddress("127.0.0.1", 1, 0),
+		testHostAddress("203.0.113.10", 2, 0),
+		testHostAddress("fe80::1", 2, 0),
+	})
+	if err != nil {
+		t.Fatalf("link-local replaceWithChange: %v", err)
+	}
+	if changed {
+		t.Fatal("link-local addition unexpectedly reported globalChanged=true")
+	}
+
+	// WAN global unicast change MUST trigger globalChanged=true.
+	changed, err = s.replaceWithChange([]netlink.Addr{
+		testHostAddress("127.0.0.1", 1, 0),
+		testHostAddress("203.0.113.99", 2, 0),
+		testHostAddress("fe80::1", 2, 0),
+	})
+	if err != nil {
+		t.Fatalf("WAN change replaceWithChange: %v", err)
+	}
+	if !changed {
+		t.Fatal("WAN global unicast change reported globalChanged=false, want true")
+	}
+}

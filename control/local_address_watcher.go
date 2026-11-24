@@ -25,15 +25,23 @@ type localAddressMap interface {
 }
 
 type localAddressSet struct {
-	target    localAddressMap
-	installed map[[16]byte]struct{}
+	target        localAddressMap
+	installed     map[[16]byte]struct{}
+	initialized   bool
+	globalAddrs   map[[16]byte]struct{}
 }
 
 // Reconcile a complete snapshot, rather than replaying NEWADDR/DELADDR. This
 // handles duplicate addresses on different interfaces and notifications queued
 // while the initial dump was in progress without resurrecting removed IPs.
 func (s *localAddressSet) replace(addrs []netlink.Addr) error {
+	_, err := s.replaceWithChange(addrs)
+	return err
+}
+
+func (s *localAddressSet) replaceWithChange(addrs []netlink.Addr) (bool, error) {
 	next := make(map[[16]byte]struct{}, len(addrs))
+	nextGlobal := make(map[[16]byte]struct{}, len(addrs))
 	for _, addr := range addrs {
 		if addr.IPNet == nil || addr.Flags&(unix.IFA_F_TENTATIVE|unix.IFA_F_DADFAILED) != 0 {
 			continue
@@ -42,7 +50,20 @@ func (s *localAddressSet) replace(addrs []netlink.Addr) error {
 		if !ok || ip.IsUnspecified() || ip.IsMulticast() {
 			continue
 		}
-		next[ip.Unmap().As16()] = struct{}{}
+		unmapped := ip.Unmap()
+		key := unmapped.As16()
+		next[key] = struct{}{}
+		if unmapped.IsGlobalUnicast() {
+			nextGlobal[key] = struct{}{}
+		}
+	}
+	globalChanged := false
+	if s.initialized && addrs != nil && !equalAddrSets(s.globalAddrs, nextGlobal) {
+		globalChanged = true
+	}
+	if addrs != nil {
+		s.globalAddrs = nextGlobal
+		s.initialized = true
 	}
 	var errs []error
 	// Remove stale permissions before adding new ones.
@@ -66,13 +87,80 @@ func (s *localAddressSet) replace(addrs []netlink.Addr) error {
 			s.installed[key] = struct{}{}
 		}
 	}
-	return errors.Join(errs...)
+	return globalChanged, errors.Join(errs...)
 }
+
+func equalAddrSets(a, b map[[16]byte]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+const globalAddrChangeDebounce = 500 * time.Millisecond
 
 type localAddressWatcher struct {
 	refs int
 	stop chan struct{}
 	done chan struct{}
+
+	cbMu         sync.Mutex
+	nextCBID     uint64
+	callbacks    map[uint64]func()
+	lastNotified time.Time
+}
+
+func (w *localAddressWatcher) addCallback(fn func()) uint64 {
+	if fn == nil {
+		return 0
+	}
+	w.cbMu.Lock()
+	defer w.cbMu.Unlock()
+	w.nextCBID++
+	id := w.nextCBID
+	if w.callbacks == nil {
+		w.callbacks = make(map[uint64]func())
+	}
+	w.callbacks[id] = fn
+	return id
+}
+
+func (w *localAddressWatcher) removeCallback(id uint64) {
+	if id == 0 {
+		return
+	}
+	w.cbMu.Lock()
+	delete(w.callbacks, id)
+	w.cbMu.Unlock()
+}
+
+func (w *localAddressWatcher) notifyGlobalAddrChange() {
+	now := time.Now()
+	w.cbMu.Lock()
+	if !w.lastNotified.IsZero() && now.Sub(w.lastNotified) < globalAddrChangeDebounce {
+		w.cbMu.Unlock()
+		return
+	}
+	w.lastNotified = now
+	fns := make([]func(), 0, len(w.callbacks))
+	for _, fn := range w.callbacks {
+		fns = append(fns, fn)
+	}
+	w.cbMu.Unlock()
+
+	if len(fns) == 0 {
+		return
+	}
+	go func() {
+		for _, fn := range fns {
+			fn()
+		}
+	}()
 }
 
 // Same-BPF reloads share one writer. Fresh BPF objects have unpinned maps and
@@ -83,6 +171,10 @@ var localAddressWatchers = struct {
 }{entries: make(map[*bpfObjects]*localAddressWatcher)}
 
 func acquireLocalAddressWatcher(bpf *bpfObjects, log *logrus.Logger) (func(), error) {
+	return acquireLocalAddressWatcherWithCallback(bpf, log, nil)
+}
+
+func acquireLocalAddressWatcherWithCallback(bpf *bpfObjects, log *logrus.Logger, onGlobalAddrChange func()) (func(), error) {
 	if bpf == nil || bpf.LocalAddrMap == nil {
 		return nil, fmt.Errorf("missing local_addr_map")
 	}
@@ -98,9 +190,11 @@ func acquireLocalAddressWatcher(bpf *bpfObjects, log *logrus.Logger) (func(), er
 		localAddressWatchers.entries[bpf] = w
 	}
 	w.refs++
+	cbID := w.addCallback(onGlobalAddrChange)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			w.removeCallback(cbID)
 			localAddressWatchers.Lock()
 			defer localAddressWatchers.Unlock()
 			w.refs--
@@ -138,7 +232,11 @@ func startLocalAddressWatcher(target localAddressMap, log *logrus.Logger) (*loca
 			// Losing authoritative state must not leave stale bypass permissions.
 			return errors.Join(err, set.replace(nil))
 		}
-		return set.replace(addrs)
+		globalChanged, rerr := set.replaceWithChange(addrs)
+		if globalChanged {
+			w.notifyGlobalAddrChange()
+		}
+		return rerr
 	}
 	failures := make(chan struct{}, 1)
 	subscribe := func() (chan netlink.AddrUpdate, chan struct{}, error) {

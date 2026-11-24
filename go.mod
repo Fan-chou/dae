@@ -129,4 +129,4 @@ replace github.com/olicesx/quic-go => github.com/Fan-chou/quic-go v0.0.0-2026111
 // the SS2022 UDP replay-window shift fix, the hysteria2 FastOpen deadline
 // handling, the VMess request padding fill (pool residue used to be sent) and
 // the REALITY spiderX parse-error handling.
-replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261117062026-9ae19d9e4423
+replace github.com/daeuniverse/outbound => github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261124060354-6298b3909c2d

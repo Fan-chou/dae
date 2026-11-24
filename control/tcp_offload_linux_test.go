@@ -34,3 +34,12 @@ func TestEpollCtlAddIgnoreExist(t *testing.T) {
 		t.Fatalf("second ADD (EEXIST) = %v, want nil", err)
 	}
 }
+
+func TestTCPOffloadMaxPeerBacklogForRAM(t *testing.T) {
+	if got := tcpOffloadMaxPeerBacklogForRAM(1024 << 20); got != tcpOffloadLowMemMaxPeerBacklog {
+		t.Fatalf("1 GiB host backlog = %d, want %d", got, tcpOffloadLowMemMaxPeerBacklog)
+	}
+	if got := tcpOffloadMaxPeerBacklogForRAM(10240 << 20); got != tcpOffloadMaxPeerBacklog {
+		t.Fatalf("10 GiB host backlog = %d, want %d", got, tcpOffloadMaxPeerBacklog)
+	}
+}

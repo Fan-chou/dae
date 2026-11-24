@@ -447,6 +447,7 @@ func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetw
 
 type TcpCheckOptionRaw struct {
 	opt               *TcpCheckOption
+	lastGood          *TcpCheckOption
 	mu                sync.Mutex
 	Log               *logrus.Logger
 	Raw               []string
@@ -472,15 +473,23 @@ func (c *TcpCheckOptionRaw) Option() (opt *TcpCheckOption, err error) {
 		ctx = context.WithValue(ctx, contextKey("logger"), c.Log)
 		tcpCheckOption, err := parseTcpCheckOption(ctx, c.Raw, c.Method, c.ResolverNetwork, c.DirectDialer, c.SystemDNSResolver)
 		if err != nil {
+			if c.lastGood != nil {
+				if c.Log != nil {
+					c.Log.WithError(err).Debug("Failed to refresh tcp_check_url; falling back to last known good target")
+				}
+				return c.lastGood, nil
+			}
 			return nil, fmt.Errorf("failed to parse tcp_check_url: %w", err)
 		}
 		c.opt = tcpCheckOption
+		c.lastGood = tcpCheckOption
 	}
 	return c.opt, nil
 }
 
 type CheckDnsOptionRaw struct {
 	opt               *CheckDnsOption
+	lastGood          *CheckDnsOption
 	mu                sync.Mutex
 	Raw               []string
 	ResolverNetwork   string
@@ -503,9 +512,13 @@ func (c *CheckDnsOptionRaw) Option() (opt *CheckDnsOption, err error) {
 		defer cancel()
 		udpCheckOption, err := parseCheckDNSOption(ctx, c.Raw, c.ResolverNetwork, c.DirectDialer, c.SystemDNSResolver)
 		if err != nil {
+			if c.lastGood != nil {
+				return c.lastGood, nil
+			}
 			return nil, fmt.Errorf("failed to parse udp_check_dns: %w", err)
 		}
 		c.opt = udpCheckOption
+		c.lastGood = udpCheckOption
 	}
 	return c.opt, nil
 }
@@ -1471,6 +1484,13 @@ func (d *Dialer) HttpCheck(ctx context.Context, networkIdx int, u *netutils.URL,
 	// Judge the status code.
 	if page := path.Base(req.URL.Path); strings.HasPrefix(page, "generate_") {
 		if strconv.Itoa(resp.StatusCode) != strings.TrimPrefix(page, "generate_") {
+			// CDN/WAF challenges or rate limits (403/429) on generate_204
+			// endpoints still confirm end-to-end TCP+HTTP reachability to the
+			// origin through this proxy, unlike captive portals (200/302) or
+			// broken proxy/upstream paths (5xx / timeout / connection error).
+			if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+				return true, nil
+			}
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			buf := pool.GetBuffer()
 			defer pool.PutBuffer(buf)

@@ -1047,6 +1047,41 @@ func (d *Dialer) GetHttpClient(idx int, ip netip.Addr, soMark uint32, mptcp bool
 	return cli
 }
 
+// ResetTransport resets any long-lived pooled or multiplexed underlay
+// transports (e.g. Hysteria2 QUIC tunnels, AnyTLS idle sessions, and cached
+// health-check HTTP clients) across this dialer and its isolated transport
+// classes without closing the dialer.
+func (d *Dialer) ResetTransport() bool {
+	if d == nil {
+		return false
+	}
+	reset := netproxy.ResetTransport(d.Dialer)
+
+	d.httpClientMu.Lock()
+	for _, cli := range d.httpClients {
+		if cli != nil {
+			cli.CloseIdleConnections()
+		}
+	}
+	d.httpClientMu.Unlock()
+
+	d.transportClassMu.Lock()
+	classes := make([]*Dialer, 0, len(d.transportClasses))
+	for _, child := range d.transportClasses {
+		if child != nil && child != d {
+			classes = append(classes, child)
+		}
+	}
+	d.transportClassMu.Unlock()
+
+	for _, child := range classes {
+		if child.ResetTransport() {
+			reset = true
+		}
+	}
+	return reset
+}
+
 func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
 	return NewDialerContext(context.Background(), dialer, option, iOption, property)
 }

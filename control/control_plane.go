@@ -475,11 +475,20 @@ func NewControlPlaneWithContextOptions(
 		}
 	}()
 
-	stopLocalAddresses, err := acquireLocalAddressWatcher(bpf, log)
+	var onGlobalAddrChange atomic.Pointer[func()]
+	stopLocalAddresses, err := acquireLocalAddressWatcherWithCallback(bpf, log, func() {
+		if fn := onGlobalAddrChange.Load(); fn != nil && *fn != nil {
+			(*fn)()
+		}
+	})
 	if err != nil {
 		return nil, fmt.Errorf("watch host addresses: %w", err)
 	}
-	core.addDeferFunc(func() error { stopLocalAddresses(); return nil })
+	core.addDeferFunc(func() error {
+		onGlobalAddrChange.Store(nil)
+		stopLocalAddresses()
+		return nil
+	})
 
 	var qualityModel *quality.ModelWorker
 	if global.LayaEnabled {
@@ -755,6 +764,7 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	registeredDialerCallbacks := make(map[*dialer.Dialer]struct{})
+	uniqueProxyDialers := make([]*dialer.Dialer, 0)
 	for _, group := range outbounds {
 		for _, d := range group.Dialers {
 			if _, ok := registeredDialerCallbacks[d]; ok {
@@ -762,7 +772,27 @@ func NewControlPlaneWithContextOptions(
 			}
 			registeredDialerCallbacks[d] = struct{}{}
 			d.RegisterAliveTransitionCallback(core.dialerAliveTransitionCallback(d))
+			if !d.DisableCheck {
+				uniqueProxyDialers = append(uniqueProxyDialers, d)
+			}
 		}
+	}
+	if len(uniqueProxyDialers) > 0 {
+		handleGlobalAddrChange := func() {
+			resetCount := 0
+			for _, d := range uniqueProxyDialers {
+				if d.ResetTransport() {
+					resetCount++
+				}
+				d.NotifyCheckTcp()
+				d.NotifyCheckDnsUdp()
+			}
+			log.WithFields(logrus.Fields{
+				"dialers": len(uniqueProxyDialers),
+				"reset":   resetCount,
+			}).Info("Host global address changed; reset pooled outbound transports and triggered health checks")
+		}
+		onGlobalAddrChange.Store(&handleGlobalAddrChange)
 	}
 
 	/// Routing.

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	daerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/observation"
 	"github.com/daeuniverse/outbound/netproxy"
 	dnsmessage "github.com/miekg/dns"
@@ -97,6 +98,11 @@ func (t *establishedTCPTask) run() (err error) {
 	}
 	offloaded, reason, offloadErr := t.offload.run(t.flow.Context(), t.left, t.right, t.flow.recordDownload, t.flow.recordUpload, t.flow.offloadLiveAccounting())
 	if offloadErr != nil {
+		if daerrors.IsIgnorableTCPRelayError(offloadErr) {
+			facts.Stage = "offload"
+			t.captured.Offloaded()
+			return nil
+		}
 		outcome = "offload_error"
 		facts.Class, facts.Stage = observation.ErrorClass(offloadErr), "offload"
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)

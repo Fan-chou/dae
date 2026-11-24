@@ -46,11 +46,39 @@ const (
 	// bpf-next 2025-04 series issue #4). Exceeding it engages the backlog
 	// fuse: the verdict passes data through and the userspace fallback
 	// forwards it only after the kernel has drained the queue.
-	tcpOffloadMaxPeerBacklog = 64 << 20
+	tcpOffloadMaxPeerBacklog          = 64 << 20
+	tcpOffloadLowMemMaxPeerBacklog    = 16 << 20
+	tcpOffloadLowMemHostRAMThreshold  = 1536 << 20
 	// relayPassWriteTimeout bounds a userspace-fallback write to a congested
 	// peer socket so one stalled direction cannot wedge the session loop.
 	relayPassWriteTimeout = 5 * time.Second
 )
+
+var (
+	tcpOffloadEffectiveBacklogOnce sync.Once
+	tcpOffloadEffectiveBacklogVal  uint64 = tcpOffloadMaxPeerBacklog
+)
+
+func tcpOffloadMaxPeerBacklogForRAM(totalRAM uint64) uint64 {
+	if totalRAM > 0 && totalRAM <= tcpOffloadLowMemHostRAMThreshold {
+		return tcpOffloadLowMemMaxPeerBacklog
+	}
+	return tcpOffloadMaxPeerBacklog
+}
+
+func tcpOffloadEffectiveMaxPeerBacklog() uint64 {
+	tcpOffloadEffectiveBacklogOnce.Do(func() {
+		var si unix.Sysinfo_t
+		if err := unix.Sysinfo(&si); err == nil && si.Totalram > 0 {
+			unit := uint64(si.Unit)
+			if unit == 0 {
+				unit = 1
+			}
+			tcpOffloadEffectiveBacklogVal = tcpOffloadMaxPeerBacklogForRAM(uint64(si.Totalram) * unit)
+		}
+	})
+	return tcpOffloadEffectiveBacklogVal
+}
 
 var errTCPRelayOffloadUnavailable = errors.New("tcp relay eBPF offload unavailable")
 
@@ -467,7 +495,7 @@ func (s *tcpRelayOffloadSession) fuseStep() (engage, startFallback bool, err err
 		}
 		return false, false, nil
 	}
-	if backlog > tcpOffloadMaxPeerBacklog {
+	if backlog > tcpOffloadEffectiveMaxPeerBacklog() {
 		one := uint8(1)
 		if err := s.pauseMap.Update(&s.leftKey, &one, ebpf.UpdateAny); err != nil {
 			return false, false, fmt.Errorf("pause left redirect: %w", err)
