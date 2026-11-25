@@ -21,9 +21,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// This file holds the Phase 0 DNS corpus fixtures. Each fixture focuses on
-// one observable behaviour the refactor must preserve. Fixtures are pure
-// data + factory functions; the driver lives in refactor_dns_corpus.go.
+// This file holds the DNS compatibility corpus fixtures. Each fixture focuses on
+// one observable behaviour the controller must preserve. Fixtures are pure
+// data + factory functions; the driver lives in dns_corpus_support_test.go.
 
 // udpCacheMissFixture pins the cold-cache UDP path: a fresh query that
 // misses cache, contacts the upstream via the forwarder factory, and

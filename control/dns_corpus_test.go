@@ -9,20 +9,14 @@ import (
 	"testing"
 )
 
-// TestPhase0DnsCorpus_LegacyBaseline runs the Phase 0 DNS corpus against the
+// TestDnsCorpus_LegacyBaseline runs the DNS compatibility corpus against the
 // current DnsController implementation. Each fixture builds a fresh
 // controller, installs its forwarder factory, and replays the cases.
 //
-// This test pins the legacy baseline. Future phases (DNS projection split,
-// three-valued response routing, etc.) MUST keep these tests passing, since
-// they encode user-visible behaviour the refactor cannot regress.
-//
-// See docs/en/semantic-architecture-refactor-plan.md Phase 0 acceptance
-// clause 2: DNS UDP/TCP, stale cache, reject-before-cache, QUIC sniffing,
-// full-cone and symmetric UDP flows, and reload-with-live-flows have replay
-// coverage. The current corpus covers UDP cache-miss and reject-before-cache;
-// the remaining sub-corpora are tracked in progress.md.
-func TestPhase0DnsCorpus_LegacyBaseline(t *testing.T) {
+// This test pins observable DNS behavior (UDP/TCP transport, stale cache,
+// reject-before-cache, negative responses) so subsequent refactors cannot
+// regress user-visible semantics.
+func TestDnsCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range DnsCorpusFixtures() {
 		fixture := fixture
 		t.Run(fixture.Name, func(t *testing.T) {

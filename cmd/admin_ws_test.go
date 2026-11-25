@@ -403,7 +403,7 @@ func TestAdminWebSocketPreUpgradeRateLimitPendingCapShutdownAndMalformedAuth(t *
 	})
 }
 
-func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
+func TestAdminWebSocketHealthAndControlEvents(t *testing.T) {
 	plane := &stubAdminPlane{
 		groups: []control.AdminGroup{
 			{Name: "proxy", Policy: "fixed", Selected: "hk-01"},
@@ -412,7 +412,7 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 	}
 	addr := reserveTestLoopbackAddr(t)
 	server := newAdminServer(nil, "", t.TempDir(), func() adminPlane { return plane }, nil)
-	server.refreshWithCORS(addr, "ws-p0-secret", nil)
+	server.refreshWithCORS(addr, "ws-events-secret", nil)
 	t.Cleanup(server.shutdown)
 
 	wsURL := "ws://" + addr + "/api/v1/ws"
@@ -421,7 +421,7 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(wsClientFrame{Type: "auth", Token: "ws-p0-secret"}); err != nil {
+	if err := conn.WriteJSON(wsClientFrame{Type: "auth", Token: "ws-events-secret"}); err != nil {
 		t.Fatal(err)
 	}
 	var authOK wsServerFrame
@@ -458,7 +458,7 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 	// Trigger group_probe_triggered, group_sticky_changed, and system_suspended events.
 	client := &http.Client{Timeout: 2 * time.Second}
 	postProbe, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/api/v1/groups/probe", nil)
-	postProbe.Header.Set("Authorization", "Bearer ws-p0-secret")
+	postProbe.Header.Set("Authorization", "Bearer ws-events-secret")
 	if resp, rerr := client.Do(postProbe); rerr != nil {
 		t.Fatal(rerr)
 	} else {
@@ -466,7 +466,7 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 	}
 
 	delSticky, _ := http.NewRequest(http.MethodDelete, "http://"+addr+"/api/v1/groups/proxy/sticky/example.com", nil)
-	delSticky.Header.Set("Authorization", "Bearer ws-p0-secret")
+	delSticky.Header.Set("Authorization", "Bearer ws-events-secret")
 	if resp, rerr := client.Do(delSticky); rerr != nil {
 		t.Fatal(rerr)
 	} else {
@@ -480,7 +480,7 @@ func TestAdminWebSocketP0HealthAndControlEvents(t *testing.T) {
 	for len(seen) < 4 {
 		var frame wsServerFrame
 		if err := conn.ReadJSON(&frame); err != nil {
-			t.Fatalf("missing WS P0 events (seen=%v): %v", seen, err)
+			t.Fatalf("missing WS health/control events (seen=%v): %v", seen, err)
 		}
 		if frame.Type == "event" {
 			seen[frame.Event] = true

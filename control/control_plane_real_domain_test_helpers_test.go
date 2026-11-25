@@ -14,9 +14,8 @@ import (
 )
 
 // newJanitorTestMap loads a real (unpinned) bpf map by spec for janitor tests.
-// Recovered from the pruned control_plane_janitor_test.go (Sprint 5 T1).
-// No build tag: callers span default and !dae_stub_ebpf builds; a tagless
-// helper file is visible in both, matching the original definition's semantics.
+// No build tag: callers span default and !dae_stub_ebpf builds, so a tagless
+// helper file stays visible in both.
 func newJanitorTestMap(t *testing.T, mapName string) *ebpf.Map {
 	t.Helper()
 

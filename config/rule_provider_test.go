@@ -111,12 +111,12 @@ func TestValidateRuleProvidersRejectsReservedIPv6Ranges(t *testing.T) {
 }
 
 func TestValidateRuleProvidersRedactsCredentialsFromMalformedURL(t *testing.T) {
-	rawURL := "http://user:stage1-secret%zz@example.com/rules"
+	rawURL := "http://user:provider-secret%zz@example.com/rules"
 	err := ValidateRuleProviders([]RuleProvider{{
 		Name: "credentialed", Type: "http", URL: rawURL,
 		Behavior: "domain", Format: "yaml",
 	}}, "/etc/dae")
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "user")
-	require.NotContains(t, err.Error(), "stage1-secret")
+	require.NotContains(t, err.Error(), "provider-secret")
 }

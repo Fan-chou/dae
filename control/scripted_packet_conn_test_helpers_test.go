@@ -16,12 +16,9 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-// Scripted packet-conn mock family shared by connectivity / udp_flow_binding /
-// udp_proxy_dial_bench / udp_quic_e2e_bench / quic_corpus tests.
-// Recovered verbatim from the pruned udp_endpoint_pool_test.go (Sprint 5 T1):
-// the 3013-line file's *tests* were bloat, but this mock fixture is a shared
-// dependency of multiple surviving (including non-bulk) test files, so it is
-// kept here as a centralized helper. No build tag (matches original).
+// Scripted packet-conn mock family shared by connectivity, UDP flow binding,
+// UDP proxy dial benchmarks, QUIC E2E benchmarks, and QUIC corpus tests.
+// No build tag so the shared mock fixture is available across all builds.
 
 type scriptedPacketRead struct {
 	data []byte

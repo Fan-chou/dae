@@ -17,9 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// DNS message/controller helpers recovered from pruned dns_cache_scope_test.go
-// (Sprint 5 T1). Referenced by multiple surviving non-bulk fuzz-corpus test
-// files, so centralized here. No build tag (matches original).
+// Shared DNS message and controller test helpers used across control-plane
+// DNS test suites. No build tag so helpers are available in all builds.
 
 // dnsAResponseMsg builds a single-A-record DNS response message.
 func dnsAResponseMsg(name string, ip string) *dnsmessage.Msg {

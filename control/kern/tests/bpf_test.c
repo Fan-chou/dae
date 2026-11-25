@@ -2953,7 +2953,7 @@ int testcheck_lan_fakeip_nonsyn_stateless_tproxy(struct __sk_buff *skb)
 	return check_redirect_non_syn_tcp(skb);
 }
 
-struct ab_test_ah_hdr {
+struct ipv6_ah_hdr_fixture {
 	__u8 nexthdr;
 	__u8 payload_len;
 	__be16 reserved;
@@ -2961,8 +2961,8 @@ struct ab_test_ah_hdr {
 	__be32 seq_no;
 };
 
-SEC("tc/ab_test/control_plane_custom_mark")
-int test_ab_control_plane_custom_mark(struct __sk_buff *skb)
+SEC("tc/regression/control_plane_custom_mark")
+int test_control_plane_custom_mark(struct __sk_buff *skb)
 {
 	struct pid_pname *p = NULL;
 
@@ -2981,12 +2981,12 @@ int test_ab_control_plane_custom_mark(struct __sk_buff *skb)
 	return 0;
 }
 
-SEC("tc/ab_test/ipv6_ah_udp_parse")
-int test_ab_ipv6_ah_udp_parse(struct __sk_buff *skb)
+SEC("tc/regression/ipv6_ah_udp_parse")
+int test_ipv6_ah_udp_parse(struct __sk_buff *skb)
 {
 	const __u32 packet_len = FAST_PATH_PACKET_SIZE;
 	const __u32 ah_offset = ETH_HLEN + IP6_HLEN;
-	const __u32 udp_offset = ah_offset + sizeof(struct ab_test_ah_hdr);
+	const __u32 udp_offset = ah_offset + sizeof(struct ipv6_ah_hdr_fixture);
 
 	if (bpf_skb_change_tail(skb, packet_len, 0))
 		return 1;
@@ -2999,7 +2999,7 @@ int test_ab_ipv6_ah_udp_parse(struct __sk_buff *skb)
 
 	struct ethhdr *eth = data;
 	struct ipv6hdr *ip6 = data + ETH_HLEN;
-	struct ab_test_ah_hdr *ah = data + ah_offset;
+	struct ipv6_ah_hdr_fixture *ah = data + ah_offset;
 	struct udphdr *udp = data + udp_offset;
 
 	eth->h_proto = bpf_htons(ETH_P_IPV6);
@@ -3037,18 +3037,18 @@ int test_ab_ipv6_ah_udp_parse(struct __sk_buff *skb)
 	return 0;
 }
 
-#define AB_TEST_HOST_UDP_PORT 54321
+#define LAN_INGRESS_HOST_UDP_PORT 54321
 
-SEC("tc/ab_test/lan_ingress_udp_host_listener_pktgen")
-int test_ab_lan_ingress_udp_host_listener_pktgen(struct __sk_buff *skb)
+SEC("tc/regression/lan_ingress_udp_host_listener_pktgen")
+int test_lan_ingress_udp_host_listener_pktgen(struct __sk_buff *skb)
 {
 	return set_ipv4_udp_fastpath_with_dscp(skb,
 					   IPV4(192,168,0,1), IPV4(1,1,1,1),
-					   24567, AB_TEST_HOST_UDP_PORT, 0);
+					   24567, LAN_INGRESS_HOST_UDP_PORT, 0);
 }
 
-SEC("tc/ab_test/lan_ingress_udp_host_listener")
-int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
+SEC("tc/regression/lan_ingress_udp_host_listener")
+int test_lan_ingress_udp_host_listener(struct __sk_buff *skb)
 {
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, true);
 	return do_tproxy_lan_ingress(skb, ETH_HLEN);

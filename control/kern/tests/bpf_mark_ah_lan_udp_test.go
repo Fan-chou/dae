@@ -16,9 +16,9 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-const abTestHostUDPPort = 54321
+const lanIngressHostUDPPort = 54321
 
-func loadABRegressionObjects(t *testing.T) *bpftestObjects {
+func loadMarkAHLanUDPObjects(t *testing.T) *bpftestObjects {
 	t.Helper()
 
 	obj := &bpftestObjects{}
@@ -54,14 +54,14 @@ func loadABRegressionObjects(t *testing.T) *bpftestObjects {
 	return obj
 }
 
-func TestABRegression(t *testing.T) {
-	obj := loadABRegressionObjects(t)
+func TestControlPlaneMarkIPv6AHAndLanIngressUDP(t *testing.T) {
+	obj := loadMarkAHLanUDPObjects(t)
 	defer obj.Close()
 
 	t.Run("custom mark excludes foreign bit 8", func(t *testing.T) {
 		data := make([]byte, 4096-256-320)
 		ctx := make([]byte, 256)
-		status, _, _, err := runBpfProgram(obj.TestAbControlPlaneCustomMark, data, ctx)
+		status, _, _, err := runBpfProgram(obj.TestControlPlaneCustomMark, data, ctx)
 		if err != nil || status != 0 {
 			t.Fatalf("custom-mark policy: status=%d err=%v", status, err)
 		}
@@ -70,7 +70,7 @@ func TestABRegression(t *testing.T) {
 	t.Run("IPv6 AH UDP parse", func(t *testing.T) {
 		data := make([]byte, 4096-256-320)
 		ctx := make([]byte, 256)
-		status, _, _, err := runBpfProgram(obj.TestAbIpv6AhUdpParse, data, ctx)
+		status, _, _, err := runBpfProgram(obj.TestIpv6AhUdpParse, data, ctx)
 		if err != nil || status != 0 {
 			t.Fatalf("AH parse: status=%d err=%v", status, err)
 		}
@@ -79,7 +79,7 @@ func TestABRegression(t *testing.T) {
 	t.Run("LAN ingress wildcard UDP listener requires local destination", func(t *testing.T) {
 		listener, err := net.ListenUDP("udp4", &net.UDPAddr{
 			IP:   net.IPv4zero,
-			Port: abTestHostUDPPort,
+			Port: lanIngressHostUDPPort,
 		})
 		if err != nil {
 			t.Fatalf("bind host-netns UDP listener: %v", err)
@@ -95,11 +95,11 @@ func TestABRegression(t *testing.T) {
 
 		data := make([]byte, 4096-256-320)
 		ctx := make([]byte, 256)
-		status, data, ctx, err := runBpfProgram(obj.TestAbLanIngressUdpHostListenerPktgen, data, ctx)
+		status, data, ctx, err := runBpfProgram(obj.TestLanIngressUdpHostListenerPktgen, data, ctx)
 		if err != nil || status != 0 {
 			t.Fatalf("packet generation: status=%d err=%v", status, err)
 		}
-		status, _, _, err = runBpfProgram(obj.TestAbLanIngressUdpHostListener, data, ctx)
+		status, _, _, err = runBpfProgram(obj.TestLanIngressUdpHostListener, data, ctx)
 		if err != nil {
 			t.Fatalf("LAN ingress program: %v", err)
 		}
@@ -113,7 +113,7 @@ func TestABRegression(t *testing.T) {
 			t.Fatal(err)
 		}
 		copy(data[14+16:14+20], local.AsSlice())
-		status, _, _, err = runBpfProgram(obj.TestAbLanIngressUdpHostListener, data, ctx)
+		status, _, _, err = runBpfProgram(obj.TestLanIngressUdpHostListener, data, ctx)
 		if err != nil || status != 0 {
 			t.Fatalf("local UDP listener was not passed through: status=%d err=%v", status, err)
 		}

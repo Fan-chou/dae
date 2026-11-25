@@ -4,12 +4,10 @@
  */
 
 // Unit tests for the reload state machine, reload manager bookkeeping, and
-// signal shutdown teardown. Recovered from the run_shutdown_test.go pruned in
-// the Sprint 5 test reduction and adapted to the current tree:
-//   - shutdownAfterSignal was folded into shutdownAfterSignalWithHandoff, so
-//     its tests pass a nil handoff;
-//   - shutdown now tears down the dae netns even on fast exit, so fast-exit
-//     expectations include one netns.Close call.
+// signal shutdown teardown.
+//   - shutdownAfterSignalWithHandoff tests pass a nil handoff when verifying
+//     standalone signal teardown;
+//   - shutdown always tears down the dae netns, including on fast exit.
 package cmd
 
 import (

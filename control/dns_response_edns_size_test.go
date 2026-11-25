@@ -56,11 +56,11 @@ func TestDNSRejectResponseOversizedOPT(t *testing.T) {
 		Response: config.DnsResponseRouting{Fallback: "accept"},
 	}}, &componentdns.NewOption{Logger: logger, UpstreamReadyCallback: func(*componentdns.Upstream) error { return nil }})
 	require.NoError(t, err)
-	controller, err := NewDnsController(routing, phase0NamedUpstreamControllerOption(logger))
+	controller, err := NewDnsController(routing, namedUpstreamControllerOption(logger))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, controller.Close()) })
 	query := new(dnsmessage.Msg)
-	query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	query.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 	query.SetEdns0(512, true)
 	query.IsEdns0().Option = []dnsmessage.EDNS0{&dnsmessage.EDNS0_PADDING{Padding: make([]byte, 600)}}
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
@@ -84,8 +84,8 @@ func TestDNSDialSendOversizedOPT(t *testing.T) {
 			req, client := newDNSResponseUDPTestPair(t)
 
 			logger := newDNSListenerTestLogger()
-			routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-			response := dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.11")
+			routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+			response := dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.11")
 			response.SetEdns0(1232, true)
 			response.IsEdns0().SetZ(0x0040)
 			response.IsEdns0().Option = []dnsmessage.EDNS0{&dnsmessage.EDNS0_PADDING{Padding: make([]byte, 600)}}
@@ -104,7 +104,7 @@ func TestDNSDialSendOversizedOPT(t *testing.T) {
 			}
 			t.Cleanup(func() { dnsForwarderFactory = originalFactory })
 			stored := make(chan struct{}, 1)
-			option := phase0NamedUpstreamControllerOption(logger)
+			option := namedUpstreamControllerOption(logger)
 			option.CacheAccessCallback = func(*DnsCache) error {
 				select {
 				case stored <- struct{}{}:
@@ -116,15 +116,15 @@ func TestDNSDialSendOversizedOPT(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, controller.Close()) })
 			query := new(dnsmessage.Msg)
-			query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+			query.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 			if size != 0 {
 				query.SetEdns0(size, true)
 			}
 			queryWire, err := query.Pack()
 			require.NoError(t, err)
-			index, upstream, err := routing.RequestSelect(context.Background(), phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+			index, upstream, err := routing.RequestSelect(context.Background(), namedUpstreamScopeQName, dnsmessage.TypeA)
 			require.NoError(t, err)
-			cacheKey := controller.responseCacheKey(controller.cacheKey(phase0NamedUpstreamScopeQName, dnsmessage.TypeA), req, index, upstream)
+			cacheKey := controller.responseCacheKey(controller.cacheKey(namedUpstreamScopeQName, dnsmessage.TypeA), req, index, upstream)
 			require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
 			require.NoError(t, controller.dialSend(context.Background(), req, queryWire, query.Id, upstream, nil, cacheKey))
 			buf := make([]byte, dnsmessage.MaxMsgSize)
@@ -183,7 +183,7 @@ func TestDNSResponseOversizedOPT(t *testing.T) {
 		{name: "normal_opt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			response := dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.11")
+			response := dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.11")
 			response.SetEdns0(4096, true)
 			responseOPT := response.IsEdns0()
 			responseOPT.SetZ(0x0040)
@@ -232,7 +232,7 @@ func TestDNSResponseOversizedOPT(t *testing.T) {
 			for _, cacheEnabled := range []bool{true, false} {
 				t.Run(fmt.Sprintf("cache=%t", cacheEnabled), func(t *testing.T) {
 					logger := newDNSListenerTestLogger()
-					routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+					routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
 					var forwards atomic.Int32
 					originalFactory := dnsForwarderFactory
 					dnsForwarderFactory = func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
@@ -242,7 +242,7 @@ func TestDNSResponseOversizedOPT(t *testing.T) {
 						}}, nil
 					}
 					t.Cleanup(func() { dnsForwarderFactory = originalFactory })
-					option := phase0NamedUpstreamControllerOption(logger)
+					option := namedUpstreamControllerOption(logger)
 					if !cacheEnabled {
 						option.NewCache = func(string, []dnsmessage.RR, []dnsmessage.RR, []dnsmessage.RR, time.Time, time.Time) (*DnsCache, error) {
 							return nil, stderrors.New("test cache storage failure")
@@ -265,7 +265,7 @@ func TestDNSResponseOversizedOPT(t *testing.T) {
 					} {
 						t.Run(request.name, func(t *testing.T) {
 							query := new(dnsmessage.Msg)
-							query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+							query.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 							query.Id = uint16(i + 1)
 							if request.size != 0 {
 								query.SetEdns0(request.size, true)

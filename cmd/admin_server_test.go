@@ -924,7 +924,7 @@ func TestAdminServerRefreshResolvesOnceAndHotReloadsListenAndSecret(t *testing.T
 	}
 }
 
-func TestAdminP0ProbesStickySelectionCloseExistingAndSuspend(t *testing.T) {
+func TestAdminProbesStickySelectionCloseExistingAndSuspend(t *testing.T) {
 	t.Parallel()
 	plane := &stubAdminPlane{
 		groups: []control.AdminGroup{

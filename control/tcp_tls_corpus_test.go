@@ -22,15 +22,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type phase0TCPTLSAction string
+type corpusTCPTLSAction string
 
 const (
-	phase0TCPTLSActionDirect phase0TCPTLSAction = "direct"
-	phase0TCPTLSActionProxy  phase0TCPTLSAction = "proxy"
-	phase0TCPTLSActionBlock  phase0TCPTLSAction = "block"
+	corpusTCPTLSActionDirect corpusTCPTLSAction = "direct"
+	corpusTCPTLSActionProxy  corpusTCPTLSAction = "proxy"
+	corpusTCPTLSActionBlock  corpusTCPTLSAction = "block"
 )
 
-type phase0TCPTLSCorpusFixture struct {
+type corpusTCPTLSFixture struct {
 	name             string
 	clientHello      []byte
 	expectedDomain   string
@@ -39,13 +39,13 @@ type phase0TCPTLSCorpusFixture struct {
 	expectedMust     bool
 	expectedTarget   string
 	expectedNetwork  string
-	expectedAction   phase0TCPTLSAction
+	expectedAction   corpusTCPTLSAction
 }
 
-// phase0TLSClientHello is a minimal TLS 1.2 ClientHello with SNI
+// corpusTLSClientHello is a minimal TLS 1.2 ClientHello with SNI
 // "tls.phase0.test". Its fixed bytes make the corpus independent of a live
 // TLS stack while still exercising the production stream sniffer.
-var phase0TLSClientHello = []byte{
+var corpusTLSClientHello = []byte{
 	0x16, 0x03, 0x01, 0x00, 0x47,
 	0x01, 0x00, 0x00, 0x43,
 	0x03, 0x03,
@@ -62,33 +62,33 @@ var phase0TLSClientHello = []byte{
 	't', 'l', 's', '.', 'p', 'h', 'a', 's', 'e', '0', '.', 't', 'e', 's', 't',
 }
 
-func phase0TCPTLSCorpusFixtures() []phase0TCPTLSCorpusFixture {
-	return []phase0TCPTLSCorpusFixture{{
+func corpusTCPTLSFixtures() []corpusTCPTLSFixture {
+	return []corpusTCPTLSFixture{{
 		name:             "tls_sni_routes_to_marked_must_proxy",
-		clientHello:      phase0TLSClientHello,
+		clientHello:      corpusTLSClientHello,
 		expectedDomain:   "tls.phase0.test",
 		expectedOutbound: consts.OutboundUserDefinedMin,
 		expectedMark:     42,
 		expectedMust:     true,
 		expectedTarget:   "198.51.100.20:443",
 		expectedNetwork:  "tcp",
-		expectedAction:   phase0TCPTLSActionProxy,
+		expectedAction:   corpusTCPTLSActionProxy,
 	}}
 }
 
-// TestPhase0TCPTLSCorpus_LegacyBaseline fixes the legacy TCP/TLS observable
+// TestTCPTLSCorpus_LegacyBaseline fixes the legacy TCP/TLS observable
 // decision: parse a ClientHello SNI, route that evidence, and dial the chosen
 // proxy. Later policy or flow refactors must preserve this entire outcome.
-func TestPhase0TCPTLSCorpus_LegacyBaseline(t *testing.T) {
-	for _, fixture := range phase0TCPTLSCorpusFixtures() {
+func TestTCPTLSCorpus_LegacyBaseline(t *testing.T) {
+	for _, fixture := range corpusTCPTLSFixtures() {
 		fixture := fixture
 		t.Run(fixture.name, func(t *testing.T) {
-			replayPhase0TCPTLSCorpusFixture(t, fixture)
+			replayCorpusTCPTLSFixture(t, fixture)
 		})
 	}
 }
 
-func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFixture) {
+func replayCorpusTCPTLSFixture(t *testing.T, fixture corpusTCPTLSFixture) {
 	t.Helper()
 
 	sniffer := sniffing.NewStreamSniffer(bytes.NewReader(fixture.clientHello), time.Second)
@@ -101,7 +101,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 		t.Fatalf("SNI = %q, want %q", domain, fixture.expectedDomain)
 	}
 
-	matcher := newPhase0TCPTLSLegacyMatcher(t, fixture)
+	matcher := newCorpusTCPTLSLegacyMatcher(t, fixture)
 	clientConn, proxyConn := net.Pipe()
 	t.Cleanup(func() { _ = proxyConn.Close() })
 	dialer, underlay := newCountingProxyEndpointDialer("shadowsocks_2022", "proxy.example:443", clientConn)
@@ -150,7 +150,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 	if result.SelectionNetworkTypeObj == nil || result.SelectionNetworkTypeObj.L4Proto != consts.L4ProtoStr_TCP || result.SelectionNetworkTypeObj.IpVersion != consts.IpVersionStr_4 {
 		t.Fatalf("selected network family = %+v, want tcp/ipv4", result.SelectionNetworkTypeObj)
 	}
-	if action := phase0TCPTLSActionForOutbound(result.OutboundIndex); action != fixture.expectedAction {
+	if action := corpusTCPTLSActionForOutbound(result.OutboundIndex); action != fixture.expectedAction {
 		t.Fatalf("action = %q, want %q", action, fixture.expectedAction)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -158,7 +158,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 	}
 }
 
-func newPhase0TCPTLSLegacyMatcher(t *testing.T, fixture phase0TCPTLSCorpusFixture) *RoutingMatcher {
+func newCorpusTCPTLSLegacyMatcher(t *testing.T, fixture corpusTCPTLSFixture) *RoutingMatcher {
 	t.Helper()
 	program, err := routing.NewNormalizedProgram(
 		[]*config_parser.RoutingRule{{
@@ -201,13 +201,13 @@ func newPhase0TCPTLSLegacyMatcher(t *testing.T, fixture phase0TCPTLSCorpusFixtur
 	return matcher
 }
 
-func phase0TCPTLSActionForOutbound(outbound consts.OutboundIndex) phase0TCPTLSAction {
+func corpusTCPTLSActionForOutbound(outbound consts.OutboundIndex) corpusTCPTLSAction {
 	switch outbound {
 	case consts.OutboundDirect:
-		return phase0TCPTLSActionDirect
+		return corpusTCPTLSActionDirect
 	case consts.OutboundBlock:
-		return phase0TCPTLSActionBlock
+		return corpusTCPTLSActionBlock
 	default:
-		return phase0TCPTLSActionProxy
+		return corpusTCPTLSActionProxy
 	}
 }

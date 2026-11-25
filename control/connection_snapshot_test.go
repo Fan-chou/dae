@@ -205,7 +205,7 @@ func TestAdminConnectionsSnapshotKeepsHeaviestFlowsWhenTruncated(t *testing.T) {
 	}
 }
 
-func TestAdminConnectionsP0AllActiveFilterAndClosedFlowsAfter(t *testing.T) {
+func TestAdminConnectionsAllActiveFilterAndClosedFlowsAfter(t *testing.T) {
 	manager := NewSessionManager(context.Background())
 	t.Cleanup(func() { _ = manager.Close() })
 	runtime := newEgressRuntime(nil, nil)

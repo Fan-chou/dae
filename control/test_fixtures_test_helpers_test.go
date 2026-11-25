@@ -21,13 +21,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Shared control-plane test fixtures recovered from pruned bulk test files
-// (Sprint 5 T1). These are referenced by multiple surviving (including
-// non-bulk fuzz-corpus and bench) test files, so they are centralized here.
-// No build tag (matches original definitions).
+// Shared control-plane test fixtures referenced across unit, corpus, and
+// benchmark test files. No build tag so definitions stay available in all builds.
 
 // errorDialer is a netproxy.Dialer that always returns a fixed error.
-// Recovered from udp_endpoint_pool_test.go.
 type errorDialer struct {
 	err   error
 	calls atomic.Int32

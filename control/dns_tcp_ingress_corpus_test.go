@@ -25,15 +25,15 @@ import (
 
 // TTL0 responses are delivered once without cache replay. Preserve the
 // upstream header, including its unset RA bit, and its zero address TTL.
-const phase0TCPIngressResponseWireHex = "" +
+const tcpDNSIngressResponseWireHex = "" +
 	"4a2b810000010001000000000b7463702d696e67726573730670686173653004746573740000010001" +
 	"0b7463702d696e67726573730670686173653004746573740000010001000000000004c633644d"
 
-// TestPhase0TCPDNSIngressCorpus_LegacyBaseline fixes the complete ingress
+// TestTCPDNSIngressCorpus_LegacyBaseline fixes the complete ingress
 // DNS-over-TCP observable: a fixed query frame reaches the real TCP fast path,
 // the controller resolves through the configured forwarder, and the response is
 // returned with the required two-byte length prefix and stable DNS wire bytes.
-func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
+func TestTCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 	const (
 		queryName = "tcp-ingress.phase0.test."
 		queryID   = 0x4a2b
@@ -48,7 +48,7 @@ func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 	})
 	installCorpusDnsForwarderFactory(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 		return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
-			return phase0TCPIngressAResponse(queryName, answerIP), nil
+			return tcpDNSIngressAResponse(queryName, answerIP), nil
 		}}, nil
 	})
 
@@ -97,12 +97,12 @@ func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 		t.Fatalf("client query frame Write() error = %v", err)
 	}
 
-	responseFrame, responseWire := readPhase0TCPDnsFrame(t, clientConn)
+	responseFrame, responseWire := readTCPDnsFrame(t, clientConn)
 	if got, want := binary.BigEndian.Uint16(responseFrame[:2]), uint16(len(responseWire)); got != want {
 		t.Fatalf("response length prefix = %d, want payload length %d", got, want)
 	}
 
-	wantWire, err := hex.DecodeString(phase0TCPIngressResponseWireHex)
+	wantWire, err := hex.DecodeString(tcpDNSIngressResponseWireHex)
 	if err != nil {
 		t.Fatalf("decode expected TCP DNS wire: %v", err)
 	}
@@ -145,7 +145,7 @@ type tcpDnsIngressResult struct {
 	err     error
 }
 
-func readPhase0TCPDnsFrame(t *testing.T, conn net.Conn) ([]byte, []byte) {
+func readTCPDnsFrame(t *testing.T, conn net.Conn) ([]byte, []byte) {
 	t.Helper()
 
 	lengthPrefix := make([]byte, 2)
@@ -163,7 +163,7 @@ func readPhase0TCPDnsFrame(t *testing.T, conn net.Conn) ([]byte, []byte) {
 	return append(lengthPrefix, payload...), payload
 }
 
-func phase0TCPIngressAResponse(name, address string) *dnsmessage.Msg {
+func tcpDNSIngressAResponse(name, address string) *dnsmessage.Msg {
 	msg := dnsAResponseMsg(name, address)
 	msg.Answer[0].Header().Ttl = 0
 	return msg

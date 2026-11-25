@@ -13,7 +13,6 @@ import (
 )
 
 // newTestNetworkType returns a TCP/IPv4/DNS NetworkType used by dialer tests.
-// Recovered from the pruned connectivity_check_test.go (Sprint 5 T1).
 func newTestNetworkType() *NetworkType {
 	return &NetworkType{
 		L4Proto:   consts.L4ProtoStr_TCP,
@@ -23,7 +22,6 @@ func newTestNetworkType() *NetworkType {
 }
 
 // newNamedTestDialer builds a real Dialer backed by SymmetricDirect for tests.
-// Recovered from the pruned connectivity_check_test.go (Sprint 5 T1).
 func newNamedTestDialer(t *testing.T, name string) *Dialer {
 	t.Helper()
 

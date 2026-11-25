@@ -14,7 +14,7 @@ import (
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
-func stage4ARefreshConfig(provider config.RuleProvider, routeProvider string) *config.Config {
+func refreshTestConfig(provider config.RuleProvider, routeProvider string) *config.Config {
 	return &config.Config{
 		RuleProvider: []config.RuleProvider{provider},
 		Routing: config.Routing{
@@ -29,7 +29,7 @@ func stage4ARefreshConfig(provider config.RuleProvider, routeProvider string) *c
 	}
 }
 
-func stage4ARefreshConfigForProviders(providers ...config.RuleProvider) *config.Config {
+func refreshTestConfigForProviders(providers ...config.RuleProvider) *config.Config {
 	rules := make([]*config_parser.RoutingRule, 0, len(providers))
 	for _, provider := range providers {
 		rules = append(rules, &config_parser.RoutingRule{
@@ -48,7 +48,7 @@ func stage4ARefreshConfigForProviders(providers ...config.RuleProvider) *config.
 	}
 }
 
-func assertStage4ARefreshKeepsRuleset(t *testing.T, conf *config.Config, routeProvider string) {
+func assertRefreshKeepsRuleset(t *testing.T, conf *config.Config, routeProvider string) {
 	t.Helper()
 	if len(conf.Routing.Rules) != 1 {
 		t.Fatalf("routing rules = %#v, want one unexpanded rule", conf.Routing.Rules)
@@ -69,7 +69,7 @@ func assertStage4ARefreshKeepsRuleset(t *testing.T, conf *config.Config, routePr
 	}
 }
 
-func stage4AReadPublishedSnapshot(t *testing.T, descriptor cacheDescriptor) (cacheSnapshot, currentState) {
+func readPublishedSnapshot(t *testing.T, descriptor cacheDescriptor) (cacheSnapshot, currentState) {
 	t.Helper()
 	state, err := readCurrentState(descriptor.root)
 	if err != nil {
@@ -85,7 +85,7 @@ func stage4AReadPublishedSnapshot(t *testing.T, descriptor cacheDescriptor) (cac
 	return snapshot, state
 }
 
-func assertStage4ANoPublishedSnapshot(t *testing.T, descriptor cacheDescriptor) {
+func assertNoPublishedSnapshot(t *testing.T, descriptor cacheDescriptor) {
 	t.Helper()
 	state, err := readCurrentState(descriptor.root)
 	if err != nil {
@@ -104,7 +104,7 @@ func TestRefreshFileProviderReportsOutcomeAndPreservesRuleset(t *testing.T) {
 	provider := config.RuleProvider{
 		Name: "local", Type: "file", Path: "rules.yaml", Behavior: "domain", Format: "yaml", MaxSize: 1024,
 	}
-	conf := stage4ARefreshConfig(provider, provider.Name)
+	conf := refreshTestConfig(provider, provider.Name)
 	path := filepath.Join(dir, provider.Path)
 	firstBody := []byte("payload:\n  - first.example\n")
 	secondBody := []byte("payload:\n  - second.example\n")
@@ -120,11 +120,11 @@ func TestRefreshFileProviderReportsOutcomeAndPreservesRuleset(t *testing.T) {
 	if report != (RefreshReport{Changed: true}) {
 		t.Fatalf("first Refresh() report = %#v, want changed=true and no last-good fallback", report)
 	}
-	first, firstState := stage4AReadPublishedSnapshot(t, descriptor)
+	first, firstState := readPublishedSnapshot(t, descriptor)
 	if string(first.body) != string(firstBody) {
 		t.Fatalf("first cache body = %q, want %q", first.body, firstBody)
 	}
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 
 	report, err = Refresh(context.Background(), conf, dir, http.DefaultClient)
 	if err != nil {
@@ -133,14 +133,14 @@ func TestRefreshFileProviderReportsOutcomeAndPreservesRuleset(t *testing.T) {
 	if report != (RefreshReport{}) {
 		t.Fatalf("same-body Refresh() report = %#v, want unchanged without last-good fallback", report)
 	}
-	same, sameState := stage4AReadPublishedSnapshot(t, descriptor)
+	same, sameState := readPublishedSnapshot(t, descriptor)
 	if string(same.body) != string(firstBody) {
 		t.Fatalf("same-body cache body = %q, want %q", same.body, firstBody)
 	}
 	if sameState.target != firstState.target {
 		t.Fatalf("same-body current target = %q, want unchanged target %q", sameState.target, firstState.target)
 	}
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 
 	if err := os.WriteFile(path, secondBody, 0o600); err != nil {
 		t.Fatalf("WriteFile(second provider body) error = %v", err)
@@ -152,11 +152,11 @@ func TestRefreshFileProviderReportsOutcomeAndPreservesRuleset(t *testing.T) {
 	if report != (RefreshReport{Changed: true}) {
 		t.Fatalf("changed-body Refresh() report = %#v, want changed=true and no last-good fallback", report)
 	}
-	changed, _ := stage4AReadPublishedSnapshot(t, descriptor)
+	changed, _ := readPublishedSnapshot(t, descriptor)
 	if string(changed.body) != string(secondBody) {
 		t.Fatalf("changed-body cache body = %q, want %q", changed.body, secondBody)
 	}
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 }
 
 func TestRefreshHTTPProviderUsesLastGoodAfter503(t *testing.T) {
@@ -174,7 +174,7 @@ func TestRefreshHTTPProviderUsesLastGoodAfter503(t *testing.T) {
 	provider := config.RuleProvider{
 		Name: "remote", Type: "http", URL: server.URL, Behavior: "domain", Format: "yaml", MaxSize: 1024,
 	}
-	conf := stage4ARefreshConfig(provider, provider.Name)
+	conf := refreshTestConfig(provider, provider.Name)
 	descriptor := testCacheDescriptor(t, provider, dir)
 
 	report, err := Refresh(context.Background(), conf, dir, http.DefaultClient)
@@ -184,11 +184,11 @@ func TestRefreshHTTPProviderUsesLastGoodAfter503(t *testing.T) {
 	if report != (RefreshReport{Changed: true}) {
 		t.Fatalf("initial HTTP Refresh() report = %#v, want changed=true and no last-good fallback", report)
 	}
-	initial, initialState := stage4AReadPublishedSnapshot(t, descriptor)
+	initial, initialState := readPublishedSnapshot(t, descriptor)
 	if string(initial.body) != firstBody {
 		t.Fatalf("initial HTTP cache body = %q, want %q", initial.body, firstBody)
 	}
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 
 	status = http.StatusServiceUnavailable
 	report, err = Refresh(context.Background(), conf, dir, http.DefaultClient)
@@ -198,7 +198,7 @@ func TestRefreshHTTPProviderUsesLastGoodAfter503(t *testing.T) {
 	if report != (RefreshReport{UsedLastGood: true}) {
 		t.Fatalf("503 HTTP Refresh() report = %#v, want unchanged with last-good fallback", report)
 	}
-	lastGood, lastGoodState := stage4AReadPublishedSnapshot(t, descriptor)
+	lastGood, lastGoodState := readPublishedSnapshot(t, descriptor)
 	if string(lastGood.body) != firstBody {
 		t.Fatalf("503 HTTP cache body = %q, want first valid body %q", lastGood.body, firstBody)
 	}
@@ -208,7 +208,7 @@ func TestRefreshHTTPProviderUsesLastGoodAfter503(t *testing.T) {
 	if lastGood.metadata != initial.metadata {
 		t.Fatalf("503 HTTP cache metadata changed: initial=%#v lastGood=%#v", initial.metadata, lastGood.metadata)
 	}
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 }
 
 func TestRefreshSameGenerationBodyDifferentETagDoesNotReportChange(t *testing.T) {
@@ -228,7 +228,7 @@ func TestRefreshSameGenerationBodyDifferentETagDoesNotReportChange(t *testing.T)
 	provider := config.RuleProvider{
 		Name: "remote", Type: "http", URL: server.URL, Behavior: "domain", Format: "yaml", MaxSize: 1024,
 	}
-	conf := stage4ARefreshConfig(provider, provider.Name)
+	conf := refreshTestConfig(provider, provider.Name)
 	descriptor := testCacheDescriptor(t, provider, dir)
 
 	report, err := Refresh(context.Background(), conf, dir, http.DefaultClient)
@@ -238,7 +238,7 @@ func TestRefreshSameGenerationBodyDifferentETagDoesNotReportChange(t *testing.T)
 	if report != (RefreshReport{Changed: true}) {
 		t.Fatalf("first Refresh() report = %#v, want changed=true", report)
 	}
-	first, firstState := stage4AReadPublishedSnapshot(t, descriptor)
+	first, firstState := readPublishedSnapshot(t, descriptor)
 
 	report, err = Refresh(context.Background(), conf, dir, http.DefaultClient)
 	if err != nil {
@@ -247,7 +247,7 @@ func TestRefreshSameGenerationBodyDifferentETagDoesNotReportChange(t *testing.T)
 	if report != (RefreshReport{}) {
 		t.Fatalf("same-generation same-body different-ETag Refresh() report = %#v, want unchanged", report)
 	}
-	second, secondState := stage4AReadPublishedSnapshot(t, descriptor)
+	second, secondState := readPublishedSnapshot(t, descriptor)
 	if secondState.target != firstState.target {
 		t.Fatalf("same-generation same-body different-ETag current target = %q, want unchanged target %q", secondState.target, firstState.target)
 	}
@@ -274,7 +274,7 @@ func TestRefreshMixedFreshAndLastGoodReportsBothOutcomes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, providerB.Path), oldBodyB, 0o600); err != nil {
 		t.Fatalf("WriteFile(B initial body) error = %v", err)
 	}
-	conf := stage4ARefreshConfigForProviders(providerA, providerB)
+	conf := refreshTestConfigForProviders(providerA, providerB)
 	descriptorA := testCacheDescriptor(t, providerA, dir)
 	descriptorB := testCacheDescriptor(t, providerB, dir)
 
@@ -285,8 +285,8 @@ func TestRefreshMixedFreshAndLastGoodReportsBothOutcomes(t *testing.T) {
 	if report != (RefreshReport{Changed: true}) {
 		t.Fatalf("initial mixed-provider Refresh() report = %#v, want changed=true", report)
 	}
-	initialA, initialAState := stage4AReadPublishedSnapshot(t, descriptorA)
-	initialB, initialBState := stage4AReadPublishedSnapshot(t, descriptorB)
+	initialA, initialAState := readPublishedSnapshot(t, descriptorA)
+	initialB, initialBState := readPublishedSnapshot(t, descriptorB)
 	if string(initialA.body) != string(oldBodyA) || string(initialB.body) != string(oldBodyB) {
 		t.Fatalf("initial mixed-provider snapshots = A:%q B:%q, want initial bodies", initialA.body, initialB.body)
 	}
@@ -305,8 +305,8 @@ func TestRefreshMixedFreshAndLastGoodReportsBothOutcomes(t *testing.T) {
 	if report != (RefreshReport{Changed: true, UsedLastGood: true}) {
 		t.Fatalf("mixed fresh/last-good Refresh() report = %#v, want changed=true and used-last-good=true", report)
 	}
-	currentA, currentAState := stage4AReadPublishedSnapshot(t, descriptorA)
-	currentB, currentBState := stage4AReadPublishedSnapshot(t, descriptorB)
+	currentA, currentAState := readPublishedSnapshot(t, descriptorA)
+	currentB, currentBState := readPublishedSnapshot(t, descriptorB)
 	if string(currentA.body) != string(newBodyA) || currentAState.target == initialAState.target {
 		t.Fatalf("A after mixed fresh/last-good Refresh() = body:%q state:%#v, want new body and new current", currentA.body, currentAState)
 	}
@@ -323,7 +323,7 @@ func TestRefreshRejectsInvalidRulesetWithoutPublishing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, provider.Path), []byte("payload:\n  - valid.example\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(provider body) error = %v", err)
 	}
-	conf := stage4ARefreshConfig(provider, "missing")
+	conf := refreshTestConfig(provider, "missing")
 	descriptor := testCacheDescriptor(t, provider, dir)
 
 	report, err := Refresh(context.Background(), conf, dir, http.DefaultClient)
@@ -333,8 +333,8 @@ func TestRefreshRejectsInvalidRulesetWithoutPublishing(t *testing.T) {
 	if report != (RefreshReport{}) {
 		t.Fatalf("invalid ruleset Refresh() report = %#v, want all false", report)
 	}
-	assertStage4ANoPublishedSnapshot(t, descriptor)
-	assertStage4ARefreshKeepsRuleset(t, conf, "missing")
+	assertNoPublishedSnapshot(t, descriptor)
+	assertRefreshKeepsRuleset(t, conf, "missing")
 }
 
 func TestRefreshCanceledContextDoesNotPublish(t *testing.T) {
@@ -345,7 +345,7 @@ func TestRefreshCanceledContextDoesNotPublish(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, provider.Path), []byte("payload:\n  - canceled.example\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(provider body) error = %v", err)
 	}
-	conf := stage4ARefreshConfig(provider, provider.Name)
+	conf := refreshTestConfig(provider, provider.Name)
 	descriptor := testCacheDescriptor(t, provider, dir)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -357,17 +357,17 @@ func TestRefreshCanceledContextDoesNotPublish(t *testing.T) {
 	if report != (RefreshReport{}) {
 		t.Fatalf("canceled Refresh() report = %#v, want all false", report)
 	}
-	assertStage4ANoPublishedSnapshot(t, descriptor)
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertNoPublishedSnapshot(t, descriptor)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 }
 
-type stage4ACancelAtPublishBoundaryContext struct {
+type cancelAtPublishBoundaryContext struct {
 	context.Context
 	cancel   context.CancelFunc
 	errCalls int
 }
 
-func (ctx *stage4ACancelAtPublishBoundaryContext) Err() error {
+func (ctx *cancelAtPublishBoundaryContext) Err() error {
 	ctx.errCalls++
 	if ctx.errCalls == 3 {
 		// Refresh has completed preparation and its final pre-publish check. The
@@ -386,11 +386,11 @@ func TestRefreshCanceledWhileWaitingForPublishLockDoesNotPublish(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, provider.Path), []byte("payload:\n  - locked.example\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(provider body) error = %v", err)
 	}
-	conf := stage4ARefreshConfig(provider, provider.Name)
+	conf := refreshTestConfig(provider, provider.Name)
 	descriptor := testCacheDescriptor(t, provider, dir)
 	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx := &stage4ACancelAtPublishBoundaryContext{Context: baseCtx, cancel: cancel}
+	ctx := &cancelAtPublishBoundaryContext{Context: baseCtx, cancel: cancel}
 
 	cachePublishMu.Lock()
 	released := false
@@ -428,6 +428,6 @@ func TestRefreshCanceledWhileWaitingForPublishLockDoesNotPublish(t *testing.T) {
 	if report != (RefreshReport{}) {
 		t.Errorf("canceled while waiting for publish lock Refresh() report = %#v, want all false", report)
 	}
-	assertStage4ANoPublishedSnapshot(t, descriptor)
-	assertStage4ARefreshKeepsRuleset(t, conf, provider.Name)
+	assertNoPublishedSnapshot(t, descriptor)
+	assertRefreshKeepsRuleset(t, conf, provider.Name)
 }

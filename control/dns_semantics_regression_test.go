@@ -12,8 +12,8 @@ import (
 
 func TestDNSCacheRecordLifetimesAndNegativeTransitions(t *testing.T) {
 	logger := newDNSListenerTestLogger()
-	routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-	c, err := NewDnsController(routing, phase0NamedUpstreamControllerOption(logger))
+	routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+	c, err := NewDnsController(routing, namedUpstreamControllerOption(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +130,8 @@ func TestDNSQuerySharedSemantics(t *testing.T) {
 
 func TestDNSSpecialQueriesDoNotReadOrPopulateOrdinaryCache(t *testing.T) {
 	logger := newDNSListenerTestLogger()
-	routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-	c, err := NewDnsController(routing, phase0NamedUpstreamControllerOption(logger))
+	routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+	c, err := NewDnsController(routing, namedUpstreamControllerOption(logger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestDNSSpecialQueriesDoNotReadOrPopulateOrdinaryCache(t *testing.T) {
 		}}, nil
 	}
 	ordinary := new(dnsmessage.Msg)
-	ordinary.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	ordinary.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 	request := &udpRequest{routingResult: &bpfRoutingResult{}}
 	query := func(msg *dnsmessage.Msg, want string) {
 		t.Helper()

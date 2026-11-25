@@ -315,7 +315,7 @@ func TestEstablishedTCPDNSReleasesGeneration(t *testing.T) {
 		Response: config.DnsResponseRouting{Fallback: config.FunctionOrString("accept")}}})
 	installCorpusDnsForwarderFactory(t, func(*dns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 		return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
-			return phase0TCPIngressAResponse("handoff.invalid.", "198.51.100.77"), nil
+			return tcpDNSIngressAResponse("handoff.invalid.", "198.51.100.77"), nil
 		}}, nil
 	})
 	successor := &ControlPlane{ctx: context.Background(), controlPlaneDNSRuntime: controlPlaneDNSRuntime{dnsController: ctrl}}

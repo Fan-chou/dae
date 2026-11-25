@@ -19,18 +19,18 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline exercises DNS routing
+// TestDnsRoutingFunctionsCorpus_LegacyBaseline exercises DNS routing
 // functions through DnsController instead of calling request/response matchers
 // directly. The selected request upstream and response-routing disposition are
 // observable through the deterministic forwarder and captured client response.
-func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
+func TestDnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	t.Run("request_qtype_selects_named_upstream", func(t *testing.T) {
 		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{"typed:udp://192.0.2.53:53"},
 			Routing: config.DnsRouting{
 				Request: config.DnsRequestRouting{
 					Rules: []*config_parser.RoutingRule{
-						phase0DnsRoutingRule(consts.Function_QType, "typed", &config_parser.Param{Val: "AAAA"}),
+						corpusDnsRoutingRule(consts.Function_QType, "typed", &config_parser.Param{Val: "AAAA"}),
 					},
 					Fallback: config.FunctionOrString("asis"),
 				},
@@ -45,11 +45,11 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			}
 			selectedHost = upstream.Hostname
 			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
-				return phase0DnsAAAAResponseMsg("request-qtype.test.", "2001:db8::53"), nil
+				return corpusDnsAAAAResponseMsg("request-qtype.test.", "2001:db8::53"), nil
 			}}, nil
 		})
 
-		response := replayPhase0DnsRoutingQuery(t, ctrl, "request-qtype.test.", dnsmessage.TypeAAAA)
+		response := replayCorpusDnsRoutingQuery(t, ctrl, "request-qtype.test.", dnsmessage.TypeAAAA)
 		if selectedHost != "192.0.2.53" {
 			t.Fatalf("request qtype selected upstream host %q, want %q", selectedHost, "192.0.2.53")
 		}
@@ -65,7 +65,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
 				Response: config.DnsResponseRouting{
 					Rules: []*config_parser.RoutingRule{
-						phase0DnsRoutingRule(consts.Function_QName, "reject", &config_parser.Param{
+						corpusDnsRoutingRule(consts.Function_QName, "reject", &config_parser.Param{
 							Key: string(consts.RoutingDomainKey_Full),
 							Val: "response-qname.test",
 						}),
@@ -75,8 +75,8 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			},
 		})
 
-		installCorpusDnsForwarderFactory(t, phase0DnsRoutingAForwarder("response-qname.test.", "203.0.113.53"))
-		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-qname.test.", dnsmessage.TypeA)
+		installCorpusDnsForwarderFactory(t, corpusDnsRoutingAForwarder("response-qname.test.", "203.0.113.53"))
+		response := replayCorpusDnsRoutingQuery(t, ctrl, "response-qname.test.", dnsmessage.TypeA)
 		if len(response.Answer) != 0 {
 			t.Fatalf("response qname reject returned %d answers, want 0", len(response.Answer))
 		}
@@ -89,7 +89,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
 				Response: config.DnsResponseRouting{
 					Rules: []*config_parser.RoutingRule{
-						phase0DnsRoutingRule(consts.Function_QType, "reject", &config_parser.Param{Val: "AAAA"}),
+						corpusDnsRoutingRule(consts.Function_QType, "reject", &config_parser.Param{Val: "AAAA"}),
 					},
 					Fallback: config.FunctionOrString("accept"),
 				},
@@ -98,11 +98,11 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 
 		installCorpusDnsForwarderFactory(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
-				return phase0DnsAAAAResponseMsg("response-qtype.test.", "2001:db8::54"), nil
+				return corpusDnsAAAAResponseMsg("response-qtype.test.", "2001:db8::54"), nil
 			}}, nil
 		})
 
-		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-qtype.test.", dnsmessage.TypeAAAA)
+		response := replayCorpusDnsRoutingQuery(t, ctrl, "response-qtype.test.", dnsmessage.TypeAAAA)
 		if len(response.Answer) != 0 {
 			t.Fatalf("response qtype reject returned %d answers, want 0", len(response.Answer))
 		}
@@ -115,15 +115,15 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
 				Response: config.DnsResponseRouting{
 					Rules: []*config_parser.RoutingRule{
-						phase0DnsRoutingRule(consts.Function_Ip, "reject", &config_parser.Param{Val: "203.0.113.0/24"}),
+						corpusDnsRoutingRule(consts.Function_Ip, "reject", &config_parser.Param{Val: "203.0.113.0/24"}),
 					},
 					Fallback: config.FunctionOrString("accept"),
 				},
 			},
 		})
 
-		installCorpusDnsForwarderFactory(t, phase0DnsRoutingAForwarder("response-ip.test.", "203.0.113.54"))
-		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-ip.test.", dnsmessage.TypeA)
+		installCorpusDnsForwarderFactory(t, corpusDnsRoutingAForwarder("response-ip.test.", "203.0.113.54"))
+		response := replayCorpusDnsRoutingQuery(t, ctrl, "response-ip.test.", dnsmessage.TypeA)
 		if len(response.Answer) != 0 {
 			t.Fatalf("response ip reject returned %d answers, want 0", len(response.Answer))
 		}
@@ -139,7 +139,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
 				Response: config.DnsResponseRouting{
 					Rules: []*config_parser.RoutingRule{
-						phase0DnsRoutingRule(consts.Function_Upstream, "secondary", &config_parser.Param{Val: "primary"}),
+						corpusDnsRoutingRule(consts.Function_Upstream, "secondary", &config_parser.Param{Val: "primary"}),
 					},
 					Fallback: config.FunctionOrString("accept"),
 				},
@@ -166,7 +166,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			}
 		})
 
-		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-upstream.test.", dnsmessage.TypeA)
+		response := replayCorpusDnsRoutingQuery(t, ctrl, "response-upstream.test.", dnsmessage.TypeA)
 		if len(calls) != 2 || calls[0] != "192.0.2.53" || calls[1] != "192.0.2.54" {
 			t.Fatalf("response upstream forward sequence = %v, want [192.0.2.53 192.0.2.54]", calls)
 		}
@@ -176,7 +176,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	})
 }
 
-func replayPhase0DnsRoutingQuery(t *testing.T, ctrl *DnsController, name string, qtype uint16) *dnsmessage.Msg {
+func replayCorpusDnsRoutingQuery(t *testing.T, ctrl *DnsController, name string, qtype uint16) *dnsmessage.Msg {
 	t.Helper()
 
 	query := new(dnsmessage.Msg)
@@ -192,7 +192,7 @@ func replayPhase0DnsRoutingQuery(t *testing.T, ctrl *DnsController, name string,
 	return response
 }
 
-func phase0DnsRoutingRule(function, outbound string, params ...*config_parser.Param) *config_parser.RoutingRule {
+func corpusDnsRoutingRule(function, outbound string, params ...*config_parser.Param) *config_parser.RoutingRule {
 	return &config_parser.RoutingRule{
 		AndFunctions: []*config_parser.Function{{
 			Name:   function,
@@ -202,7 +202,7 @@ func phase0DnsRoutingRule(function, outbound string, params ...*config_parser.Pa
 	}
 }
 
-func phase0DnsRoutingAForwarder(name, address string) func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
+func corpusDnsRoutingAForwarder(name, address string) func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 	return func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 		return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
 			return dnsAResponseMsg(name, address), nil
@@ -210,7 +210,7 @@ func phase0DnsRoutingAForwarder(name, address string) func(*componentdns.Upstrea
 	}
 }
 
-func phase0DnsAAAAResponseMsg(name, address string) *dnsmessage.Msg {
+func corpusDnsAAAAResponseMsg(name, address string) *dnsmessage.Msg {
 	msg := new(dnsmessage.Msg)
 	msg.SetReply(&dnsmessage.Msg{})
 	msg.SetQuestion(name, dnsmessage.TypeAAAA)

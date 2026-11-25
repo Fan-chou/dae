@@ -540,7 +540,7 @@ func TestAdminMetricsSnapshotIncludesTCPAndUDP(t *testing.T) {
 	}
 }
 
-func TestAdminGroupsP0RichHealthQualityScoreDataUDPAndSticky(t *testing.T) {
+func TestAdminGroupsRichHealthQualityScoreDataUDPAndSticky(t *testing.T) {
 	t.Parallel()
 	d := newNamedTestEndpointDialer("hk-rich")
 	t.Cleanup(func() { _ = d.Close() })

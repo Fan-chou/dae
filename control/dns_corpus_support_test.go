@@ -24,26 +24,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file is the Phase 0 DNS compatibility corpus for the semantic
-// architecture refactor. It mirrors the routing corpus pattern: each fixture
-// declares a DNS routing program plus a set of cases that exercise a specific
-// behaviour, and the ReplayDns driver runs the fixture against the current
-// DnsController implementation to pin the observable result.
+// This file is the DNS compatibility corpus. It mirrors the routing corpus
+// pattern: each fixture declares a DNS routing program plus a set of cases
+// that exercise a specific behaviour, and the ReplayDns driver runs the
+// fixture against the current DnsController implementation to pin the
+// observable result.
 //
-// Coverage target (per Phase 0 acceptance clause 2):
+// Coverage scope:
 //   - UDP transport: cache miss / cache hit / cache stale + background refresh
 //   - TCP transport: UDP failure triggering TCP fallback
 //   - Reject-before-cache: routing-level reject must short-circuit cache hits
 //   - Negative upstream response: NXDOMAIN is delivered but not stored as an
 //     address cache entry
-//   - QUIC sniffing: response routing driven by sniffed SNI (planned; needs
-//     sniffing pipeline hook)
 //   - Concurrency cap: REFUSED on overload
 //
-// Future phases (DNS projection split, three-valued response routing, etc.)
-// MUST keep these corpus tests passing. Cases with WireHex pin the canonical
-// packed response byte-for-byte; all cases continue to assert the response
-// shape that matters for their behavior.
+// Cases with WireHex pin the canonical packed response byte-for-byte; all
+// cases continue to assert the response shape that matters for their behavior.
 
 // DnsCorpusCase captures a single DNS request and the observable response
 // shape the corpus is pinning. Selected deterministic cases also pin their
@@ -96,9 +92,9 @@ type DnsCorpusFixture struct {
 	Cases            []DnsCorpusCase
 }
 
-// DnsCorpusFixtures returns the full Phase 0 DNS corpus. Add a constructor
-// here to extend coverage; downstream refactor phases replay the same slice
-// and must produce byte-identical observable results.
+// DnsCorpusFixtures returns the full DNS compatibility corpus. Add a
+// constructor here to extend coverage; replays must produce byte-identical
+// observable results.
 func DnsCorpusFixtures() []DnsCorpusFixture {
 	return []DnsCorpusFixture{
 		udpCacheMissFixture(),

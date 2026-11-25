@@ -241,7 +241,7 @@ routing {
 }
 
 func TestLoadRedactsCredentialsFromMalformedProviderURL(t *testing.T) {
-	rawURL := "http://stage1-user:stage1-secret%zz@example.com/rules"
+	rawURL := "http://provider-user:provider-secret%zz@example.com/rules"
 	_, err := Load(context.Background(), []config.RuleProvider{{
 		Name: "credentialed", Type: "http", URL: rawURL,
 		Behavior: "domain", Format: "yaml", MaxSize: 1024,
@@ -249,7 +249,7 @@ func TestLoadRedactsCredentialsFromMalformedProviderURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() error = nil for malformed credentialed provider URL")
 	}
-	for _, forbidden := range []string{rawURL, "stage1-user", "stage1-secret", "%zz"} {
+	for _, forbidden := range []string{rawURL, "provider-user", "provider-secret", "%zz"} {
 		if strings.Contains(err.Error(), forbidden) {
 			t.Fatalf("Load() error %q leaks %q", err, forbidden)
 		}
@@ -720,7 +720,7 @@ func TestFetchHTTPRejectsRedirectToBlockedEndpoint(t *testing.T) {
 }
 
 func TestFetchHTTPRedactsRedirectUserinfo(t *testing.T) {
-	const rawLocation = "http://stage1-user:stage1-secret@127.0.0.1:1/redirected"
+	const rawLocation = "http://provider-user:provider-secret@127.0.0.1:1/redirected"
 	server := newPublicHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, rawLocation, http.StatusFound)
 	}))
@@ -729,7 +729,7 @@ func TestFetchHTTPRedactsRedirectUserinfo(t *testing.T) {
 	if err == nil {
 		t.Fatal("fetchHTTP() error = nil for redirect with userinfo to blocked endpoint")
 	}
-	for _, secret := range []string{"stage1-user", "stage1-secret", rawLocation} {
+	for _, secret := range []string{"provider-user", "provider-secret", rawLocation} {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("fetchHTTP() error = %q, must not contain redirect credential/URL %q", err, secret)
 		}
@@ -737,7 +737,7 @@ func TestFetchHTTPRedactsRedirectUserinfo(t *testing.T) {
 }
 
 func TestFetchHTTPRedactsMalformedRedirectLocationUserinfo(t *testing.T) {
-	const rawLocation = "http://stage1-user:stage1-secret@example.com/a\tb"
+	const rawLocation = "http://provider-user:provider-secret@example.com/a\tb"
 	endpoint, served := newPublicRawHTTPRedirectServer(t, rawLocation)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -754,7 +754,7 @@ func TestFetchHTTPRedactsMalformedRedirectLocationUserinfo(t *testing.T) {
 	if err == nil {
 		t.Fatal("fetchHTTP() error = nil for malformed redirect Location")
 	}
-	for _, forbidden := range []string{"stage1-user", "stage1-secret", "example.com/a", rawLocation} {
+	for _, forbidden := range []string{"provider-user", "provider-secret", "example.com/a", rawLocation} {
 		if strings.Contains(err.Error(), forbidden) {
 			t.Fatalf("fetchHTTP() error = %q, must not contain malformed redirect detail %q", err, forbidden)
 		}
@@ -3689,7 +3689,7 @@ func TestMultiProviderLoadUpdatesHealthyProviderWhenUnversionedSiblingUsesLastGo
 		{Name: "a", Type: "http", URL: server.URL + "/a", Behavior: "domain", Format: "yaml", MaxSize: 1024},
 		{Name: "b", Type: "http", URL: server.URL + "/b", Behavior: "domain", Format: "yaml", MaxSize: 1024},
 	}
-	conf := stage4ARefreshConfigForProviders(providers...)
+	conf := refreshTestConfigForProviders(providers...)
 	dir := t.TempDir()
 	opts := loadOptions{allowPrivate: true, reuseFresh: true, refreshGrace: true}
 	if _, _, err := refreshWithOptions(context.Background(), conf, dir, http.DefaultClient, opts); err != nil {
@@ -3857,13 +3857,13 @@ func TestBatchConsistencyAndWarningsNameAllFallbackProviders(t *testing.T) {
 		}
 		dir := t.TempDir()
 		opts := loadOptions{allowPrivate: true}
-		conf := stage4ARefreshConfigForProviders(providers...)
+		conf := refreshTestConfigForProviders(providers...)
 		if _, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, opts); err != nil {
 			t.Fatalf("initial load = %v", err)
 		}
 
 		down.Store(true)
-		conf = stage4ARefreshConfigForProviders(providers...)
+		conf = refreshTestConfigForProviders(providers...)
 		report, err := loadAndExpandWithOptionsAndReport(context.Background(), conf, dir, http.DefaultClient, opts)
 		if err != nil {
 			t.Fatalf("unversioned mixed update error = %v, want healthy provider updated", err)

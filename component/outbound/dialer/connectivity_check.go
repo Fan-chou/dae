@@ -834,9 +834,9 @@ func (d *Dialer) aliveBackground() {
 
 		var wg sync.WaitGroup
 		d.submitCheckTasks(workerPool, &wg, opts, checkFamily != "", cycleRes)
-		// Per-cycle waiter goroutine evaluated (round 11) and kept: it runs
-		// microseconds per interval across all dialers; alternatives either
-		// spin or complicate submit/failure accounting.
+		// Keep the per-cycle waiter goroutine: it runs for microseconds per
+		// interval across all dialers, whereas alternatives either spin or
+		// complicate submit/failure accounting.
 		waitDone := make(chan struct{})
 		go func() {
 			wg.Wait()

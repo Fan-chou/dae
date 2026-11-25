@@ -83,8 +83,8 @@ type LoadReport struct {
 }
 
 // ErrProductionRuntimeDisabled is kept for source compatibility with callers
-// that used the phase-0 gate. The production loader is now enabled and never
-// returns this sentinel.
+// that checked the legacy bootstrap gate. The production loader is now enabled
+// and never returns this sentinel.
 var ErrProductionRuntimeDisabled = errors.New("native rule provider runtime is disabled until security hardening is complete")
 
 // loadOptions is intentionally unexported. Private-network access is only a

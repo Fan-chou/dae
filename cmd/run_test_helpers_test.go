@@ -6,8 +6,7 @@ import (
 )
 
 // newTestRuntimeGeneration returns a minimal runtimeGeneration for runtime
-// supervisor tests. Recovered from the pruned runtime_supervisor_test.go
-// (Sprint 5 T1).
+// supervisor tests.
 func newTestRuntimeGeneration() *runtimeGeneration {
 	return &runtimeGeneration{
 		controlPlane: &control.ControlPlane{},

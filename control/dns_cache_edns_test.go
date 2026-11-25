@@ -24,8 +24,8 @@ func TestDNSCacheDoesNotShareUnsolicitedEDNS(t *testing.T) {
 		t.Run(fmt.Sprint(ttl), func(t *testing.T) {
 			logger := logrus.New()
 			logger.SetOutput(io.Discard)
-			routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-			response := dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.11")
+			routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+			response := dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.11")
 			response.Answer[0].Header().Ttl = ttl
 			response.SetEdns0(1232, true)
 			opt := response.IsEdns0()
@@ -48,14 +48,14 @@ func TestDNSCacheDoesNotShareUnsolicitedEDNS(t *testing.T) {
 				}}, nil
 			}
 			t.Cleanup(func() { dnsForwarderFactory = originalFactory })
-			controller, err := NewDnsController(routing, phase0NamedUpstreamControllerOption(logger))
+			controller, err := NewDnsController(routing, namedUpstreamControllerOption(logger))
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, controller.Close()) })
 			req := &udpRequest{routingResult: &bpfRoutingResult{}}
 
 			for i, path := range []string{"miss", "hit"} {
 				t.Run(path, func(t *testing.T) {
-					got := resolvePhase0NamedUpstreamScope(t, controller, req, uint16(i+1))
+					got := resolveNamedUpstreamScope(t, controller, req, uint16(i+1))
 					require.EqualValues(t, 1, forwards.Load())
 					require.Nil(t, got.IsEdns0(), "ordinary query must not inherit unsolicited upstream EDNS options")
 				})
@@ -67,7 +67,7 @@ func TestDNSCacheDoesNotShareUnsolicitedEDNS(t *testing.T) {
 				require.Len(t, cache.Extra, 1, "only the ordinary additional record is shared")
 				require.Equal(t, opt, response.IsEdns0(), "cache insertion must not mutate upstream OPT")
 				t.Run("refresh", func(t *testing.T) {
-					wire := cache.GetPackedResponseWithApproximateTTL(phase0NamedUpstreamScopeQName, dnsmessage.TypeA, cache.Deadline.Add(-30*time.Second))
+					wire := cache.GetPackedResponseWithApproximateTTL(namedUpstreamScopeQName, dnsmessage.TypeA, cache.Deadline.Add(-30*time.Second))
 					var got dnsmessage.Msg
 					require.NoError(t, got.Unpack(wire))
 					require.EqualValues(t, 30, got.Answer[0].Header().Ttl)

@@ -21,12 +21,12 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type phase0QuicAction string
+type corpusQuicAction string
 
 const (
-	phase0QuicActionDirect phase0QuicAction = "direct"
-	phase0QuicActionProxy  phase0QuicAction = "proxy"
-	phase0QuicActionBlock  phase0QuicAction = "block"
+	corpusQuicActionDirect corpusQuicAction = "direct"
+	corpusQuicActionProxy  corpusQuicAction = "proxy"
+	corpusQuicActionBlock  corpusQuicAction = "block"
 )
 
 // QUIC SNI is a UDP data-plane fact, not a DnsController input. This corpus
@@ -39,10 +39,10 @@ type quicSniffingCorpusFixture struct {
 	expectedMark     uint32
 	expectedMust     bool
 	expectedTarget   string
-	expectedAction   phase0QuicAction
+	expectedAction   corpusQuicAction
 }
 
-func phase0QuicSniffingCorpusFixtures() []quicSniffingCorpusFixture {
+func corpusQuicSniffingFixtures() []quicSniffingCorpusFixture {
 	return []quicSniffingCorpusFixture{{
 		name:             "reassembled_initial_routes_by_sni",
 		expectedDomain:   "i.ytimg.com",
@@ -50,17 +50,17 @@ func phase0QuicSniffingCorpusFixtures() []quicSniffingCorpusFixture {
 		expectedMark:     77,
 		expectedMust:     true,
 		expectedTarget:   "i.ytimg.com:443",
-		expectedAction:   phase0QuicActionProxy,
+		expectedAction:   corpusQuicActionProxy,
 	}}
 }
 
-// TestPhase0QuicSniffingCorpus_LegacyBaseline records the observable result
+// TestQuicSniffingCorpus_LegacyBaseline records the observable result
 // of the QUIC sniffing pipeline. The captured Initial spans two datagrams; its
 // first packet must wait for more crypto data, while the completed handshake
 // must bind the SNI, select the SNI-matched outbound, pass domain:port
 // (no resolve_dns on the test dialer), and reuse that bound flow for later packets.
-func TestPhase0QuicSniffingCorpus_LegacyBaseline(t *testing.T) {
-	for _, fixture := range phase0QuicSniffingCorpusFixtures() {
+func TestQuicSniffingCorpus_LegacyBaseline(t *testing.T) {
+	for _, fixture := range corpusQuicSniffingFixtures() {
 		fixture := fixture
 		t.Run(fixture.name, func(t *testing.T) {
 			replayQuicSniffingCorpusFixture(t, fixture)
@@ -138,7 +138,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	if magicNetwork.Network != "udp" || magicNetwork.Mark != fixture.expectedMark || magicNetwork.Mptcp {
 		t.Fatalf("QUIC magic network = %+v, want udp with mark %d and mptcp disabled", magicNetwork, fixture.expectedMark)
 	}
-	if action := phase0QuicActionForOutbound(binding.Route.Outbound); action != fixture.expectedAction {
+	if action := corpusQuicActionForOutbound(binding.Route.Outbound); action != fixture.expectedAction {
 		t.Fatalf("QUIC action = %q, want %q", action, fixture.expectedAction)
 	}
 	if got := endpoint.natTimeout(); got != QuicNatTimeout {
@@ -202,7 +202,7 @@ func rebuildAfterSniffedEndpointEviction(t *testing.T, withResolveDNS bool, evic
 	resetQuicRejectMemoryForTest()
 	t.Cleanup(resetQuicRejectMemoryForTest)
 
-	fixture := phase0QuicSniffingCorpusFixtures()[0]
+	fixture := corpusQuicSniffingFixtures()[0]
 	first, second := newSnifferNeedMorePayloads(t)
 	fallbackConn := &udpReuseSimulationConn{
 		reads:   make(chan scriptedPacketRead),
@@ -335,13 +335,13 @@ func newQuicSniffingCorpusMatcher(t *testing.T, fixture quicSniffingCorpusFixtur
 	return matcher
 }
 
-func phase0QuicActionForOutbound(outbound consts.OutboundIndex) phase0QuicAction {
+func corpusQuicActionForOutbound(outbound consts.OutboundIndex) corpusQuicAction {
 	switch outbound {
 	case consts.OutboundDirect:
-		return phase0QuicActionDirect
+		return corpusQuicActionDirect
 	case consts.OutboundBlock:
-		return phase0QuicActionBlock
+		return corpusQuicActionBlock
 	default:
-		return phase0QuicActionProxy
+		return corpusQuicActionProxy
 	}
 }

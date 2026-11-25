@@ -24,15 +24,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type phase2ScriptedPeerRead struct {
+type scriptedPeerPacketRead struct {
 	data []byte
 	from netip.AddrPort
 	peer netip.AddrPort
 	err  error
 }
 
-type phase2PeerPacketConn struct {
-	reads      chan phase2ScriptedPeerRead
+type peerTrackingPacketConn struct {
+	reads      chan scriptedPeerPacketRead
 	closeCh    chan struct{}
 	closeOnce  sync.Once
 	writeMu    sync.Mutex
@@ -40,33 +40,33 @@ type phase2PeerPacketConn struct {
 	writeCh    chan string
 }
 
-func newPhase2PeerPacketConn() *phase2PeerPacketConn {
-	return &phase2PeerPacketConn{
-		reads:   make(chan phase2ScriptedPeerRead, 16),
+func newPeerTrackingPacketConn() *peerTrackingPacketConn {
+	return &peerTrackingPacketConn{
+		reads:   make(chan scriptedPeerPacketRead, 16),
 		closeCh: make(chan struct{}),
 		writeCh: make(chan string, 16),
 	}
 }
 
-func (c *phase2PeerPacketConn) Read(_ []byte) (int, error) { return 0, io.EOF }
-func (c *phase2PeerPacketConn) Write(_ []byte) (int, error) {
+func (c *peerTrackingPacketConn) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (c *peerTrackingPacketConn) Write(_ []byte) (int, error) {
 	return 0, netproxy.UnsupportedTunnelTypeError
 }
-func (c *phase2PeerPacketConn) SetDeadline(_ time.Time) error      { return nil }
-func (c *phase2PeerPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
-func (c *phase2PeerPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+func (c *peerTrackingPacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *peerTrackingPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *peerTrackingPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 
-func (c *phase2PeerPacketConn) Close() error {
+func (c *peerTrackingPacketConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	return nil
 }
 
-func (c *phase2PeerPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+func (c *peerTrackingPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 	n, from, _, err := c.ReadFromWithPeer(p)
 	return n, from, err
 }
 
-func (c *phase2PeerPacketConn) ReadFromWithPeer(p []byte) (int, netip.AddrPort, netip.AddrPort, error) {
+func (c *peerTrackingPacketConn) ReadFromWithPeer(p []byte) (int, netip.AddrPort, netip.AddrPort, error) {
 	select {
 	case <-c.closeCh:
 		return 0, netip.AddrPort{}, netip.AddrPort{}, io.EOF
@@ -79,7 +79,7 @@ func (c *phase2PeerPacketConn) ReadFromWithPeer(p []byte) (int, netip.AddrPort, 
 	}
 }
 
-func (c *phase2PeerPacketConn) WriteTo(b []byte, addr string) (int, error) {
+func (c *peerTrackingPacketConn) WriteTo(b []byte, addr string) (int, error) {
 	c.writeMu.Lock()
 	c.writeAddrs = append(c.writeAddrs, addr)
 	c.writeMu.Unlock()
@@ -90,7 +90,7 @@ func (c *phase2PeerPacketConn) WriteTo(b []byte, addr string) (int, error) {
 	return len(b), nil
 }
 
-func (c *phase2PeerPacketConn) recordedWriteAddrs() []string {
+func (c *peerTrackingPacketConn) recordedWriteAddrs() []string {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	out := make([]string, len(c.writeAddrs))
@@ -98,19 +98,19 @@ func (c *phase2PeerPacketConn) recordedWriteAddrs() []string {
 	return out
 }
 
-type phase2ReceiverPacketConn struct {
-	*phase2PeerPacketConn
+type peerTrackingReceiverPacketConn struct {
+	*peerTrackingPacketConn
 	mu      sync.Mutex
 	handler netproxy.PacketReceiveHandler
 }
 
-func newPhase2ReceiverPacketConn() *phase2ReceiverPacketConn {
-	return &phase2ReceiverPacketConn{
-		phase2PeerPacketConn: newPhase2PeerPacketConn(),
+func newPeerTrackingReceiverPacketConn() *peerTrackingReceiverPacketConn {
+	return &peerTrackingReceiverPacketConn{
+		peerTrackingPacketConn: newPeerTrackingPacketConn(),
 	}
 }
 
-func (c *phase2ReceiverPacketConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
+func (c *peerTrackingReceiverPacketConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
 	c.mu.Lock()
 	c.handler = handler
 	c.mu.Unlock()
@@ -121,7 +121,7 @@ func (c *phase2ReceiverPacketConn) RegisterPacketReceiver(handler netproxy.Packe
 	}, true
 }
 
-func (c *phase2ReceiverPacketConn) deliver(data []byte, from, peer netip.AddrPort) bool {
+func (c *peerTrackingReceiverPacketConn) deliver(data []byte, from, peer netip.AddrPort) bool {
 	c.mu.Lock()
 	h := c.handler
 	c.mu.Unlock()
@@ -149,13 +149,13 @@ func TestResolveDNSExplicitConfigAlwaysResolvesSynchronously(t *testing.T) {
 	}
 	anyDialer.SetResolveDNS(netip.MustParseAddrPort("127.0.0.2:53"))
 
-	ssConn := newPhase2PeerPacketConn()
+	ssConn := newPeerTrackingPacketConn()
 	defer func() { _ = ssConn.Close() }()
 	ssDialer, _ := newCountingProxyEndpointDialer("shadowsocks", "203.0.113.2:34564", ssConn)
 	defer func() { _ = ssDialer.Close() }()
 	ssDialer.SetResolveDNS(netip.MustParseAddrPort("127.0.0.2:53"))
 
-	socksConn := newPhase2PeerPacketConn()
+	socksConn := newPeerTrackingPacketConn()
 	defer func() { _ = socksConn.Close() }()
 	socksDialer, _ := newCountingProxyEndpointDialer("socks5", "203.0.113.3:1080", socksConn)
 	defer func() { _ = socksDialer.Close() }()
@@ -226,7 +226,7 @@ func TestResolveDNSExplicitConfigAlwaysResolvesSynchronously(t *testing.T) {
 
 func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 	t.Run("ReadLoopWithPeer", func(t *testing.T) {
-		conn := newPhase2PeerPacketConn()
+		conn := newPeerTrackingPacketConn()
 		defer func() { _ = conn.Close() }()
 		d, _ := newCountingProxyEndpointDialer("shadowsocks", "203.0.113.2:34564", conn)
 		defer func() { _ = d.Close() }()
@@ -300,9 +300,9 @@ func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 		}
 
 		// Invalid peers must not pin passivePin: loopback, FakeIP, wrong port.
-		conn.reads <- phase2ScriptedPeerRead{data: []byte("loop"), from: dst, peer: netip.MustParseAddrPort("127.0.0.1:443")}
-		conn.reads <- phase2ScriptedPeerRead{data: []byte("fake"), from: dst, peer: netip.AddrPortFrom(fakeV4, 443)}
-		conn.reads <- phase2ScriptedPeerRead{data: []byte("port"), from: dst, peer: netip.MustParseAddrPort("203.0.113.55:80")}
+		conn.reads <- scriptedPeerPacketRead{data: []byte("loop"), from: dst, peer: netip.MustParseAddrPort("127.0.0.1:443")}
+		conn.reads <- scriptedPeerPacketRead{data: []byte("fake"), from: dst, peer: netip.AddrPortFrom(fakeV4, 443)}
+		conn.reads <- scriptedPeerPacketRead{data: []byte("port"), from: dst, peer: netip.MustParseAddrPort("203.0.113.55:80")}
 		for range 3 {
 			select {
 			case <-replies:
@@ -316,7 +316,7 @@ func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 
 		// Valid decrypted peer IP pins the endpoint without polluting resolveDNSPins cache.
 		validPeer := netip.MustParseAddrPort("203.0.113.55:443")
-		conn.reads <- phase2ScriptedPeerRead{data: []byte("ok"), from: dst, peer: validPeer}
+		conn.reads <- scriptedPeerPacketRead{data: []byte("ok"), from: dst, peer: validPeer}
 		select {
 		case <-replies:
 		case <-time.After(time.Second):
@@ -327,7 +327,7 @@ func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 		})
 
 		// Another valid peer later does not overwrite the locked pin.
-		conn.reads <- phase2ScriptedPeerRead{data: []byte("second-ip"), from: dst, peer: netip.MustParseAddrPort("203.0.113.66:443")}
+		conn.reads <- scriptedPeerPacketRead{data: []byte("second-ip"), from: dst, peer: netip.MustParseAddrPort("203.0.113.66:443")}
 		select {
 		case <-replies:
 		case <-time.After(time.Second):
@@ -352,7 +352,7 @@ func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 	})
 
 	t.Run("PacketReceiverAndConcurrentRace", func(t *testing.T) {
-		conn := newPhase2ReceiverPacketConn()
+		conn := newPeerTrackingReceiverPacketConn()
 		defer func() { _ = conn.Close() }()
 		d, _ := newCountingProxyEndpointDialer("socks5", "203.0.113.3:1080", conn)
 		defer func() { _ = d.Close() }()
@@ -412,7 +412,7 @@ func TestResolveDNSUnconfiguredUsesPassiveReplyPinFastPath(t *testing.T) {
 	})
 
 	t.Run("SkipsInboundAndEnforceMode", func(t *testing.T) {
-		ssConn := newPhase2PeerPacketConn()
+		ssConn := newPeerTrackingPacketConn()
 		defer func() { _ = ssConn.Close() }()
 		d, _ := newCountingProxyEndpointDialer("shadowsocks", "203.0.113.2:34564", ssConn)
 		defer func() { _ = d.Close() }()

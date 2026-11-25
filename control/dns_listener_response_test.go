@@ -33,8 +33,8 @@ func TestDNSListenerResponseSize(t *testing.T) {
 		for _, ednsSize := range []uint16{0, 128, 1232, 4096} {
 			t.Run(fmt.Sprintf("cache=%t/edns=%d", cacheEnabled, ednsSize), func(t *testing.T) {
 				logger := newDNSListenerTestLogger()
-				routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-				response := dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.11")
+				routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+				response := dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.11")
 				for len(response.Answer) < 128 {
 					response.Answer = append(response.Answer, dnsmessage.Copy(response.Answer[0]))
 				}
@@ -54,7 +54,7 @@ func TestDNSListenerResponseSize(t *testing.T) {
 					}}, nil
 				}
 				t.Cleanup(func() { dnsForwarderFactory = originalFactory })
-				option := phase0NamedUpstreamControllerOption(logger)
+				option := namedUpstreamControllerOption(logger)
 				if !cacheEnabled {
 					option.NewCache = func(string, []dnsmessage.RR, []dnsmessage.RR, []dnsmessage.RR, time.Time, time.Time) (*DnsCache, error) {
 						return nil, stderrors.New("test cache storage failure")
@@ -75,7 +75,7 @@ func TestDNSListenerResponseSize(t *testing.T) {
 				for i, path := range []string{"udp_first", "udp_repeat", "tcp"} {
 					t.Run(path, func(t *testing.T) {
 						query := new(dnsmessage.Msg)
-						query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+						query.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 						query.Id = uint16(i + 1)
 						if ednsSize != 0 {
 							query.SetEdns0(ednsSize, false)

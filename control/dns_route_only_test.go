@@ -23,8 +23,8 @@ func TestDNSRouteOnlyProjectionLifecycle(t *testing.T) {
 	for _, mode := range []string{"ordinary", "DO", "TTL0"} {
 		t.Run(mode, func(t *testing.T) {
 			logger := newDNSListenerTestLogger()
-			routing := newPhase0NamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
-			option := phase0NamedUpstreamControllerOption(logger)
+			routing := newNamedUpstreamRouting(t, logger, "u", "192.0.2.11:53")
+			option := namedUpstreamControllerOption(logger)
 			tracker := newDomainRoutingTracker()
 			var published *DnsCache
 			option.ProjectCacheRoute = func(*DnsCache) []uint32 { return domainRoutingBitmap(1) }
@@ -39,8 +39,8 @@ func TestDNSRouteOnlyProjectionLifecycle(t *testing.T) {
 				}
 				return cache, err
 			}
-			option.CacheAccessCallback = func(cache *DnsCache) error { published = cache; return phase5ProjectCache(tracker, 0, cache) }
-			option.CacheDeleteCallback = func(_ string, cache *DnsCache) error { return phase5RemoveCache(tracker, 0, cache) }
+			option.CacheAccessCallback = func(cache *DnsCache) error { published = cache; return projectDnsCacheToTracker(tracker, 0, cache) }
+			option.CacheDeleteCallback = func(_ string, cache *DnsCache) error { return removeDnsCacheFromTracker(tracker, 0, cache) }
 			c, err := NewDnsController(routing, option)
 			if err != nil {
 				t.Fatal(err)
@@ -68,7 +68,7 @@ func TestDNSRouteOnlyProjectionLifecycle(t *testing.T) {
 				}}, nil
 			}
 			q := new(dnsmessage.Msg)
-			q.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+			q.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 			if mode == "DO" {
 				q.SetEdns0(1232, true)
 			}
@@ -82,7 +82,7 @@ func TestDNSRouteOnlyProjectionLifecycle(t *testing.T) {
 			if published == nil {
 				t.Fatal("DNS succeeded without route projection")
 			}
-			phase5RequireTrackerBitmap(t, tracker, published, 1)
+			requireDomainRoutingTrackerBitmap(t, tracker, published, 1)
 			if err := c.HandleWithResponseWriter_(context.Background(), q.Copy(), &udpRequest{routingResult: &bpfRoutingResult{}}, writer); err != nil {
 				t.Fatal(err)
 			}
@@ -139,7 +139,7 @@ func TestDNSRouteOnlyProjectionLifecycle(t *testing.T) {
 			}
 			// Route-only expiration applies even when ordinary optimistic entries never expire.
 			replacement.evictExpiredDnsCache(published.Deadline)
-			phase5RequireTrackerAbsent(t, tracker, published)
+			requireDomainRoutingTrackerAbsent(t, tracker, published)
 			if replacement.HasDnsKnowledge(c.cacheKey(q.Question[0].Name, q.Question[0].Qtype)) {
 				t.Fatal("expired route retained domain evidence")
 			}

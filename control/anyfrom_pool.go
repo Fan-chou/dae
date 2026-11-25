@@ -333,12 +333,12 @@ func (p *AnyfromPool) Reset() {
 		shard := &p.shards[i]
 		shard.createMu.Lock()
 		shard.mu.Lock()
-		// Phase 1: Collect keys to avoid modifying map during iteration
+		// Collect keys first to avoid mutating the map during iteration.
 		keys := make([]anyfromPoolKey, 0, len(shard.pool))
 		for key := range shard.pool {
 			keys = append(keys, key)
 		}
-		// Phase 2: Delete and close each entry
+		// Delete and close each pooled socket.
 		for _, key := range keys {
 			if af, ok := shard.pool[key]; ok {
 				delete(shard.pool, key)

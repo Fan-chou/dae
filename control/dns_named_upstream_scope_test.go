@@ -23,14 +23,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const phase0NamedUpstreamScopeQName = "same-name.scope.test."
+const namedUpstreamScopeQName = "same-name.scope.test."
 
-func TestPhase0DnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
+func TestDnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	primaryRouting := newPhase0NamedUpstreamRouting(t, logger, "primary", "192.0.2.11:53")
-	secondaryRouting := newPhase0NamedUpstreamRouting(t, logger, "secondary", "192.0.2.12:53")
+	primaryRouting := newNamedUpstreamRouting(t, logger, "primary", "192.0.2.11:53")
+	secondaryRouting := newNamedUpstreamRouting(t, logger, "secondary", "192.0.2.12:53")
 
 	var primaryForwards atomic.Int32
 	var secondaryForwards atomic.Int32
@@ -40,12 +40,12 @@ func TestPhase0DnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
 		case "192.0.2.11":
 			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
 				primaryForwards.Add(1)
-				return dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.11"), nil
+				return dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.11"), nil
 			}}, nil
 		case "192.0.2.12":
 			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
 				secondaryForwards.Add(1)
-				return dnsAResponseMsg(phase0NamedUpstreamScopeQName, "198.51.100.12"), nil
+				return dnsAResponseMsg(namedUpstreamScopeQName, "198.51.100.12"), nil
 			}}, nil
 		default:
 			return nil, fmt.Errorf("unexpected named DNS upstream %q", upstream)
@@ -53,7 +53,7 @@ func TestPhase0DnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
 	}
 	t.Cleanup(func() { dnsForwarderFactory = originalFactory })
 
-	option := phase0NamedUpstreamControllerOption(logger)
+	option := namedUpstreamControllerOption(logger)
 	controller, err := NewDnsController(primaryRouting, option)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, controller.Close()) })
@@ -63,27 +63,27 @@ func TestPhase0DnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
 		realDst:       netip.MustParseAddrPort("192.0.2.53:53"),
 		routingResult: &bpfRoutingResult{},
 	}
-	baseKey := controller.cacheKey(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	baseKey := controller.cacheKey(namedUpstreamScopeQName, dnsmessage.TypeA)
 
-	primaryIndex, primaryUpstream, err := primaryRouting.RequestSelect(context.Background(), phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	primaryIndex, primaryUpstream, err := primaryRouting.RequestSelect(context.Background(), namedUpstreamScopeQName, dnsmessage.TypeA)
 	require.NoError(t, err)
 	require.NotNil(t, primaryUpstream)
 	primaryKey := controller.responseCacheKey(baseKey, req, primaryIndex, primaryUpstream)
 
-	first := resolvePhase0NamedUpstreamScope(t, controller, req, 0x6101)
+	first := resolveNamedUpstreamScope(t, controller, req, 0x6101)
 	require.Equal(t, "198.51.100.11", dnsAnswerIPv4(t, first))
 	require.EqualValues(t, 1, primaryForwards.Load())
 	_, primaryCached := controller.dnsCache.Load(primaryKey)
 	require.True(t, primaryCached, "primary route should populate its scoped cache key")
 
 	require.NoError(t, controller.TryUpdateRuntime(option, secondaryRouting))
-	secondaryIndex, secondaryUpstream, err := secondaryRouting.RequestSelect(context.Background(), phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	secondaryIndex, secondaryUpstream, err := secondaryRouting.RequestSelect(context.Background(), namedUpstreamScopeQName, dnsmessage.TypeA)
 	require.NoError(t, err)
 	require.NotNil(t, secondaryUpstream)
 	secondaryKey := controller.responseCacheKey(baseKey, req, secondaryIndex, secondaryUpstream)
 	require.NotEqual(t, primaryKey, secondaryKey, "distinct named upstream routes need distinct cache keys")
 
-	second := resolvePhase0NamedUpstreamScope(t, controller, req, 0x6102)
+	second := resolveNamedUpstreamScope(t, controller, req, 0x6102)
 	require.Equal(t, "198.51.100.12", dnsAnswerIPv4(t, second))
 	require.EqualValues(t, 1, primaryForwards.Load(), "secondary route must not serve the primary cache entry")
 	require.EqualValues(t, 1, secondaryForwards.Load(), "secondary route should resolve once")
@@ -91,13 +91,13 @@ func TestPhase0DnsNamedUpstreamRoutesKeepDistinctCacheScopes(t *testing.T) {
 	require.True(t, secondaryCached, "secondary route should populate its scoped cache key")
 
 	require.NoError(t, controller.TryUpdateRuntime(option, primaryRouting))
-	third := resolvePhase0NamedUpstreamScope(t, controller, req, 0x6103)
+	third := resolveNamedUpstreamScope(t, controller, req, 0x6103)
 	require.Equal(t, "198.51.100.11", dnsAnswerIPv4(t, third))
 	require.EqualValues(t, 1, primaryForwards.Load(), "primary route should reuse only its own cache entry")
 	require.EqualValues(t, 1, secondaryForwards.Load())
 }
 
-func newPhase0NamedUpstreamRouting(t *testing.T, logger *logrus.Logger, upstreamName, endpoint string) *componentdns.Dns {
+func newNamedUpstreamRouting(t *testing.T, logger *logrus.Logger, upstreamName, endpoint string) *componentdns.Dns {
 	t.Helper()
 	routing, err := componentdns.New(&config.Dns{
 		Upstream: []config.KeyableString{config.KeyableString(upstreamName + ":udp://" + endpoint)},
@@ -127,7 +127,7 @@ func newPhase0NamedUpstreamRouting(t *testing.T, logger *logrus.Logger, upstream
 	return routing
 }
 
-func phase0NamedUpstreamControllerOption(logger *logrus.Logger) *DnsControllerOption {
+func namedUpstreamControllerOption(logger *logrus.Logger) *DnsControllerOption {
 	return &DnsControllerOption{
 		Log:              logger,
 		LifecycleContext: context.Background(),
@@ -150,10 +150,10 @@ func phase0NamedUpstreamControllerOption(logger *logrus.Logger) *DnsControllerOp
 	}
 }
 
-func resolvePhase0NamedUpstreamScope(t *testing.T, controller *DnsController, req *udpRequest, id uint16) *dnsmessage.Msg {
+func resolveNamedUpstreamScope(t *testing.T, controller *DnsController, req *udpRequest, id uint16) *dnsmessage.Msg {
 	t.Helper()
 	query := new(dnsmessage.Msg)
-	query.SetQuestion(phase0NamedUpstreamScopeQName, dnsmessage.TypeA)
+	query.SetQuestion(namedUpstreamScopeQName, dnsmessage.TypeA)
 	query.Id = id
 	writer := &captureResponseWriter{}
 	require.NoError(t, controller.HandleWithResponseWriter_(context.Background(), query, req, writer))

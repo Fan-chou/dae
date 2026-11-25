@@ -16,10 +16,10 @@ func TestDomainRoutingTrackerZeroFingerprintORsBitmaps(t *testing.T) {
 	cacheA := domainRoutingACache("a.example.:1", "203.0.113.77", domainRoutingBitmap(0x1))
 	cacheB := domainRoutingACache("b.example.:1", "203.0.113.77", domainRoutingBitmap(0x2))
 
-	if err := phase5ProjectCache(tracker, 0, cacheA); err != nil {
+	if err := projectDnsCacheToTracker(tracker, 0, cacheA); err != nil {
 		t.Fatalf("project A: %v", err)
 	}
-	if err := phase5ProjectCache(tracker, 0, cacheB); err != nil {
+	if err := projectDnsCacheToTracker(tracker, 0, cacheB); err != nil {
 		t.Fatalf("project B: %v", err)
 	}
 	merged := requireTrackerMerged(t, tracker, cacheA)
@@ -95,7 +95,7 @@ func TestDomainRoutingTrackerDropOwnerClearsAmbiguous(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("project B: %v", err)
 	}
-	if err := phase5RemoveCache(tracker, 0, cacheB); err != nil {
+	if err := removeDnsCacheFromTracker(tracker, 0, cacheB); err != nil {
 		t.Fatalf("remove B: %v", err)
 	}
 	merged := requireTrackerMerged(t, tracker, cacheA)
