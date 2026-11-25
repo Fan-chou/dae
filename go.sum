@@ -17,8 +17,8 @@ cloud.google.com/go/storage v1.5.0/go.mod h1:tpKbwo567HUNpVclU5sGELwQWBDZ8gh0Zeo
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261124060354-6298b3909c2d h1:+ED0DTgYQH8G245uCKJE+i65XaxzGJ0rHIUfZdTWqhI=
-github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261124060354-6298b3909c2d/go.mod h1:Uz4Vs5q6xBnrYgFQOOZJxcryIVYNd6Y1Bnr56/6etgE=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261125134637-7e43ae6457d9 h1:Sgbr8zs9g67zudoSKQbNkS7KSox+TE2xlYHfOTPcA6w=
+github.com/Fan-chou/outbound v0.0.0-sticky-ip.0.20261125134637-7e43ae6457d9/go.mod h1:Uz4Vs5q6xBnrYgFQOOZJxcryIVYNd6Y1Bnr56/6etgE=
 github.com/Fan-chou/quic-go v0.0.0-20261117013931-85c44dfd15e2 h1:Nsg8VOOAz99LQitIomUkNFCieRVtBzwY4NlGQX2uIWM=
 github.com/Fan-chou/quic-go v0.0.0-20261117013931-85c44dfd15e2/go.mod h1:SQhVTKPkAs94Gq2i/129OGfYy/X/j/6O7UHFc020PD8=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=

@@ -96,6 +96,7 @@ func newPinnedRebuildFixtureWith(t *testing.T, kind string, clientV6, peerV6 boo
 	f.old.Dialer.SetResolveDNS(dns.LocalAddr().(*net.UDPAddr).AddrPort())
 	f.dnsPlane = testDialControlPlane(f.old.Outbound)
 	f.dnsPlane.policyIdentity = f.c.policyIdentity
+	f.dnsPlane.udpReplyDrought = f.o
 	cacheKey := resolveDNSResultKey(&proxyDialResult{Dialer: f.old.Dialer, Mark: f.dnsPlane.soMarkFromDae}, "pinned.example", clientV6)
 	f.dnsPlane.resolveDNSPins.store(cacheKey, f.b.Addr(), time.Now(), time.Minute)
 	opts := *f.rebuildFixture.options

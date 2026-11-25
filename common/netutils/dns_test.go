@@ -7,6 +7,7 @@ package netutils
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -273,4 +274,142 @@ func writeTCPDNSResponse(conn net.Conn, resp *dnsmessage.Msg, fragmented bool) e
 		return err
 	}
 	return nil
+}
+
+type blockingDialer struct{}
+
+func (blockingDialer) DialContext(ctx context.Context, _, _ string) (netproxy.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type hangingReadConn struct {
+	fakeDNSUDPConn
+	closeCh chan struct{}
+}
+
+func (c *hangingReadConn) Read(p []byte) (int, error) {
+	<-c.closeCh
+	return 0, io.EOF
+}
+
+func (c *hangingReadConn) Close() error {
+	select {
+	case <-c.closeCh:
+	default:
+		close(c.closeCh)
+	}
+	return nil
+}
+
+type funcNetDialer struct {
+	fn func(context.Context, string, string) (netproxy.Conn, error)
+}
+
+func (d funcNetDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
+	return d.fn(ctx, network, addr)
+}
+
+type scriptedResponseUDPConn struct {
+	fakeDNSUDPConn
+	buildResp func(req *dnsmessage.Msg) *dnsmessage.Msg
+}
+
+func (c *scriptedResponseUDPConn) Read(p []byte) (int, error) {
+	var req dnsmessage.Msg
+	if err := req.Unpack(c.query); err != nil {
+		return 0, err
+	}
+	resp := c.buildResp(&req)
+	out, err := resp.Pack()
+	if err != nil {
+		return 0, err
+	}
+	return copy(p, out), nil
+}
+
+func TestResolveNetipTimeoutWrapsErrResolveTimeout(t *testing.T) {
+	t.Run("dial_deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, _, err := ResolveNetipTTL(ctx, blockingDialer{}, netip.MustParseAddrPort("192.0.2.53:53"), "example.com", dnsmessage.TypeA, "udp")
+		if !errors.Is(err, ErrResolveTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want ErrResolveTimeout and context.DeadlineExceeded", err)
+		}
+	})
+	t.Run("read_deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		conn := &hangingReadConn{closeCh: make(chan struct{})}
+		_, _, err := ResolveNetipTTL(ctx, funcNetDialer{fn: func(context.Context, string, string) (netproxy.Conn, error) {
+			return conn, nil
+		}}, netip.MustParseAddrPort("192.0.2.53:53"), "example.com", dnsmessage.TypeA, "udp")
+		if !errors.Is(err, ErrResolveTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want ErrResolveTimeout and context.DeadlineExceeded", err)
+		}
+	})
+}
+
+func TestResolveNetipRcodeTruncatedAndEDNS0(t *testing.T) {
+	t.Run("edns0_and_nxdomain", func(t *testing.T) {
+		var sawOPT bool
+		var udpSize uint16
+		conn := &scriptedResponseUDPConn{
+			buildResp: func(req *dnsmessage.Msg) *dnsmessage.Msg {
+				if opt := req.IsEdns0(); opt != nil {
+					sawOPT = true
+					udpSize = opt.UDPSize()
+				}
+				resp := new(dnsmessage.Msg)
+				resp.SetReply(req)
+				resp.Rcode = dnsmessage.RcodeNameError
+				return resp
+			},
+		}
+		_, _, err := ResolveNetipTTL(context.Background(), funcNetDialer{fn: func(context.Context, string, string) (netproxy.Conn, error) {
+			return conn, nil
+		}}, netip.MustParseAddrPort("192.0.2.53:53"), "nx.example", dnsmessage.TypeA, "udp")
+		if !sawOPT || udpSize != edns0UDPPayloadLen {
+			t.Fatalf("edns0 opt = (%v, %d), want (true, %d)", sawOPT, udpSize, edns0UDPPayloadLen)
+		}
+		if !IsDnsNegativeError(err) {
+			t.Fatalf("err = %v, want IsDnsNegativeError=true", err)
+		}
+	})
+	t.Run("servfail_not_negative", func(t *testing.T) {
+		conn := &scriptedResponseUDPConn{
+			buildResp: func(req *dnsmessage.Msg) *dnsmessage.Msg {
+				resp := new(dnsmessage.Msg)
+				resp.SetReply(req)
+				resp.Rcode = dnsmessage.RcodeServerFailure
+				return resp
+			},
+		}
+		_, _, err := ResolveNetipTTL(context.Background(), funcNetDialer{fn: func(context.Context, string, string) (netproxy.Conn, error) {
+			return conn, nil
+		}}, netip.MustParseAddrPort("192.0.2.53:53"), "sf.example", dnsmessage.TypeA, "udp")
+		var rcodeErr *DnsRcodeError
+		if !errors.As(err, &rcodeErr) || rcodeErr.Rcode != dnsmessage.RcodeServerFailure {
+			t.Fatalf("err = %v, want SERVFAIL DnsRcodeError", err)
+		}
+		if IsDnsNegativeError(err) {
+			t.Fatalf("SERVFAIL must not be treated as authoritative negative")
+		}
+	})
+	t.Run("truncated", func(t *testing.T) {
+		conn := &scriptedResponseUDPConn{
+			buildResp: func(req *dnsmessage.Msg) *dnsmessage.Msg {
+				resp := new(dnsmessage.Msg)
+				resp.SetReply(req)
+				resp.Truncated = true
+				return resp
+			},
+		}
+		_, _, err := ResolveNetipTTL(context.Background(), funcNetDialer{fn: func(context.Context, string, string) (netproxy.Conn, error) {
+			return conn, nil
+		}}, netip.MustParseAddrPort("192.0.2.53:53"), "tc.example", dnsmessage.TypeA, "udp")
+		if !errors.Is(err, ErrDnsTruncated) {
+			t.Fatalf("err = %v, want ErrDnsTruncated", err)
+		}
+	})
 }

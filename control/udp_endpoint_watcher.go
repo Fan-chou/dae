@@ -219,6 +219,13 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		return true
 	}
 	now := time.Now()
+	if ue.passivePin != nil {
+		peer := packet.Peer
+		if !peer.IsValid() {
+			peer = packet.From
+		}
+		ue.observePassiveReplyPeer(peer)
+	}
 	if ue.replyDrought != nil {
 		ue.replyDrought.reply(ue.droughtPeer(packet.Peer), now)
 	}
@@ -271,12 +278,12 @@ func (ue *UdpEndpoint) startReadLoop() {
 	}()
 	for {
 		var n int
-		var from, peer netip.AddrPort
+		var rawFrom, from, peer netip.AddrPort
 		var err error
-		if ue.replyDrought != nil || ue.rebuildPeers.Load() != nil {
-			n, from, peer, err = netproxy.ReadFromWithPeer(ue.conn, buf[:])
+		if ue.replyDrought != nil || ue.rebuildPeers.Load() != nil || ue.passivePin != nil {
+			n, rawFrom, peer, err = netproxy.ReadFromWithPeer(ue.conn, buf[:])
 		} else {
-			n, from, err = ue.conn.ReadFrom(buf[:])
+			n, rawFrom, err = ue.conn.ReadFrom(buf[:])
 		}
 		if err != nil {
 			if ue.applyUpstreamReadErrorPolicy(err, ue.retire) {
@@ -289,7 +296,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 		if ue.prepared.Load() {
 			continue
 		}
-		from = ue.canonicalReplyFrom(from)
+		from = ue.canonicalReplyFrom(rawFrom)
 		if !ue.hasReply.Load() && !ue.acceptsInitialReplyFrom(from) {
 			if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
 				ue.log.WithFields(logrus.Fields{
@@ -302,6 +309,13 @@ func (ue *UdpEndpoint) startReadLoop() {
 			continue
 		}
 		now := time.Now()
+		if ue.passivePin != nil {
+			p := peer
+			if !p.IsValid() {
+				p = rawFrom
+			}
+			ue.observePassiveReplyPeer(p)
+		}
 		if ue.replyDrought != nil {
 			ue.replyDrought.reply(ue.droughtPeer(peer), now)
 		}

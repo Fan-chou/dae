@@ -199,6 +199,9 @@ type DialOption struct {
 	ResolveDNSPinned         bool
 	ResolveDNSOriginalNative bool
 	ResolveDNSInitial        PacketSnifferKey
+	PassiveReplyPin          bool
+	ResolveDNSPinKey         string
+	ResolveDNSPinCache       *proxyResolveDNSPinCache
 	Target                   string
 	Dialer                   *dialer.Dialer
 	Outbound                 *ob.DialerGroup
@@ -1225,23 +1228,26 @@ getNew:
 					ResolveDNSPinned:         res.ResolveDNSPinned,
 					ResolveDNSInitial:        flowDecision.PacketSnifferKey(),
 					ResolveDNSOriginalNative: originalNative,
+					PassiveReplyPin:          res.PassiveReplyPin,
+					ResolveDNSPinKey:         res.ResolveDNSPinKey,
+					ResolveDNSPinCache:       &c.resolveDNSPins,
 					FakeIPName:               fakeIPName,
 					FakeIPStore:              fakeIPStoreFor(fakeDestination, c),
 					// Pass the domain (or resolve_dns-pinned IP) from chooseProxyDialer.
 					// Endpoint key stays on the client destination (including FakeIP).
-					Target:        udpDialTarget(res.DialTarget, realDst.String()),
-					Dialer:        res.Dialer,
-					Outbound:      res.Outbound,
-					Network:       res.Network,
-					NetworkType:   res.SelectionNetworkTypeObj,
-					SniffedDomain: res.SniffedDomain,
-					StickySite:    res.StickySite,
-					IsDialIp:      res.IsDialIp,
-					SelectPath:    res.SelectPath,
-					Excluded:                 excludedDialer,
-					NowNano:                  nowNano,
-					RuleMatchIndex:           res.RuleMatchIndex,
-					Rule:                     res.Rule,
+					Target:         udpDialTarget(res.DialTarget, realDst.String()),
+					Dialer:         res.Dialer,
+					Outbound:       res.Outbound,
+					Network:        res.Network,
+					NetworkType:    res.SelectionNetworkTypeObj,
+					SniffedDomain:  res.SniffedDomain,
+					StickySite:     res.StickySite,
+					IsDialIp:       res.IsDialIp,
+					SelectPath:     res.SelectPath,
+					Excluded:       excludedDialer,
+					NowNano:        nowNano,
+					RuleMatchIndex: res.RuleMatchIndex,
+					Rule:           res.Rule,
 				}
 				if res.ResolveDNSRestored && dialParam.ResolveDNSRecovery != nil {
 					option.ResolveDNSInitial = dialParam.ResolveDNSRecovery.initial

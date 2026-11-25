@@ -43,28 +43,6 @@ func TestResolveDNSFallbackBeforeTotalDeadline(t *testing.T) {
 	}
 }
 
-func TestResolveDNSPrefetchPartialRouting(t *testing.T) {
-	for _, tc := range []struct {
-		name, rules string
-		fake, ok    bool
-		out         consts.OutboundIndex
-	}{
-		{"domain", "domain(full: quic.example) -> proxy\nfallback: direct", false, true, consts.OutboundUserDefinedMin},
-		{"hypothetical443", "dport(443) -> proxy\nfallback: direct", false, true, consts.OutboundUserDefinedMin},
-		{"unknown_source_port", "sport(40000) -> direct\nfallback: proxy", false, false, 0},
-		{"unknown_dscp", "dscp(8) -> direct\nfallback: proxy", false, false, 0},
-		{"unknown_ip", "ip(203.0.113.0/24) -> direct\nfallback: proxy", false, false, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m := testFakeIPMatcher(t, tc.rules, []string{"proxy"})
-			out, _, _, ok := m.resolveDNSPrefetchRoute("quic.example", false, netip.MustParseAddr("192.0.2.10"), [6]uint8{}, tc.fake)
-			if ok != tc.ok || (ok && out != tc.out) {
-				t.Fatalf("out=%v known=%v", out, ok)
-			}
-		})
-	}
-}
-
 func TestResolveDNSCandidateCacheCapacity(t *testing.T) {
 	var c proxyResolveDNSPinCache
 	now := time.Now()
@@ -208,19 +186,6 @@ func TestResolveDNSRecoveryAdministrativeCloseDoesNotRestore(t *testing.T) {
 				t.Fatal("late retire restored closed recovery record")
 			}
 		})
-	}
-}
-
-func TestResolveDNSPrefetchNoResolveUsesKnownFakeIdentity(t *testing.T) {
-	// Use the existing parser/normalizer so no-resolve composition stays covered.
-	m := testFakeIPMatcher(t, "ip_no_resolve(203.0.113.0/24) -> direct\nfallback: proxy", []string{"proxy"})
-	src := netip.MustParseAddr("192.0.2.10")
-	out, _, _, ok := m.resolveDNSPrefetchRoute("quic.example", false, src, [6]uint8{}, true)
-	if !ok || out != consts.OutboundUserDefinedMin {
-		t.Fatalf("known FakeIP route: %v %v", out, ok)
-	}
-	if _, _, _, ok := m.resolveDNSPrefetchRoute("quic.example", false, src, [6]uint8{}, false); ok {
-		t.Fatal("unknown real destination was treated as FakeIP")
 	}
 }
 

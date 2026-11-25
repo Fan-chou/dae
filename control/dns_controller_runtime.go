@@ -41,7 +41,6 @@ type dnsControllerRuntimeState struct {
 	optimisticCacheTtl     int
 	maxCacheSize           int
 	fakeIPPolicy           *FakeIPPolicy
-	prefetchResolveDNS     func(qname string, qtype uint16, req *udpRequest, fakeDestination bool)
 }
 
 func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint16, optimisticCacheEnabled bool, optimisticCacheTtl int, maxCacheSize int, err error) {
@@ -164,7 +163,6 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		optimisticCacheTtl:     optimisticCacheTtl,
 		maxCacheSize:           maxCacheSize,
 		fakeIPPolicy:           option.FakeIPPolicy,
-		prefetchResolveDNS:     option.PrefetchResolveDNS,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)
@@ -210,23 +208,9 @@ func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed [
 			}()
 		}
 	}
-	prefetch := func(answer []byte) {
-		if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
-			return
-		}
-		rt := c.runtime()
-		if rt == nil || rt.prefetchResolveDNS == nil {
-			return
-		}
-		var msg dnsmessage.Msg
-		if msg.Unpack(answer) == nil && resolveDNSPrefetchAnswer(&msg) {
-			c.maybePrefetchResolveDNS(qname, qtype, req, &msg)
-		}
-	}
 
 	policy := c.fakeIPPolicy()
 	if policy == nil {
-		prefetch(packed)
 		return packed
 	}
 	src, mac := fakeIPClientFromReq(req)
@@ -235,10 +219,8 @@ func (c *DnsController) rewriteClientPacked(qname string, qtype uint16, packed [
 		if c.log != nil {
 			c.log.WithError(err).Warn("fakeip packed rewrite failed; sending real response")
 		}
-		prefetch(packed)
 		return packed
 	}
-	prefetch(out)
 	return out
 }
 
@@ -250,29 +232,12 @@ func (c *DnsController) rewriteClientMsg(msg *dnsmessage.Msg, req *udpRequest) {
 	}
 	policy := c.fakeIPPolicy()
 	if policy == nil || msg == nil {
-		if resolveDNSPrefetchAnswer(msg) && len(msg.Question) > 0 {
-			c.maybePrefetchResolveDNS(msg.Question[0].Name, msg.Question[0].Qtype, req, msg)
-		}
 		return
 	}
 	src, mac := fakeIPClientFromReq(req)
 	if err := policy.RewriteMsg(msg, src, mac); err != nil && c.log != nil {
 		c.log.WithError(err).Warn("fakeip message rewrite failed; sending real response")
 	}
-	if resolveDNSPrefetchAnswer(msg) && len(msg.Question) > 0 {
-		c.maybePrefetchResolveDNS(msg.Question[0].Name, msg.Question[0].Qtype, req, msg)
-	}
-}
-
-func (c *DnsController) maybePrefetchResolveDNS(qname string, qtype uint16, req *udpRequest, msg *dnsmessage.Msg) {
-	if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
-		return
-	}
-	rt := c.runtime()
-	if rt == nil || rt.prefetchResolveDNS == nil {
-		return
-	}
-	rt.prefetchResolveDNS(qname, qtype, req, c.resolveDNSPrefetchFakeAnswer(msg, qtype))
 }
 
 func (c *DnsController) LookupCacheAnswers(qname string, qtype uint16) []dnsmessage.RR {
@@ -686,44 +651,4 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 // invalid behavior config via error.
 func (c *DnsController) TryUpdateRuntime(option *DnsControllerOption, routing *dns.Dns) error {
 	return c.updateRuntime(option, routing)
-}
-
-func resolveDNSPrefetchAnswer(msg *dnsmessage.Msg) bool {
-	if msg == nil || msg.Rcode != dnsmessage.RcodeSuccess || !msg.Response {
-		return false
-	}
-	for _, rr := range msg.Answer {
-		switch rr.(type) {
-		case *dnsmessage.A, *dnsmessage.AAAA:
-			return true
-		}
-	}
-	return false
-}
-
-func (c *DnsController) resolveDNSPrefetchFakeAnswer(msg *dnsmessage.Msg, qtype uint16) bool {
-	policy := c.fakeIPPolicy()
-	if policy == nil || policy.store == nil || msg == nil {
-		return false
-	}
-	found := false
-	for _, rr := range msg.Answer {
-		if rr.Header().Rrtype != qtype {
-			continue
-		}
-		var ip netip.Addr
-		switch rr := rr.(type) {
-		case *dnsmessage.A:
-			ip, _ = netip.AddrFromSlice(rr.A)
-		case *dnsmessage.AAAA:
-			ip, _ = netip.AddrFromSlice(rr.AAAA)
-		default:
-			continue
-		}
-		if !policy.store.Contains(ip.Unmap()) {
-			return false
-		}
-		found = true
-	}
-	return found
 }

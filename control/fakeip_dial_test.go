@@ -860,9 +860,13 @@ func TestProxyResolveDNSPinKeyLowercasesDomain(t *testing.T) {
 }
 
 func TestPrefetchProxyResolveDNSSkipsWithoutResolveDNSNode(t *testing.T) {
-	cp := testDialControlPlane(newTestFixedOutboundGroup(newTestEndpointDialer()))
-	cp.routingMatcher = testFakeIPMatcher(t, `fallback: proxy`, []string{"proxy"})
-	cp.prefetchProxyResolveDNS("chatgpt.com", false, netip.MustParseAddrPort("192.0.2.10:40000"), [6]uint8{}, 0, [16]uint8{})
+	d := newTestEndpointDialer()
+	cp := testDialControlPlane(newTestFixedOutboundGroup(d))
+	cp.prefetchProxyResolveDNSForResult(&proxyDialResult{
+		OutboundIndex: consts.OutboundUserDefinedMin,
+		Dialer:        d,
+		Outbound:      cp.outbounds[consts.OutboundUserDefinedMin],
+	}, "chatgpt.com", false)
 	cp.resolveDNSPins.mu.Lock()
 	n := len(cp.resolveDNSPins.background)
 	cp.resolveDNSPins.mu.Unlock()
@@ -988,7 +992,11 @@ func TestApplyProxyResolveDNSPrefetchJoinsInFlight(t *testing.T) {
 	t.Cleanup(func() { resolveIPViaDialer = old })
 
 	src := netip.MustParseAddrPort("192.0.2.10:40000")
-	cp.prefetchProxyResolveDNS("ChatGPT.COM", false, src, [6]uint8{}, 0, [16]uint8{})
+	cp.prefetchProxyResolveDNSForResult(&proxyDialResult{
+		OutboundIndex: consts.OutboundUserDefinedMin,
+		Dialer:        d,
+		Outbound:      cp.outbounds[consts.OutboundUserDefinedMin],
+	}, "ChatGPT.COM", false)
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):

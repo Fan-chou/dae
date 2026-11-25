@@ -470,7 +470,7 @@ return view.extend({
 				_('dae 运行并读取到路由源后，这里列出节点。')))];
 			return E('div', { class: 'cbi-section' }, [
 				E('h3', {}, _('节点解析 DNS')),
-				E('div', { class: 'cbi-section-descr' }, _('为指定节点的服务器名改用这个 DNS 解析；留空则不覆盖。')),
+				E('div', { class: 'cbi-section-descr' }, _('经由该代理节点从远端访问的 UDP DNS（用于固定 UDP/QUIC 目标 IP，如 127.0.0.2:53 或 1.1.1.1:53）；并非解析节点自身域名，留空则不覆盖。')),
 				E('table', { class: 'table', id: 'fdae-dns-table' }, rows)
 			]);
 		};

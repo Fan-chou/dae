@@ -522,6 +522,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
 | `fd_count` / `goroutines` | `int` | 是 | 打开文件描述符数、当前 Goroutine 数 |
 | `dns` | `AdminDNSStats` | 是 | `{cache_entries, inflight, dropped_datagrams, dropped_retries, dropped_retry_failures, upstream_count}` |
 | `fakeip` | `AdminFakeIPStats \| null` | 否 | 未启用 FakeIP 时省略；启用时含 `{ready, disk_ok, live_count, max_live, leases, retained_tombstones, lease_limit, load_warn?}` |
+| `resolve_dns` | `AdminResolveDNSStats \| null` | 否 | 仅当存在配置了 `node_resolve_dns` 的节点时返回：`{cache_entries, hits, stale_hits, misses, negative_hits, prefetch_started, prefetch_consumed, timeouts, failures, fail_open, passive_pins, pooled_dials, pooled_reuses}` |
 | `bpf_overflow` | `object` | 是 | eBPF map 溢出计数：`{udp: uint64, tcp: uint64}` |
 | `tcp_conn_panic_count` | `uint64` | 是 | TCP 处理路径恢复的 panic 次数 |
 | `udp_reply_drought` | `object \| null` | 否 | 若启用了 UDP 回复中断观测时返回：`{mode, generation, group?, client?, contract?, stats, excluded?}` |
@@ -631,6 +632,7 @@ O(1) 实时指标快照；其中速率由单调时钟采样环计算，`/proc` �
     - `reason` (`string`, omitempty): 准入判定原因（如 `"ok"` / `"not_alive"` / `"fail"` / `"rtt"` / `"congestion"`）
     - `checked_at` (`string`, omitempty): 最近检测时间（RFC3339 UTC）
     - `probes` (`Record<string, AdminProbeHealth>`, omitempty): 按传输路径区分的最近探测结果，常见键为 `"tcp4"`、`"tcp6"`、`"dns4"`、`"dns6"`、`"udp4"`、`"udp6"`；每槽含 `baseline_ms`、`quality_score_ms`、`loss_rate`、`recent_latencies_ms`、`congested`、`fail_streak`、`penalty_level` 等字段
+    - `resolve_dns` (`ResolveDNSHealthSnapshot`, omitempty): 仅当该节点配置了 `resolve_dns` 时返回，含 `server`、`state`（`"closed"` \| `"open"` \| `"half_open"`）、`consecutive_failures`、`total_success`、`total_failure`、`total_timeout`、`total_fail_open`、`last_latency_ms`、`last_error`、`last_error_at`、`last_success_at`、`circuit_open_until`
 - `display_names` (`Record<string, string>`): 成员名到展示名的映射表。
 
 ---

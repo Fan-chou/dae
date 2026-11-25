@@ -8,10 +8,12 @@ package netutils
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +31,40 @@ var (
 
 	ErrBadDnsAns      = fmt.Errorf("bad dns answer")
 	ErrResolveTimeout = fmt.Errorf("timeout")
+	ErrDnsTruncated   = fmt.Errorf("dns response truncated")
 
 	FallbackDns netip.AddrPort
 )
 
-const maxDNSMessageSize = 65535
+// DnsRcodeError reports a non-zero DNS response code.
+type DnsRcodeError struct {
+	Rcode int
+}
+
+func (e *DnsRcodeError) Error() string {
+	if s, ok := dnsmessage.RcodeToString[e.Rcode]; ok {
+		return fmt.Sprintf("dns rcode %s (%d)", s, e.Rcode)
+	}
+	return fmt.Sprintf("dns rcode %d", e.Rcode)
+}
+
+// IsDnsRcodeError reports whether err is a DNS non-zero response code error.
+func IsDnsRcodeError(err error) bool {
+	var rcodeErr *DnsRcodeError
+	return errors.As(err, &rcodeErr)
+}
+
+// IsDnsNegativeError reports whether err represents an authoritative negative
+// DNS answer (NXDOMAIN) rather than a resolver or transport failure.
+func IsDnsNegativeError(err error) bool {
+	var rcodeErr *DnsRcodeError
+	return errors.As(err, &rcodeErr) && rcodeErr.Rcode == dnsmessage.RcodeNameError
+}
+
+const (
+	maxDNSMessageSize  = 65535
+	edns0UDPPayloadLen = 1232
+)
 
 type dnsResolveResult struct {
 	ans []dnsmessage.RR
@@ -129,6 +160,10 @@ func ResolveNetipTTL(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort,
 	if err != nil {
 		return nil, 0, err
 	}
+	return extractNetipTTL(resources, typ)
+}
+
+func extractNetipTTL(resources []dnsmessage.RR, typ uint16) (addrs []netip.Addr, ttl time.Duration, err error) {
 	var minTTL uint32
 	foundTTL := false
 	for _, ans := range resources {
@@ -169,63 +204,74 @@ func ResolveNetipTTL(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort,
 	return addrs, ttl, nil
 }
 
+func parseLiteralIPAnswer(host string, typ uint16) ([]dnsmessage.RR, bool) {
+	if typ != dnsmessage.TypeA && typ != dnsmessage.TypeAAAA {
+		return nil, false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil, false
+	}
+	fqdn := dnsmessage.CanonicalName(host)
+	if (addr.Is4() || addr.Is4In6()) && typ == dnsmessage.TypeA {
+		return []dnsmessage.RR{
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   fqdn,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+					Rrtype: typ,
+				},
+				A: addr.AsSlice(),
+			},
+		}, true
+	}
+	if addr.Is6() && typ == dnsmessage.TypeAAAA {
+		return []dnsmessage.RR{
+			&dnsmessage.AAAA{
+				Hdr: dnsmessage.RR_Header{
+					Name:   fqdn,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+					Rrtype: typ,
+				},
+				AAAA: addr.AsSlice(),
+			},
+		}, true
+	}
+	// MUST No record.
+	return nil, true
+}
+
+func packDNSQuery(fqdn string, typ uint16, id uint16, edns0 bool) ([]byte, error) {
+	var builder dnsmessage.Msg
+	// SetQuestion assigns a random Id and resets header flags, so set Id after it.
+	builder.SetQuestion(fqdn, typ)
+	builder.Id = id
+	builder.RecursionDesired = true
+	if edns0 {
+		builder.SetEdns0(edns0UDPPayloadLen, false)
+	}
+	return builder.Pack()
+}
+
 func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host string, typ uint16, network string) ([]dnsmessage.RR, error) {
 	if d == nil {
 		return nil, fmt.Errorf("nil dialer")
 	}
+	if ans, ok := parseLiteralIPAnswer(host, typ); ok {
+		return ans, nil
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	fqdn := dnsmessage.CanonicalName(host)
-	switch typ {
-	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-		if addr, err := netip.ParseAddr(host); err == nil {
-			if (addr.Is4() || addr.Is4In6()) && typ == dnsmessage.TypeA {
-				return []dnsmessage.RR{
-					&dnsmessage.A{
-						Hdr: dnsmessage.RR_Header{
-							Name:   dnsmessage.CanonicalName(fqdn),
-							Class:  dnsmessage.ClassINET,
-							Ttl:    0,
-							Rrtype: typ,
-						},
-						A: addr.AsSlice(),
-					},
-				}, nil
-			} else if addr.Is6() && typ == dnsmessage.TypeAAAA {
-				return []dnsmessage.RR{
-					&dnsmessage.AAAA{
-						Hdr: dnsmessage.RR_Header{
-							Name:   dnsmessage.CanonicalName(fqdn),
-							Class:  dnsmessage.ClassINET,
-							Ttl:    0,
-							Rrtype: typ,
-						},
-						AAAA: addr.AsSlice(),
-					},
-				}, nil
-			}
-			// MUST No record.
-			return nil, nil
-		}
-	default:
-	}
-	// Build DNS req.
-	builder := dnsmessage.Msg{
-		MsgHdr: dnsmessage.MsgHdr{
-			Id:               uint16(fastrand.Intn(math.MaxUint16 + 1)),
-			Response:         false,
-			Opcode:           0,
-			Truncated:        false,
-			RecursionDesired: true,
-			Authoritative:    false,
-		},
-	}
-	builder.SetQuestion(fqdn, typ)
-	b, err := builder.Pack()
+	magicNetwork, err := netproxy.ParseMagicNetwork(network)
 	if err != nil {
 		return nil, err
 	}
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+	// Build DNS req.
+	queryID := uint16(fastrand.Intn(math.MaxUint16 + 1))
+	b, err := packDNSQuery(fqdn, typ, queryID, magicNetwork.Network == "udp")
 	if err != nil {
 		return nil, err
 	}
@@ -241,6 +287,9 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	// Dial and write.
 	c, err := d.DialContext(ctx, network, dns.String())
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %w", ErrResolveTimeout, ctx.Err())
+		}
 		return nil, err
 	}
 	defer func() { _ = c.Close() }()
@@ -291,16 +340,14 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 				ch <- dnsResolveResult{err: err}
 				return
 			}
-			ch <- decodeResolvedAnswer(buf[:msgLen], builder.Id)
+			ch <- decodeResolvedAnswer(buf[:msgLen], queryID, fqdn, typ)
 			return
 		}
 
-		// Cover the full legal DNS message, not a link-MTU-sized guess. This
-		// resolver builds its queries without an EDNS0 OPT record, so a
-		// compliant server stays within 512 bytes or sets TC; the full-range
-		// buffer keeps a non-compliant or oversized answer from being read
-		// short and misreported as a decode failure. Callers that forward a
-		// client's advertised EDNS0 size must cover that size instead
+		// Cover the full legal DNS message, not a link-MTU-sized guess, so
+		// even non-compliant oversized UDP responses are not truncated at the
+		// read buffer before decoding. Callers that forward a client's
+		// advertised EDNS0 size must cover that size instead
 		// (control.dnsUdpMaxResponseSize).
 		buf := pool.GetFullCap(maxDNSMessageSize)
 		defer buf.Put()
@@ -309,12 +356,15 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 			ch <- dnsResolveResult{err: err}
 			return
 		}
-		ch <- decodeResolvedAnswer(buf[:n], builder.Id)
+		ch <- decodeResolvedAnswer(buf[:n], queryID, fqdn, typ)
 	}()
 	select {
 	case <-ctx.Done():
-		// Wrap ctx.Err() so callers can distinguish cancellation from a
-		// real deadline via errors.Is while the message stays readable.
+		// Wrap ErrResolveTimeout on deadline expiry so callers can separate
+		// DNS timeouts from cancellation and handshake deadlines.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %w", ErrResolveTimeout, ctx.Err())
+		}
 		return nil, fmt.Errorf("timeout: %w", ctx.Err())
 	case res := <-ch:
 		if res.err != nil {
@@ -324,14 +374,40 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	}
 }
 
-func decodeResolvedAnswer(payload []byte, expectedID uint16) dnsResolveResult {
+func decodeResolvedAnswer(payload []byte, expectedID uint16, expectedFQDN string, expectedType uint16) dnsResolveResult {
 	var msg dnsmessage.Msg
 	if err := msg.Unpack(payload); err != nil {
 		return dnsResolveResult{err: err}
 	}
+	res, matched := decodeUnpackedAnswer(&msg, expectedID, expectedFQDN, expectedType)
+	if !matched {
+		if msg.Id != expectedID {
+			return dnsResolveResult{err: fmt.Errorf("id mismatch: expect %v, got %v", expectedID, msg.Id)}
+		}
+		return dnsResolveResult{err: ErrBadDnsAns}
+	}
+	return res
+}
 
-	if msg.Id != expectedID {
-		return dnsResolveResult{err: fmt.Errorf("id mismatch: expect %v, got %v", expectedID, msg.Id)}
+func decodeUnpackedAnswer(msg *dnsmessage.Msg, expectedID uint16, expectedFQDN string, expectedType uint16) (dnsResolveResult, bool) {
+	if msg == nil || !msg.Response || msg.Id != expectedID {
+		return dnsResolveResult{}, false
+	}
+	if expectedFQDN != "" {
+		if len(msg.Question) > 0 {
+			q := msg.Question[0]
+			if !strings.EqualFold(dnsmessage.CanonicalName(q.Name), expectedFQDN) || (expectedType != 0 && q.Qtype != expectedType) {
+				return dnsResolveResult{}, false
+			}
+		} else if msg.Rcode == dnsmessage.RcodeSuccess {
+			return dnsResolveResult{}, false
+		}
+	}
+	if msg.Truncated {
+		return dnsResolveResult{err: ErrDnsTruncated}, true
+	}
+	if msg.Rcode != dnsmessage.RcodeSuccess {
+		return dnsResolveResult{err: &DnsRcodeError{Rcode: msg.Rcode}}, true
 	}
 
 	// Copy RRs before returning so callers don't retain pooled memory indirectly.
@@ -342,5 +418,5 @@ func decodeResolvedAnswer(payload []byte, expectedID uint16) dnsResolveResult {
 			ans[i] = dnsmessage.Copy(rr)
 		}
 	}
-	return dnsResolveResult{ans: ans}
+	return dnsResolveResult{ans: ans}, true
 }

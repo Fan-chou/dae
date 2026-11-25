@@ -18,6 +18,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/daedns"
 	"github.com/daeuniverse/dae/config"
 	D "github.com/daeuniverse/outbound/dialer"
@@ -132,7 +133,12 @@ type Dialer struct {
 
 	// resolveDNS, when set, pins UDP/QUIC DialTarget to an IP looked up
 	// through this node at that DNS. Empty means pass the domain.
-	resolveDNS netip.AddrPort
+	resolveDNS       netip.AddrPort
+	resolveDNSHealth resolveDNSHealthState
+
+	resolveDNSPoolsMu     sync.Mutex
+	resolveDNSPools       map[resolveDNSPoolKey]*netutils.PooledUDPResolver
+	resolveDNSPoolsClosed bool
 
 	// recoveryState manages exponential backoff for recovery detection.
 	// It is intentionally scoped to a single dialer instance so cloned or
@@ -399,6 +405,7 @@ func (d *Dialer) RetireForEstablishedFlows() {
 	}
 	d.retireOnce.Do(func() {
 		d.retireTransportClasses()
+		d.CloseResolveDNSPools()
 		d.cancel()
 		d.retireForEstablishedFlows()
 		if d.metadataRetirer != nil {
@@ -455,6 +462,7 @@ func (d *Dialer) Close() error {
 	d.closeOnce.Do(func() {
 		d.RetireForEstablishedFlows()
 		d.closeTransportClasses()
+		d.CloseResolveDNSPools()
 
 		// Multiplexed transports must remain open until the last established flow
 		// releases this concrete dialer.
@@ -481,6 +489,15 @@ func (d *Dialer) SetResolveDNS(dns netip.AddrPort) {
 		return
 	}
 	d.resolveDNS = dns
+}
+
+// PinsUDPSessionTarget reports whether this dialer's exit protocol pins UDP
+// destinations per session on the proxy server.
+func (d *Dialer) PinsUDPSessionTarget() bool {
+	if d == nil {
+		return false
+	}
+	return netproxy.PinsUDPSessionTarget(d.Dialer)
 }
 
 func cloneProperty(property *Property) *Property {
@@ -1055,7 +1072,11 @@ func (d *Dialer) ResetTransport() bool {
 	if d == nil {
 		return false
 	}
+	d.ResetResolveDNSCircuit()
 	reset := netproxy.ResetTransport(d.Dialer)
+	if d.ResetResolveDNSPools() {
+		reset = true
+	}
 
 	d.httpClientMu.Lock()
 	for _, cli := range d.httpClients {

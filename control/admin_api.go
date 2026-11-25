@@ -94,9 +94,28 @@ type AdminMetricsSnapshot struct {
 	Goroutines        int                          `json:"goroutines"`
 	DNS               AdminDNSStats                `json:"dns"`
 	FakeIP            *AdminFakeIPStats            `json:"fakeip,omitempty"`
+	ResolveDNS        *AdminResolveDNSStats        `json:"resolve_dns,omitempty"`
 	BpfOverflow       AdminBpfOverflow             `json:"bpf_overflow"`
 	TCPConnPanicCount uint64                       `json:"tcp_conn_panic_count"`
 	UDPReplyDrought   *AdminUDPReplyDroughtSummary `json:"udp_reply_drought,omitempty"`
+}
+
+// AdminResolveDNSStats exposes per-generation node resolve_dns cache, fallback,
+// circuit-breaker fail-open, and pooling counters for GET /api/v1/metrics.
+type AdminResolveDNSStats struct {
+	CacheEntries     int    `json:"cache_entries"`
+	Hits             uint64 `json:"hits"`
+	StaleHits        uint64 `json:"stale_hits"`
+	Misses           uint64 `json:"misses"`
+	NegativeHits     uint64 `json:"negative_hits"`
+	PrefetchStarted  uint64 `json:"prefetch_started"`
+	PrefetchConsumed uint64 `json:"prefetch_consumed"`
+	Timeouts         uint64 `json:"timeouts"`
+	Failures         uint64 `json:"failures"`
+	FailOpen         uint64 `json:"fail_open"`
+	PassivePins      uint64 `json:"passive_pins"`
+	PooledDials      uint64 `json:"pooled_dials"`
+	PooledReuses     uint64 `json:"pooled_reuses"`
 }
 
 // AdminTrafficSample is one overview chart point. Rates are bytes/sec.
@@ -125,23 +144,24 @@ type AdminProbeHealth struct {
 // AdminGroupMember is one selectable or observed member. Name is the logical
 // identity persisted by SetGroupSelection; node links are never exposed.
 type AdminGroupMember struct {
-	Name              string                       `json:"name"`
-	DisplayName       string                       `json:"display_name,omitempty"`
-	Kind              string                       `json:"kind,omitempty"`
-	ResolvedLeaf      string                       `json:"resolved_leaf,omitempty"`
-	Protocol          string                       `json:"protocol,omitempty"`
-	Endpoint          string                       `json:"endpoint,omitempty"`
-	Alive             bool                         `json:"alive"`
-	LatencyMs         *int32                       `json:"latency_ms,omitempty"`
-	BaselineMs        *int32                       `json:"baseline_ms,omitempty"`
-	QualityScoreMs    *int32                       `json:"quality_score_ms,omitempty"`
-	LossRate          *float64                     `json:"loss_rate,omitempty"`
-	RecentLatenciesMs []int32                      `json:"recent_latencies_ms,omitempty"`
-	Load              *dialer.LoadContext          `json:"load,omitempty"`
-	Admission         string                       `json:"admission,omitempty"`
-	Reason            string                       `json:"reason,omitempty"`
-	CheckedAt         string                       `json:"checked_at,omitempty"`
-	Probes            map[string]*AdminProbeHealth `json:"probes,omitempty"`
+	Name              string                           `json:"name"`
+	DisplayName       string                           `json:"display_name,omitempty"`
+	Kind              string                           `json:"kind,omitempty"`
+	ResolvedLeaf      string                           `json:"resolved_leaf,omitempty"`
+	Protocol          string                           `json:"protocol,omitempty"`
+	Endpoint          string                           `json:"endpoint,omitempty"`
+	Alive             bool                             `json:"alive"`
+	LatencyMs         *int32                           `json:"latency_ms,omitempty"`
+	BaselineMs        *int32                           `json:"baseline_ms,omitempty"`
+	QualityScoreMs    *int32                           `json:"quality_score_ms,omitempty"`
+	LossRate          *float64                         `json:"loss_rate,omitempty"`
+	RecentLatenciesMs []int32                          `json:"recent_latencies_ms,omitempty"`
+	Load              *dialer.LoadContext              `json:"load,omitempty"`
+	Admission         string                           `json:"admission,omitempty"`
+	Reason            string                           `json:"reason,omitempty"`
+	CheckedAt         string                           `json:"checked_at,omitempty"`
+	Probes            map[string]*AdminProbeHealth     `json:"probes,omitempty"`
+	ResolveDNS        *dialer.ResolveDNSHealthSnapshot `json:"resolve_dns,omitempty"`
 }
 
 // AdminGroup is one outbound group for the management API.
@@ -225,6 +245,7 @@ func (c *ControlPlane) AdminGroups() []AdminGroup {
 				member.Reason = sample.Reason
 				member.CheckedAt = sample.CheckedAt
 				member.Probes = sample.Probes
+				member.ResolveDNS = sample.ResolveDNS
 			}
 			item.Members = append(item.Members, member)
 		}
@@ -295,12 +316,12 @@ func (c *ControlPlane) AdminMetricsSnapshot() AdminMetricsSnapshot {
 	now := time.Now()
 	proc := readSelfProcessStats()
 	snap := AdminMetricsSnapshot{
-		TimestampMs: now.UnixMilli(),
+		TimestampMs:  now.UnixMilli(),
 		OffloadedTCP: tcpOffloadActive.Load(),
-		RssBytes:    proc.RSSBytes,
-		HeapBytes:   proc.HeapBytes,
-		FdCount:     proc.FDCount,
-		Goroutines:  proc.Goroutines,
+		RssBytes:     proc.RSSBytes,
+		HeapBytes:    proc.HeapBytes,
+		FdCount:      proc.FDCount,
+		Goroutines:   proc.Goroutines,
 	}
 	if c == nil {
 		return snap
@@ -322,6 +343,10 @@ func (c *ControlPlane) AdminMetricsSnapshot() AdminMetricsSnapshot {
 	if fake := c.fakeIPStore(); fake != nil {
 		fs := fake.AdminStats()
 		snap.FakeIP = &fs
+	}
+	if c.hasResolveDNSNode() {
+		rs := c.adminResolveDNSStats()
+		snap.ResolveDNS = &rs
 	}
 	if c.core != nil {
 		if objs := c.core.bpf.Load(); objs != nil && objs.BpfStatsMap != nil {
@@ -438,6 +463,7 @@ type adminLatencySample struct {
 	Reason            string
 	CheckedAt         string
 	Probes            map[string]*AdminProbeHealth
+	ResolveDNS        *dialer.ResolveDNSHealthSnapshot
 }
 
 func adminSampleFromDialer(d *dialer.Dialer, kind string) adminLatencySample {
@@ -468,16 +494,17 @@ func adminSampleFromDialer(d *dialer.Dialer, kind string) adminLatencySample {
 	probes, checkedAt := adminProbeMapForDialer(d)
 	repProbe := selectRepresentativeAdminProbe(probes)
 	sample := adminLatencySample{
-		Kind:      kind,
-		Protocol:  protocol,
-		Endpoint:  endpoint,
-		Alive:     alive,
-		LatencyMs: snapshot.LatencyMs,
-		Load:      loadCtx,
-		Admission: admission,
-		Reason:    reason,
-		CheckedAt: checkedAt,
-		Probes:    probes,
+		Kind:       kind,
+		Protocol:   protocol,
+		Endpoint:   endpoint,
+		Alive:      alive,
+		LatencyMs:  snapshot.LatencyMs,
+		Load:       loadCtx,
+		Admission:  admission,
+		Reason:     reason,
+		CheckedAt:  checkedAt,
+		Probes:     probes,
+		ResolveDNS: d.SnapshotResolveDNSHealth(time.Now()),
 	}
 	if repProbe != nil {
 		sample.BaselineMs = repProbe.BaselineMs

@@ -50,6 +50,18 @@ type udpConnStateOwner interface {
 	ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error
 }
 
+type udpPassivePin struct {
+	addr   netip.AddrPort
+	target string
+}
+
+type udpPassivePinState struct {
+	pinned    atomic.Pointer[udpPassivePin]
+	cache     *proxyResolveDNSPinCache
+	key       string
+	fakeStore *FakeIPStore
+}
+
 type UdpEndpoint struct {
 	replyStage  atomic.Int32
 	crossFamily *UDPCrossFamilyStore
@@ -119,6 +131,7 @@ type UdpEndpoint struct {
 	SniffedDomain   string
 	DialTarget      string
 	resolveDNSState *udpResolveDNSState
+	passivePin      *udpPassivePinState
 	// quicIdentified is set when this endpoint forwarded identified QUIC
 	// (Initial, sniffer session, or persisted mark). Later 1-RTT packets
 	// keep that identity after the sniffer expires.
@@ -880,6 +893,12 @@ func newUDPEndpointFromConn(p *UdpEndpointPool, key UdpEndpointKey, createOption
 	}
 	if dialOption.ResolveDNSPinned {
 		ue.resolveDNSState = &udpResolveDNSState{initial: dialOption.ResolveDNSInitial, id: resolveDNSRecoverySequence.Add(1)}
+	} else if dialOption.PassiveReplyPin && key.Dst.IsValid() {
+		ue.passivePin = &udpPassivePinState{
+			cache:     dialOption.ResolveDNSPinCache,
+			key:       dialOption.ResolveDNSPinKey,
+			fakeStore: dialOption.FakeIPStore,
+		}
 	}
 	if udpWriteBatchOptedIn() {
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
@@ -936,6 +955,9 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	// under unhealthy-node bursts without preventing any extra dial attempts.
 	if stderrors.Is(err, outbound.ErrNoAliveDialer) || stderrors.Is(err, ErrQuicAdministrativelyProhibited) {
 		return false
+	}
+	if isUdpEndpointTimeoutFailure(err) {
+		return true
 	}
 	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
 		return false

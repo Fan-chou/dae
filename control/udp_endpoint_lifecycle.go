@@ -518,6 +518,20 @@ func isUdpEndpointWriteTolerated(err error) bool {
 	return stderrors.As(err, &tolerated)
 }
 
+// activeDialTarget returns the passively pinned remote IP:port if observed,
+// otherwise the endpoint's initial DialTarget.
+func (ue *UdpEndpoint) activeDialTarget() string {
+	if ue == nil {
+		return ""
+	}
+	if ps := ue.passivePin; ps != nil {
+		if p := ps.pinned.Load(); p != nil {
+			return p.target
+		}
+	}
+	return ue.DialTarget
+}
+
 // dialTargetForWrite returns the string form of the datagram's upstream
 // destination for WriteTo. Symmetric endpoints (non-zero Dst in the pool
 // key) have a fixed dial target stored once at creation, so the per-packet
@@ -525,7 +539,7 @@ func isUdpEndpointWriteTolerated(err error) bool {
 // (zero Dst) serve multiple destinations and must format per call.
 func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
 	if ue != nil && ue.poolKey.Dst.IsValid() {
-		return ue.DialTarget
+		return ue.activeDialTarget()
 	}
 	if ue != nil && ue.crossFamily != nil {
 		if real, alias, err := ue.crossFamily.decode(realDst); alias && err == nil {
@@ -914,6 +928,45 @@ func (ue *UdpEndpoint) markReplied(nowNano int64) {
 		return
 	}
 	ue.RefreshTtlWithTime(nowNano)
+}
+
+// observePassiveReplyPeer locks an eligible stateless UDP endpoint (such as
+// Shadowsocks/SOCKS5 on an optimistic cold miss) onto the first valid remote
+// peer IP observed in a reply, and seeds the pin cache when not yet populated.
+func (ue *UdpEndpoint) observePassiveReplyPeer(peer netip.AddrPort) {
+	if ue == nil {
+		return
+	}
+	ps := ue.passivePin
+	if ps == nil || ps.pinned.Load() != nil {
+		return
+	}
+	if !peer.IsValid() || peer.Port() == 0 {
+		return
+	}
+	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
+	addr := peer.Addr()
+	if !addr.IsValid() || addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() {
+		return
+	}
+	if expectedPort := ue.poolKey.Dst.Port(); expectedPort != 0 && peer.Port() != expectedPort {
+		return
+	}
+	if ps.fakeStore != nil && ps.fakeStore.Contains(addr) {
+		return
+	}
+	if ue.crossFamily != nil && ue.crossFamily.store != nil && ue.crossFamily.store.Contains(addr) {
+		return
+	}
+	if !ps.pinned.CompareAndSwap(nil, &udpPassivePin{addr: peer, target: peer.String()}) {
+		return
+	}
+	if ps.cache != nil {
+		ps.cache.metrics.passivePins.Add(1)
+		if ps.key != "" {
+			ps.cache.storeIfUnset(ps.key, addr, time.Now(), consts.ResolveDNSCacheTTLMin)
+		}
+	}
 }
 
 func (ue *UdpEndpoint) rememberPendingReplyPeer(addr string) {

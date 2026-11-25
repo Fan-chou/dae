@@ -59,7 +59,7 @@ func (s *resolveDNSRecoveryStore) save(ue *UdpEndpoint) {
 	if s == nil || ue == nil || ue.resolveDNSState == nil || !ue.poolKey.Dst.IsValid() || !isProxyBackedDialer(ue.Dialer) || (!ue.hasSent.Load() && !ue.hasReply.Load()) {
 		return
 	}
-	target, err := netip.ParseAddrPort(ue.DialTarget)
+	target, err := netip.ParseAddrPort(ue.activeDialTarget())
 	if err != nil {
 		return
 	}
@@ -145,7 +145,7 @@ func (ue *UdpEndpoint) resolveDNSTargetForRetry(decision ...UdpFlowDecision) *re
 			return nil
 		}
 	}
-	target, err := netip.ParseAddrPort(ue.DialTarget)
+	target, err := netip.ParseAddrPort(ue.activeDialTarget())
 	if err != nil {
 		return nil
 	}

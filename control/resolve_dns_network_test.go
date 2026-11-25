@@ -153,7 +153,11 @@ func TestResolveDNSPrefetchResponseDelay(t *testing.T) {
 				cp := testDialControlPlane(newTestFixedOutboundGroup(d))
 				cp.routingMatcher = testFakeIPMatcher(t, "fallback: proxy", []string{"proxy"})
 				src := netip.MustParseAddrPort("192.0.2.10:40000")
-				cp.prefetchProxyResolveDNS("quic.example", false, src, [6]uint8{}, 0, [16]uint8{})
+				cp.prefetchProxyResolveDNSForResult(&proxyDialResult{
+					OutboundIndex: consts.OutboundUserDefinedMin,
+					Dialer:        d,
+					Outbound:      cp.outbounds[consts.OutboundUserDefinedMin],
+				}, "quic.example", false)
 				time.Sleep(lead)
 				start := time.Now()
 				_, e = cp.chooseProxyDialer(context.Background(), &proxyDialParam{Outbound: consts.OutboundUserDefinedMin, Domain: "quic.example", Src: src, Dest: netip.MustParseAddrPort("198.51.100.10:443"), Network: "udp"})

@@ -49,16 +49,18 @@ type proxyDialParam struct {
 type proxyDialResult struct {
 	ResolveDNSPinned   bool
 	ResolveDNSRestored bool
+	PassiveReplyPin    bool
+	ResolveDNSPinKey   string
 	OutboundIndex      consts.OutboundIndex
 	Outbound           *ob.DialerGroup
 	Dialer             *dialer.Dialer
 	DialTarget         string
 	Network            string
-	Mark                    uint32
-	Must                    bool
-	RuleMatchIndex          uint16
-	Rule                    *RoutingRuleMeta
-	SniffedDomain           string
+	Mark               uint32
+	Must               bool
+	RuleMatchIndex     uint16
+	Rule               *RoutingRuleMeta
+	SniffedDomain      string
 	// StickySite is the fallback/url_test pin key. It may be a dest IP when
 	// the flow has no sniffed name; it must not replace SniffedDomain.
 	StickySite string
@@ -414,7 +416,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}
 	if p.Network == "tcp" && p.Dest.Port() == 443 && res.Dialer != nil && res.Dialer.ResolveDNS().IsValid() {
 		preferV6 := p.Dest.Addr().Is6() && !p.Dest.Addr().Is4In6()
-		c.prefetchProxyResolveDNS(domain, preferV6, p.Src, p.Mac, mark, p.ProcessName, c.destIsFakeIP(p.Dest.Addr()) || p.nameOnlyPending(p.Dest))
+		c.prefetchProxyResolveDNSForResult(res, domain, preferV6)
 	}
 	if err := c.ensureUdpDialTargetIP(ctx, p, res); err != nil {
 		return res, err

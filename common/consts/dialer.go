@@ -51,8 +51,9 @@ const (
 	// It is independent of DefaultDialTimeout so a slow DNS query cannot
 	// starve the subsequent proxy handshake. Sized for a US-node RTT plus a
 	// couple of UDP retries, not a full 3s stall on the first packet.
-	ResolveDNSTimeout       = 800 * time.Millisecond
-	ResolveDNSFallbackDelay = 250 * time.Millisecond
+	ResolveDNSTimeout          = 800 * time.Millisecond
+	ResolveDNSFallbackDelay    = 250 * time.Millisecond
+	ResolveDNSFallbackDelayMax = 500 * time.Millisecond
 	// ResolveDNSUDPResendInterval is how often a UDP resolve_dns query is
 	// resent while waiting for an answer. Must be well below ResolveDNSTimeout
 	// so a lost packet can retry inside the budget.
@@ -66,6 +67,15 @@ const (
 	// background refresh runs. First packets after TTL expiry keep using the
 	// old IP instead of blocking on resolve_dns.
 	ResolveDNSStaleTTL = 5 * time.Minute
+	// ResolveDNSNegativeTTL caches authoritative negative/empty resolve_dns answers
+	// (e.g. NXDOMAIN or empty A/AAAA) so repeated packets do not thrash the proxy.
+	ResolveDNSNegativeTTL = 20 * time.Second
+	// ResolveDNSCircuitFailureThreshold trips a node's resolve_dns circuit breaker
+	// after consecutive non-negative failures, failing open to proxy-side resolution.
+	ResolveDNSCircuitFailureThreshold = 5
+	// ResolveDNSCircuitOpenDuration keeps the resolve_dns circuit open before a
+	// single half-open probe attempts recovery.
+	ResolveDNSCircuitOpenDuration = 60 * time.Second
 	// UdpEndpointFailureCacheTTL is the default UDP 4-tuple negative cache
 	// after a cacheable create/dial failure.
 	UdpEndpointFailureCacheTTL = 2 * time.Second
